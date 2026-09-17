@@ -1,0 +1,13 @@
+[package]
+name = "coldstart-infer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+build = "build.rs"
+
+[dependencies]
+cudarc = { version = "0.11", features = ["driver", "cublas", "cuda-12000", "f16"] }
+half = "2.3"
+memmap2 = "0.9"
+
+[dev-dependencies]
