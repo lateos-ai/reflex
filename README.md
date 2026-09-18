@@ -54,6 +54,67 @@ model-architecture work begins.
    latent-KV) caching strategy, not an incremental GQA extension. Read llama.cpp's real
    implementation (PR #11446) before attempting it.
 
+## Non-goals
+
+These are permanent constraints on this engine, not just current-MVP scope — the whole
+reason coldstart-infer exists is to win a narrower bet (cold-start energy/latency) than
+sustained-server throughput, and RustFeference's own postmortem
+(`../RustFeference/LESSONS_LEARNED_RUSTFEFERENCE.md`) is explicit that a broad project
+re-inherits the exact throughput/serving race that's unwinnable against llama.cpp/vLLM/
+SGLang's head start. Multi-tenancy and persistent state belong in the *host
+orchestrator*, not in this engine:
+
+- **`batch_size` is always 1.** No request queue, no continuous batching, no
+  PagedAttention-style dynamic allocation, no context preemption. Horizontal scaling
+  (many concurrent jobs) is the orchestrator's job — spin up N `coldstart-infer`
+  processes across GPU slices/time-slices — not this engine's, ever.
+- **No internal multi-tenant LoRA router/scheduler.**
+- **No internal NVMe/S3 KV-cache manager or cache-hit logic.**
+- **No concurrent HTTP/gRPC server**, no request auth/rate-limiting, no autoscaling
+  decision-making. If a warm-context mode ever exists (see Phase 4 below), it accepts
+  one job at a time, strictly sequentially — never a thread pool.
+
+This mirrors RustFeference's own `serve_http.rs`, which drew this same line once before
+("explicitly out of scope: gRPC, auth/rate-limiting, multi-model serving").
+
+## Post-architecture-MVP roadmap: productization
+
+Once the model-architecture MVP above proves the engine handles the target model
+families at all, the next axis is making the *cold-start path itself* faster and
+adoptable — without ever crossing into building a serving platform. The framing: let
+vLLM win the warm-throughput race; coldstart-infer wins by being the fastest way to turn
+cold compute into one output token, then getting out of the way.
+
+- **Phase 1 (current)** — Single-shot CLI: process launch -> one forward pass -> exit.
+  This is what MVP steps 1-2 (dense Qwen3, Qwen3-MoE) already are.
+- **Phase 2 — Fast IO**: zero-copy storage-to-GPU weight loading. Investigate `mmap` +
+  `io_uring` (Linux) or NVIDIA GPUDirect Storage to skip the current host-side
+  dequant-then-`htod_sync_copy` round trip per weight (`model.rs`'s `load_weight`
+  closure), and pre-faulted/pre-allocated CUDA memory pools instead of per-kernel-call
+  `alloc_zeros` (every `gemv`/`rmsnorm`/etc. call in `model.rs` currently allocates a
+  fresh device buffer). Architecture-agnostic — applies uniformly under dense, MoE, and
+  future hybrid/MLA forward passes, so it doesn't block on or get blocked by remaining
+  architecture-coverage work. Before investing heavily here, run the still-outstanding
+  first real cold-start A/B benchmark against llama.cpp on the same hardware/model
+  (flagged as pending in this README's dense-Qwen3 and MoE status sections, never done
+  yet) — that data, not assumption, should size how much of this phase is worth doing.
+- **Phase 3 — State I/O**: two new CLI flags, `--export-kv <file>` and
+  `--import-kv <file>`, doing raw binary dump/load of the K/V cache to/from a file
+  descriptor. coldstart-infer stays ignorant of *where* that file lives or how it got
+  there (NVMe, an S3-backed FUSE mount, tmpfs) — that's the orchestrator's job. No
+  caching policy, no cache-hit logic, inside this engine.
+- **Phase 4 — Embeddability**: a single `--lora <path>` CLI flag (load-time adapter
+  application only, no runtime hot-swap multiplexer — process spin-up is already cheap
+  enough that a fresh process per adapter is the scale-from-zero answer, not in-process
+  swapping), plus a Rust C-FFI surface so an external orchestrator daemon can embed
+  coldstart-infer directly instead of `exec`-ing a binary. If a warm-context IPC mode is
+  ever built, it's stdin/stdout or a Unix domain socket, one job at a time, never a
+  concurrent server (see Non-goals above).
+
+Phase 2 can run in parallel with the remaining architecture-coverage steps (3-4) above;
+Phases 3-4 are lower priority and should follow once architecture coverage and Phase 2
+are solid.
+
 ## Salvaged from RustFeference (reused as-is, unmodified except path)
 
 - `src/gguf.rs` — GGUF metadata/tensor-directory parsing (mmap-based).
