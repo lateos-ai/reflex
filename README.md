@@ -281,4 +281,48 @@ Single-machine, single-session, `n=3` — not a rigorous statistical benchmark, 
 enough and repeatable enough (all three coldstart-infer runs within ~2s of each other) to
 act on.
 
-Next: Qwen3.5 hybrid Gated DeltaNet mixer per the MVP order above.
+### Phase 2 (Fast IO), round 1: fixing the load path identified above
+
+The `model.rs` root cause above was actually two compounding bugs, not one:
+`load_weight` did dequantize every tensor to a full-`f32` host `Vec` at load time (as
+suspected), but every one of `gemv`/`gemv_expert`/`rmsnorm`'s host `Vec<f32>` weight
+buffers were *also* being re-uploaded to the GPU via a fresh `htod_sync_copy` on every
+single call — i.e. every layer, every token position, every generated token — on top of
+staying host-resident (never freed) for the model's entire lifetime. GGUF file loading
+itself was already zero-copy `mmap` (`gguf.rs`), so "Fast IO" here turned out to mean
+"stop re-uploading and re-retaining weights we already uploaded once", not `io_uring`.
+
+Fix: `Weight` now holds a `CudaSlice<f32>` (uploaded once, immediately after
+dequantizing, with the host scratch buffer dropped right after) instead of a host
+`Vec<f32>`. `gemv`/`gemv_expert`/`rmsnorm` take that device buffer directly — MoE's
+per-expert dispatch slices it with `CudaSlice::slice` (a zero-copy device-side view, no
+device-to-device copy). Only the token embedding table stays host-resident (needed for
+host-side embedding-lookup gather; unchanged from before) and, only when embeddings are
+tied to the LM head, its already-dequantized host bytes are uploaded a second time as
+`lm_head` rather than dequantized twice as the old `.or_else(|_| load_weight(...))`
+fallback did.
+
+Re-measured the same way (`/usr/bin/time -v`, same `Qwen3-0.6B-Q4_K_M.gguf`, same
+prompt, three runs), after re-verifying byte-identical output on both fixtures first
+(dense `"Once upon a time"` -> `","` token id 11, `"The capital of France is"` ->
+`" Paris"`; MoE `Tiny-Moe.Q4_K_M.gguf` -> token id 4036 -- all unchanged):
+
+| | run 1 | run 2 | run 3 | peak RSS | user+sys CPU time |
+|---|---|---|---|---|---|
+| **llama.cpp** (unchanged) | 6.47s | 6.59s | 6.56s | 900 MB | 1.70s + 1.27s |
+| **coldstart-infer, before** | 29.64s | 27.93s | 28.23s | 3.68 GB | 5.13s + 14.02s |
+| **coldstart-infer, after** | 11.31s | 11.70s | 10.44s | 1.33 GB | ~3.2s + ~4.0s |
+
+Gap closed from ~4.3x to **~1.7x slower than llama.cpp** — peak RSS down ~2.75x, system
+time down ~3.3x. Still not faster, and the remaining gap is most likely the CPU-bound
+host-side dequantize-to-`f32` step itself (llama.cpp's CUDA backend uploads quantized
+bytes as-is and dequantizes/matmuls on the GPU, never materializing a full-`f32` host
+copy at all) plus this MVP's one-host-round-trip-per-op kernel structure (every `gemv`/
+`rmsnorm`/`rope`/`silu`/`attention` call still does its own `htod`/`dtoh` for the
+*activation* vectors, even though those are small). Candidate follow-ups, not yet
+attempted: an on-GPU dequant kernel (matches llama.cpp's approach, but is a real new-
+kernel-writing project, not a load-path tweak), and/or keeping activations device-
+resident across a whole layer instead of round-tripping between every op.
+
+Next: Qwen3.5 hybrid Gated DeltaNet mixer per the MVP order above, or a second Phase 2
+round on the remaining gap above -- open call, not yet decided.

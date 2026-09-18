@@ -47,7 +47,7 @@ use crate::dequant;
 use crate::gguf::{GgufFile, GgufValue};
 use crate::moe::route_top_k;
 use crate::tokenizer::Tokenizer;
-use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice, DeviceRepr, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
 
 fn u64_meta(file: &GgufFile, key: &str) -> Option<u64> {
@@ -74,12 +74,15 @@ pub struct LayerConfig {
     pub rmsnorm_eps: f32,
 }
 
-/// A dequantized weight tensor plus its original GGUF shape
-/// (`[in_features, out_features]` for a 2-D `nn.Linear`-style weight,
-/// `[hidden_size]` for a norm weight, `[hidden_size, vocab_size]` for the
-/// token embedding table).
+/// A weight tensor, dequantized to `f32` once at load time and uploaded to
+/// device memory immediately after (see `Model::load`'s `load_weight`) so
+/// no forward-pass call re-uploads it -- kernels below take `&self.data`
+/// (or a zero-copy `CudaView` slice of it, for per-expert MoE tensors)
+/// directly. Shape is the original GGUF shape (`[in_features,
+/// out_features]` for a 2-D `nn.Linear`-style weight, `[hidden_size]` for a
+/// norm weight).
 struct Weight {
-    data: Vec<f32>,
+    data: CudaSlice<f32>,
     shape: Vec<u64>,
 }
 
@@ -205,10 +208,12 @@ pub struct Model {
     /// `k` (top-k expert count), `Some` iff this is an MoE model.
     expert_used_count: Option<usize>,
     /// `[hidden_size, vocab_size]`, row-major `(vocab_size, hidden_size)`
-    /// flat data -- used both for embedding lookup (host-side gather; batch
-    /// is always 1 in this MVP, so a GPU gather kernel buys nothing) and,
-    /// when no separate `output.weight` tensor exists, as the tied LM head.
-    token_embd: Weight,
+    /// flat data -- kept host-resident (unlike every other weight) for
+    /// embedding lookup (host-side gather; batch is always 1 in this MVP, so
+    /// a GPU gather kernel buys nothing). When no separate `output.weight`
+    /// tensor exists, its dequantized bytes are also uploaded to device
+    /// memory once, as `lm_head`, rather than dequantizing them twice.
+    token_embd: Vec<f32>,
     output_norm: Weight,
     lm_head: Weight,
     tokenizer: Tokenizer,
@@ -226,10 +231,16 @@ impl Model {
         let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
         let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
 
+        // Dequantizes straight from the mmap'd GGUF bytes into a scratch host
+        // `Vec<f32>`, uploads it to device memory, then drops the host copy
+        // (goes out of scope) -- unlike before, no dequantized weight stays
+        // host-resident for the model's lifetime, and no forward-pass call
+        // re-uploads it (see `Weight`'s doc comment).
         let load_weight = |name: &str| -> Result<Weight, String> {
             let info = file.tensor_info(name).ok_or_else(|| format!("missing weight '{name}'"))?;
             let bytes = file.tensor_bytes(info)?;
-            let data = dequant::dequantize(info.ggml_type, bytes, info.element_count())?;
+            let host = dequant::dequantize(info.ggml_type, bytes, info.element_count())?;
+            let data = device.htod_sync_copy(&host).map_err(|e| format!("upload weight '{name}' to device: {e}"))?;
             Ok(Weight { data, shape: info.shape.clone() })
         };
 
@@ -277,9 +288,32 @@ impl Model {
             layers.push(layer);
         }
 
-        let token_embd = load_weight("token_embd.weight")?;
+        let token_embd_info =
+            file.tensor_info("token_embd.weight").ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
+        let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
+        let token_embd =
+            dequant::dequantize(token_embd_info.ggml_type, token_embd_bytes, token_embd_info.element_count())?;
+
         let output_norm = load_weight("output_norm.weight")?;
-        let lm_head = load_weight("output.weight").or_else(|_| load_weight("token_embd.weight"))?;
+
+        // Tied-embedding models have no separate `output.weight` tensor --
+        // reuse `token_embd`'s already-dequantized host bytes for the LM
+        // head's device upload instead of dequantizing them a second time.
+        let lm_head = match file.tensor_info("output.weight") {
+            Some(info) => {
+                let bytes = file.tensor_bytes(info)?;
+                let host = dequant::dequantize(info.ggml_type, bytes, info.element_count())?;
+                let data =
+                    device.htod_sync_copy(&host).map_err(|e| format!("upload weight 'output.weight' to device: {e}"))?;
+                Weight { data, shape: info.shape.clone() }
+            }
+            None => {
+                let data = device
+                    .htod_sync_copy(&token_embd)
+                    .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
+                Weight { data, shape: token_embd_info.shape.clone() }
+            }
+        };
 
         let tokenizer = Tokenizer::from_gguf(file)?;
 
@@ -300,9 +334,15 @@ impl Model {
         })
     }
 
-    fn rmsnorm(&self, x: &[f32], weight: &[f32], rows: usize, hidden_size: usize, eps: f32) -> Result<Vec<f32>, String> {
+    fn rmsnorm(
+        &self,
+        x: &[f32],
+        weight: &CudaSlice<f32>,
+        rows: usize,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<Vec<f32>, String> {
         let dev_x = self.device.htod_sync_copy(x).map_err(|e| format!("rmsnorm htod x: {e}"))?;
-        let dev_w = self.device.htod_sync_copy(weight).map_err(|e| format!("rmsnorm htod weight: {e}"))?;
         let mut dev_out = self.device.alloc_zeros::<f32>(x.len()).map_err(|e| format!("rmsnorm alloc out: {e}"))?;
 
         let n = x.len() as u32;
@@ -313,19 +353,22 @@ impl Model {
             self.rmsnorm_k
                 .function
                 .clone()
-                .launch(launch_cfg, (&dev_x, &dev_w, &mut dev_out, rows as u32, hidden_size as u32, eps))
+                .launch(launch_cfg, (&dev_x, weight, &mut dev_out, rows as u32, hidden_size as u32, eps))
                 .map_err(|e| format!("rmsnorm launch: {e}"))?;
         }
         self.device.dtoh_sync_copy(&dev_out).map_err(|e| format!("rmsnorm dtoh: {e}"))
     }
 
-    fn gemv_raw(&self, x: &[f32], w_data: &[f32], in_features: usize, out_features: usize) -> Result<Vec<f32>, String> {
+    /// `w_dev` is already device-resident -- either `&self.data` on a whole
+    /// [`Weight`] (a `&CudaSlice<f32>`) or a zero-copy `CudaView` slice of
+    /// one (see `Self::gemv_expert`) -- so, unlike `x`, it is never
+    /// re-uploaded here.
+    fn gemv_raw<W: DeviceRepr>(&self, x: &[f32], w_dev: W, in_features: usize, out_features: usize) -> Result<Vec<f32>, String> {
         if x.len() != in_features {
             return Err(format!("gemv: x.len()={} != in_features={in_features}", x.len()));
         }
 
         let dev_x = self.device.htod_sync_copy(x).map_err(|e| format!("gemv htod x: {e}"))?;
-        let dev_w = self.device.htod_sync_copy(w_data).map_err(|e| format!("gemv htod w: {e}"))?;
         let mut dev_y = self.device.alloc_zeros::<f32>(out_features).map_err(|e| format!("gemv alloc y: {e}"))?;
 
         let threads = 256u32;
@@ -335,7 +378,7 @@ impl Model {
             self.gemv_k
                 .function
                 .clone()
-                .launch(launch_cfg, (&dev_x, &dev_w, &mut dev_y, in_features as u32, out_features as u32))
+                .launch(launch_cfg, (&dev_x, w_dev, &mut dev_y, in_features as u32, out_features as u32))
                 .map_err(|e| format!("gemv launch: {e}"))?;
         }
         self.device.dtoh_sync_copy(&dev_y).map_err(|e| format!("gemv dtoh: {e}"))
@@ -352,7 +395,8 @@ impl Model {
     /// Expert `e`'s `in_features * out_features` elements are a contiguous
     /// chunk already in the same row-major `(out_features, in_features)`
     /// layout as a standalone 2-D weight (see this module's doc comment), so
-    /// no copy/transpose is needed beyond slicing.
+    /// `CudaSlice::slice` gives a zero-copy device-side view -- no
+    /// device-to-device copy, let alone a host round-trip.
     fn gemv_expert(&self, x: &[f32], w: &Weight, expert_idx: usize) -> Result<Vec<f32>, String> {
         let (in_features, out_features, expert_count) = match w.shape.as_slice() {
             [i, o, e] => (*i as usize, *o as usize, *e as usize),
@@ -363,7 +407,8 @@ impl Model {
         }
         let expert_len = in_features * out_features;
         let start = expert_idx * expert_len;
-        self.gemv_raw(x, &w.data[start..start + expert_len], in_features, out_features)
+        let view = w.data.slice(start..start + expert_len);
+        self.gemv_raw(x, &view, in_features, out_features)
     }
 
     fn rope(&self, t: &mut Vec<f32>, num_heads: usize, head_dim: usize, position: usize, base: f32) -> Result<(), String> {
@@ -627,7 +672,7 @@ impl Model {
         let mut hidden = vec![0.0f32; hidden_size];
         for (position, &token_id) in ids.iter().enumerate() {
             let embd_base = token_id as usize * hidden_size;
-            hidden.copy_from_slice(&self.token_embd.data[embd_base..embd_base + hidden_size]);
+            hidden.copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 hidden = self.forward_layer(layer, &hidden, position, &mut k_caches[layer_idx], &mut v_caches[layer_idx])?;
