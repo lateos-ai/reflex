@@ -94,10 +94,12 @@ cold compute into one output token, then getting out of the way.
   `alloc_zeros` (every `gemv`/`rmsnorm`/etc. call in `model.rs` currently allocates a
   fresh device buffer). Architecture-agnostic — applies uniformly under dense, MoE, and
   future hybrid/MLA forward passes, so it doesn't block on or get blocked by remaining
-  architecture-coverage work. Before investing heavily here, run the still-outstanding
-  first real cold-start A/B benchmark against llama.cpp on the same hardware/model
-  (flagged as pending in this README's dense-Qwen3 and MoE status sections, never done
-  yet) — that data, not assumption, should size how much of this phase is worth doing.
+  architecture-coverage work. **Now sized by real data, not assumption**: the first real
+  cold-start A/B benchmark against llama.cpp (see the MoE status section above) found
+  coldstart-infer ~4.3x *slower* than llama.cpp on the same hardware/model, with 4x the
+  peak RSS and ~11x the system CPU time — strong evidence `load_weight`'s full-`f32`
+  host-side dequant is the dominant cost. This makes Phase 2 high-priority, not
+  speculative.
 - **Phase 3 — State I/O**: two new CLI flags, `--export-kv <file>` and
   `--import-kv <file>`, doing raw binary dump/load of the K/V cache to/from a file
   descriptor. coldstart-infer stays ignorant of *where* that file lives or how it got
@@ -237,5 +239,46 @@ The dense Qwen3 path was re-verified byte-identical against both of its previous
 results (`"Once upon a time"` -> `","` token id 11; `"The capital of France is"` ->
 `" Paris"`) after this refactor, confirming `forward_attn_block`'s extraction didn't
 change dense behavior.
+
+### First real cold-start benchmark: coldstart-infer vs. llama.cpp
+
+The comparison flagged as outstanding since dense Qwen3 landed (see "Status" above) has
+now been run, on the same A6000 instance, against the same `Qwen3-0.6B-Q4_K_M.gguf`, same
+prompt (`"Once upon a time"`), greedy/`--temp 0`, full GPU offload for both. llama.cpp was
+built from source this session (`ggml-org/llama.cpp` commit `972d231`, `cmake
+-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86`, Release) and run via `llama-cli -n 1 --temp
+0 -ngl 99 --no-warmup -st --simple-io`. Both engines were measured the same way — external
+wall clock via `/usr/bin/time -v` (process launch to exit, including OS exec/dynamic-
+linking overhead that coldstart-infer's own internal `Instant::now()`-based metric
+excludes) — three runs each:
+
+| | run 1 | run 2 | run 3 | peak RSS | user+sys CPU time |
+|---|---|---|---|---|---|
+| **llama.cpp** | 6.47s | 6.59s | 6.56s | 900 MB | 1.70s + 1.27s |
+| **coldstart-infer** | 29.64s | 27.93s | 28.23s | 3.68 GB | 5.13s + 14.02s |
+
+**coldstart-infer is currently ~4.3x slower than llama.cpp on cold start, not faster —
+the core thesis this project bets on is unproven and currently reversed.** This isn't a
+surprise (README's own "Status"/MoE sections already flagged the load path as
+correctness-first and unoptimized), but the magnitude and a concrete likely cause are new:
+coldstart-infer's 14.02s of *system* time (kernel/syscall time — page faults, memory
+allocation) versus llama.cpp's 1.27s, and 4x the peak resident memory, points squarely at
+`model.rs`'s `load_weight` closure, which dequantizes every tensor to a fresh full-`f32`
+host `Vec` before any GPU upload — exactly the "host-side dequant of every weight" and
+"one host<->device round trip per kernel call per layer" candidates already named as
+unoptimized. This is real, actionable evidence for sizing Phase 2 (Fast IO) below, not
+just a hypothesis.
+
+Caveats, disclosed rather than smoothed over: llama.cpp's `llama-cli` runs a
+conversation-style REPL (ASCII banner, `/exit`-style commands) that coldstart-infer's
+minimal binary doesn't have, and this llama-cli build gave no discovered flag to fully
+confirm the raw prompt wasn't wrapped in the model's embedded chat template (`tokenizer.
+chat_template` is present in this GGUF) the way coldstart-infer's raw tokenizer path
+guarantees — llama.cpp's own reported prompt-processing rate (150.4 t/s over a handful of
+tokens, tens of milliseconds either way) makes this negligible next to the multi-second
+gap, but it means the two runs are not proven to process byte-identical token sequences.
+Single-machine, single-session, `n=3` — not a rigorous statistical benchmark, but large
+enough and repeatable enough (all three coldstart-infer runs within ~2s of each other) to
+act on.
 
 Next: Qwen3.5 hybrid Gated DeltaNet mixer per the MVP order above.
