@@ -1,19 +1,34 @@
-//! Dense Qwen3 forward pass (MVP step 1, see README.md's MVP order): loads a
-//! GGUF file's weights, runs embedding -> every transformer layer -> final
-//! RMSNorm -> LM head -> argmax for the *first* generated token only. No KV
-//! cache reuse across separate calls, no batching, no sampling beyond greedy
-//! argmax -- the target metric is process-start-to-first-token latency, not
-//! sustained decode throughput (see README.md's "Why this exists").
+//! Dense and MoE Qwen3 forward pass (MVP steps 1-2, see README.md's MVP
+//! order): loads a GGUF file's weights, runs embedding -> every transformer
+//! layer -> final RMSNorm -> LM head -> argmax for the *first* generated
+//! token only. No KV cache reuse across separate calls, no batching, no
+//! sampling beyond greedy argmax -- the target metric is
+//! process-start-to-first-token latency, not sustained decode throughput
+//! (see README.md's "Why this exists").
 //!
 //! Architecture and math ported from RustFeference's own most mature, most-
-//! verified dense-model code (`rft-gpu/src/generate.rs` + `dispatch.rs` +
-//! `kernels/{rmsnorm,rope,silu_and_mul}.rs`, git history around commits
-//! `d8ed273` "minimal end-to-end dense forward pass" and `1459330` "Qwen3
-//! architecture support") as the correctness oracle, not copied wholesale:
+//! verified model code (`rft-gpu/src/generate.rs` + `dispatch.rs` +
+//! `moe.rs`, git history around commits `d8ed273` "minimal end-to-end dense
+//! forward pass", `1459330` "Qwen3 architecture support", and `6a70287`
+//! "qwen3moe support") as the correctness oracle, not copied wholesale:
 //! RustFeference's serving/paged-KV-cache/tensor-parallel machinery is all
 //! out of scope here (see MVP scope discussion) -- kernels below are
 //! deliberately fresh, simple, from-scratch AOT kernels, not ports of
 //! RustFeference's own (far more complex, paged/batched/fused) CUDA source.
+//!
+//! MoE scope (MVP step 2): naive per-token expert dispatch -- one `gemv`
+//! call per selected expert per FFN matrix, no batched/grouped-by-expert
+//! GEMM -- which RustFeference's own docs call the correct starting point.
+//! The attention block is byte-for-byte identical between dense and MoE
+//! layers (shared via `Model::forward_attn_block`); MoE only replaces the
+//! single shared FFN with a router (softmax + top-k, `crate::moe::route_top_k`)
+//! over per-expert-stacked SwiGLU weights. No real small `qwen3moe`-
+//! architecture GGUF was available to test against, so this was verified
+//! against a real (Mixtral-style, `general.architecture = "llama"`, no
+//! QK-Norm) `Tiny-Moe.Q4_K_M.gguf` fixture instead -- the MoE routing/dispatch
+//! math is architecture-agnostic (see `crate::moe`'s doc comment), and the
+//! shared attention block already covers Qwen3's QK-Norm separately (dense
+//! Qwen3 MVP step 1).
 //!
 //! GEMM convention throughout: `y = x @ W^T` (`nn.Linear`), where a real
 //! GGUF weight tensor's parsed `shape` is `[in_features, out_features]`
@@ -21,11 +36,16 @@
 //! usage of the identical, unmodified `gguf.rs` parser this crate salvaged)
 //! and its flat dequantized bytes are already row-major
 //! `(out_features, in_features)` -- exactly `gemv_kernel`'s expected layout,
-//! no transpose needed.
+//! no transpose needed. A per-expert-stacked MoE tensor's shape is
+//! `[in_features, out_features, expert_count]` (confirmed against
+//! llama.cpp's `qwen3moe.cpp`), and expert `e`'s `in_features * out_features`
+//! chunk is contiguous and already in that same 2-D layout -- see
+//! `Model::gemv_expert`.
 
 use crate::aot::{self, AotKernel};
 use crate::dequant;
 use crate::gguf::{GgufFile, GgufValue};
+use crate::moe::route_top_k;
 use crate::tokenizer::Tokenizer;
 use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
@@ -63,7 +83,7 @@ struct Weight {
     shape: Vec<u64>,
 }
 
-struct LayerWeights {
+struct DenseLayerWeights {
     attn_norm: Weight,
     attn_q: Weight,
     attn_k: Weight,
@@ -80,40 +100,96 @@ struct LayerWeights {
     ffn_down: Weight,
 }
 
-/// Derive [`LayerConfig`] and the layer count from a GGUF file's `qwen3.*`
-/// metadata (plus `blk.0.ffn_gate.weight`'s real shape, since GGUF has no
-/// dedicated "FFN hidden size" metadata key). Pure/host-only, no GPU
-/// required. Dense `qwen3` only -- `qwen3moe` and other architectures are
-/// out of scope (see README.md's MVP order).
-pub fn parse_model_config(file: &GgufFile) -> Result<(LayerConfig, usize), String> {
+/// One MoE transformer layer's weights: an attention block identical in
+/// shape/meaning to [`DenseLayerWeights`]'s (shared at forward time via
+/// `Model::forward_attn_block`), plus a router (`ffn_gate_inp`, `[hidden_size,
+/// expert_count]`) and per-expert-stacked SwiGLU weights (`ffn_gate_exps`/
+/// `ffn_up_exps`/`ffn_down_exps`, each `[in_features, out_features,
+/// expert_count]`) in place of the dense path's single shared FFN.
+struct MoeLayerWeights {
+    attn_norm: Weight,
+    attn_q: Weight,
+    attn_k: Weight,
+    attn_v: Weight,
+    attn_output: Weight,
+    attn_q_norm: Option<Weight>,
+    attn_k_norm: Option<Weight>,
+    ffn_norm: Weight,
+    ffn_gate_inp: Weight,
+    ffn_gate_exps: Weight,
+    ffn_up_exps: Weight,
+    ffn_down_exps: Weight,
+}
+
+enum LayerWeights {
+    Dense(DenseLayerWeights),
+    Moe(MoeLayerWeights),
+}
+
+/// `<arch>.expert_count`/`<arch>.expert_used_count` metadata for an MoE
+/// model -- present (and `expert_count` nonzero) iff the file describes an
+/// MoE architecture. See `crate::moe`'s doc comment for why this is keyed by
+/// the file's own architecture string rather than hardcoded to `llama.*`.
+pub struct MoeMetaConfig {
+    pub expert_count: usize,
+    pub expert_used_count: usize,
+}
+
+/// Derive [`LayerConfig`], the layer count, and (for an MoE architecture)
+/// [`MoeMetaConfig`] from a GGUF file's `<arch>.*` metadata (plus
+/// `blk.0.ffn_gate[_exps].weight`'s real shape, since GGUF has no dedicated
+/// "FFN hidden size" metadata key). Pure/host-only, no GPU required.
+/// Supports dense `qwen3` and any architecture reporting a nonzero
+/// `<arch>.expert_count` (real `qwen3moe`, or a Mixtral-style test fixture
+/// under `llama.*`) -- other architectures are out of scope (see README.md's
+/// MVP order).
+pub fn parse_model_config(file: &GgufFile) -> Result<(LayerConfig, usize, Option<MoeMetaConfig>), String> {
     let architecture = file.metadata.get("general.architecture").and_then(GgufValue::as_str).unwrap_or("");
-    if architecture != "qwen3" {
+
+    let moe = match u64_meta(file, &format!("{architecture}.expert_count")).filter(|&n| n > 0) {
+        Some(expert_count) => {
+            let expert_used_count = u64_meta(file, &format!("{architecture}.expert_used_count"))
+                .ok_or_else(|| format!("missing {architecture}.expert_used_count metadata key"))?;
+            Some(MoeMetaConfig { expert_count: expert_count as usize, expert_used_count: expert_used_count as usize })
+        }
+        None => None,
+    };
+
+    if architecture != "qwen3" && moe.is_none() {
         return Err(format!(
-            "unsupported architecture '{architecture}': only dense 'qwen3' is in scope for this MVP"
+            "unsupported architecture '{architecture}': only dense 'qwen3' and MoE architectures reporting a nonzero '{architecture}.expert_count' are in scope for this MVP"
         ));
     }
 
-    let block_count = u64_meta(file, "qwen3.block_count").ok_or("missing qwen3.block_count metadata key")? as usize;
-    let hidden_size =
-        u64_meta(file, "qwen3.embedding_length").ok_or("missing qwen3.embedding_length metadata key")? as usize;
-    let num_q_heads = u64_meta(file, "qwen3.attention.head_count")
-        .ok_or("missing qwen3.attention.head_count metadata key")? as usize;
-    let num_kv_heads = u64_meta(file, "qwen3.attention.head_count_kv").unwrap_or(num_q_heads as u64) as usize;
-    let head_dim = u64_meta(file, "qwen3.attention.key_length")
-        .ok_or("missing qwen3.attention.key_length metadata key (Qwen3's head_dim is not derivable from hidden_size/num_q_heads)")?
-        as usize;
+    let block_count =
+        u64_meta(file, &format!("{architecture}.block_count")).ok_or_else(|| format!("missing {architecture}.block_count metadata key"))? as usize;
+    let hidden_size = u64_meta(file, &format!("{architecture}.embedding_length"))
+        .ok_or_else(|| format!("missing {architecture}.embedding_length metadata key"))? as usize;
+    let num_q_heads = u64_meta(file, &format!("{architecture}.attention.head_count"))
+        .ok_or_else(|| format!("missing {architecture}.attention.head_count metadata key"))? as usize;
+    let num_kv_heads =
+        u64_meta(file, &format!("{architecture}.attention.head_count_kv")).unwrap_or(num_q_heads as u64) as usize;
+    // Qwen3 (dense and MoE) decouples head_dim from hidden_size/num_q_heads via
+    // this key. Non-Qwen3 MoE fixtures (e.g. a Mixtral-style test GGUF with no
+    // per-head decoupling) don't set it, so fall back to the standard derivation
+    // rather than hard-failing -- real Qwen3 files always have the key, so this
+    // fallback only ever engages for such fixtures.
+    let head_dim = u64_meta(file, &format!("{architecture}.attention.key_length"))
+        .map(|n| n as usize)
+        .unwrap_or(hidden_size / num_q_heads);
 
-    let ffn_gate_info =
-        file.tensor_info("blk.0.ffn_gate.weight").ok_or("missing blk.0.ffn_gate.weight tensor")?;
+    let ffn_gate_weight_name = if moe.is_some() { "blk.0.ffn_gate_exps.weight" } else { "blk.0.ffn_gate.weight" };
+    let ffn_gate_info = file.tensor_info(ffn_gate_weight_name).ok_or_else(|| format!("missing {ffn_gate_weight_name} tensor"))?;
     let ffn_hidden_size = match ffn_gate_info.shape.as_slice() {
         [_in_features, out_features] => *out_features as usize,
-        other => return Err(format!("blk.0.ffn_gate.weight has unexpected shape {other:?}, expected 2-D")),
+        [_in_features, out_features, _expert_count] => *out_features as usize,
+        other => return Err(format!("{ffn_gate_weight_name} has unexpected shape {other:?}")),
     };
 
-    let rope_base = f32_meta(file, "qwen3.rope.freq_base").unwrap_or(10000.0);
-    let rmsnorm_eps = f32_meta(file, "qwen3.attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
+    let rope_base = f32_meta(file, &format!("{architecture}.rope.freq_base")).unwrap_or(10000.0);
+    let rmsnorm_eps = f32_meta(file, &format!("{architecture}.attention.layer_norm_rms_epsilon")).unwrap_or(1e-5);
 
-    Ok((LayerConfig { hidden_size, num_q_heads, num_kv_heads, head_dim, ffn_hidden_size, rope_base, rmsnorm_eps }, block_count))
+    Ok((LayerConfig { hidden_size, num_q_heads, num_kv_heads, head_dim, ffn_hidden_size, rope_base, rmsnorm_eps }, block_count, moe))
 }
 
 /// A loaded dense Qwen3 model, ready to [`Model::forward_prompt`] from.
@@ -126,6 +202,8 @@ pub struct Model {
     attn_k: AotKernel,
     cfg: LayerConfig,
     layers: Vec<LayerWeights>,
+    /// `k` (top-k expert count), `Some` iff this is an MoE model.
+    expert_used_count: Option<usize>,
     /// `[hidden_size, vocab_size]`, row-major `(vocab_size, hidden_size)`
     /// flat data -- used both for embedding lookup (host-side gather; batch
     /// is always 1 in this MVP, so a GPU gather kernel buys nothing) and,
@@ -138,7 +216,8 @@ pub struct Model {
 
 impl Model {
     pub fn load(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
-        let (cfg, block_count) = parse_model_config(file)?;
+        let (cfg, block_count, moe) = parse_model_config(file)?;
+        let expert_used_count = moe.map(|m| m.expert_used_count);
 
         let rmsnorm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_RMSNORM"), "rmsnorm", "rmsnorm_kernel")?;
         let rope_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope", "rope_kernel")?;
@@ -156,19 +235,46 @@ impl Model {
 
         let mut layers = Vec::with_capacity(block_count);
         for i in 0..block_count {
-            layers.push(LayerWeights {
-                attn_norm: load_weight(&format!("blk.{i}.attn_norm.weight"))?,
-                attn_q: load_weight(&format!("blk.{i}.attn_q.weight"))?,
-                attn_k: load_weight(&format!("blk.{i}.attn_k.weight"))?,
-                attn_v: load_weight(&format!("blk.{i}.attn_v.weight"))?,
-                attn_output: load_weight(&format!("blk.{i}.attn_output.weight"))?,
-                attn_q_norm: load_weight(&format!("blk.{i}.attn_q_norm.weight")).ok(),
-                attn_k_norm: load_weight(&format!("blk.{i}.attn_k_norm.weight")).ok(),
-                ffn_norm: load_weight(&format!("blk.{i}.ffn_norm.weight"))?,
-                ffn_gate: load_weight(&format!("blk.{i}.ffn_gate.weight"))?,
-                ffn_up: load_weight(&format!("blk.{i}.ffn_up.weight"))?,
-                ffn_down: load_weight(&format!("blk.{i}.ffn_down.weight"))?,
-            });
+            let attn_norm = load_weight(&format!("blk.{i}.attn_norm.weight"))?;
+            let attn_q = load_weight(&format!("blk.{i}.attn_q.weight"))?;
+            let attn_k = load_weight(&format!("blk.{i}.attn_k.weight"))?;
+            let attn_v = load_weight(&format!("blk.{i}.attn_v.weight"))?;
+            let attn_output = load_weight(&format!("blk.{i}.attn_output.weight"))?;
+            let attn_q_norm = load_weight(&format!("blk.{i}.attn_q_norm.weight")).ok();
+            let attn_k_norm = load_weight(&format!("blk.{i}.attn_k_norm.weight")).ok();
+            let ffn_norm = load_weight(&format!("blk.{i}.ffn_norm.weight"))?;
+
+            let layer = if expert_used_count.is_some() {
+                LayerWeights::Moe(MoeLayerWeights {
+                    attn_norm,
+                    attn_q,
+                    attn_k,
+                    attn_v,
+                    attn_output,
+                    attn_q_norm,
+                    attn_k_norm,
+                    ffn_norm,
+                    ffn_gate_inp: load_weight(&format!("blk.{i}.ffn_gate_inp.weight"))?,
+                    ffn_gate_exps: load_weight(&format!("blk.{i}.ffn_gate_exps.weight"))?,
+                    ffn_up_exps: load_weight(&format!("blk.{i}.ffn_up_exps.weight"))?,
+                    ffn_down_exps: load_weight(&format!("blk.{i}.ffn_down_exps.weight"))?,
+                })
+            } else {
+                LayerWeights::Dense(DenseLayerWeights {
+                    attn_norm,
+                    attn_q,
+                    attn_k,
+                    attn_v,
+                    attn_output,
+                    attn_q_norm,
+                    attn_k_norm,
+                    ffn_norm,
+                    ffn_gate: load_weight(&format!("blk.{i}.ffn_gate.weight"))?,
+                    ffn_up: load_weight(&format!("blk.{i}.ffn_up.weight"))?,
+                    ffn_down: load_weight(&format!("blk.{i}.ffn_down.weight"))?,
+                })
+            };
+            layers.push(layer);
         }
 
         let token_embd = load_weight("token_embd.weight")?;
@@ -177,7 +283,21 @@ impl Model {
 
         let tokenizer = Tokenizer::from_gguf(file)?;
 
-        Ok(Model { device, rmsnorm_k, rope_k, silu_k, gemv_k, attn_k, cfg, layers, token_embd, output_norm, lm_head, tokenizer })
+        Ok(Model {
+            device,
+            rmsnorm_k,
+            rope_k,
+            silu_k,
+            gemv_k,
+            attn_k,
+            cfg,
+            layers,
+            expert_used_count,
+            token_embd,
+            output_norm,
+            lm_head,
+            tokenizer,
+        })
     }
 
     fn rmsnorm(&self, x: &[f32], weight: &[f32], rows: usize, hidden_size: usize, eps: f32) -> Result<Vec<f32>, String> {
@@ -199,15 +319,13 @@ impl Model {
         self.device.dtoh_sync_copy(&dev_out).map_err(|e| format!("rmsnorm dtoh: {e}"))
     }
 
-    fn gemv(&self, x: &[f32], w: &Weight) -> Result<Vec<f32>, String> {
-        let in_features = w.shape[0] as usize;
-        let out_features = w.shape[1] as usize;
+    fn gemv_raw(&self, x: &[f32], w_data: &[f32], in_features: usize, out_features: usize) -> Result<Vec<f32>, String> {
         if x.len() != in_features {
             return Err(format!("gemv: x.len()={} != in_features={in_features}", x.len()));
         }
 
         let dev_x = self.device.htod_sync_copy(x).map_err(|e| format!("gemv htod x: {e}"))?;
-        let dev_w = self.device.htod_sync_copy(&w.data).map_err(|e| format!("gemv htod w: {e}"))?;
+        let dev_w = self.device.htod_sync_copy(w_data).map_err(|e| format!("gemv htod w: {e}"))?;
         let mut dev_y = self.device.alloc_zeros::<f32>(out_features).map_err(|e| format!("gemv alloc y: {e}"))?;
 
         let threads = 256u32;
@@ -221,6 +339,31 @@ impl Model {
                 .map_err(|e| format!("gemv launch: {e}"))?;
         }
         self.device.dtoh_sync_copy(&dev_y).map_err(|e| format!("gemv dtoh: {e}"))
+    }
+
+    fn gemv(&self, x: &[f32], w: &Weight) -> Result<Vec<f32>, String> {
+        let in_features = w.shape[0] as usize;
+        let out_features = w.shape[1] as usize;
+        self.gemv_raw(x, &w.data, in_features, out_features)
+    }
+
+    /// GEMV against expert `expert_idx`'s slice of a per-expert-stacked 3-D
+    /// MoE tensor (shape `[in_features, out_features, expert_count]`).
+    /// Expert `e`'s `in_features * out_features` elements are a contiguous
+    /// chunk already in the same row-major `(out_features, in_features)`
+    /// layout as a standalone 2-D weight (see this module's doc comment), so
+    /// no copy/transpose is needed beyond slicing.
+    fn gemv_expert(&self, x: &[f32], w: &Weight, expert_idx: usize) -> Result<Vec<f32>, String> {
+        let (in_features, out_features, expert_count) = match w.shape.as_slice() {
+            [i, o, e] => (*i as usize, *o as usize, *e as usize),
+            other => return Err(format!("gemv_expert: expected 3-D per-expert tensor shape, got {other:?}")),
+        };
+        if expert_idx >= expert_count {
+            return Err(format!("gemv_expert: expert_idx {expert_idx} out of range (expert_count={expert_count})"));
+        }
+        let expert_len = in_features * out_features;
+        let start = expert_idx * expert_len;
+        self.gemv_raw(x, &w.data[start..start + expert_len], in_features, out_features)
     }
 
     fn rope(&self, t: &mut Vec<f32>, num_heads: usize, head_dim: usize, position: usize, base: f32) -> Result<(), String> {
@@ -320,28 +463,37 @@ impl Model {
         self.device.dtoh_sync_copy(&dev_out).map_err(|e| format!("attn dtoh: {e}"))
     }
 
-    /// RMSNorm -> QKV -> QK-Norm (if present) -> RoPE -> attention -> O-proj
-    /// (residual) -> RMSNorm -> SwiGLU FFN (residual), for one layer at
-    /// `position`, appending this position's K/V onto `k_cache`/`v_cache`.
-    fn forward_layer(
+    /// RMSNorm -> QKV -> QK-Norm (if present) -> RoPE -> causal attention ->
+    /// O-proj (residual), for one layer at `position`, appending this
+    /// position's K/V onto `k_cache`/`v_cache`. Shared byte-for-byte by
+    /// dense and MoE layers -- MoE only replaces what comes after this (see
+    /// `forward_layer_moe`).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_attn_block(
         &self,
-        layer: &LayerWeights,
+        attn_norm: &Weight,
+        attn_q: &Weight,
+        attn_k: &Weight,
+        attn_v: &Weight,
+        attn_output: &Weight,
+        attn_q_norm: &Option<Weight>,
+        attn_k_norm: &Option<Weight>,
         hidden: &[f32],
         position: usize,
         k_cache: &mut Vec<f32>,
         v_cache: &mut Vec<f32>,
     ) -> Result<Vec<f32>, String> {
         let cfg = &self.cfg;
-        let normed = self.rmsnorm(hidden, &layer.attn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let normed = self.rmsnorm(hidden, &attn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
 
-        let mut q = self.gemv(&normed, &layer.attn_q)?;
-        let mut k = self.gemv(&normed, &layer.attn_k)?;
-        let v = self.gemv(&normed, &layer.attn_v)?;
+        let mut q = self.gemv(&normed, attn_q)?;
+        let mut k = self.gemv(&normed, attn_k)?;
+        let v = self.gemv(&normed, attn_v)?;
 
-        if let Some(qn) = &layer.attn_q_norm {
+        if let Some(qn) = attn_q_norm {
             q = self.rmsnorm(&q, &qn.data, cfg.num_q_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
         }
-        if let Some(kn) = &layer.attn_k_norm {
+        if let Some(kn) = attn_k_norm {
             k = self.rmsnorm(&k, &kn.data, cfg.num_kv_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
         }
 
@@ -353,9 +505,33 @@ impl Model {
         let seq_len = position + 1;
 
         let attn_out = self.attention(&q, k_cache, v_cache, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, seq_len)?;
-        let o_proj = self.gemv(&attn_out, &layer.attn_output)?;
-        let post_attn: Vec<f32> = hidden.iter().zip(o_proj.iter()).map(|(&h, &o)| h + o).collect();
+        let o_proj = self.gemv(&attn_out, attn_output)?;
+        Ok(hidden.iter().zip(o_proj.iter()).map(|(&h, &o)| h + o).collect())
+    }
 
+    fn forward_layer_dense(
+        &self,
+        layer: &DenseLayerWeights,
+        hidden: &[f32],
+        position: usize,
+        k_cache: &mut Vec<f32>,
+        v_cache: &mut Vec<f32>,
+    ) -> Result<Vec<f32>, String> {
+        let post_attn = self.forward_attn_block(
+            &layer.attn_norm,
+            &layer.attn_q,
+            &layer.attn_k,
+            &layer.attn_v,
+            &layer.attn_output,
+            &layer.attn_q_norm,
+            &layer.attn_k_norm,
+            hidden,
+            position,
+            k_cache,
+            v_cache,
+        )?;
+
+        let cfg = &self.cfg;
         let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
         let gate = self.gemv(&ffn_normed, &layer.ffn_gate)?;
         let up = self.gemv(&ffn_normed, &layer.ffn_up)?;
@@ -363,6 +539,69 @@ impl Model {
         let down = self.gemv(&activated, &layer.ffn_down)?;
 
         Ok(post_attn.iter().zip(down.iter()).map(|(&h, &d)| h + d).collect())
+    }
+
+    /// Same attention block as [`Self::forward_layer_dense`], but the shared
+    /// FFN is replaced by a router (softmax + top-k over `ffn_gate_inp`'s
+    /// logits, `crate::moe::route_top_k`) dispatching to each selected
+    /// expert's SwiGLU FFN (naive per-expert `gemv` calls, no batched/grouped
+    /// GEMM -- see this module's MoE scope doc comment), weighted-summed by
+    /// the router's renormalized combination weights.
+    fn forward_layer_moe(
+        &self,
+        layer: &MoeLayerWeights,
+        hidden: &[f32],
+        position: usize,
+        k_cache: &mut Vec<f32>,
+        v_cache: &mut Vec<f32>,
+    ) -> Result<Vec<f32>, String> {
+        let post_attn = self.forward_attn_block(
+            &layer.attn_norm,
+            &layer.attn_q,
+            &layer.attn_k,
+            &layer.attn_v,
+            &layer.attn_output,
+            &layer.attn_q_norm,
+            &layer.attn_k_norm,
+            hidden,
+            position,
+            k_cache,
+            v_cache,
+        )?;
+
+        let cfg = &self.cfg;
+        let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
+
+        let router_logits = self.gemv(&ffn_normed, &layer.ffn_gate_inp)?;
+        let k = self.expert_used_count.ok_or("forward_layer_moe called on a model with no expert_used_count")?;
+        let routed = route_top_k(&router_logits, k)?;
+
+        let mut ffn_out = vec![0.0f32; cfg.hidden_size];
+        for (expert_idx, weight) in routed {
+            let gate = self.gemv_expert(&ffn_normed, &layer.ffn_gate_exps, expert_idx)?;
+            let up = self.gemv_expert(&ffn_normed, &layer.ffn_up_exps, expert_idx)?;
+            let activated = self.silu_and_mul(&gate, &up, cfg.ffn_hidden_size)?;
+            let down = self.gemv_expert(&activated, &layer.ffn_down_exps, expert_idx)?;
+            for (o, d) in ffn_out.iter_mut().zip(down.iter()) {
+                *o += weight * d;
+            }
+        }
+
+        Ok(post_attn.iter().zip(ffn_out.iter()).map(|(&h, &f)| h + f).collect())
+    }
+
+    fn forward_layer(
+        &self,
+        layer: &LayerWeights,
+        hidden: &[f32],
+        position: usize,
+        k_cache: &mut Vec<f32>,
+        v_cache: &mut Vec<f32>,
+    ) -> Result<Vec<f32>, String> {
+        match layer {
+            LayerWeights::Dense(l) => self.forward_layer_dense(l, hidden, position, k_cache, v_cache),
+            LayerWeights::Moe(l) => self.forward_layer_moe(l, hidden, position, k_cache, v_cache),
+        }
     }
 
     /// Encodes `prompt`, runs the full prompt through every layer one

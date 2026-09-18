@@ -8,4 +8,5 @@ pub mod dequant_iq;
 pub mod dequant_iq_tables;
 pub mod gguf;
 pub mod model;
+pub mod moe;
 pub mod tokenizer;

@@ -133,4 +133,48 @@ layer — this MVP is correctness-first, none of that is optimized yet). Breakin
 down, and comparing against llama.cpp's cold start on the same model/hardware, is future
 work, not this milestone's scope.
 
-Next: Qwen3-MoE per the MVP order above.
+### Qwen3-MoE (MVP step 2)
+
+`src/moe.rs` (router: softmax over all experts, top-k select, renormalize -- ported
+from RustFeference's own verified `route_top_k`, git history around commit `6a70287`
+"qwen3moe support") plus `src/model.rs` changes: `parse_model_config` now returns an
+`Option<MoeMetaConfig>` keyed off `<arch>.expert_count` being present and nonzero (not a
+hardcoded architecture-string check -- GGUF namespaces all per-arch metadata under the
+file's own `general.architecture` value, confirmed against a real fixture, not assumed),
+and `LayerWeights` is now `Dense`/`Moe`, sharing one `forward_attn_block` (RMSNorm -> QKV
+-> QK-Norm if present -> RoPE -> causal attention -> O-proj residual) byte-for-byte
+between both. MoE's FFN replaces the dense path's single shared FFN with: a router GEMM
+(`ffn_gate_inp`) reusing the existing `gemv` kernel unchanged, `route_top_k` run host-side,
+then one naive per-selected-expert SwiGLU FFN (`gemv_expert` slices the relevant
+contiguous chunk out of each 3-D per-expert-stacked tensor -- `[in_features,
+out_features, expert_count]`, confirmed against llama.cpp's `qwen3moe.cpp` -- and reuses
+the existing `gemv`/`silu_and_mul` kernels unchanged), weighted-summed by the router's
+combination weights. No new CUDA kernels were needed. Naive (ungrouped) per-expert
+dispatch is the deliberate MVP scope, per RustFeference's own documented finding that
+it's the correct starting point.
+
+No small real `qwen3moe`-architecture GGUF was available to test against (a real
+Qwen3-30B-A3B is far too large for quick iteration), so this was verified end to end on
+real hardware against RustFeference's `Tiny-Moe.Q4_K_M.gguf` fixture instead: a real,
+Mixtral-style MoE GGUF (`general.architecture = "llama"`, `expert_count=2`,
+`expert_used_count=2`, no QK-Norm tensors) that exercises the actual new MoE-specific
+machinery (per-expert tensor slicing, router GEMM, weighted-sum dispatch) even though
+it isn't Qwen3's own architecture. Three runs of `"Once upon a time"` against it produced
+byte-identical output (token id 4036, `","`) -- deterministic, doesn't crash, and (since
+this fixture is a randomly-initialized synthetic test model, per its own
+`general.name = "Tiny_Test"`) that's the correctness bar this fixture can actually prove,
+not a factual-completion check like dense Qwen3's `"Paris"` result. **Known limitation of
+this fixture**: `expert_used_count` equals `expert_count` here (2 of 2), so top-k always
+selects *every* expert -- this run cannot distinguish "top-k routing selects correctly"
+from "all experts are always used"; it does verify per-expert weight slicing, the router
+GEMM, and weighted-sum accumulation, since both experts' distinct weights are genuinely
+exercised and combined. Re-verifying against a fixture with `expert_used_count <
+expert_count` (ideally real `qwen3moe`-architecture metadata, to also exercise Qwen3's
+QK-Norm and MoE together in one file) is future work, not this milestone's scope.
+
+The dense Qwen3 path was re-verified byte-identical against both of its previous known
+results (`"Once upon a time"` -> `","` token id 11; `"The capital of France is"` ->
+`" Paris"`) after this refactor, confirming `forward_attn_block`'s extraction didn't
+change dense behavior.
+
+Next: Qwen3.5 hybrid Gated DeltaNet mixer per the MVP order above.
