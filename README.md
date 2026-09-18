@@ -101,6 +101,36 @@ the first time (it had never actually produced a working binary before):
   `COLDSTART_CUDA_ARCH` on and off now triggers a real `nvcc` recompile each time, exactly
   the kind of stale-benchmark trap `LESSONS_LEARNED_RUSTFEFERENCE.md` warns about.
 
-Next: start on dense Qwen3 per the MVP order above — the AOT-compilation and
-cold-start-benchmark harness is now proven for both output modes on a real kernel; time to
-prove it for a real model.
+### Dense Qwen3 (MVP step 1)
+
+`src/model.rs` + `src/bin/qwen3_coldstart.rs` + five new AOT kernels
+(`src/kernels_cuda/{rmsnorm,rope,silu_and_mul,gemv,attention}.cu`) implement a real,
+from-scratch dense Qwen3 forward pass: embedding lookup (host-side gather; batch is
+always 1) -> every transformer layer (RMSNorm -> QKV -> QK-Norm -> RoPE -> causal GQA
+attention -> O-proj residual -> RMSNorm -> SwiGLU FFN residual) -> final RMSNorm -> LM
+head -> greedy argmax. No KV-cache reuse across separate process runs, no batching, no
+sampling beyond argmax — deliberately out of scope (matches the project's actual target
+metric: process-start-to-first-token, not sustained decode throughput). The
+architecture/math was ported from RustFeference's own dense-model code as a *correctness
+oracle* (git history around commits `d8ed273` and `1459330`), not copied wholesale —
+RustFeference's paged-KV-cache/tensor-parallel/serving-scheduler machinery is all out of
+scope; the five kernels above are fresh, simple, from-scratch AOT kernels.
+
+Verified end to end on the same real A6000 against `test-data/Qwen3-0.6B-Q4_K_M.gguf`
+(real dense Qwen3, not MoE):
+- `"Once upon a time"` -> `","` (token id 11), three runs, byte-identical each time
+  (greedy argmax, no randomness) — matches RustFeference's own real A100-verified
+  generation of this exact prompt/model (`"Once upon a time, there was a man..."` — the
+  token immediately after "time" there is also `","`).
+- `"The capital of France is"` -> `" Paris"` — a real factual completion, not noise.
+
+Both results are strong independent evidence the RMSNorm/QK-Norm/RoPE/GQA-attention/
+SwiGLU math is correct, not just "doesn't crash." `process_start_to_first_token_ms` came
+in around **25.6–32.0s** across these runs — far slower than `smoke_coldstart`'s
+sub-second numbers, expected and not yet broken down (candidates: host-side dequant of
+every weight to f32 at load time, and one host<->device round trip per kernel call per
+layer — this MVP is correctness-first, none of that is optimized yet). Breaking that
+down, and comparing against llama.cpp's cold start on the same model/hardware, is future
+work, not this milestone's scope.
+
+Next: Qwen3-MoE per the MVP order above.
