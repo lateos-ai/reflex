@@ -34,6 +34,8 @@ fn find_nvcc() -> Option<PathBuf> {
 fn main() {
     let src_dir = Path::new("src/kernels_cuda");
     println!("cargo:rerun-if-changed={}", src_dir.display());
+    println!("cargo:rerun-if-env-changed=COLDSTART_CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=COLDSTART_SKIP_CUDA");
 
     if env::var("COLDSTART_SKIP_CUDA").is_ok() {
         println!("cargo:warning=COLDSTART_SKIP_CUDA set, skipping AOT kernel compilation (dev-machine-without-CUDA path)");

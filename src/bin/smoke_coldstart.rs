@@ -13,13 +13,13 @@ use coldstart_infer::aot;
 use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
 use std::time::Instant;
 
-const SMOKE_PTX: &str = include_str!(env!("COLDSTART_KERNEL_SMOKE"));
+const SMOKE_KERNEL_PATH: &str = env!("COLDSTART_KERNEL_SMOKE");
 
 fn main() {
     let t0 = Instant::now();
 
     let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
-    let kernel = aot::load_kernel(&device, SMOKE_PTX, "smoke", "axpy_f32")
+    let kernel = aot::load_kernel(&device, SMOKE_KERNEL_PATH, "smoke", "axpy_f32")
         .expect("failed to load AOT smoke kernel");
 
     let n = 1024usize;

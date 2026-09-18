@@ -2,12 +2,13 @@
 //! No NVRTC call happens anywhere on this path -- that's the entire point of this
 //! project vs. RustFeference/rft-gpu (see LESSONS_LEARNED_RUSTFEFERENCE.md there).
 //!
-//! UNVERIFIED ON REAL HARDWARE YET: this loads PTX text via `Ptx::from_src`, which
-//! still costs the driver a JIT-to-SASS step at load time (smaller than a full NVRTC
-//! source compile, but nonzero -- see plan risk #1 in the pivot plan). Compiling
-//! straight to a `cubin` for a known compute capability (COLDSTART_CUDA_ARCH in
-//! build.rs) is the true zero-JIT path and needs to be measured against this one
-//! before picking a default.
+//! Loads by file path via `Ptx::from_file`, which maps to the driver's `cuModuleLoad`.
+//! Per the CUDA driver API docs that call accepts a cubin, PTX, or fatbin file
+//! transparently, so this same code path covers both of build.rs's output modes:
+//! the default PTX build (driver JITs to SASS at load time) and the
+//! COLDSTART_CUDA_ARCH=sm_XX cubin build (no JIT at all -- the true
+//! zero-runtime-compilation path). Which one wins on real hardware is measured by
+//! `src/bin/smoke_coldstart.rs`, not assumed (see plan risk #1).
 
 use cudarc::driver::{CudaDevice, CudaFunction};
 use cudarc::nvrtc::Ptx;
@@ -17,16 +18,16 @@ pub struct AotKernel {
     pub function: CudaFunction,
 }
 
-/// Loads a single kernel from a PTX file embedded at compile time via `include_str!`.
-/// `module_name` and `function_name` must match the `extern "C" __global__` symbol
-/// name in the original `.cu` source (see `src/kernels_cuda/smoke.cu`).
+/// Loads a single kernel from the PTX or cubin file produced by `build.rs`, given
+/// its path. `module_name` and `function_name` must match the `extern "C" __global__`
+/// symbol name in the original `.cu` source (see `src/kernels_cuda/smoke.cu`).
 pub fn load_kernel(
     device: &Arc<CudaDevice>,
-    ptx_src: &str,
+    kernel_path: &str,
     module_name: &'static str,
     function_name: &'static str,
 ) -> Result<AotKernel, String> {
-    let ptx = Ptx::from_src(ptx_src);
+    let ptx = Ptx::from_file(kernel_path);
     device
         .load_ptx(ptx, module_name, &[function_name])
         .map_err(|e| format!("failed to load AOT-compiled module {module_name}: {e}"))?;

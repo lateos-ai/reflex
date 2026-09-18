@@ -67,6 +67,40 @@ the thing this project replaces, not reuses.
 
 ## Status
 
-Scaffold only. `smoke_coldstart` has not yet been run on real hardware — do that before
-writing any model code, and before trusting anything in this README's numbers claims
-(there are none yet on purpose).
+`smoke_coldstart` has been run on real hardware (ThunderCompute A6000, `cuda12-9`
+template, driver `nvidia-smi` 610.43.02 / CUDA 12.9, `rustc`/`cargo` 1.98.1) in **both**
+of `build.rs`'s output modes, each verified with a clean rebuild (not a stale binary):
+
+- **Default (PTX, no `COLDSTART_CUDA_ARCH`)**: `build.rs` finds `nvcc` and produces valid
+  PTX; `aot::load_kernel` loads and launches it correctly via cudarc 0.11.9. Five runs of
+  `./target/release/smoke_coldstart` measured `process_start_to_first_result_ms` (wall
+  clock from `Instant::now()` inside `main()`, not from OS process exec) between
+  **473–637ms**.
+- **`COLDSTART_CUDA_ARCH=sm_86` (cubin)**: also verified end to end — five runs measured
+  **480–617ms**, i.e. statistically indistinguishable from the PTX numbers above. For this
+  trivial smoke kernel, CUDA context/primary-context init (`CudaDevice::new`) dominates
+  the timing; the driver's PTX-JIT-vs-cubin-no-JIT difference is noise-level at this
+  scale. That may not hold once real model kernels (bigger PTX, more of them) are loaded —
+  worth re-measuring once dense Qwen3 exists.
+
+Risk #1's basic pipeline question is resolved for both modes. Neither number has been
+compared against llama.cpp's or rft-gpu's cold start on the *same* hardware in the same
+session — don't cite either as a win until that A/B is run.
+
+Two real bugs were found and fixed this session while getting the cubin path working for
+the first time (it had never actually produced a working binary before):
+- `src/bin/smoke_coldstart.rs` used `include_str!` to embed the compiled kernel, which
+  fails to compile against a `.cubin` (binary, not UTF-8). Fixed by switching
+  `aot::load_kernel` to take a file path and load via `Ptx::from_file`, which maps to the
+  driver's `cuModuleLoad` — per the CUDA driver API docs that accepts cubin, PTX, or
+  fatbin files transparently, so one code path now covers both of `build.rs`'s output
+  modes. Verified on real hardware above.
+- `build.rs` didn't declare `cargo:rerun-if-env-changed=COLDSTART_CUDA_ARCH` (or
+  `COLDSTART_SKIP_CUDA`), so Cargo silently reused a stale build when that variable
+  changed between runs instead of recompiling. Fixed and verified: switching
+  `COLDSTART_CUDA_ARCH` on and off now triggers a real `nvcc` recompile each time, exactly
+  the kind of stale-benchmark trap `LESSONS_LEARNED_RUSTFEFERENCE.md` warns about.
+
+Next: start on dense Qwen3 per the MVP order above — the AOT-compilation and
+cold-start-benchmark harness is now proven for both output modes on a real kernel; time to
+prove it for a real model.
