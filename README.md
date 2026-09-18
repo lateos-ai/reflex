@@ -46,10 +46,8 @@ model-architecture work begins.
 1. **Dense Qwen3** — reuses RustFeference's most mature, most-verified architecture;
    proves the AOT-compilation + cold-start-benchmark harness works at all.
 2. **Qwen3-MoE**
-3. **Qwen3.5 hybrid Gated DeltaNet mixer** — `reference/gated_deltanet_rustfeference.rs`
-   carries over the host/CPU reference recurrence math from RustFeference as the
-   correctness oracle for a from-scratch AOT kernel (not compiled as part of this crate
-   yet — extract the pure-math functions when this milestone starts).
+3. **Qwen3.5 hybrid Gated DeltaNet mixer** — done; see the "Qwen3.5 hybrid Gated DeltaNet
+   mixer (MVP step 3)" section below for scope and real-hardware verification.
 4. **DeepSeek-V2/V3 MLA** — deliberately last; a genuinely different (compressed
    latent-KV) caching strategy, not an incremental GQA extension. Read llama.cpp's real
    implementation (PR #11446) before attempting it.
@@ -324,5 +322,53 @@ attempted: an on-GPU dequant kernel (matches llama.cpp's approach, but is a real
 kernel-writing project, not a load-path tweak), and/or keeping activations device-
 resident across a whole layer instead of round-tripping between every op.
 
-Next: Qwen3.5 hybrid Gated DeltaNet mixer per the MVP order above, or a second Phase 2
-round on the remaining gap above -- open call, not yet decided.
+### Qwen3.5 hybrid Gated DeltaNet mixer (MVP step 3)
+
+`src/gated_deltanet.rs` (shape config) + `src/kernels_cuda/gated_deltanet.cu` (five new AOT
+kernels: causal depthwise conv1d+SiLU+window-advance, per-head L2-norm, gate/decay
+computation, the delta-rule state update, and the gated-output RMSNorm) + `src/model.rs`'s
+new hybrid path implement a real Qwen3.5 (`general.architecture = "qwen35"`) forward pass.
+A hybrid file interleaves two mixer kinds per transformer layer -- Gated DeltaNet
+(recurrent linear attention, no KV cache) and Gated Attention (regular GQA softmax
+attention with a *fused* query+gate projection and partial RoPE) -- resolved from the
+file's own `qwen35.attention.recurrent_layers` array or `qwen35.full_attention_interval`
+fallback (never hardcoded), matching real llama.cpp `qwen35.cpp`/`delta-net-base.cpp`
+exactly (the math was ported from RustFeference's own `reference/
+gated_deltanet_rustfeference.rs`, itself fetched from real llama.cpp source, as the
+correctness oracle). Scope deliberately narrowed from that reference for this MVP:
+single-token sequential dispatch only (no chunked/parallel-prefill kernels -- same
+naive-first precedent as MoE's per-expert dispatch), the dense `qwen35` architecture only
+(`qwen35moe`, which additionally replaces the FFN with routed MoE, is out of scope and
+rejected with a clear error), and no MTP/NextN block support (rejected outright if
+`nextn_predict_layers` is nonzero).
+
+Verified end to end on the same real A6000 against a real `Qwen3.5-0.8B-Q4_K_M.gguf`
+fixture (24 layers, Gated Attention at trunk indices `[3,7,11,15,19,23]`, GDN elsewhere --
+confirmed both via metadata parsing and by scanning the file's own tensor names):
+`"Once upon a time"` -> `","` (token id 11) and `"The capital of France is"` -> `" the"`
+(token id 279), both **independently reproduced by a fresh `ggml-org/llama.cpp` build from
+source** (`examples/simple`'s raw, non-chat-templated completion path -- `tools/llama-cli`'s
+newer conversational mode always applies the model's embedded chat template even with
+`-p`, the same caveat already flagged in the dense-vs-llama.cpp benchmark above, so
+`examples/simple` was used instead for a true prompt-in/token-out comparison). Byte-exact
+match on both prompts is strong independent evidence the implementation is correct, not
+just "doesn't crash."
+
+**One real bug found and fixed via this cross-check**: the first attempt produced
+fluent-looking but semantically wrong completions (e.g. Chinese text following an English
+prompt) that ran without crashing or producing NaN -- `forward_gdn_mixer` computed the
+mixer's output projection but never added it back to the residual stream (`x + out_proj`),
+unlike the Gated Attention mixer's forward function, which did. Since 18 of the fixture's
+24 layers are Gated DeltaNet layers, this silently broke the residual stream through most
+of the network. Isolated by cross-checking layer 0's mixer output against a pure-host
+CPU reference (a trimmed, cudarc-free port of `reference/gated_deltanet_rustfeference.rs`'s
+`step` function) given the same real dequantized weights and input -- the two matched
+bit-for-bit before the fix (confirming the kernels themselves were already correct) and
+the end-to-end generation matched real llama.cpp only after adding the missing residual
+add. Lesson for future sessions: a plausible-looking non-crashing output is not evidence
+of correctness for a new architecture path -- get an independent ground truth (here, a
+fresh llama.cpp build) before trusting it, the same posture this project already takes
+toward its own kernels.
+
+Next: DeepSeek-V2/V3 MLA (MVP step 4, deliberately last per the MVP order above), or a
+second Phase 2 round on the remaining cold-start gap -- open call, not yet decided.

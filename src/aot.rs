@@ -36,3 +36,28 @@ pub fn load_kernel(
         .ok_or_else(|| format!("function {function_name} not found in module {module_name}"))?;
     Ok(AotKernel { function })
 }
+
+/// Like [`load_kernel`], but for a `.cu` file that defines several
+/// `extern "C" __global__` kernels (e.g. `gated_deltanet.cu`) -- loads the
+/// module once, then resolves every named function against it, in the same
+/// order as `function_names`.
+pub fn load_kernel_module(
+    device: &Arc<CudaDevice>,
+    kernel_path: &str,
+    module_name: &'static str,
+    function_names: &[&'static str],
+) -> Result<Vec<AotKernel>, String> {
+    let ptx = Ptx::from_file(kernel_path);
+    device
+        .load_ptx(ptx, module_name, function_names)
+        .map_err(|e| format!("failed to load AOT-compiled module {module_name}: {e}"))?;
+    function_names
+        .iter()
+        .map(|&function_name| {
+            device
+                .get_func(module_name, function_name)
+                .map(|function| AotKernel { function })
+                .ok_or_else(|| format!("function {function_name} not found in module {module_name}"))
+        })
+        .collect()
+}
