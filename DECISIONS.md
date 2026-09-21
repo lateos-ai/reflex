@@ -166,6 +166,46 @@ worth defending against regression** for the same reason round 1's decision is: 
 found by systematically removing every per-op host round-trip, not by guessing, and
 reintroducing one for convenience would silently reopen part of the gap.
 
+## MLA (MVP step 4): synthetic fixture instead of real DeepSeek-V2-Lite, narrow scope
+
+**Decision**: DeepSeek-V2/V3 MLA support is verified against a fully synthetic
+`deepseek2` GGUF (`test-data/deepseek-tiny-mla.gguf` — hand-built HF `config.json` +
+random-weight `safetensors`, run through llama.cpp's own real `convert_hf_to_gguf.py`
+for authentic tensor layout), not the smallest real `deepseek2` model
+(DeepSeek-V2-Lite). Scope is dense-only (no MoE FFN/shared experts), no Q-LoRA query
+decomposition, no YaRN RoPE scaling, no MTP — each rejected with a clear error
+(`parse_mla_config` in `model.rs`), not silently mishandled.
+
+**Why**: no small real `deepseek2`-architecture GGUF exists publicly at all (unlike
+every prior MVP step's fixture problem, which was "not available locally" — this one
+genuinely doesn't exist to find). DeepSeek-V2-Lite, the smallest real one, needs
+~63GB of `f32` device memory for its 64-routed-expert MoE FFN alone under this
+project's "dequantize every weight once, hold it GPU-resident for the model's whole
+lifetime" design (`Weight` in `model.rs`, defended against regression by the "Weights
+are GPU-resident once" decision above) — more than the A6000 (48GB) this project
+develops against. Given the user's explicit choice between renting an ~80GB H100 for
+the real model vs. a synthetic fixture on the existing A6000, the synthetic fixture
+was chosen to verify the MLA *mechanism* cheaply first, deferring the real model (and
+its MoE-residency implications, a separate, bigger decision) to optional future work.
+
+**Two real bugs found via the byte-exact llama.cpp comparison**, both silently
+producing plausible-looking wrong tokens rather than crashing (same lesson as the
+Gated DeltaNet mixer's residual-add bug):
+1. The attention softmax scale must be `1/sqrt(qk_nope_head_dim +
+   qk_rope_head_dim)` (the *uncompressed* per-head dim) — not `1/sqrt(kv_lora_rank +
+   qk_rope_head_dim)` (the compressed dot-product width actually used to compute the
+   scores), confirmed against llama.cpp's `deepseek2.cpp` `kq_scale` directly. Every
+   other attention op in this codebase scales by its own dot-product dimension, so
+   this is an easy trap to fall into by pattern-matching instead of reading the
+   reference source.
+2. MLA's `q_pe`/`k_pe` RoPE uses `LLAMA_ROPE_TYPE_NORM` (consecutive-pair rotation),
+   confirmed against llama.cpp's `llama_model_rope_type` — a different convention
+   from `LLAMA_ROPE_TYPE_NEOX` (half-split), which `rope_kernel` already implements
+   for Qwen3/Qwen3.5. Fixed with a new, separate `rope_norm_kernel`
+   (`kernels_cuda/rope.cu`) rather than modifying the existing, hardware-verified
+   `rope_kernel` — **don't assume RoPE convention is architecture-independent** when
+   adding another model family later; check `llama_model_rope_type` first.
+
 ## Cold-start-vs-llama.cpp benchmark methodology
 
 **Decision**: measure with external wall-clock (`/usr/bin/time -v`, process launch to

@@ -91,6 +91,25 @@ combination weights) → final RMSNorm → LM head → greedy argmax. No KV-cach
 process runs, no batching, no sampling beyond argmax — deliberately out of scope (see
 Non-goals).
 
+`general.architecture == "deepseek2"` dispatches to `Model::load_mla`/
+`forward_prompt_mla` (MVP step 4, Multi-head Latent Attention) instead, a separate path
+from the `LayerWeights`/`forward_layer` machinery above (own `MlaLayerWeights`/
+`MlaModel`, same dispatch pattern as `"qwen35"` → `load_hybrid`). See README.md's MLA
+section for the math and this MVP step's deliberately narrow scope (dense-only, no
+Q-LoRA, no YaRN, no MTP — see `parse_mla_config`'s doc comment for the exact rejected
+cases). Reuses every device-resident op convention Phase 2 round 2 established
+(`rmsnorm`/`gemv`/`silu_and_mul`/`add_inplace` unchanged) plus two new ones specific to
+MLA: `gemv_view`/`gemv_per_head` (per-head GEMV via the same `gemv_kernel`, "expert" →
+"head" vs. `gemv_expert`'s MoE slicing) and `mla_attention` (`kernels_cuda/
+mla_attention.cu`, MQA with mismatched Q/K vs. V dims — the existing `attention_kernel`
+assumes a uniform head_dim, which doesn't fit MLA's compressed-KV/decompressed-output
+split). **Important, easy-to-miss detail**: MLA's `q_pe`/`k_pe` RoPE uses llama.cpp's
+`LLAMA_ROPE_TYPE_NORM` convention (consecutive-pair rotation, `rope_norm_kernel`), not
+the `LLAMA_ROPE_TYPE_NEOX` (half-split) convention `rope_kernel` implements for
+Qwen3/Qwen3.5 — confirmed against `llama_model_rope_type` in llama.cpp's
+`llama-model.cpp`; don't assume RoPE convention is architecture-independent when adding
+another model family later.
+
 ### MoE routing (`src/moe.rs`)
 `route_top_k`: softmax over all experts, select top-k, renormalize. Ported from
 RustFeference's verified `route_top_k` (git history around commit `6a70287`). No new
@@ -113,10 +132,15 @@ as part of this crate yet.
 
 1. Dense Qwen3 — done.
 2. Qwen3-MoE — done.
-3. Qwen3.5 hybrid Gated DeltaNet mixer — not started.
+3. Qwen3.5 hybrid Gated DeltaNet mixer — done.
 4. DeepSeek-V2/V3 MLA — deliberately last (compressed latent-KV caching is a genuinely
    different mechanism from GQA, not an incremental extension). Read llama.cpp PR
-   #11446 before attempting it.
+   #11446 before attempting it. **Done, but narrowly scoped**: dense-only (no MoE
+   FFN), no Q-LoRA query decomposition, no YaRN RoPE scaling, no MTP — see
+   README.md's MLA section for why (no small real `deepseek2` GGUF exists publicly;
+   DeepSeek-V2-Lite, the smallest real one, needs ~63GB of `f32` device memory under
+   this project's GPU-residency model, more than the A6000 this project develops
+   against). Verified against a synthetic fixture, not a real pretrained model.
 
 ## Non-goals (permanent constraints, not just current-MVP scope)
 
@@ -135,3 +159,13 @@ Mixtral-style synthetic fixture with `expert_used_count == expert_count`, so it 
 prove top-k routing actually excludes any expert). Real GGUF test fixtures live outside
 this repo (`.gguf` is gitignored) — check with the user for their location before
 assuming a fixture path is valid.
+
+No small real `deepseek2`-architecture GGUF exists publicly at all (not just locally
+— see README.md's MLA section). `test-data/deepseek-tiny-mla.gguf` is a fully
+synthetic fixture: hand-built HF-format `config.json`/`safetensors` (random weights,
+authentic tensor names/shapes) run through llama.cpp's own real, unmodified
+`convert_hf_to_gguf.py`, verified against a real llama.cpp build. Its source
+(`config.json`, the weight-generation script, tokenizer files) is archived as
+`test-data/deepseek-tiny-mla-src.tar.gz` (gitignored, like all of `test-data/`) in
+case it needs regenerating or extending (e.g. to cover MoE/Q-LoRA/YaRN, all out of
+scope for the current MLA implementation — see `parse_mla_config` in `model.rs`).

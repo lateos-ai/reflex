@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `README.md` — this file is the
 short, current-state summary; README is the log.
 
-_Last updated: 2026-09-21_
+_Last updated: 2026-09-21 (MLA session)_
 
 ## MVP progress
 
@@ -13,7 +13,7 @@ _Last updated: 2026-09-21_
 | 1. Dense Qwen3 | Done — real-hardware-verified (A6000) |
 | 2. Qwen3-MoE | Done — real-hardware-verified (A6000), against a synthetic (non-Qwen3) MoE fixture |
 | 3. Qwen3.5 hybrid Gated DeltaNet mixer | Done — real-hardware-verified (A6000) against a real `Qwen3.5-0.8B-Q4_K_M.gguf` fixture, cross-checked byte-exact against a fresh `llama.cpp` build. Scope: dense `qwen35` only (`qwen35moe`, MTP/NextN unsupported), single-token sequential dispatch (no chunked prefill). |
-| 4. DeepSeek-V2/V3 MLA | Not started (deliberately last) |
+| 4. DeepSeek-V2/V3 MLA | Done, narrowly scoped (dense-only, no Q-LoRA/YaRN/MTP) — verified against a synthetic fixture, not a real pretrained model (see below) |
 
 ## Performance
 
@@ -40,12 +40,27 @@ touch weight loading — so the residual gap is still attributed to the CPU-boun
 host-side dequant step, per llama.cpp's on-GPU dequant/matmul approach never
 materializing a full-`f32` host copy at all).
 
+## MLA (MVP step 4)
+
+DeepSeek-V2/V3 support is real but narrow: dense-only (no MoE FFN/shared experts), no
+Q-LoRA query decomposition, no YaRN RoPE scaling, no MTP — `parse_mla_config` in
+`model.rs` hard-errors with a clear message on any of these. Verified against a fully
+synthetic `deepseek2` GGUF (`test-data/deepseek-tiny-mla.gguf`), not a real pretrained
+model — no small real `deepseek2`-architecture GGUF exists publicly, and the smallest
+real one (DeepSeek-V2-Lite) needs ~63GB of `f32` device memory under this project's
+GPU-residency design, more than the A6000 this project develops against. See
+README.md's MLA section for the full writeup, including two easy-to-miss correctness
+details (the attention scale's dimension, and MLA's different RoPE rotation
+convention) that produced silently-wrong (non-crashing) output before being caught by
+byte-exact comparison against a real llama.cpp build.
+
 ## Open decision (not yet resolved)
 
 Next work is unresolved between two options — ask the user before picking one:
-1. Start MVP step 4 (DeepSeek-V2/V3 MLA).
-2. Phase 2 Fast IO round 3: an on-GPU dequant kernel, to close the remaining ~1.1x
-   gap (the other round-2 candidate, activation device-residency, is now done).
+1. Phase 2 Fast IO round 3: an on-GPU dequant kernel, to close the remaining ~1.1x
+   cold-start gap vs. llama.cpp.
+2. Extend MLA to real DeepSeek-V2-Lite (MoE FFN + shared experts + an ~80GB H100
+   instance, since it won't fit the A6000 — see above).
 
 ## Known debt / limitations
 

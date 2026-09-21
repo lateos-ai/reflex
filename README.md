@@ -423,5 +423,90 @@ round didn't touch the weight-loading path) and system time is still ~2.9x llama
 host-side dequant-to-`f32` step at load time, which only an on-GPU dequant kernel (not
 attempted this round) would remove.
 
-Next: DeepSeek-V2/V3 MLA (MVP step 4), or the on-GPU dequant kernel to close the
-remaining ~1.1x gap -- open call, not yet decided.
+### DeepSeek-V2/V3 Multi-head Latent Attention (MLA) (MVP step 4)
+
+`src/kernels_cuda/mla_attention.cu` (one new AOT kernel) + `src/model.rs`'s new
+`parse_mla_config`/`MlaLayerWeights`/`MlaModel`/`Model::load_mla`/
+`Model::forward_mla_attn_block`/`Model::forward_prompt_mla` implement a real
+DeepSeek-V2/V3 (`general.architecture = "deepseek2"`) forward pass, ported from a full
+read of a real `llama.cpp` build's `src/models/deepseek2.cpp` (the `is_mla && is_lite`
+branch specifically).
+
+**Fixture problem, resolved differently from every prior MVP step**: no small real
+`deepseek2`-architecture GGUF exists publicly at all (not just locally) -- the
+smallest real one, DeepSeek-V2-Lite (16B total params, 64 routed + 2 shared experts
+across 26 MoE layers), needs **~63GB of `f32` device memory** just for its routed
+experts alone under this project's "dequantize every weight once, hold it GPU-resident
+for the model's whole lifetime" design (`Weight` in `model.rs`) -- more than the A6000
+(48GB) this project develops against; it would need an ~80GB H100 instead. Rather than
+rent bigger hardware or partially undo the GPU-residency decision (a bigger, separate
+decision -- see DECISIONS.md), this MVP step instead builds a **fully synthetic**
+`deepseek2` fixture (`test-data/deepseek-tiny-mla.gguf`): a hand-built HF-format
+`config.json` + random-weight `safetensors` checkpoint (27 layers -- chosen specifically
+to trip llama.cpp's own `is_lite` heuristic, `hidden_size=64`, `kv_lora_rank=32`,
+`qk_rope_head_dim=8`, `qk_nope_head_dim=16`, `v_head_dim=16`, dense-only FFN, Qwen's
+real tokenizer -- see below for why) run through llama.cpp's **own real, unmodified**
+`convert_hf_to_gguf.py`, so the resulting GGUF has fully authentic `deepseek2` tensor
+names/shapes/metadata despite meaningless random weights -- the same validity argument
+`Tiny-Moe.Q4_K_M.gguf` already established for MoE. Building this hit two real
+gotchas worth recording: llama.cpp's `is_lite` (no Q-LoRA) detection is a hardcoded
+`n_layer` check (27, 26, or 48-with-a-specific-vocab-size) against known real models,
+not a general flag, so the fixture's layer count had to match one of those magic
+numbers on purpose; and `transformers`' `AutoConfig` recognizes `deepseek_v2` as a
+real model type and silently fills in *its own* class defaults (`n_routed_experts=64`,
+etc.) for anything the hand-written `config.json` didn't set, which crashed llama.cpp's
+loader (`n_expert_used_max > 0` assert) until those fields were set to an explicit `0`.
+
+**Scope, deliberately narrow** (same "naive/narrow first" precedent as every prior MVP
+step, made unusually pointed here since this is the riskiest item in the whole MVP
+order): dense-only (no MoE FFN or shared experts -- `parse_mla_config` hard-errors if
+`leading_dense_block_count < block_count`), no Q-LoRA query decomposition (direct `wq`
+only, matching real DeepSeek-V2-Lite's own `is_lite` convention, not just a fixture
+shortcut -- hard error if `attention.q_lora_rank` is present and nonzero), no YaRN RoPE
+scaling, no MTP/NextN (existing precedent). A real DeepSeek-V2/V3 checkpoint needs at
+least the MoE+shared-expert FFN to be usable; that, Q-LoRA, and YaRN are open follow-up
+work, each with a clear rejection error rather than silent mishandling in the meantime.
+
+**Two non-obvious implementation details, easy to get wrong silently**:
+1. The attention softmax scale is `1/sqrt(qk_nope_head_dim + qk_rope_head_dim)` -- the
+   *uncompressed* per-head dimension -- **not** `1/sqrt(kv_lora_rank +
+   qk_rope_head_dim)` (the actual compressed dot-product width used to compute the
+   scores). Every other scaled-dot-product attention in this codebase scales by its
+   own dot-product dimension, so this is a real, silent-wrong-numbers trap if copied
+   by pattern-matching instead of reading `deepseek2.cpp`'s `kq_scale` directly.
+2. MLA's `q_pe`/`k_pe` RoPE uses a **different rotation convention** than every other
+   architecture this project supports: llama.cpp's `llama_model_rope_type` maps
+   `deepseek2` to `LLAMA_ROPE_TYPE_NORM` (rotates *consecutive* pairs `(2i, 2i+1)`),
+   while Qwen3/Qwen3.5 use `LLAMA_ROPE_TYPE_NEOX` (rotates half-split pairs `(i, i +
+   rotary_dim/2)`, what `rope_kernel` already implemented). Missing this produced a
+   non-crashing, plausible-looking wrong token on the first attempt -- caught only by
+   the byte-exact llama.cpp comparison below, the same "don't trust non-crashing
+   output" lesson DECISIONS.md already records from the Gated DeltaNet mixer's bug.
+   Fixed with a new, separate `rope_norm_kernel` (`kernels_cuda/rope.cu`) rather than
+   modifying the existing, already-hardware-verified `rope_kernel`.
+
+The absorption (`wk_b`) and decompression (`wv_b`) steps reuse the existing
+`gemv_kernel` unchanged via two new small Rust wrappers (`gemv_view`/`gemv_per_head`)
+that slice per-head chunks out of `wk_b`/`wv_b`'s per-head-stacked tensors -- the exact
+same tensor-layout convention as MoE's per-expert tensors (`Model::gemv_expert`), just
+"expert" → "head" (every head is always used, unlike MoE's top-k selection). The MQA
+attention step itself (mismatched Q/K width vs. V width, one shared KV "head") needed
+a genuinely new kernel (`mla_attention_kernel`) since the existing `attention_kernel`
+assumes a uniform head_dim for both the score dot-product and the value
+weighted-sum. The KV cache is a single preallocated per-layer device buffer (one row
+of `kv_lora_rank + qk_rope_head_dim` per position, written via `CudaDevice::dtod_copy`
+-- the same Phase 2 round 2 convention already established for GQA's `k_cache`/
+`v_cache`) -- and needs no separate value cache at all, since K and V share the same
+compressed representation. This is smaller than GQA's cache, not just differently
+shaped -- the actual payoff "latent attention" is named for.
+
+Verified byte-exact against a real `llama.cpp` build (`ce8caa6`) on the synthetic
+fixture, three prompts: `"Hello"` -> `" hern"`, `"Once upon a time"` -> `"
+removeFrom"`, `"The capital of France is"` -> `" NavLink"` (meaningless text, as
+expected from random weights -- the value is architectural correctness, exactly like
+`Tiny-Moe.Q4_K_M.gguf`'s own non-linguistic verification). All 55 existing unit tests
+and the dense/MoE/hybrid golden-token checks were re-verified unaffected.
+
+Next: on-GPU dequant kernel (Phase 2 round 3, closing the remaining ~1.1x cold-start
+gap), or extending MLA to real DeepSeek-V2-Lite (MoE FFN + shared experts + an ~80GB
+H100 instance) -- open call, not yet decided.

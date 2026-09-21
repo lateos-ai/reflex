@@ -245,6 +245,96 @@ fn parse_hybrid_layer_kinds(file: &GgufFile, architecture: &str, block_count: us
     }
 }
 
+/// Derives [`MlaConfig`] and the layer count from a GGUF file's `deepseek2.*`
+/// metadata. Scope deliberately narrowed to what's needed for a first, narrow MLA
+/// implementation (same "naive/narrow first" precedent as every prior MVP step),
+/// each rejected case matching existing precedent (`qwen35moe`/MTP rejection):
+/// hard errors on Q-LoRA query decomposition (`attention.q_lora_rank` present and
+/// nonzero), MoE layers (`leading_dense_block_count < block_count` -- a real
+/// DeepSeek-V2/V3 file always has MoE layers past its dense-lead layers; only a
+/// dense-only file, like this MVP step's synthetic test fixture, is in scope),
+/// YaRN RoPE scaling, and MTP/NextN blocks. No small real `deepseek2`-architecture
+/// GGUF exists publicly (see README.md) -- verified against a synthetic fixture
+/// built via llama.cpp's own real `convert_hf_to_gguf.py` (authentic tensor
+/// layout, random weights), cross-checked against a real llama.cpp build.
+fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize), String> {
+    let architecture = "deepseek2";
+    let key = |suffix: &str| format!("{architecture}.{suffix}");
+
+    let block_count = u64_meta(file, &key("block_count")).ok_or_else(|| format!("missing {}", key("block_count")))? as usize;
+
+    let nextn = u64_meta(file, &key("nextn_predict_layers")).unwrap_or(0);
+    if nextn != 0 {
+        return Err(format!(
+            "{} MTP/NextN blocks (nextn_predict_layers={nextn}) are not supported by this MVP",
+            key("nextn_predict_layers")
+        ));
+    }
+
+    let leading_dense = u64_meta(file, &key("leading_dense_block_count"))
+        .ok_or_else(|| format!("missing {}", key("leading_dense_block_count")))? as usize;
+    if leading_dense < block_count {
+        return Err(format!(
+            "{} ({leading_dense}) < block_count ({block_count}): MoE layers present, not supported by this MVP (dense-only deepseek2 files only)",
+            key("leading_dense_block_count")
+        ));
+    }
+
+    if u64_meta(file, &key("attention.q_lora_rank")).filter(|&n| n > 0).is_some() {
+        return Err(format!("{} (Q-LoRA query decomposition) is not supported by this MVP", key("attention.q_lora_rank")));
+    }
+
+    let rope_scaling_type = file.metadata.get(&key("rope.scaling.type")).and_then(GgufValue::as_str);
+    if matches!(rope_scaling_type, Some(t) if t != "none") {
+        return Err(format!("{} = {rope_scaling_type:?} (YaRN/RoPE scaling) is not supported by this MVP", key("rope.scaling.type")));
+    }
+
+    let hidden_size = u64_meta(file, &key("embedding_length")).ok_or_else(|| format!("missing {}", key("embedding_length")))? as usize;
+    let num_heads = u64_meta(file, &key("attention.head_count")).ok_or_else(|| format!("missing {}", key("attention.head_count")))? as usize;
+    let kv_lora_rank =
+        u64_meta(file, &key("attention.kv_lora_rank")).ok_or_else(|| format!("missing {}", key("attention.kv_lora_rank")))? as usize;
+    let n_embd_head_k_mla = u64_meta(file, &key("attention.key_length_mla"))
+        .ok_or_else(|| format!("missing {}", key("attention.key_length_mla")))? as usize;
+    let v_head_dim = u64_meta(file, &key("attention.value_length_mla"))
+        .ok_or_else(|| format!("missing {}", key("attention.value_length_mla")))? as usize;
+    let qk_rope_head_dim =
+        u64_meta(file, &key("rope.dimension_count")).ok_or_else(|| format!("missing {}", key("rope.dimension_count")))? as usize;
+    if n_embd_head_k_mla <= qk_rope_head_dim {
+        return Err(format!(
+            "{} ({n_embd_head_k_mla}) must be greater than {} ({qk_rope_head_dim})",
+            key("attention.key_length_mla"),
+            key("rope.dimension_count")
+        ));
+    }
+    let qk_nope_head_dim = n_embd_head_k_mla - qk_rope_head_dim;
+
+    let ffn_gate_info = file
+        .tensor_info("blk.0.ffn_gate.weight")
+        .ok_or("missing blk.0.ffn_gate.weight tensor (MoE-only deepseek2 files are not supported by this MVP)")?;
+    let ffn_hidden_size = match ffn_gate_info.shape.as_slice() {
+        [_in_features, out_features] => *out_features as usize,
+        other => return Err(format!("blk.0.ffn_gate.weight has unexpected shape {other:?}")),
+    };
+
+    // Sanity-check `attention.value_length_mla` against `wv_b`'s own shape (the
+    // tensor `Model::gemv_per_head` actually derives its decompressed output width
+    // from) -- catches a malformed/mismatched real file early rather than silently
+    // producing a wrong-sized attention output deep in the forward pass.
+    let wv_b_info = file.tensor_info("blk.0.attn_v_b.weight").ok_or("missing blk.0.attn_v_b.weight tensor")?;
+    match wv_b_info.shape.as_slice() {
+        [_in_features, out_features, _n_head] if *out_features as usize == v_head_dim => {}
+        other => return Err(format!("blk.0.attn_v_b.weight shape {other:?} doesn't match {} ({v_head_dim})", key("attention.value_length_mla"))),
+    }
+
+    let rope_base = f32_meta(file, &key("rope.freq_base")).unwrap_or(10000.0);
+    let rmsnorm_eps = f32_meta(file, &key("attention.layer_norm_rms_epsilon")).unwrap_or(1e-6);
+
+    Ok((
+        MlaConfig { hidden_size, num_heads, qk_rope_head_dim, qk_nope_head_dim, kv_lora_rank, ffn_hidden_size, rope_base, rmsnorm_eps },
+        block_count,
+    ))
+}
+
 /// One Gated Attention transformer layer's weights (Qwen3.5 hybrid, see
 /// `HybridModel`). Differs from [`DenseLayerWeights`]'s attention block in
 /// exactly two ways (confirmed against `reference/gated_deltanet_rustfeference.rs`'s
@@ -298,6 +388,78 @@ struct GatedDeltaNetLayerWeights {
 enum HybridLayerWeights {
     GatedAttention(GatedAttnLayerWeights),
     GatedDeltaNet(GatedDeltaNetLayerWeights),
+}
+
+/// Shape/hyperparameter config for a DeepSeek-V2/V3 Multi-head Latent Attention
+/// (MLA) model (MVP step 4), read from the GGUF file's `deepseek2.*` metadata by
+/// `parse_mla_config`. Scope deliberately narrowed (see that function's doc
+/// comment): dense-only (no MoE FFN), no Q-LoRA query decomposition (`is_lite`-style
+/// direct `wq` only), no YaRN RoPE scaling, no MTP/NextN.
+struct MlaConfig {
+    hidden_size: usize,
+    num_heads: usize,
+    /// Per-head dim of the RoPE-rotated part of Q/K (`qk_rope_head_dim` in real
+    /// DeepSeek configs). Also `rope_dim` -- full rotation, no partial-head split
+    /// like Qwen3.5's Gated Attention layers (see `LayerConfig::rotary_dim`'s doc
+    /// comment) -- MLA's `q_pe`/`k_pe` are already separately-extracted buffers of
+    /// exactly this width, not a slice of a wider head.
+    qk_rope_head_dim: usize,
+    /// Per-head dim of the non-rotated part of Q (and, after decompression via
+    /// `wk_b`, of the K side too -- see `Model::forward_mla_attn_block`).
+    qk_nope_head_dim: usize,
+    /// Compressed KV-cache dimension shared by every head (MQA) -- the whole point
+    /// of "latent" attention. Also the per-head width of `Vcur` before
+    /// decompression via `wv_b`.
+    kv_lora_rank: usize,
+    ffn_hidden_size: usize,
+    rope_base: f32,
+    rmsnorm_eps: f32,
+}
+
+/// One MLA layer's weights. Tensor names/shapes confirmed against a real
+/// `llama.cpp` build's `src/models/deepseek2.cpp` (`is_mla && is_lite` branch) and a
+/// synthetic `deepseek2`-architecture GGUF fixture built for this MVP step (see
+/// README.md -- no small real `deepseek2` GGUF exists publicly). `wk_b`/`wv_b` are
+/// per-head-stacked tensors (`[in_features, out_features, n_head]`, the same
+/// layout convention as MoE's per-expert tensors -- see `Model::gemv_expert`'s doc
+/// comment -- just "expert" -> "head"; every head is always used here, unlike MoE's
+/// top-k selection). Dense SwiGLU FFN (`ffn_gate`/`ffn_up`/`ffn_down`), identical in
+/// shape/meaning to `DenseLayerWeights`'s (MoE FFN is out of scope this round).
+struct MlaLayerWeights {
+    attn_norm: Weight,
+    /// `[hidden, n_head*(qk_nope_head_dim+qk_rope_head_dim)]` -- direct projection,
+    /// no Q-LoRA decomposition (out of scope this round).
+    wq: Weight,
+    /// `[hidden, kv_lora_rank+qk_rope_head_dim]`, fused compressed-KV + shared
+    /// rope-K projection (MQA: a single shared "head").
+    wkv_a_mqa: Weight,
+    attn_kv_a_norm: Weight,
+    /// `[qk_nope_head_dim, kv_lora_rank, n_head]`.
+    wk_b: Weight,
+    /// `[kv_lora_rank, v_head_dim, n_head]`.
+    wv_b: Weight,
+    /// `[n_head*v_head_dim, hidden]`.
+    wo: Weight,
+    ffn_norm: Weight,
+    ffn_gate: Weight,
+    ffn_up: Weight,
+    ffn_down: Weight,
+}
+
+/// A loaded DeepSeek-V2/V3 MLA model's extra state, layered on top of the same
+/// [`Model`] every other architecture uses (shared `token_embd`/`output_norm`/
+/// `lm_head`/`tokenizer`, and the same `rmsnorm_k`/`rope_k`/`silu_k`/`gemv_k`/
+/// `add_k` kernels every other path reuses unchanged -- see `Model::forward_mla_attn_block`).
+struct MlaModel {
+    cfg: MlaConfig,
+    layers: Vec<MlaLayerWeights>,
+    mla_attn_k: AotKernel,
+    /// `rope_norm_kernel` (`kernels_cuda/rope.cu`), **not** the shared `Model::rope_k`
+    /// (`rope_kernel`) every other architecture uses -- confirmed against
+    /// llama.cpp's `llama_model_rope_type`, which maps `deepseek2` to
+    /// `LLAMA_ROPE_TYPE_NORM` (consecutive-pair rotation), not the
+    /// `LLAMA_ROPE_TYPE_NEOX` (half-split) convention Qwen3/Qwen3.5 use.
+    rope_norm_k: AotKernel,
 }
 
 /// Per-sequence recurrent state for one hybrid layer, matching
@@ -363,6 +525,9 @@ pub struct Model {
     /// `cfg`/`layers`/`expert_used_count` above are unused garbage in that
     /// case (`forward_prompt` branches on this before touching them).
     hybrid: Option<HybridModel>,
+    /// `Some` iff this is a DeepSeek-V2/V3 MLA model (see `Self::load_mla`); like
+    /// `hybrid`, `cfg`/`layers`/`expert_used_count` are unused garbage in that case.
+    mla: Option<MlaModel>,
 }
 
 impl Model {
@@ -377,6 +542,9 @@ impl Model {
                  qwen35 hybrid architecture, and qwen3/qwen3-MoE, are in scope for this MVP"
                     .to_string(),
             );
+        }
+        if architecture == "deepseek2" {
+            return Self::load_mla(device, file);
         }
 
         let (cfg, block_count, moe) = parse_model_config(file)?;
@@ -492,6 +660,7 @@ impl Model {
             lm_head,
             tokenizer,
             hybrid: None,
+            mla: None,
         })
     }
 
@@ -658,6 +827,108 @@ impl Model {
             lm_head,
             tokenizer,
             hybrid: Some(HybridModel { attn_cfg, gdn_cfg, layers, gdn_conv_k, gdn_l2_norm_k, gdn_gates_k, gdn_delta_k, gdn_gated_norm_k }),
+            mla: None,
+        })
+    }
+
+    /// Loads a DeepSeek-V2/V3 MLA model (MVP step 4). See [`parse_mla_config`] for
+    /// the scope this supports (dense-only, no Q-LoRA, no YaRN, no MTP).
+    /// `cfg`/`layers`/`expert_used_count` below are unused garbage (matching the
+    /// `hybrid` path's own convention) -- `forward_prompt` branches on `self.mla`
+    /// before touching them.
+    fn load_mla(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
+        let (mla_cfg, block_count) = parse_mla_config(file)?;
+
+        let rmsnorm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_RMSNORM"), "rmsnorm", "rmsnorm_kernel")?;
+        let rope_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope", "rope_kernel")?;
+        let silu_k =
+            aot::load_kernel(&device, env!("COLDSTART_KERNEL_SILU_AND_MUL"), "silu_and_mul", "silu_and_mul_kernel")?;
+        let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
+        let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
+        let add_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ELEMENTWISE"), "elementwise", "add_kernel")?;
+        let mla_attn_k =
+            aot::load_kernel(&device, env!("COLDSTART_KERNEL_MLA_ATTENTION"), "mla_attention", "mla_attention_kernel")?;
+        let rope_norm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_norm", "rope_norm_kernel")?;
+
+        let load_weight = |name: &str| -> Result<Weight, String> {
+            let info = file.tensor_info(name).ok_or_else(|| format!("missing weight '{name}'"))?;
+            let bytes = file.tensor_bytes(info)?;
+            let host = dequant::dequantize(info.ggml_type, bytes, info.element_count())?;
+            let data = device.htod_sync_copy(&host).map_err(|e| format!("upload weight '{name}' to device: {e}"))?;
+            Ok(Weight { data, shape: info.shape.clone() })
+        };
+
+        let mut layers = Vec::with_capacity(block_count);
+        for i in 0..block_count {
+            layers.push(MlaLayerWeights {
+                attn_norm: load_weight(&format!("blk.{i}.attn_norm.weight"))?,
+                wq: load_weight(&format!("blk.{i}.attn_q.weight"))?,
+                wkv_a_mqa: load_weight(&format!("blk.{i}.attn_kv_a_mqa.weight"))?,
+                attn_kv_a_norm: load_weight(&format!("blk.{i}.attn_kv_a_norm.weight"))?,
+                wk_b: load_weight(&format!("blk.{i}.attn_k_b.weight"))?,
+                wv_b: load_weight(&format!("blk.{i}.attn_v_b.weight"))?,
+                wo: load_weight(&format!("blk.{i}.attn_output.weight"))?,
+                ffn_norm: load_weight(&format!("blk.{i}.ffn_norm.weight"))?,
+                ffn_gate: load_weight(&format!("blk.{i}.ffn_gate.weight"))?,
+                ffn_up: load_weight(&format!("blk.{i}.ffn_up.weight"))?,
+                ffn_down: load_weight(&format!("blk.{i}.ffn_down.weight"))?,
+            });
+        }
+
+        let token_embd_info =
+            file.tensor_info("token_embd.weight").ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
+        let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
+        let token_embd =
+            dequant::dequantize(token_embd_info.ggml_type, token_embd_bytes, token_embd_info.element_count())?;
+
+        let output_norm = load_weight("output_norm.weight")?;
+
+        let lm_head = match file.tensor_info("output.weight") {
+            Some(info) => {
+                let bytes = file.tensor_bytes(info)?;
+                let host = dequant::dequantize(info.ggml_type, bytes, info.element_count())?;
+                let data =
+                    device.htod_sync_copy(&host).map_err(|e| format!("upload weight 'output.weight' to device: {e}"))?;
+                Weight { data, shape: info.shape.clone() }
+            }
+            None => {
+                let data = device
+                    .htod_sync_copy(&token_embd)
+                    .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
+                Weight { data, shape: token_embd_info.shape.clone() }
+            }
+        };
+
+        let tokenizer = Tokenizer::from_gguf(file)?;
+
+        let dummy_cfg = LayerConfig {
+            hidden_size: mla_cfg.hidden_size,
+            num_q_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+            rotary_dim: 1,
+            ffn_hidden_size: 1,
+            rope_base: mla_cfg.rope_base,
+            rmsnorm_eps: mla_cfg.rmsnorm_eps,
+        };
+
+        Ok(Model {
+            device,
+            rmsnorm_k,
+            rope_k,
+            silu_k,
+            gemv_k,
+            attn_k,
+            add_k,
+            cfg: dummy_cfg,
+            layers: Vec::new(),
+            expert_used_count: None,
+            token_embd,
+            output_norm,
+            lm_head,
+            tokenizer,
+            hybrid: None,
+            mla: Some(MlaModel { cfg: mla_cfg, layers, mla_attn_k, rope_norm_k }),
         })
     }
 
@@ -770,6 +1041,28 @@ impl Model {
         Ok(())
     }
 
+    /// Like [`Self::rope`], but launches `m.rope_norm_k` (`rope_norm_kernel` --
+    /// consecutive-pair rotation) instead of the shared `self.rope_k`
+    /// (`rope_kernel` -- half-split rotation). Only DeepSeek-V2/V3 MLA needs this
+    /// (see `MlaModel::rope_norm_k`'s doc comment); every other architecture uses
+    /// `Self::rope` unchanged.
+    fn rope_norm(&self, m: &MlaModel, t: &mut CudaSlice<f32>, num_heads: usize, head_dim: usize, rotary_dim: usize, position: usize, base: f32) -> Result<(), String> {
+        let half_rotary = rotary_dim / 2;
+        let total_pairs = (num_heads * half_rotary) as u32;
+        let threads = 256u32;
+        let blocks = total_pairs.div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+
+        unsafe {
+            m.rope_norm_k
+                .function
+                .clone()
+                .launch(launch_cfg, (t, position as u32, num_heads as u32, head_dim as u32, rotary_dim as u32, base))
+                .map_err(|e| format!("rope_norm launch: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// `gate`/`up` are already device-resident, separate (not concatenated)
     /// buffers -- `silu_and_mul_kernel` takes them as two pointers, so no
     /// device-side concatenation step is needed either (Phase 2 round 2).
@@ -851,6 +1144,100 @@ impl Model {
             self.add_k.function.clone().launch(launch_cfg, (a, b, n)).map_err(|e| format!("add launch: {e}"))?;
         }
         Ok(())
+    }
+
+    /// Like [`Self::gemv_raw`], but generic over both operands being any
+    /// device-resident reference (`&CudaSlice<f32>` or `&CudaView<f32>`) instead of
+    /// requiring `x` to be a whole owned `CudaSlice`. Needed for MLA's per-head
+    /// absorption/decompression steps (see `Self::forward_mla_attn_block`,
+    /// `Self::gemv_per_head`), where `x` is a strided per-head slice of a larger
+    /// buffer. No length assertion (unlike `gemv_raw`) -- a generic view type isn't
+    /// cheaply length-checked here, so correctness relies on the caller passing
+    /// consistent `in_features`/`out_features`.
+    fn gemv_view<X: DeviceRepr, W: DeviceRepr>(&self, x: X, w_dev: W, in_features: usize, out_features: usize) -> Result<CudaSlice<f32>, String> {
+        let mut dev_y = self.device.alloc_zeros::<f32>(out_features).map_err(|e| format!("gemv_view alloc y: {e}"))?;
+        let threads = 256u32;
+        let blocks = (out_features as u32).div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            self.gemv_k
+                .function
+                .clone()
+                .launch(launch_cfg, (x, w_dev, &mut dev_y, in_features as u32, out_features as u32))
+                .map_err(|e| format!("gemv_view launch: {e}"))?;
+        }
+        Ok(dev_y)
+    }
+
+    /// Applies a per-head-stacked weight tensor (`w`, shape `[in_features,
+    /// out_features, n_head]` -- same layout convention as MoE's per-expert
+    /// tensors, see `Self::gemv_expert`'s doc comment, just "expert" -> "head") to
+    /// every head of a per-head-stacked input `x` (`[n_head, in_features]`
+    /// row-major, contiguous per head), producing a per-head-stacked output
+    /// (`[n_head, out_features]`). Unlike `gemv_expert` (which selects one of many
+    /// experts per token), MLA's decompression step (`wv_b`, see
+    /// `Self::forward_mla_attn_block`) always uses every head, so this loops over
+    /// all of them, reusing the same `gemv_kernel` per head via zero-copy
+    /// `CudaSlice::slice` views on both operands (via `Self::gemv_view`).
+    fn gemv_per_head(&self, x: &CudaSlice<f32>, w: &Weight, n_head: usize) -> Result<CudaSlice<f32>, String> {
+        let (in_features, out_features, head_count) = match w.shape.as_slice() {
+            [i, o, h] => (*i as usize, *o as usize, *h as usize),
+            other => return Err(format!("gemv_per_head: expected 3-D per-head tensor shape, got {other:?}")),
+        };
+        if head_count != n_head {
+            return Err(format!("gemv_per_head: tensor's head dim {head_count} != n_head {n_head}"));
+        }
+        let mut out = self.device.alloc_zeros::<f32>(n_head * out_features).map_err(|e| format!("gemv_per_head alloc: {e}"))?;
+        for h in 0..n_head {
+            let w_view = w.data.slice(h * in_features * out_features..(h + 1) * in_features * out_features);
+            let x_view = x.slice(h * in_features..(h + 1) * in_features);
+            let y = self.gemv_view(&x_view, &w_view, in_features, out_features)?;
+            let mut dst = out.slice_mut(h * out_features..(h + 1) * out_features);
+            self.device.dtod_copy(&y, &mut dst).map_err(|e| format!("gemv_per_head dtod head {h}: {e}"))?;
+        }
+        Ok(out)
+    }
+
+    /// DeepSeek-V2/V3 MLA's MQA-style attention: `num_q_heads` query heads (each
+    /// `qk_dim` wide) attend against a single shared compressed KV "head"
+    /// (`kv_cache` view, `[seq_len, qk_dim]` row-major, one row per cached
+    /// position -- the *same* row also serves as the value vector, using only its
+    /// first `v_dim` elements, since MLA's whole point is that K and V share one
+    /// compressed representation, unlike GQA's separate caches). Output is
+    /// `[num_q_heads, v_dim]`, still in compressed latent space --
+    /// `Self::gemv_per_head` (with `wv_b`) decompresses it afterward. `scale` must
+    /// be `1/sqrt(qk_nope_head_dim + qk_rope_head_dim)` -- the *uncompressed*
+    /// per-head dim, confirmed against llama.cpp's `deepseek2.cpp` (`kq_scale`) --
+    /// **not** `1/sqrt(qk_dim)` (the compressed dot-product width), an easy
+    /// mistake since every other op in this codebase scales by its own dot-product
+    /// dimension.
+    #[allow(clippy::too_many_arguments)]
+    fn mla_attention(
+        &self,
+        m: &MlaModel,
+        q: &CudaSlice<f32>,
+        kv_cache: &CudaView<f32>,
+        num_q_heads: usize,
+        qk_dim: usize,
+        v_dim: usize,
+        seq_len: usize,
+        scale: f32,
+    ) -> Result<CudaSlice<f32>, String> {
+        let mut dev_out = self.device.alloc_zeros::<f32>(num_q_heads * v_dim).map_err(|e| format!("mla_attn alloc out: {e}"))?;
+        let block_dim = (qk_dim as u32).next_power_of_two();
+        let launch_cfg = LaunchConfig {
+            grid_dim: (num_q_heads as u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: (seq_len * std::mem::size_of::<f32>()) as u32,
+        };
+        unsafe {
+            m.mla_attn_k
+                .function
+                .clone()
+                .launch(launch_cfg, (q, kv_cache, &mut dev_out, num_q_heads as u32, qk_dim as u32, v_dim as u32, seq_len as u32, scale))
+                .map_err(|e| format!("mla_attn launch: {e}"))?;
+        }
+        Ok(dev_out)
     }
 
     /// RMSNorm -> QKV -> QK-Norm (if present) -> RoPE -> causal attention ->
@@ -1026,6 +1413,9 @@ impl Model {
     pub fn forward_prompt(&self, prompt: &str) -> Result<(u32, String), String> {
         if let Some(h) = &self.hybrid {
             return self.forward_prompt_hybrid(h, prompt);
+        }
+        if let Some(m) = &self.mla {
+            return self.forward_prompt_mla(m, prompt);
         }
 
         let mut ids = self.tokenizer.encode(prompt)?;
@@ -1333,6 +1723,115 @@ impl Model {
         Ok(post_mixer)
     }
 
+    /// One DeepSeek-V2/V3 MLA attention block (see `MlaConfig`'s doc comment for
+    /// this MVP step's scope). Ported from llama.cpp's `src/models/deepseek2.cpp`
+    /// `graph::graph()`, the `is_mla && is_lite` branch (read in full while
+    /// planning this): RMSNorm -> `wq` (direct, no Q-LoRA) -> split into
+    /// `q_nope`/`q_pe` per head -> `wkv_a_mqa` -> split into `kv_cmpr`/`k_pe` ->
+    /// RoPE on `k_pe`/`q_pe` (full rotation over their own small buffers, not a
+    /// slice of a wider head -- `Self::rope` applies unchanged) -> RMSNorm
+    /// `kv_cmpr` -> **absorption** (`q_nope` per head times `wk_b`'s matching
+    /// per-head slice, via `Self::gemv_view`) -> concat into `Qcur` per head
+    /// (`kv_lora_rank + qk_rope_head_dim` wide) -> write this position's `Kcur`
+    /// (`kv_cmpr_normed` concat `k_pe`, a single shared MQA "head") into the
+    /// preallocated `kv_cache` via device-to-device copy (same convention Phase 2
+    /// round 2 established for GQA's `k_cache`/`v_cache`) -> `Self::mla_attention`
+    /// (MQA, compressed space) -> **decompression** (`Self::gemv_per_head` with
+    /// `wv_b`) -> `wo` -> residual add. Takes ownership of `hidden` and mutates it
+    /// in place for the residual add (same convention as `forward_attn_block`).
+    fn forward_mla_attn_block(
+        &self,
+        m: &MlaModel,
+        w: &MlaLayerWeights,
+        mut hidden: CudaSlice<f32>,
+        position: usize,
+        kv_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
+        let cfg = &m.cfg;
+        let n_head = cfg.num_heads;
+        let qk_nope = cfg.qk_nope_head_dim;
+        let qk_rope = cfg.qk_rope_head_dim;
+        let n_embd_head_k_mla = qk_nope + qk_rope;
+        let kv_lora = cfg.kv_lora_rank;
+        let qk_dim = kv_lora + qk_rope;
+        let v_dim = kv_lora;
+
+        let normed = self.rmsnorm(&hidden, &w.attn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
+
+        // q: [n_head, n_embd_head_k_mla] flat (plain gemv -- is_lite path, no Q-LoRA).
+        let q = self.gemv(&normed, &w.wq)?;
+
+        // kv_cmpr_pe: [kv_lora_rank + qk_rope_head_dim] flat (single shared "head").
+        let kv_cmpr_pe = self.gemv(&normed, &w.wkv_a_mqa)?;
+
+        let mut k_pe = self.device.alloc_zeros::<f32>(qk_rope).map_err(|e| format!("mla k_pe alloc: {e}"))?;
+        {
+            let src = kv_cmpr_pe.slice(kv_lora..kv_lora + qk_rope);
+            self.device.dtod_copy(&src, &mut k_pe).map_err(|e| format!("mla k_pe dtod: {e}"))?;
+        }
+        self.rope_norm(m, &mut k_pe, 1, qk_rope, qk_rope, position, cfg.rope_base)?;
+
+        let mut kv_cmpr_owned = self.device.alloc_zeros::<f32>(kv_lora).map_err(|e| format!("mla kv_cmpr alloc: {e}"))?;
+        {
+            let src = kv_cmpr_pe.slice(0..kv_lora);
+            self.device.dtod_copy(&src, &mut kv_cmpr_owned).map_err(|e| format!("mla kv_cmpr dtod: {e}"))?;
+        }
+        let kv_cmpr_normed = self.rmsnorm(&kv_cmpr_owned, &w.attn_kv_a_norm.data, 1, kv_lora, cfg.rmsnorm_eps)?;
+
+        // Gather q_pe (all heads) into its own contiguous [n_head, qk_rope_head_dim]
+        // buffer before RoPE -- `Self::rope` expects one contiguous multi-head buffer,
+        // and q_pe is a strided sub-slice of each head's [n_embd_head_k_mla]-wide row
+        // in `q`, not itself contiguous across heads.
+        let mut q_pe = self.device.alloc_zeros::<f32>(n_head * qk_rope).map_err(|e| format!("mla q_pe alloc: {e}"))?;
+        for h in 0..n_head {
+            let src = q.slice(h * n_embd_head_k_mla + qk_nope..h * n_embd_head_k_mla + n_embd_head_k_mla);
+            let mut dst = q_pe.slice_mut(h * qk_rope..(h + 1) * qk_rope);
+            self.device.dtod_copy(&src, &mut dst).map_err(|e| format!("mla q_pe dtod head {h}: {e}"))?;
+        }
+        self.rope_norm(m, &mut q_pe, n_head, qk_rope, qk_rope, position, cfg.rope_base)?;
+
+        // Per head: absorb q_nope via wk_b, then concat with the (already-roped)
+        // q_pe slice into Qcur's per-head [qk_dim]-wide row.
+        let mut qcur = self.device.alloc_zeros::<f32>(n_head * qk_dim).map_err(|e| format!("mla qcur alloc: {e}"))?;
+        for h in 0..n_head {
+            let q_nope_view = q.slice(h * n_embd_head_k_mla..h * n_embd_head_k_mla + qk_nope);
+            let wk_b_view = w.wk_b.data.slice(h * qk_nope * kv_lora..(h + 1) * qk_nope * kv_lora);
+            let absorbed = self.gemv_view(&q_nope_view, &wk_b_view, qk_nope, kv_lora)?;
+
+            let mut dst_nope = qcur.slice_mut(h * qk_dim..h * qk_dim + kv_lora);
+            self.device.dtod_copy(&absorbed, &mut dst_nope).map_err(|e| format!("mla qcur absorbed dtod head {h}: {e}"))?;
+
+            let pe_src = q_pe.slice(h * qk_rope..(h + 1) * qk_rope);
+            let mut dst_pe = qcur.slice_mut(h * qk_dim + kv_lora..h * qk_dim + qk_dim);
+            self.device.dtod_copy(&pe_src, &mut dst_pe).map_err(|e| format!("mla qcur pe dtod head {h}: {e}"))?;
+        }
+
+        // Write this position's compressed Kcur (== kv_cmpr_normed ++ k_pe) into the
+        // preallocated per-layer cache -- device-resident from the start (Phase 2
+        // round 2 convention), no host round-trip, ever, for this cache.
+        let offset = position * qk_dim;
+        {
+            let mut dst = kv_cache.slice_mut(offset..offset + kv_lora);
+            self.device.dtod_copy(&kv_cmpr_normed, &mut dst).map_err(|e| format!("mla kv_cache dtod cmpr: {e}"))?;
+        }
+        {
+            let mut dst = kv_cache.slice_mut(offset + kv_lora..offset + qk_dim);
+            self.device.dtod_copy(&k_pe, &mut dst).map_err(|e| format!("mla kv_cache dtod k_pe: {e}"))?;
+        }
+        let seq_len = position + 1;
+
+        let kv_view = kv_cache.slice(0..seq_len * qk_dim);
+        // Scale uses the *uncompressed* per-head dim (n_embd_head_k_mla), not
+        // qk_dim -- see `Self::mla_attention`'s doc comment.
+        let scale = 1.0 / (n_embd_head_k_mla as f32).sqrt();
+        let compressed_out = self.mla_attention(m, &qcur, &kv_view, n_head, qk_dim, v_dim, seq_len, scale)?;
+
+        let decompressed = self.gemv_per_head(&compressed_out, &w.wv_b, n_head)?;
+        let o_proj = self.gemv(&decompressed, &w.wo)?;
+        self.add_inplace(&mut hidden, &o_proj)?;
+        Ok(hidden)
+    }
+
     /// Hybrid-model counterpart to [`Self::forward_prompt`]: same encode ->
     /// per-position, per-layer loop -> final norm -> LM head -> argmax
     /// shape, but each layer dispatches to [`Self::forward_gated_attn_mixer`]
@@ -1397,6 +1896,76 @@ impl Model {
                     }
                     _ => return Err("internal error: hybrid layer/state kind mismatch".to_string()),
                 };
+            }
+            hidden_dev = Some(hidden);
+        }
+        let hidden = hidden_dev.ok_or("no tokens processed")?;
+
+        let normed = self.rmsnorm(&hidden, &self.output_norm.data, 1, hidden_size, eps)?;
+        let logits_dev = self.gemv(&normed, &self.lm_head)?;
+        let logits = self.device.dtoh_sync_copy(&logits_dev).map_err(|e| format!("logits dtoh: {e}"))?;
+
+        let next_id = logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i as u32)
+            .ok_or("cannot argmax an empty logits slice")?;
+
+        let text = self.tokenizer.decode(&[next_id]);
+        Ok((next_id, text))
+    }
+
+    /// MLA-model counterpart to [`Self::forward_prompt`]/[`Self::forward_prompt_hybrid`]:
+    /// same encode -> per-position, per-layer loop -> final norm -> LM head ->
+    /// argmax shape. Each layer runs [`Self::forward_mla_attn_block`] then the
+    /// dense SwiGLU FFN tail (reuses [`Self::forward_hybrid_ffn`] unchanged -- it's
+    /// already generic over which norm/gate/up/down weights it's given, not
+    /// actually hybrid-specific). `kv_caches` are preallocated up front (same
+    /// rationale as `forward_prompt`'s/`forward_prompt_hybrid`'s own caches: the
+    /// full prompt's token count is already known before the per-position loop
+    /// starts).
+    fn forward_prompt_mla(&self, m: &MlaModel, prompt: &str) -> Result<(u32, String), String> {
+        let mut ids = self.tokenizer.encode(prompt)?;
+        if let Some(bos) = self.tokenizer.bos_token_id {
+            if ids.first() != Some(&bos) {
+                ids.insert(0, bos);
+            }
+        }
+        if ids.is_empty() {
+            return Err("encode produced no tokens".to_string());
+        }
+
+        let cfg = &m.cfg;
+        let qk_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim;
+        let kv_cache_len = ids.len() * qk_dim;
+        let mut kv_caches: Vec<CudaSlice<f32>> = (0..m.layers.len())
+            .map(|_| self.device.alloc_zeros::<f32>(kv_cache_len))
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("alloc mla kv_cache: {e}"))?;
+
+        let hidden_size = cfg.hidden_size;
+        let ffn_hidden_size = cfg.ffn_hidden_size;
+        let eps = cfg.rmsnorm_eps;
+        let mut hidden_host = vec![0.0f32; hidden_size];
+        let mut hidden_dev: Option<CudaSlice<f32>> = None;
+        for (position, &token_id) in ids.iter().enumerate() {
+            let embd_base = token_id as usize * hidden_size;
+            hidden_host.copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
+            let mut hidden = self.device.htod_sync_copy(&hidden_host).map_err(|e| format!("embedding htod: {e}"))?;
+
+            for (layer_idx, layer) in m.layers.iter().enumerate() {
+                let post_attn = self.forward_mla_attn_block(m, layer, hidden, position, &mut kv_caches[layer_idx])?;
+                hidden = self.forward_hybrid_ffn(
+                    post_attn,
+                    &layer.ffn_norm,
+                    &layer.ffn_gate,
+                    &layer.ffn_up,
+                    &layer.ffn_down,
+                    hidden_size,
+                    ffn_hidden_size,
+                    eps,
+                )?;
             }
             hidden_dev = Some(hidden);
         }
