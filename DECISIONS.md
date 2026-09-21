@@ -36,6 +36,70 @@ revisit whether hybrid `Gdn` state (already streaming-friendly — fixed-size, n
 indexed by position) can piggyback on the same file-format version bump used for
 hybrid `Attn`/MLA's cache shapes.
 
+## Phase 3 (State I/O) round 2 scope: dense/MoE + hybrid resume, MLA still round 3
+
+**Decision**: round 2 wires `--import-kv` up to actually resume generation and adds a
+real per-token generation loop (`--max-tokens N`), together, per round 1's own "How to
+apply" note. Scope is **dense/MoE and the Qwen3.5 hybrid mixer**; MLA's single
+compressed cache is deliberately deferred to round 3.
+
+**Why**: confirmed with the user before starting (three options offered: dense/MoE
+only, +hybrid, or +hybrid+MLA all in one round). Dense/MoE+hybrid matches this
+project's narrow-first precedent while still being the meaningfully smaller lift of
+the two extensions round 1 flagged as open: the hybrid `GatedAttention` sublayers need
+exactly the same `start_pos`-offset `k_cache`/`v_cache` treatment dense/MoE's single
+`k_cache`/`v_cache` pair does (same `forward_attn_block`-style position-indexed
+device-to-device copy), and the `GatedDeltaNet` sublayers' `conv_state`/`recurrent`
+need *no* `start_pos` handling at all — they're fixed-size buffers mutated in place
+regardless of position, so they round-trip by uploading them as-is. MLA's single
+compressed `kv_cache` (`forward_mla_attn_block`) is a third, structurally different
+shape again and was left for its own round rather than tripling this round's
+verification surface.
+
+**Implementation note**: `k_cache`/`v_cache` (and hybrid's `GatedAttention` cache) are
+now allocated for `start_pos + prompt_len + max_new_tokens` up front — headroom for
+every token the call might still generate — rather than exactly the prompt length.
+Callers that download the cache for `--export-kv` (`forward_prompt_capture_kv`/
+`forward_prompt_capture_kv_hybrid`) must slice to `0..seq_len * kv_stride` before the
+download, not the whole buffer, or the exported file's `k_caches`/`v_caches` length
+stops matching its own `seq_len` metadata. `kv_io.rs`'s hybrid format is a new version
+(2), read-dispatched by `import_kv`/`ImportedKv` — round 1's version-1 dense format is
+untouched and stays readable via the same `import_dense_kv` it always was, satisfying
+round 1's own "version-gated so a later round can add per-architecture variants
+without breaking round-1 files" design note.
+
+**Finding surfaced during verification, not a round-2 defect**: byte-exact
+export→import→continue-vs-single-run verification worked cleanly for dense
+(`Qwen3-0.6B-Q4_K_M.gguf`) and hybrid (`Qwen3.5-0.8B-Q4_K_M.gguf`) — both use the
+`gpt2`-style tokenizer path (`encode_gpt2`), whose regex pre-tokenization has no
+context-dependent whitespace handling across an arbitrary split. It did *not* work for
+`Tiny-Moe.Q4_K_M.gguf` (the only local MoE fixture): its `general.architecture="llama"`
+GGUF routes through `encode_sentencepiece`, which unconditionally prepends an implicit
+leading-space symbol to *every* `encode()` call (`tokenizer.rs`'s own doc comment,
+confirmed against real TinyLlama). A continuation prompt re-encoded on its own always
+picks up that phantom extra symbol, so it can never be byte-identical to the same text
+encoded as a substring of one continuous prompt — a real, deliberate property of
+SentencePiece tokenization, not something `--import-kv`'s resume logic does wrong.
+Confirmed this is tokenizer-level, not resume-level, three ways: (1) the discrepancy is
+reproducible from two independent, non-resuming `encode()` calls with no cache/model
+code involved at all; (2) `generate_dense_impl`/`forward_one_token_dense` — the actual
+resume machinery — is *exactly* the same code for dense and MoE, since `forward_layer`
+dispatches dense vs. MoE only inside the FFN tail (`forward_layer_moe`), which has no
+position or cache logic whatsoever; (3) resuming `Tiny-Moe` twice with identical
+imported-cache + continuation-prompt inputs produces byte-identical output both times
+(determinism holds; the surprising part is only that it disagrees with the *differently
+tokenized* single-run baseline, not that it's inconsistent with itself).
+
+**How to apply**: don't add a workaround for SentencePiece's implicit-leading-space
+convention to `tokenizer.rs` — it's correct, documented, real-model-verified behavior,
+not a bug. If a real `qwen3moe` fixture is ever obtained (open follow-up, see
+STATUS.md), prefer it over `Tiny-Moe` for any future text-level continuation testing,
+since Qwen-family models use the `gpt2` tokenizer path this property doesn't apply to.
+Round 3 (MLA) should budget for verifying resume the same two ways used here: a
+byte-exact text-continuation check against whichever tokenizer the MLA fixture(s) use,
+plus a determinism check as a fallback if that fixture also turns out to be
+SentencePiece-based.
+
 ## Hybrid Qwen3.5 MVP scope: dense `qwen35` only, single-token dispatch, no MTP
 
 **Decision**: MVP step 3 supports only the dense `qwen35` architecture string. The

@@ -104,8 +104,10 @@ cold compute into one output token, then getting out of the way.
   there (NVMe, an S3-backed FUSE mount, tmpfs) — that's the orchestrator's job. No
   caching policy, no cache-hit logic, inside this engine. **Round 1 done** (dense/MoE
   export/import of the raw buffers, verified byte-exact round trip on real hardware —
-  see the "Phase 3, round 1" section below); resuming generation from an imported cache,
-  and hybrid/MLA cache shapes, are round 2+.
+  see the "Phase 3, round 1" section below). **Round 2 done**: `--import-kv` actually
+  resumes generation (a real per-token generation loop, `--max-tokens N`, was added
+  alongside it), for dense/MoE and the Qwen3.5 hybrid mixer — see the "Phase 3, round 2"
+  section below. MLA's single compressed cache is round 3.
 - **Phase 4 — Embeddability**: a single `--lora <path>` CLI flag (load-time adapter
   application only, no runtime hot-swap multiplexer — process spin-up is already cheap
   enough that a fresh process per adapter is the scale-from-zero answer, not in-process
@@ -696,3 +698,57 @@ a plain run (`"Once upon a time"` -> `","` id 11, both with and without `--expor
 `--import-kv` reports `KV_IMPORT_OK` with the correct shape and a verified device round
 trip, and both error paths (malformed file, hybrid-architecture GGUF) fail with a clear
 message instead of silently producing wrong output.
+
+### Phase 3 (State I/O), round 2: real resume, dense/MoE + hybrid
+
+Confirmed scope with the user before starting (round 1 explicitly deferred this
+decision): round 2 extends to **dense/MoE and the Qwen3.5 hybrid mixer**; MLA's single
+compressed cache stays out (round 3), matching this project's narrow-first precedent.
+See DECISIONS.md's "Phase 3 round 2 scope" entry for the full why.
+
+Two pieces landed together, per round 1's own note that one without the other is
+useless: a real per-token generation loop (`Model::generate`, `--max-tokens N` on
+`qwen3_coldstart`, default 1 so the existing single-token cold-start benchmark path is
+unchanged) and `start_pos` plumbing so `--import-kv` actually resumes into it instead
+of just proving a device round trip. `Model::forward_prompt`/`forward_prompt_hybrid`
+are now thin wrappers over the same `generate_dense_impl`/`generate_hybrid_impl`
+functions `Model::generate` and the `--export-kv` capture functions all share.
+
+`k_cache`/`v_cache` (dense/MoE's pair, and the hybrid mixer's `GatedAttention`
+sublayers' pair) are now allocated for `start_pos + prompt_len + max_new_tokens`
+instead of exactly the prompt's token count, and an imported cache is uploaded
+directly into the front of that buffer (`cudarc`'s `htod_sync_copy_into` into a
+`slice_mut` view) before the per-position loop starts partway through it. The hybrid
+mixer's `GatedDeltaNet` sublayers needed no equivalent change at all — their
+`conv_state`/`recurrent` are fixed-size, mutated in place regardless of position, so an
+imported one just gets uploaded as-is. `kv_io.rs` gained a version-2 hybrid format
+(`HybridKvCache`, per-layer `Attn`/`Gdn` tagged data) alongside the untouched
+version-1 dense format, plus `import_kv`/`ImportedKv` to read-dispatch between them;
+`Model::architecture_kind()` lets `qwen3_coldstart` pick the matching
+`--export-kv` capture function without reaching into `Model`'s private state.
+
+Verified on a fresh A6000 instance (`lunpulve` — the round-1 session's instance was
+already gone, confirming instances really are per-session ephemeral): `cargo test` (58
+tests, incl. a new hybrid `kv_io` round-trip test) plus the actual correctness bar —
+byte-exact match between a single uninterrupted run and export→import→continue over
+the same concatenated prompt, split at a clean sentence boundary:
+
+- Dense (`Qwen3-0.6B-Q4_K_M.gguf`, `"The capital of France is Paris. The capital of
+  Germany is"` split after the first `"."`): both paths produced
+  `[19846,13,576,6722,315]` (`" Berlin. The capital of"`).
+- Hybrid (`Qwen3.5-0.8B-Q4_K_M.gguf`, same prompt/split shape): both paths produced
+  `[19241,13,561,6511,314]` (also `" Berlin. The capital of"`).
+
+MoE (`Tiny-Moe.Q4_K_M.gguf`) surfaced a genuine, useful finding rather than a bug: it's
+the only local fixture using the SentencePiece encode path, which unconditionally
+prepends an implicit leading-space token to every `encode()` call (real SentencePiece
+behavior, not a project bug — see `tokenizer.rs`'s own doc comment). That makes a
+continuation prompt's own re-encoding pick up a phantom extra token no matter where the
+text is split, so byte-exact text-level verification isn't meaningful for this fixture
+specifically — confirmed independent of any resume/cache code (reproducible from two
+plain, non-resuming `encode()` calls) and unrelated to MoE vs. dense (the resume
+machinery, `generate_dense_impl`/`forward_one_token_dense`, is exactly the same code
+for both — `forward_layer_moe`'s FFN dispatch has no position/cache logic to differ
+in). Verified instead by determinism (identical resume inputs, run twice, produced
+byte-identical `[4014,4052,4034,262,308]` both times) plus the code-sharing argument.
+See DECISIONS.md for the full three-part reasoning.

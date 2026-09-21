@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `README.md` — this file is the
 short, current-state summary; README is the log.
 
-_Last updated: 2026-09-21 (Phase 3 round 1 session)_
+_Last updated: 2026-09-21 (Phase 3 round 2 session)_
 
 ## MVP progress
 
@@ -75,18 +75,66 @@ instance, still running from the Phase 2 round 3 session): `cargo test` (57 test
 2 new `kv_io` tests) plus real `--export-kv`/`--import-kv` runs against both
 `Qwen3-0.6B-Q4_K_M.gguf` (dense) and `Tiny-Moe.Q4_K_M.gguf` (MoE).
 
+## Phase 3 (State I/O), round 2
+
+`--import-kv` now actually resumes generation, and `--max-tokens N` adds a real
+per-token generation loop (feeding each generated id back in, stopping early on EOS) —
+both pieces round 1 deliberately deferred together (see DECISIONS.md's round 1 entry).
+Scope: **dense/MoE and the Qwen3.5 hybrid mixer**, confirmed with the user before
+starting (MLA stays round 3, matching this project's narrow-first precedent).
+
+- `Model::generate` (`model.rs`) is the new top-level entry point; `forward_prompt`
+  becomes a thin `max_new_tokens=1, imported=None` wrapper over the same
+  `generate_dense_impl`/`generate_hybrid_impl` functions.
+- `start_pos` plumbing: `k_cache`/`v_cache` buffers are now sized for
+  `start_pos + prompt_len + max_new_tokens` (headroom for every token this call might
+  still generate) instead of exactly the prompt length, and seeded from the imported
+  cache via `htod_sync_copy_into` before the per-position loop starts (mid-buffer,
+  offset by `start_pos`). The hybrid `GatedAttention` sublayers need the identical
+  treatment; the `GatedDeltaNet` sublayers' `conv_state`/`recurrent` are fixed-size and
+  round-trip as-is (no `start_pos` concept applies to them).
+- `kv_io.rs` gained a version-2 hybrid file format (`HybridKvCache`,
+  `export_hybrid_kv`/`import_hybrid_kv`) alongside the unchanged version-1 dense
+  format, plus `import_kv`/`ImportedKv` to dispatch on whichever a file holds.
+  `Model::architecture_kind()` lets the CLI pick the matching capture function
+  (`forward_prompt_capture_kv` vs. `forward_prompt_capture_kv_hybrid`) without reaching
+  into `Model`'s private fields.
+- `--export-kv`/`--import-kv` can no longer be combined in one run (round-2 scope is
+  resume, not chained re-export), and `--export-kv` requires `--max-tokens 1` (it only
+  captures the cache after the initial prompt pass).
+- **Real-hardware-verified on a fresh A6000 instance** (`lunpulve`; the round-1
+  session's `kgevfmca` instance was gone by this session — confirms instances really
+  are per-session ephemeral, not just per-purpose): `cargo test` (58 tests, incl. a new
+  hybrid `kv_io` round-trip test) plus **byte-exact** export→import→continue vs. a
+  single uninterrupted run, both for dense (`Qwen3-0.6B-Q4_K_M.gguf`, tokens
+  `[19846,13,576,6722,315]` in both) and hybrid (`Qwen3.5-0.8B-Q4_K_M.gguf`, tokens
+  `[19241,13,561,6511,314]` in both).
+- **New finding, not a round-2 bug**: `Tiny-Moe.Q4_K_M.gguf` uses the SentencePiece
+  encode path (`encode_sentencepiece` in `tokenizer.rs`), which unconditionally
+  prepends an implicit leading-space token to *any* `encode()` call (real SentencePiece
+  convention, confirmed against TinyLlama). That makes a text-level continuation prompt
+  never byte-identical to the same text encoded as part of one continuous string — a
+  property of the tokenizer, not of the resume path (`generate_dense_impl`/
+  `forward_one_token_dense` are exactly the same code for dense and MoE; only
+  `forward_layer_moe`'s FFN differs, and it has no position/cache logic at all).
+  Verified instead via determinism (two resumes with identical inputs produce identical
+  output) plus the code-sharing argument. Qwen3/Qwen3.5's real `gpt2`-style tokenizer
+  doesn't have this property, which is why the dense/hybrid byte-exact checks above
+  work as designed. See DECISIONS.md for the full writeup.
+
 ## Open decision (not yet resolved)
 
-None currently open. Phase 3 round 1 (above) is done as scoped. Remaining low-priority
+None currently open. Phase 3 round 2 (above) is done as scoped. Remaining low-priority
 follow-ups (not blocking, not actively planned): a real small `qwen3moe`-architecture
-GGUF fixture (see "Known debt" below), on-device dequant coverage for the 15+ GGUF
-block types still on the host path (Q4_0/1, Q5_0/1, Q8_0/1, Q2_K/Q3_K/Q5_K/Q8_K, the
-IQ-family formats — none exercised by a local fixture's bulk weight bytes), MoE's
-per-expert weighted-sum accumulation / the Gated Attention mixer's fused-qg gating
-still round-tripping through the host (flagged, not measured as worth closing), and
-Phase 3 round 2 (hybrid/MLA KV-cache export formats, plus the generation loop +
-`start_pos` plumbing needed for `--import-kv` to actually resume generation — see
-README.md's Phase 3 section).
+GGUF fixture with a `gpt2`-style tokenizer (see "Known debt" below — would also make
+MoE's resume path byte-exact-testable at the text level, unlike `Tiny-Moe`), on-device
+dequant coverage for the 15+ GGUF block types still on the host path (Q4_0/1, Q5_0/1,
+Q8_0/1, Q2_K/Q3_K/Q5_K/Q8_K, the IQ-family formats — none exercised by a local
+fixture's bulk weight bytes), MoE's per-expert weighted-sum accumulation / the Gated
+Attention mixer's fused-qg gating still round-tripping through the host (flagged, not
+measured as worth closing), and Phase 3 round 3 (MLA's single compressed cache —
+`start_pos` plumbing for `forward_prompt_mla`/`forward_mla_attn_block`, still
+completely unstarted).
 
 ## Known debt / limitations
 
@@ -120,7 +168,9 @@ README.md's Phase 3 section).
   always selects every expert, so it can't prove routing actually excludes an expert; no
   QK-Norm tensors, so it doesn't exercise QK-Norm+MoE together). A real small
   `qwen3moe`-architecture fixture (or one with `expert_used_count < expert_count`)
-  doesn't exist yet locally.
+  doesn't exist yet locally. Its `llama`-architecture SentencePiece tokenizer also makes
+  it unsuitable for text-level byte-exact resume verification (Phase 3 round 2's
+  `--import-kv` continuation-prompt test) — see STATUS.md's Phase 3 round 2 section.
 - **Cargo/binary staleness gotcha**: `cargo test --release` does not rebuild
   `target/release/<bin-name>` — only `target/release/deps/`. After any source change,
   run `cargo build --release --bin <name>` explicitly before trusting a binary run

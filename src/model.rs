@@ -765,7 +765,28 @@ pub struct Model {
     mla: Option<MlaModel>,
 }
 
+/// Which forward path a loaded [`Model`] dispatches to -- used by callers
+/// (currently `qwen3_coldstart`'s `--export-kv`/`--import-kv` handling) that
+/// need to pick an architecture-specific KV-cache capture/resume function
+/// without reaching into `Model`'s private `hybrid`/`mla` fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchitectureKind {
+    Dense,
+    Hybrid,
+    Mla,
+}
+
 impl Model {
+    pub fn architecture_kind(&self) -> ArchitectureKind {
+        if self.hybrid.is_some() {
+            ArchitectureKind::Hybrid
+        } else if self.mla.is_some() {
+            ArchitectureKind::Mla
+        } else {
+            ArchitectureKind::Dense
+        }
+    }
+
     pub fn load(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
         let architecture = file.metadata.get("general.architecture").and_then(GgufValue::as_str).unwrap_or("");
         if architecture == "qwen35" {
@@ -1737,11 +1758,10 @@ impl Model {
         }
     }
 
-    /// Encodes `prompt`, runs the full prompt through every layer one
-    /// position at a time (real causal self-attention throughout, matching
-    /// RustFeference's own documented scope choice for its minimal forward
-    /// pass), and returns the argmax-sampled first generated token id plus
-    /// its decoded text.
+    /// Encodes `prompt`, runs it through every layer one position at a time
+    /// (real causal self-attention throughout, matching RustFeference's own
+    /// documented scope choice for its minimal forward pass), and returns
+    /// the argmax-sampled first generated token id plus its decoded text.
     pub fn forward_prompt(&self, prompt: &str) -> Result<(u32, String), String> {
         if let Some(h) = &self.hybrid {
             return self.forward_prompt_hybrid(h, prompt);
@@ -1749,89 +1769,231 @@ impl Model {
         if let Some(m) = &self.mla {
             return self.forward_prompt_mla(m, prompt);
         }
-        let (next_id, text, _k_caches, _v_caches, _seq_len) = self.forward_prompt_dense_impl(prompt)?;
-        Ok((next_id, text))
+        let (generated, text, _k_caches, _v_caches, _seq_len) = self.generate_dense_impl(prompt, None, 1, || {})?;
+        Ok((generated[0], text))
     }
 
-    /// Same dense/MoE forward pass as `forward_prompt`, but also returns the
-    /// device-resident per-layer K/V caches and the prompt's token count, so
-    /// `forward_prompt_capture_kv` can download them for `--export-kv`
-    /// (Phase 3 round 1, `kv_io.rs`). Kept separate from `forward_prompt` so
-    /// the common case (no export) doesn't pay for the extra return
-    /// plumbing or risk diverging cache-handling logic between two copies.
-    fn forward_prompt_dense_impl(&self, prompt: &str) -> Result<(u32, String, Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>, usize), String> {
+    /// Phase 3 (State I/O) round 2's generation entry point: like
+    /// `forward_prompt`, but produces up to `max_new_tokens` tokens (feeding
+    /// each generated id back in as the next position's input embedding,
+    /// stopping early on the tokenizer's `eos_token_id`) and, when
+    /// `imported` is `Some`, resumes from a previously exported cache
+    /// instead of starting at position 0 -- `prompt` is then the
+    /// continuation text appended after the imported cache's positions, not
+    /// a fresh prompt (no BOS is inserted). `on_first_token` is called
+    /// exactly once, right after the first new token is produced, so
+    /// callers can capture accurate "time to first token" timing even when
+    /// `max_new_tokens > 1` keeps the call running past that point.
+    ///
+    /// Dense/MoE and the Qwen3.5 hybrid mixer both support resume as of
+    /// round 2 (the hybrid `GatedDeltaNet` sublayers' `conv_state`/
+    /// `recurrent` need no `start_pos` handling at all -- see
+    /// `kv_io.rs`'s doc comment). MLA is deliberately not extended yet
+    /// (round 3) -- both resuming from an imported cache and multi-token
+    /// generation past the first token are rejected for it here, matching
+    /// this project's narrow-first precedent from every prior MVP step.
+    pub fn generate(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        imported: Option<&crate::kv_io::ImportedKv>,
+        on_first_token: impl FnMut(),
+    ) -> Result<(Vec<u32>, String), String> {
+        match imported {
+            Some(crate::kv_io::ImportedKv::Dense(cache)) => {
+                if self.hybrid.is_some() || self.mla.is_some() {
+                    return Err("imported KV cache file is dense/MoE format, but this model is not a dense/MoE Qwen3 model".to_string());
+                }
+                let (generated, text, _, _, _) = self.generate_dense_impl(prompt, Some(cache), max_new_tokens, on_first_token)?;
+                Ok((generated, text))
+            }
+            Some(crate::kv_io::ImportedKv::Hybrid(cache)) => {
+                let h = self
+                    .hybrid
+                    .as_ref()
+                    .ok_or("imported KV cache file is hybrid format, but this model is not a Qwen3.5 hybrid model")?;
+                let (generated, text, _, _) = self.generate_hybrid_impl(h, prompt, Some(cache), max_new_tokens, on_first_token)?;
+                Ok((generated, text))
+            }
+            None => {
+                if let Some(h) = &self.hybrid {
+                    let (generated, text, _, _) = self.generate_hybrid_impl(h, prompt, None, max_new_tokens, on_first_token)?;
+                    return Ok((generated, text));
+                }
+                if self.mla.is_some() {
+                    if max_new_tokens != 1 {
+                        return Err("multi-token generation is not yet supported for MLA models (round 3) -- use max_new_tokens=1".to_string());
+                    }
+                    let mut on_first_token = on_first_token;
+                    let (id, text) = self.forward_prompt(prompt)?;
+                    on_first_token();
+                    return Ok((vec![id], text));
+                }
+                let (generated, text, _, _, _) = self.generate_dense_impl(prompt, None, max_new_tokens, on_first_token)?;
+                Ok((generated, text))
+            }
+        }
+    }
+
+    /// Shared dense/MoE implementation behind `forward_prompt`,
+    /// `forward_prompt_capture_kv`, and `generate` (Phase 3 round 2):
+    /// encodes `prompt` (a continuation, not a fresh prompt, when
+    /// `imported.is_some()` -- no BOS is inserted in that case), seeds the
+    /// K/V cache from `imported` first when resuming, runs every position
+    /// exactly like a from-scratch run just offset by `imported`'s
+    /// `seq_len`, then keeps decoding new tokens one at a time until
+    /// `max_new_tokens` have been produced or `eos_token_id` comes up.
+    /// Returns the generated token ids, their concatenated decoded text,
+    /// the final per-layer K/V caches (still device-resident, sized with
+    /// headroom for up to `max_new_tokens` generated positions -- callers
+    /// downloading them for export must slice to `0..seq_len * kv_stride`,
+    /// not the whole buffer), and the total sequence length reached.
+    fn generate_dense_impl(
+        &self,
+        prompt: &str,
+        imported: Option<&crate::kv_io::DenseKvCache>,
+        max_new_tokens: usize,
+        mut on_first_token: impl FnMut(),
+    ) -> Result<(Vec<u32>, String, Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>, usize), String> {
+        let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
+
         let mut ids = self.tokenizer.encode(prompt)?;
-        if let Some(bos) = self.tokenizer.bos_token_id {
-            if ids.first() != Some(&bos) {
-                ids.insert(0, bos);
+        if start_pos == 0 {
+            if let Some(bos) = self.tokenizer.bos_token_id {
+                if ids.first() != Some(&bos) {
+                    ids.insert(0, bos);
+                }
             }
         }
         if ids.is_empty() {
             return Err("encode produced no tokens".to_string());
         }
+        if max_new_tokens == 0 {
+            return Err("max_new_tokens must be at least 1".to_string());
+        }
 
-        // Preallocated up front (Phase 2 round 2) since the full prompt's
-        // token count is already known here -- `forward_attn_block` writes
-        // each position's K/V directly into these device buffers via
-        // device-to-device copy instead of the pre-round-2 pattern of
-        // re-uploading the entire host-side cache history on every call.
-        let kv_cache_len = ids.len() * self.cfg.num_kv_heads * self.cfg.head_dim;
+        let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
+        // Preallocated up front (Phase 2 round 2 sized this to exactly the
+        // prompt's token count; round 2 of Phase 3 sizes it for the whole
+        // run -- imported positions, the continuation prompt, and headroom
+        // for every token this call might still generate -- since
+        // `forward_attn_block` indexes into it by absolute position and
+        // needs the buffer to already be that big).
+        let total_len = start_pos + ids.len() + max_new_tokens;
         let mut k_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
-            .map(|_| self.device.alloc_zeros::<f32>(kv_cache_len))
+            .map(|_| self.device.alloc_zeros::<f32>(total_len * kv_stride))
             .collect::<Result<_, _>>()
             .map_err(|e| format!("alloc k_cache: {e}"))?;
         let mut v_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
-            .map(|_| self.device.alloc_zeros::<f32>(kv_cache_len))
+            .map(|_| self.device.alloc_zeros::<f32>(total_len * kv_stride))
             .collect::<Result<_, _>>()
             .map_err(|e| format!("alloc v_cache: {e}"))?;
 
-        let hidden_size = self.cfg.hidden_size;
-        let mut hidden_host = vec![0.0f32; hidden_size];
-        let mut hidden_dev: Option<CudaSlice<f32>> = None;
-        for (position, &token_id) in ids.iter().enumerate() {
-            let embd_base = token_id as usize * hidden_size;
-            hidden_host.copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
-            let mut hidden = self.device.htod_sync_copy(&hidden_host).map_err(|e| format!("embedding htod: {e}"))?;
-
-            for (layer_idx, layer) in self.layers.iter().enumerate() {
-                hidden = self.forward_layer(layer, hidden, position, &mut k_caches[layer_idx], &mut v_caches[layer_idx])?;
+        if let Some(cache) = imported {
+            if cache.num_kv_heads != self.cfg.num_kv_heads || cache.head_dim != self.cfg.head_dim {
+                return Err(format!(
+                    "imported KV cache shape mismatch: file has num_kv_heads={} head_dim={}, model expects num_kv_heads={} head_dim={}",
+                    cache.num_kv_heads, cache.head_dim, self.cfg.num_kv_heads, self.cfg.head_dim
+                ));
             }
-            hidden_dev = Some(hidden);
+            if cache.k_caches.len() != self.layers.len() {
+                return Err(format!("imported KV cache has {} layers, model has {}", cache.k_caches.len(), self.layers.len()));
+            }
+            let imported_len = cache.seq_len * kv_stride;
+            for (layer_idx, (k_host, v_host)) in cache.k_caches.iter().zip(&cache.v_caches).enumerate() {
+                let mut k_dst = k_caches[layer_idx].slice_mut(0..imported_len);
+                self.device.htod_sync_copy_into(k_host, &mut k_dst).map_err(|e| format!("import k_cache htod layer {layer_idx}: {e}"))?;
+                let mut v_dst = v_caches[layer_idx].slice_mut(0..imported_len);
+                self.device.htod_sync_copy_into(v_host, &mut v_dst).map_err(|e| format!("import v_cache htod layer {layer_idx}: {e}"))?;
+            }
         }
-        let hidden = hidden_dev.ok_or("no tokens processed")?;
 
-        let normed = self.rmsnorm(&hidden, &self.output_norm.data, 1, hidden_size, self.cfg.rmsnorm_eps)?;
+        let mut position = start_pos;
+        let mut hidden_dev: Option<CudaSlice<f32>> = None;
+        for &token_id in &ids {
+            hidden_dev = Some(self.forward_one_token_dense(token_id, position, &mut k_caches, &mut v_caches)?);
+            position += 1;
+        }
+        let mut hidden = hidden_dev.ok_or("no tokens processed")?;
+
+        let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
+        let mut next_id = self.lm_head_argmax(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
+        on_first_token();
+        generated.push(next_id);
+
+        while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
+            hidden = self.forward_one_token_dense(next_id, position, &mut k_caches, &mut v_caches)?;
+            position += 1;
+            next_id = self.lm_head_argmax(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
+            generated.push(next_id);
+        }
+
+        let text = self.tokenizer.decode(&generated);
+        Ok((generated, text, k_caches, v_caches, position))
+    }
+
+    /// Embeds `token_id` and runs it through every dense/MoE layer at
+    /// absolute `position`, writing this position's K/V into `k_caches`/
+    /// `v_caches` (preallocated device buffers, see `generate_dense_impl`).
+    fn forward_one_token_dense(
+        &self,
+        token_id: u32,
+        position: usize,
+        k_caches: &mut [CudaSlice<f32>],
+        v_caches: &mut [CudaSlice<f32>],
+    ) -> Result<CudaSlice<f32>, String> {
+        let hidden_size = self.cfg.hidden_size;
+        let embd_base = token_id as usize * hidden_size;
+        let mut hidden = self
+            .device
+            .htod_sync_copy(&self.token_embd[embd_base..embd_base + hidden_size])
+            .map_err(|e| format!("embedding htod: {e}"))?;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = self.forward_layer(layer, hidden, position, &mut k_caches[layer_idx], &mut v_caches[layer_idx])?;
+        }
+        Ok(hidden)
+    }
+
+    /// Final RMSNorm -> LM head -> argmax, shared by every architecture's
+    /// generation loop (`hidden_size`/`eps` differ by architecture; the
+    /// `output_norm`/`lm_head` weights are shared across all of them).
+    fn lm_head_argmax(&self, hidden: &CudaSlice<f32>, hidden_size: usize, eps: f32) -> Result<u32, String> {
+        let normed = self.rmsnorm(hidden, &self.output_norm.data, 1, hidden_size, eps)?;
         let logits_dev = self.gemv(&normed, &self.lm_head)?;
         let logits = self.device.dtoh_sync_copy(&logits_dev).map_err(|e| format!("logits dtoh: {e}"))?;
-
-        let next_id = logits
+        logits
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i as u32)
-            .ok_or("cannot argmax an empty logits slice")?;
-
-        let text = self.tokenizer.decode(&[next_id]);
-        Ok((next_id, text, k_caches, v_caches, ids.len()))
+            .ok_or_else(|| "cannot argmax an empty logits slice".to_string())
     }
 
-    /// Dense/MoE-only (Phase 3 round 1 -- see `kv_io.rs`'s doc comment for
-    /// why hybrid/MLA aren't supported yet): runs the same forward pass as
-    /// `forward_prompt` but also downloads the per-layer K/V caches to host
-    /// memory for `--export-kv` to serialize.
+    /// Dense/MoE-only: runs the same forward pass as `forward_prompt` but
+    /// also downloads the per-layer K/V caches (sliced to exactly the
+    /// positions actually written -- `generate_dense_impl`'s buffers carry
+    /// extra headroom this capture doesn't use) to host memory for
+    /// `--export-kv` to serialize. Hybrid models use
+    /// `forward_prompt_capture_kv_hybrid` instead; MLA isn't supported yet
+    /// (round 3).
     pub fn forward_prompt_capture_kv(&self, prompt: &str) -> Result<((u32, String), crate::kv_io::DenseKvCache), String> {
-        if self.hybrid.is_some() || self.mla.is_some() {
-            return Err("--export-kv is only supported for dense/MoE Qwen3 models in this round (see kv_io.rs)".to_string());
+        if self.hybrid.is_some() {
+            return Err("--export-kv on a hybrid Qwen3.5 model needs forward_prompt_capture_kv_hybrid, not this function".to_string());
         }
-        let (next_id, text, k_caches, v_caches, seq_len) = self.forward_prompt_dense_impl(prompt)?;
+        if self.mla.is_some() {
+            return Err("--export-kv is not yet supported for MLA models (round 3, see kv_io.rs)".to_string());
+        }
+        let (generated, text, k_caches, v_caches, seq_len) = self.generate_dense_impl(prompt, None, 1, || {})?;
 
+        let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
+        let per_layer_len = seq_len * kv_stride;
         let k_caches = k_caches
             .iter()
-            .map(|c| self.device.dtoh_sync_copy(c).map_err(|e| format!("k_cache dtoh: {e}")))
+            .map(|c| self.device.dtoh_sync_copy(&c.slice(0..per_layer_len)).map_err(|e| format!("k_cache dtoh: {e}")))
             .collect::<Result<Vec<_>, _>>()?;
         let v_caches = v_caches
             .iter()
-            .map(|c| self.device.dtoh_sync_copy(c).map_err(|e| format!("v_cache dtoh: {e}")))
+            .map(|c| self.device.dtoh_sync_copy(&c.slice(0..per_layer_len)).map_err(|e| format!("v_cache dtoh: {e}")))
             .collect::<Result<Vec<_>, _>>()?;
 
         let cache = crate::kv_io::DenseKvCache {
@@ -1841,7 +2003,7 @@ impl Model {
             k_caches,
             v_caches,
         };
-        Ok(((next_id, text), cache))
+        Ok(((generated[0], text), cache))
     }
 
     /// Causal depthwise conv1d + SiLU over the fused qkv, advancing
@@ -2213,42 +2375,95 @@ impl Model {
         Ok(hidden)
     }
 
-    /// Hybrid-model counterpart to [`Self::forward_prompt`]: same encode ->
-    /// per-position, per-layer loop -> final norm -> LM head -> argmax
-    /// shape, but each layer dispatches to [`Self::forward_gated_attn_mixer`]
-    /// or [`Self::forward_gdn_mixer`] (never both) based on its
-    /// [`HybridLayerWeights`] variant, carrying the matching
-    /// [`HybridLayerState`] variant across positions.
+    /// Hybrid-model counterpart to [`Self::forward_prompt`]: thin wrapper
+    /// over [`Self::generate_hybrid_impl`] with no import and exactly one
+    /// generated token.
     fn forward_prompt_hybrid(&self, h: &HybridModel, prompt: &str) -> Result<(u32, String), String> {
+        let (generated, text, _states, _seq_len) = self.generate_hybrid_impl(h, prompt, None, 1, || {})?;
+        Ok((generated[0], text))
+    }
+
+    /// Hybrid counterpart to [`Self::generate_dense_impl`] (Phase 3 round
+    /// 2): same encode -> seed-from-`imported` -> per-position loop ->
+    /// decode-more-tokens shape, but each layer dispatches to
+    /// [`Self::forward_gated_attn_mixer`] or [`Self::forward_gdn_mixer`]
+    /// (never both) based on its [`HybridLayerWeights`] variant, carrying
+    /// the matching [`HybridLayerState`] variant across positions. Only the
+    /// `GatedAttention` sublayers' `k_cache`/`v_cache` need `imported`'s
+    /// `seq_len` offset treatment (sized with headroom for
+    /// `max_new_tokens`, same convention as `generate_dense_impl`'s
+    /// buffers); the `GatedDeltaNet` sublayers' `conv_state`/`recurrent`
+    /// are fixed-size and get uploaded as-is when resuming.
+    fn generate_hybrid_impl(
+        &self,
+        h: &HybridModel,
+        prompt: &str,
+        imported: Option<&crate::kv_io::HybridKvCache>,
+        max_new_tokens: usize,
+        mut on_first_token: impl FnMut(),
+    ) -> Result<(Vec<u32>, String, Vec<HybridLayerState>, usize), String> {
+        let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
+
         let mut ids = self.tokenizer.encode(prompt)?;
-        if let Some(bos) = self.tokenizer.bos_token_id {
-            if ids.first() != Some(&bos) {
-                ids.insert(0, bos);
+        if start_pos == 0 {
+            if let Some(bos) = self.tokenizer.bos_token_id {
+                if ids.first() != Some(&bos) {
+                    ids.insert(0, bos);
+                }
             }
         }
         if ids.is_empty() {
             return Err("encode produced no tokens".to_string());
         }
+        if max_new_tokens == 0 {
+            return Err("max_new_tokens must be at least 1".to_string());
+        }
 
-        // Preallocated up front (Phase 2 round 2), same rationale as
-        // `forward_prompt`'s `k_caches`/`v_caches`: the full prompt's token
-        // count is already known before the per-position loop starts.
-        let attn_kv_cache_len = ids.len() * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
+        if let Some(cache) = imported {
+            if cache.attn_num_kv_heads != h.attn_cfg.num_kv_heads || cache.attn_head_dim != h.attn_cfg.head_dim {
+                return Err("imported hybrid KV cache's GatedAttention shape doesn't match this model".to_string());
+            }
+            if cache.layers.len() != h.layers.len() {
+                return Err(format!("imported hybrid KV cache has {} layers, model has {}", cache.layers.len(), h.layers.len()));
+            }
+        }
+
+        let attn_kv_cache_len = (start_pos + ids.len() + max_new_tokens) * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
         let mut states: Vec<HybridLayerState> = h
             .layers
             .iter()
-            .map(|l| -> Result<HybridLayerState, String> {
+            .enumerate()
+            .map(|(layer_idx, l)| -> Result<HybridLayerState, String> {
+                let imported_layer = imported.map(|c| &c.layers[layer_idx]);
                 match l {
                     HybridLayerWeights::GatedAttention(_) => {
-                        let k_cache = self.device.alloc_zeros::<f32>(attn_kv_cache_len).map_err(|e| format!("alloc k_cache: {e}"))?;
-                        let v_cache = self.device.alloc_zeros::<f32>(attn_kv_cache_len).map_err(|e| format!("alloc v_cache: {e}"))?;
+                        let mut k_cache = self.device.alloc_zeros::<f32>(attn_kv_cache_len).map_err(|e| format!("alloc k_cache: {e}"))?;
+                        let mut v_cache = self.device.alloc_zeros::<f32>(attn_kv_cache_len).map_err(|e| format!("alloc v_cache: {e}"))?;
+                        if let Some(crate::kv_io::HybridLayerCacheData::Attn { k_cache: k_host, v_cache: v_host }) = imported_layer {
+                            let imported_len = start_pos * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
+                            let mut k_dst = k_cache.slice_mut(0..imported_len);
+                            self.device.htod_sync_copy_into(k_host, &mut k_dst).map_err(|e| format!("import hybrid k_cache layer {layer_idx}: {e}"))?;
+                            let mut v_dst = v_cache.slice_mut(0..imported_len);
+                            self.device.htod_sync_copy_into(v_host, &mut v_dst).map_err(|e| format!("import hybrid v_cache layer {layer_idx}: {e}"))?;
+                        } else if imported_layer.is_some() {
+                            return Err(format!("imported hybrid KV cache layer {layer_idx} is Gdn-kind but model layer is GatedAttention"));
+                        }
                         Ok(HybridLayerState::Attn { k_cache, v_cache })
                     }
                     HybridLayerWeights::GatedDeltaNet(_) => {
-                        let conv_state =
-                            self.device.alloc_zeros::<f32>(h.gdn_cfg.conv_state_len()).map_err(|e| format!("alloc conv_state: {e}"))?;
-                        let recurrent =
-                            self.device.alloc_zeros::<f32>(h.gdn_cfg.recurrent_len()).map_err(|e| format!("alloc recurrent: {e}"))?;
+                        let conv_state_len = h.gdn_cfg.conv_state_len();
+                        let recurrent_len = h.gdn_cfg.recurrent_len();
+                        let mut conv_state = self.device.alloc_zeros::<f32>(conv_state_len).map_err(|e| format!("alloc conv_state: {e}"))?;
+                        let mut recurrent = self.device.alloc_zeros::<f32>(recurrent_len).map_err(|e| format!("alloc recurrent: {e}"))?;
+                        if let Some(crate::kv_io::HybridLayerCacheData::Gdn { conv_state: c_host, recurrent: r_host }) = imported_layer {
+                            if c_host.len() != conv_state_len || r_host.len() != recurrent_len {
+                                return Err(format!("imported hybrid KV cache layer {layer_idx} Gdn state size mismatch"));
+                            }
+                            self.device.htod_sync_copy_into(c_host, &mut conv_state).map_err(|e| format!("import gdn conv_state layer {layer_idx}: {e}"))?;
+                            self.device.htod_sync_copy_into(r_host, &mut recurrent).map_err(|e| format!("import gdn recurrent layer {layer_idx}: {e}"))?;
+                        } else if imported_layer.is_some() {
+                            return Err(format!("imported hybrid KV cache layer {layer_idx} is Attn-kind but model layer is GatedDeltaNet"));
+                        }
                         Ok(HybridLayerState::Gdn { conv_state, recurrent })
                     }
                 }
@@ -2256,45 +2471,95 @@ impl Model {
             .collect::<Result<Vec<_>, String>>()?;
 
         let hidden_size = h.attn_cfg.hidden_size;
+        let eps = h.attn_cfg.rmsnorm_eps;
+
+        let mut position = start_pos;
+        let mut hidden_dev: Option<CudaSlice<f32>> = None;
+        for &token_id in &ids {
+            hidden_dev = Some(self.forward_one_token_hybrid(h, token_id, position, &mut states)?);
+            position += 1;
+        }
+        let mut hidden = hidden_dev.ok_or("no tokens processed")?;
+
+        let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
+        let mut next_id = self.lm_head_argmax(&hidden, hidden_size, eps)?;
+        on_first_token();
+        generated.push(next_id);
+
+        while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
+            hidden = self.forward_one_token_hybrid(h, next_id, position, &mut states)?;
+            position += 1;
+            next_id = self.lm_head_argmax(&hidden, hidden_size, eps)?;
+            generated.push(next_id);
+        }
+
+        let text = self.tokenizer.decode(&generated);
+        Ok((generated, text, states, position))
+    }
+
+    /// Embeds `token_id` and runs it through every hybrid layer at absolute
+    /// `position`, dispatching each layer to its mixer/state pair.
+    fn forward_one_token_hybrid(&self, h: &HybridModel, token_id: u32, position: usize, states: &mut [HybridLayerState]) -> Result<CudaSlice<f32>, String> {
+        let hidden_size = h.attn_cfg.hidden_size;
         let ffn_hidden_size = h.attn_cfg.ffn_hidden_size;
         let eps = h.attn_cfg.rmsnorm_eps;
-        let mut hidden_host = vec![0.0f32; hidden_size];
-        let mut hidden_dev: Option<CudaSlice<f32>> = None;
-        for (position, &token_id) in ids.iter().enumerate() {
-            let embd_base = token_id as usize * hidden_size;
-            hidden_host.copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
-            let mut hidden = self.device.htod_sync_copy(&hidden_host).map_err(|e| format!("embedding htod: {e}"))?;
+        let embd_base = token_id as usize * hidden_size;
+        let mut hidden = self
+            .device
+            .htod_sync_copy(&self.token_embd[embd_base..embd_base + hidden_size])
+            .map_err(|e| format!("embedding htod: {e}"))?;
 
-            for (layer, state) in h.layers.iter().zip(states.iter_mut()) {
-                hidden = match (layer, state) {
-                    (HybridLayerWeights::GatedAttention(w), HybridLayerState::Attn { k_cache, v_cache }) => {
-                        let post_mixer = self.forward_gated_attn_mixer(h, w, hidden, position, k_cache, v_cache)?;
-                        self.forward_hybrid_ffn(post_mixer, &w.post_attn_norm, &w.ffn_gate, &w.ffn_up, &w.ffn_down, hidden_size, ffn_hidden_size, eps)?
-                    }
-                    (HybridLayerWeights::GatedDeltaNet(w), HybridLayerState::Gdn { conv_state, recurrent }) => {
-                        let post_mixer = self.forward_gdn_mixer(h, w, hidden, conv_state, recurrent)?;
-                        self.forward_hybrid_ffn(post_mixer, &w.post_attn_norm, &w.ffn_gate, &w.ffn_up, &w.ffn_down, hidden_size, ffn_hidden_size, eps)?
-                    }
-                    _ => return Err("internal error: hybrid layer/state kind mismatch".to_string()),
-                };
-            }
-            hidden_dev = Some(hidden);
+        for (layer, state) in h.layers.iter().zip(states.iter_mut()) {
+            hidden = match (layer, state) {
+                (HybridLayerWeights::GatedAttention(w), HybridLayerState::Attn { k_cache, v_cache }) => {
+                    let post_mixer = self.forward_gated_attn_mixer(h, w, hidden, position, k_cache, v_cache)?;
+                    self.forward_hybrid_ffn(post_mixer, &w.post_attn_norm, &w.ffn_gate, &w.ffn_up, &w.ffn_down, hidden_size, ffn_hidden_size, eps)?
+                }
+                (HybridLayerWeights::GatedDeltaNet(w), HybridLayerState::Gdn { conv_state, recurrent }) => {
+                    let post_mixer = self.forward_gdn_mixer(h, w, hidden, conv_state, recurrent)?;
+                    self.forward_hybrid_ffn(post_mixer, &w.post_attn_norm, &w.ffn_gate, &w.ffn_up, &w.ffn_down, hidden_size, ffn_hidden_size, eps)?
+                }
+                _ => return Err("internal error: hybrid layer/state kind mismatch".to_string()),
+            };
         }
-        let hidden = hidden_dev.ok_or("no tokens processed")?;
+        Ok(hidden)
+    }
 
-        let normed = self.rmsnorm(&hidden, &self.output_norm.data, 1, hidden_size, eps)?;
-        let logits_dev = self.gemv(&normed, &self.lm_head)?;
-        let logits = self.device.dtoh_sync_copy(&logits_dev).map_err(|e| format!("logits dtoh: {e}"))?;
+    /// Hybrid counterpart to [`Self::forward_prompt_capture_kv`]: runs the
+    /// same forward pass as `forward_prompt` on a hybrid model but also
+    /// downloads every layer's state (attn `k_cache`/`v_cache` sliced to
+    /// exactly the positions written; GDN `conv_state`/`recurrent` in full,
+    /// since they're already fixed-size) to host memory for `--export-kv`.
+    pub fn forward_prompt_capture_kv_hybrid(&self, prompt: &str) -> Result<((u32, String), crate::kv_io::HybridKvCache), String> {
+        let h = self.hybrid.as_ref().ok_or("forward_prompt_capture_kv_hybrid called on a non-hybrid model")?;
+        let (generated, text, states, seq_len) = self.generate_hybrid_impl(h, prompt, None, 1, || {})?;
 
-        let next_id = logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .ok_or("cannot argmax an empty logits slice")?;
+        let attn_len = seq_len * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
+        let mut layers = Vec::with_capacity(states.len());
+        for state in &states {
+            match state {
+                HybridLayerState::Attn { k_cache, v_cache } => {
+                    let k_host = self.device.dtoh_sync_copy(&k_cache.slice(0..attn_len)).map_err(|e| format!("hybrid k_cache dtoh: {e}"))?;
+                    let v_host = self.device.dtoh_sync_copy(&v_cache.slice(0..attn_len)).map_err(|e| format!("hybrid v_cache dtoh: {e}"))?;
+                    layers.push(crate::kv_io::HybridLayerCacheData::Attn { k_cache: k_host, v_cache: v_host });
+                }
+                HybridLayerState::Gdn { conv_state, recurrent } => {
+                    let conv_host = self.device.dtoh_sync_copy(conv_state).map_err(|e| format!("gdn conv_state dtoh: {e}"))?;
+                    let rec_host = self.device.dtoh_sync_copy(recurrent).map_err(|e| format!("gdn recurrent dtoh: {e}"))?;
+                    layers.push(crate::kv_io::HybridLayerCacheData::Gdn { conv_state: conv_host, recurrent: rec_host });
+                }
+            }
+        }
 
-        let text = self.tokenizer.decode(&[next_id]);
-        Ok((next_id, text))
+        let cache = crate::kv_io::HybridKvCache {
+            seq_len,
+            attn_num_kv_heads: h.attn_cfg.num_kv_heads,
+            attn_head_dim: h.attn_cfg.head_dim,
+            gdn_conv_state_len: h.gdn_cfg.conv_state_len(),
+            gdn_recurrent_len: h.gdn_cfg.recurrent_len(),
+            layers,
+        };
+        Ok(((generated[0], text), cache))
     }
 
     /// MLA-model counterpart to [`Self::forward_prompt`]/[`Self::forward_prompt_hybrid`]:
