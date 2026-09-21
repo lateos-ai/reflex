@@ -138,6 +138,34 @@ the gap from 4.3x to ~1.7x slower. **This is a decision worth defending against
 regression**: don't reintroduce per-call weight upload for convenience or refactoring —
 it was silently catastrophic and easy to miss without hardware benchmarking.
 
+## Activations are device-resident across a whole layer, not round-tripped per op
+
+**Decision**: every kernel-wrapper method in `model.rs` (`rmsnorm`, `gemv`/
+`gemv_expert`, `rope`, `silu_and_mul`, `attention`, and the Qwen3.5 hybrid's `gdn_*`
+kernels) takes/returns `CudaSlice<f32>` device buffers directly, chained through each
+of the six forward functions without touching host memory mid-layer. Residual adds use
+a new in-place `add_kernel` (`kernels_cuda/elementwise.cu`) instead of a host-side
+`zip().map()` loop. `rope_kernel` takes `position` as a scalar kernel argument instead
+of an uploaded one-element device array (`batch_size` is permanently 1, so there's
+never more than one position to pass — see the serving non-goal above).
+`silu_and_mul_kernel` takes `gate`/`up` as two separate buffers instead of requiring a
+host-side concatenation into one. `k_cache`/`v_cache` are preallocated device buffers
+(sized to the known prompt length before the per-position loop starts) written into via
+`CudaDevice::dtod_copy`, instead of `attention()` re-uploading the entire cache history
+from host on every token position.
+
+**Why**: this is Phase 2 (Fast IO) round 2 — round 1 (above) fixed *weights* being
+re-uploaded per call, but every op still separately `htod`/`dtoh`'d its small
+*activation* vectors, and `attention()`'s full-K/V-cache-history re-upload scaled with
+position count. Closed the cold-start gap vs. llama.cpp from ~1.7x to ~1.1x (see
+[[coldstart-infer-benchmark-result]] memory / README's "Phase 2, round 2" section).
+Left out of scope on purpose: MoE's per-expert weighted-sum accumulation and the Gated
+Attention mixer's fused-qg head split/sigmoid gating still round-trip through the host
+— small, and not on the primary dense/MoE path this benchmark measures. **This is
+worth defending against regression** for the same reason round 1's decision is: it was
+found by systematically removing every per-op host round-trip, not by guessing, and
+reintroducing one for convenience would silently reopen part of the gap.
+
 ## Cold-start-vs-llama.cpp benchmark methodology
 
 **Decision**: measure with external wall-clock (`/usr/bin/time -v`, process launch to

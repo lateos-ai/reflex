@@ -47,7 +47,7 @@ use crate::dequant;
 use crate::gguf::{GgufFile, GgufValue};
 use crate::moe::route_top_k;
 use crate::tokenizer::Tokenizer;
-use cudarc::driver::{CudaDevice, CudaSlice, DeviceRepr, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice, CudaView, DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
 
 fn u64_meta(file: &GgufFile, key: &str) -> Option<u64> {
@@ -301,16 +301,16 @@ enum HybridLayerWeights {
 }
 
 /// Per-sequence recurrent state for one hybrid layer, matching
-/// [`HybridLayerWeights`]'s variant for that layer index one-to-one. Like
-/// the dense/MoE path's `k_cache`/`v_cache`, this is plain host memory,
-/// fully re-uploaded to the GPU on every kernel call that touches it (see
-/// `Model::gdn_conv`/`Model::gdn_delta`) -- consistent with, not a
-/// regression from, this MVP's existing per-call host<->device round-trip
-/// convention for activations (only *weights* are GPU-resident, per
-/// DECISIONS.md).
+/// [`HybridLayerWeights`]'s variant for that layer index one-to-one.
+/// Device-resident (Phase 2 round 2): `k_cache`/`v_cache` are preallocated to
+/// the full prompt length up front (`forward_prompt_hybrid` knows the token
+/// count before the per-position loop starts) and written into directly via
+/// device-to-device copy each position -- no host round-trip, unlike the
+/// pre-round-2 convention. Same for `conv_state`/`recurrent`, mutated in
+/// place on-device by `Model::gdn_conv`/`Model::gdn_delta`.
 enum HybridLayerState {
-    Attn { k_cache: Vec<f32>, v_cache: Vec<f32> },
-    Gdn { conv_state: Vec<f32>, recurrent: Vec<f32> },
+    Attn { k_cache: CudaSlice<f32>, v_cache: CudaSlice<f32> },
+    Gdn { conv_state: CudaSlice<f32>, recurrent: CudaSlice<f32> },
 }
 
 /// A loaded Qwen3.5 hybrid model's extra state, layered on top of the same
@@ -341,6 +341,10 @@ pub struct Model {
     silu_k: AotKernel,
     gemv_k: AotKernel,
     attn_k: AotKernel,
+    /// In-place residual add (`a[i] += b[i]`, see `kernels_cuda/elementwise.cu`)
+    /// -- keeps residual-stream adds device-resident (Phase 2 round 2)
+    /// instead of downloading both operands to host just to add two vectors.
+    add_k: AotKernel,
     cfg: LayerConfig,
     layers: Vec<LayerWeights>,
     /// `k` (top-k expert count), `Some` iff this is an MoE model.
@@ -384,6 +388,7 @@ impl Model {
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_SILU_AND_MUL"), "silu_and_mul", "silu_and_mul_kernel")?;
         let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
         let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
+        let add_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ELEMENTWISE"), "elementwise", "add_kernel")?;
 
         // Dequantizes straight from the mmap'd GGUF bytes into a scratch host
         // `Vec<f32>`, uploads it to device memory, then drops the host copy
@@ -478,6 +483,7 @@ impl Model {
             silu_k,
             gemv_k,
             attn_k,
+            add_k,
             cfg,
             layers,
             expert_used_count,
@@ -545,6 +551,7 @@ impl Model {
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_SILU_AND_MUL"), "silu_and_mul", "silu_and_mul_kernel")?;
         let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
         let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
+        let add_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ELEMENTWISE"), "elementwise", "add_kernel")?;
         let mut gdn_fns = aot::load_kernel_module(
             &device,
             env!("COLDSTART_KERNEL_GATED_DELTANET"),
@@ -642,6 +649,7 @@ impl Model {
             silu_k,
             gemv_k,
             attn_k,
+            add_k,
             cfg: attn_cfg.clone(),
             layers: Vec::new(),
             expert_used_count: None,
@@ -653,18 +661,20 @@ impl Model {
         })
     }
 
+    /// `x` is already device-resident (Phase 2 round 2) -- unlike the
+    /// pre-round-2 version, no `htod`/`dtoh` happens here; the caller chains
+    /// this op's `CudaSlice` output straight into the next op.
     fn rmsnorm(
         &self,
-        x: &[f32],
+        x: &CudaSlice<f32>,
         weight: &CudaSlice<f32>,
         rows: usize,
         hidden_size: usize,
         eps: f32,
-    ) -> Result<Vec<f32>, String> {
-        let dev_x = self.device.htod_sync_copy(x).map_err(|e| format!("rmsnorm htod x: {e}"))?;
+    ) -> Result<CudaSlice<f32>, String> {
+        let n = x.len() as u32;
         let mut dev_out = self.device.alloc_zeros::<f32>(x.len()).map_err(|e| format!("rmsnorm alloc out: {e}"))?;
 
-        let n = x.len() as u32;
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
         let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
@@ -672,22 +682,21 @@ impl Model {
             self.rmsnorm_k
                 .function
                 .clone()
-                .launch(launch_cfg, (&dev_x, weight, &mut dev_out, rows as u32, hidden_size as u32, eps))
+                .launch(launch_cfg, (x, weight, &mut dev_out, rows as u32, hidden_size as u32, eps))
                 .map_err(|e| format!("rmsnorm launch: {e}"))?;
         }
-        self.device.dtoh_sync_copy(&dev_out).map_err(|e| format!("rmsnorm dtoh: {e}"))
+        Ok(dev_out)
     }
 
-    /// `w_dev` is already device-resident -- either `&self.data` on a whole
-    /// [`Weight`] (a `&CudaSlice<f32>`) or a zero-copy `CudaView` slice of
-    /// one (see `Self::gemv_expert`) -- so, unlike `x`, it is never
-    /// re-uploaded here.
-    fn gemv_raw<W: DeviceRepr>(&self, x: &[f32], w_dev: W, in_features: usize, out_features: usize) -> Result<Vec<f32>, String> {
+    /// `x` and `w_dev` are both already device-resident (Phase 2 round 2) --
+    /// `w_dev` is either `&self.data` on a whole [`Weight`] (a
+    /// `&CudaSlice<f32>`) or a zero-copy `CudaView` slice of one (see
+    /// `Self::gemv_expert`).
+    fn gemv_raw<W: DeviceRepr>(&self, x: &CudaSlice<f32>, w_dev: W, in_features: usize, out_features: usize) -> Result<CudaSlice<f32>, String> {
         if x.len() != in_features {
             return Err(format!("gemv: x.len()={} != in_features={in_features}", x.len()));
         }
 
-        let dev_x = self.device.htod_sync_copy(x).map_err(|e| format!("gemv htod x: {e}"))?;
         let mut dev_y = self.device.alloc_zeros::<f32>(out_features).map_err(|e| format!("gemv alloc y: {e}"))?;
 
         let threads = 256u32;
@@ -697,13 +706,13 @@ impl Model {
             self.gemv_k
                 .function
                 .clone()
-                .launch(launch_cfg, (&dev_x, w_dev, &mut dev_y, in_features as u32, out_features as u32))
+                .launch(launch_cfg, (x, w_dev, &mut dev_y, in_features as u32, out_features as u32))
                 .map_err(|e| format!("gemv launch: {e}"))?;
         }
-        self.device.dtoh_sync_copy(&dev_y).map_err(|e| format!("gemv dtoh: {e}"))
+        Ok(dev_y)
     }
 
-    fn gemv(&self, x: &[f32], w: &Weight) -> Result<Vec<f32>, String> {
+    fn gemv(&self, x: &CudaSlice<f32>, w: &Weight) -> Result<CudaSlice<f32>, String> {
         let in_features = w.shape[0] as usize;
         let out_features = w.shape[1] as usize;
         self.gemv_raw(x, &w.data, in_features, out_features)
@@ -716,7 +725,7 @@ impl Model {
     /// layout as a standalone 2-D weight (see this module's doc comment), so
     /// `CudaSlice::slice` gives a zero-copy device-side view -- no
     /// device-to-device copy, let alone a host round-trip.
-    fn gemv_expert(&self, x: &[f32], w: &Weight, expert_idx: usize) -> Result<Vec<f32>, String> {
+    fn gemv_expert(&self, x: &CudaSlice<f32>, w: &Weight, expert_idx: usize) -> Result<CudaSlice<f32>, String> {
         let (in_features, out_features, expert_count) = match w.shape.as_slice() {
             [i, o, e] => (*i as usize, *o as usize, *e as usize),
             other => return Err(format!("gemv_expert: expected 3-D per-expert tensor shape, got {other:?}")),
@@ -730,19 +739,21 @@ impl Model {
         self.gemv_raw(x, &view, in_features, out_features)
     }
 
+    /// In-place: `t` is already device-resident. `position` is a plain
+    /// scalar kernel argument rather than an uploaded device array --
+    /// `batch_size` is a permanent project constraint (CLAUDE.md's
+    /// Non-goals), so there is never more than one token's position to pass,
+    /// and the previous per-call device allocation+upload for it was pure
+    /// overhead (Phase 2 round 2).
     fn rope(
         &self,
-        t: &mut Vec<f32>,
+        t: &mut CudaSlice<f32>,
         num_heads: usize,
         head_dim: usize,
         rotary_dim: usize,
         position: usize,
         base: f32,
     ) -> Result<(), String> {
-        let positions = [position as i32];
-        let mut dev_t = self.device.htod_sync_copy(t).map_err(|e| format!("rope htod t: {e}"))?;
-        let dev_pos = self.device.htod_sync_copy(&positions).map_err(|e| format!("rope htod positions: {e}"))?;
-
         let half_rotary = rotary_dim / 2;
         let total_pairs = (num_heads * half_rotary) as u32;
         let threads = 256u32;
@@ -753,23 +764,16 @@ impl Model {
             self.rope_k
                 .function
                 .clone()
-                .launch(
-                    launch_cfg,
-                    (&mut dev_t, &dev_pos, 1u32, num_heads as u32, head_dim as u32, rotary_dim as u32, base),
-                )
+                .launch(launch_cfg, (t, position as u32, num_heads as u32, head_dim as u32, rotary_dim as u32, base))
                 .map_err(|e| format!("rope launch: {e}"))?;
         }
-        let result = self.device.dtoh_sync_copy(&dev_t).map_err(|e| format!("rope dtoh: {e}"))?;
-        t.copy_from_slice(&result);
         Ok(())
     }
 
-    fn silu_and_mul(&self, gate: &[f32], up: &[f32], hidden_size: usize) -> Result<Vec<f32>, String> {
-        let mut gate_up = vec![0.0f32; 2 * hidden_size];
-        gate_up[..hidden_size].copy_from_slice(gate);
-        gate_up[hidden_size..].copy_from_slice(up);
-
-        let dev_in = self.device.htod_sync_copy(&gate_up).map_err(|e| format!("silu htod: {e}"))?;
+    /// `gate`/`up` are already device-resident, separate (not concatenated)
+    /// buffers -- `silu_and_mul_kernel` takes them as two pointers, so no
+    /// device-side concatenation step is needed either (Phase 2 round 2).
+    fn silu_and_mul(&self, gate: &CudaSlice<f32>, up: &CudaSlice<f32>, hidden_size: usize) -> Result<CudaSlice<f32>, String> {
         let mut dev_out = self.device.alloc_zeros::<f32>(hidden_size).map_err(|e| format!("silu alloc out: {e}"))?;
 
         let threads = 256u32;
@@ -779,29 +783,29 @@ impl Model {
             self.silu_k
                 .function
                 .clone()
-                .launch(launch_cfg, (&dev_in, &mut dev_out, 1u32, hidden_size as u32))
+                .launch(launch_cfg, (gate, up, &mut dev_out, 1u32, hidden_size as u32))
                 .map_err(|e| format!("silu launch: {e}"))?;
         }
-        self.device.dtoh_sync_copy(&dev_out).map_err(|e| format!("silu dtoh: {e}"))
+        Ok(dev_out)
     }
 
     /// Causal single-new-query attention against the full K/V cache so far
-    /// (`k_cache`/`v_cache` already include this position's own K/V --
+    /// (`k_cache`/`v_cache` views already include this position's own K/V --
     /// `seq_len = position + 1`). GQA-grouped: query head `h` reads KV head
-    /// `h / (num_q_heads / num_kv_heads)`.
+    /// `h / (num_q_heads / num_kv_heads)`. `q`/`k_cache`/`v_cache` are all
+    /// already device-resident (Phase 2 round 2) -- `k_cache`/`v_cache` are
+    /// `CudaView`s into a preallocated per-layer device buffer, not a fresh
+    /// upload of the whole cache history on every call.
     fn attention(
         &self,
-        q: &[f32],
-        k_cache: &[f32],
-        v_cache: &[f32],
+        q: &CudaSlice<f32>,
+        k_cache: &CudaView<f32>,
+        v_cache: &CudaView<f32>,
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
         seq_len: usize,
-    ) -> Result<Vec<f32>, String> {
-        let dev_q = self.device.htod_sync_copy(q).map_err(|e| format!("attn htod q: {e}"))?;
-        let dev_k = self.device.htod_sync_copy(k_cache).map_err(|e| format!("attn htod k: {e}"))?;
-        let dev_v = self.device.htod_sync_copy(v_cache).map_err(|e| format!("attn htod v: {e}"))?;
+    ) -> Result<CudaSlice<f32>, String> {
         let mut dev_out =
             self.device.alloc_zeros::<f32>(num_q_heads * head_dim).map_err(|e| format!("attn alloc out: {e}"))?;
 
@@ -818,9 +822,9 @@ impl Model {
                 .launch(
                     launch_cfg,
                     (
-                        &dev_q,
-                        &dev_k,
-                        &dev_v,
+                        q,
+                        k_cache,
+                        v_cache,
                         &mut dev_out,
                         num_q_heads as u32,
                         num_kv_heads as u32,
@@ -831,14 +835,33 @@ impl Model {
                 )
                 .map_err(|e| format!("attn launch: {e}"))?;
         }
-        self.device.dtoh_sync_copy(&dev_out).map_err(|e| format!("attn dtoh: {e}"))
+        Ok(dev_out)
+    }
+
+    /// In-place residual add: `a[i] += b[i]`, both already device-resident
+    /// (Phase 2 round 2) -- replaces the host-side
+    /// `a.iter().zip(b.iter()).map(|(&x,&y)| x+y)` loops every forward
+    /// function used to do, which required both operands on the host.
+    fn add_inplace(&self, a: &mut CudaSlice<f32>, b: &CudaSlice<f32>) -> Result<(), String> {
+        let n = a.len() as u32;
+        let threads = 256u32;
+        let blocks = n.div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            self.add_k.function.clone().launch(launch_cfg, (a, b, n)).map_err(|e| format!("add launch: {e}"))?;
+        }
+        Ok(())
     }
 
     /// RMSNorm -> QKV -> QK-Norm (if present) -> RoPE -> causal attention ->
-    /// O-proj (residual), for one layer at `position`, appending this
-    /// position's K/V onto `k_cache`/`v_cache`. Shared byte-for-byte by
+    /// O-proj (residual), for one layer at `position`, writing this
+    /// position's K/V directly into `k_cache`/`v_cache` (preallocated
+    /// device buffers, see `Model::forward_prompt`). Shared byte-for-byte by
     /// dense and MoE layers -- MoE only replaces what comes after this (see
-    /// `forward_layer_moe`).
+    /// `forward_layer_moe`). Takes ownership of `hidden` and mutates it
+    /// in place for the final residual add, returning it back to the
+    /// caller -- the whole block stays device-resident end to end (Phase 2
+    /// round 2), no host round-trip.
     #[allow(clippy::too_many_arguments)]
     fn forward_attn_block(
         &self,
@@ -849,13 +872,13 @@ impl Model {
         attn_output: &Weight,
         attn_q_norm: &Option<Weight>,
         attn_k_norm: &Option<Weight>,
-        hidden: &[f32],
+        mut hidden: CudaSlice<f32>,
         position: usize,
-        k_cache: &mut Vec<f32>,
-        v_cache: &mut Vec<f32>,
-    ) -> Result<Vec<f32>, String> {
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
         let cfg = &self.cfg;
-        let normed = self.rmsnorm(hidden, &attn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let normed = self.rmsnorm(&hidden, &attn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
 
         let mut q = self.gemv(&normed, attn_q)?;
         let mut k = self.gemv(&normed, attn_k)?;
@@ -871,24 +894,35 @@ impl Model {
         self.rope(&mut q, cfg.num_q_heads, cfg.head_dim, cfg.rotary_dim, position, cfg.rope_base)?;
         self.rope(&mut k, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim, position, cfg.rope_base)?;
 
-        k_cache.extend_from_slice(&k);
-        v_cache.extend_from_slice(&v);
+        let kv_stride = cfg.num_kv_heads * cfg.head_dim;
+        let offset = position * kv_stride;
+        {
+            let mut dst = k_cache.slice_mut(offset..offset + kv_stride);
+            self.device.dtod_copy(&k, &mut dst).map_err(|e| format!("attn kv-cache dtod k: {e}"))?;
+        }
+        {
+            let mut dst = v_cache.slice_mut(offset..offset + kv_stride);
+            self.device.dtod_copy(&v, &mut dst).map_err(|e| format!("attn kv-cache dtod v: {e}"))?;
+        }
         let seq_len = position + 1;
 
-        let attn_out = self.attention(&q, k_cache, v_cache, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, seq_len)?;
+        let k_view = k_cache.slice(0..seq_len * kv_stride);
+        let v_view = v_cache.slice(0..seq_len * kv_stride);
+        let attn_out = self.attention(&q, &k_view, &v_view, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, seq_len)?;
         let o_proj = self.gemv(&attn_out, attn_output)?;
-        Ok(hidden.iter().zip(o_proj.iter()).map(|(&h, &o)| h + o).collect())
+        self.add_inplace(&mut hidden, &o_proj)?;
+        Ok(hidden)
     }
 
     fn forward_layer_dense(
         &self,
         layer: &DenseLayerWeights,
-        hidden: &[f32],
+        hidden: CudaSlice<f32>,
         position: usize,
-        k_cache: &mut Vec<f32>,
-        v_cache: &mut Vec<f32>,
-    ) -> Result<Vec<f32>, String> {
-        let post_attn = self.forward_attn_block(
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
+        let mut post_attn = self.forward_attn_block(
             &layer.attn_norm,
             &layer.attn_q,
             &layer.attn_k,
@@ -909,7 +943,8 @@ impl Model {
         let activated = self.silu_and_mul(&gate, &up, cfg.ffn_hidden_size)?;
         let down = self.gemv(&activated, &layer.ffn_down)?;
 
-        Ok(post_attn.iter().zip(down.iter()).map(|(&h, &d)| h + d).collect())
+        self.add_inplace(&mut post_attn, &down)?;
+        Ok(post_attn)
     }
 
     /// Same attention block as [`Self::forward_layer_dense`], but the shared
@@ -917,16 +952,20 @@ impl Model {
     /// logits, `crate::moe::route_top_k`) dispatching to each selected
     /// expert's SwiGLU FFN (naive per-expert `gemv` calls, no batched/grouped
     /// GEMM -- see this module's MoE scope doc comment), weighted-summed by
-    /// the router's renormalized combination weights.
+    /// the router's renormalized combination weights. The router's top-k is
+    /// an inherently host-side sort, and the per-expert weighted accumulate
+    /// stays host-driven too (small expert count, already flagged as
+    /// naive/unoptimized) -- not addressed by Phase 2 round 2's
+    /// device-residency work, unlike everything else in this function.
     fn forward_layer_moe(
         &self,
         layer: &MoeLayerWeights,
-        hidden: &[f32],
+        hidden: CudaSlice<f32>,
         position: usize,
-        k_cache: &mut Vec<f32>,
-        v_cache: &mut Vec<f32>,
-    ) -> Result<Vec<f32>, String> {
-        let post_attn = self.forward_attn_block(
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
+        let mut post_attn = self.forward_attn_block(
             &layer.attn_norm,
             &layer.attn_q,
             &layer.attn_k,
@@ -943,7 +982,8 @@ impl Model {
         let cfg = &self.cfg;
         let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
 
-        let router_logits = self.gemv(&ffn_normed, &layer.ffn_gate_inp)?;
+        let router_logits_dev = self.gemv(&ffn_normed, &layer.ffn_gate_inp)?;
+        let router_logits = self.device.dtoh_sync_copy(&router_logits_dev).map_err(|e| format!("moe router dtoh: {e}"))?;
         let k = self.expert_used_count.ok_or("forward_layer_moe called on a model with no expert_used_count")?;
         let routed = route_top_k(&router_logits, k)?;
 
@@ -953,22 +993,25 @@ impl Model {
             let up = self.gemv_expert(&ffn_normed, &layer.ffn_up_exps, expert_idx)?;
             let activated = self.silu_and_mul(&gate, &up, cfg.ffn_hidden_size)?;
             let down = self.gemv_expert(&activated, &layer.ffn_down_exps, expert_idx)?;
-            for (o, d) in ffn_out.iter_mut().zip(down.iter()) {
+            let down_host = self.device.dtoh_sync_copy(&down).map_err(|e| format!("moe expert down dtoh: {e}"))?;
+            for (o, d) in ffn_out.iter_mut().zip(down_host.iter()) {
                 *o += weight * d;
             }
         }
 
-        Ok(post_attn.iter().zip(ffn_out.iter()).map(|(&h, &f)| h + f).collect())
+        let ffn_out_dev = self.device.htod_sync_copy(&ffn_out).map_err(|e| format!("moe ffn_out htod: {e}"))?;
+        self.add_inplace(&mut post_attn, &ffn_out_dev)?;
+        Ok(post_attn)
     }
 
     fn forward_layer(
         &self,
         layer: &LayerWeights,
-        hidden: &[f32],
+        hidden: CudaSlice<f32>,
         position: usize,
-        k_cache: &mut Vec<f32>,
-        v_cache: &mut Vec<f32>,
-    ) -> Result<Vec<f32>, String> {
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
         match layer {
             LayerWeights::Dense(l) => self.forward_layer_dense(l, hidden, position, k_cache, v_cache),
             LayerWeights::Moe(l) => self.forward_layer_moe(l, hidden, position, k_cache, v_cache),
@@ -995,22 +1038,39 @@ impl Model {
             return Err("encode produced no tokens".to_string());
         }
 
-        let mut k_caches: Vec<Vec<f32>> = vec![Vec::new(); self.layers.len()];
-        let mut v_caches: Vec<Vec<f32>> = vec![Vec::new(); self.layers.len()];
+        // Preallocated up front (Phase 2 round 2) since the full prompt's
+        // token count is already known here -- `forward_attn_block` writes
+        // each position's K/V directly into these device buffers via
+        // device-to-device copy instead of the pre-round-2 pattern of
+        // re-uploading the entire host-side cache history on every call.
+        let kv_cache_len = ids.len() * self.cfg.num_kv_heads * self.cfg.head_dim;
+        let mut k_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
+            .map(|_| self.device.alloc_zeros::<f32>(kv_cache_len))
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("alloc k_cache: {e}"))?;
+        let mut v_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
+            .map(|_| self.device.alloc_zeros::<f32>(kv_cache_len))
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("alloc v_cache: {e}"))?;
 
         let hidden_size = self.cfg.hidden_size;
-        let mut hidden = vec![0.0f32; hidden_size];
+        let mut hidden_host = vec![0.0f32; hidden_size];
+        let mut hidden_dev: Option<CudaSlice<f32>> = None;
         for (position, &token_id) in ids.iter().enumerate() {
             let embd_base = token_id as usize * hidden_size;
-            hidden.copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
+            hidden_host.copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
+            let mut hidden = self.device.htod_sync_copy(&hidden_host).map_err(|e| format!("embedding htod: {e}"))?;
 
             for (layer_idx, layer) in self.layers.iter().enumerate() {
-                hidden = self.forward_layer(layer, &hidden, position, &mut k_caches[layer_idx], &mut v_caches[layer_idx])?;
+                hidden = self.forward_layer(layer, hidden, position, &mut k_caches[layer_idx], &mut v_caches[layer_idx])?;
             }
+            hidden_dev = Some(hidden);
         }
+        let hidden = hidden_dev.ok_or("no tokens processed")?;
 
         let normed = self.rmsnorm(&hidden, &self.output_norm.data, 1, hidden_size, self.cfg.rmsnorm_eps)?;
-        let logits = self.gemv(&normed, &self.lm_head)?;
+        let logits_dev = self.gemv(&normed, &self.lm_head)?;
+        let logits = self.device.dtoh_sync_copy(&logits_dev).map_err(|e| format!("logits dtoh: {e}"))?;
 
         let next_id = logits
             .iter()
@@ -1024,13 +1084,12 @@ impl Model {
     }
 
     /// Causal depthwise conv1d + SiLU over the fused qkv, advancing
-    /// `conv_state` in place (host-resident, fully re-uploaded/re-downloaded
-    /// here every call -- same convention as `k_cache`/`v_cache`, see
-    /// `HybridLayerState`'s doc comment). Returns the post-SiLU `conv_dim`
-    /// output. Ports `gdn_conv_kernel` (see `kernels_cuda/gated_deltanet.cu`).
-    fn gdn_conv(&self, h: &HybridModel, qkv: &[f32], conv1d: &CudaSlice<f32>, conv_state: &mut Vec<f32>, conv_dim: usize) -> Result<Vec<f32>, String> {
-        let dev_qkv = self.device.htod_sync_copy(qkv).map_err(|e| format!("gdn_conv htod qkv: {e}"))?;
-        let mut dev_state = self.device.htod_sync_copy(conv_state).map_err(|e| format!("gdn_conv htod state: {e}"))?;
+    /// `conv_state` in place on-device (Phase 2 round 2 -- no
+    /// upload/download per call, unlike the pre-round-2 convention referred
+    /// to in `HybridLayerState`'s doc comment). Returns the post-SiLU
+    /// `conv_dim` output. Ports `gdn_conv_kernel` (see
+    /// `kernels_cuda/gated_deltanet.cu`).
+    fn gdn_conv(&self, h: &HybridModel, qkv: &CudaSlice<f32>, conv1d: &CudaSlice<f32>, conv_state: &mut CudaSlice<f32>, conv_dim: usize) -> Result<CudaSlice<f32>, String> {
         let mut dev_out = self.device.alloc_zeros::<f32>(conv_dim).map_err(|e| format!("gdn_conv alloc out: {e}"))?;
 
         let threads = 256u32;
@@ -1040,12 +1099,10 @@ impl Model {
             h.gdn_conv_k
                 .function
                 .clone()
-                .launch(launch_cfg, (&dev_qkv, conv1d, &mut dev_state, &mut dev_out, conv_dim as u32, h.gdn_cfg.conv_kernel_size as u32))
+                .launch(launch_cfg, (qkv, conv1d, conv_state, &mut dev_out, conv_dim as u32, h.gdn_cfg.conv_kernel_size as u32))
                 .map_err(|e| format!("gdn_conv launch: {e}"))?;
         }
-        let updated_state = self.device.dtoh_sync_copy(&dev_state).map_err(|e| format!("gdn_conv dtoh state: {e}"))?;
-        conv_state.copy_from_slice(&updated_state);
-        self.device.dtoh_sync_copy(&dev_out).map_err(|e| format!("gdn_conv dtoh out: {e}"))
+        Ok(dev_out)
     }
 
     /// In-place per-head L2-normalize `x[offset..offset + heads*head_dim]`
@@ -1067,10 +1124,9 @@ impl Model {
     }
 
     /// `beta = sigmoid(beta_raw)`, `decay = exp(softplus(alpha_raw + dt) *
-    /// a)`. Ports `gdn_gates_kernel`.
-    fn gdn_gates(&self, h: &HybridModel, alpha_raw: &[f32], beta_raw: &[f32], dt: &CudaSlice<f32>, a: &CudaSlice<f32>, num_v_heads: usize) -> Result<(Vec<f32>, Vec<f32>), String> {
-        let dev_alpha = self.device.htod_sync_copy(alpha_raw).map_err(|e| format!("gdn_gates htod alpha: {e}"))?;
-        let dev_beta_raw = self.device.htod_sync_copy(beta_raw).map_err(|e| format!("gdn_gates htod beta: {e}"))?;
+    /// a)`. All inputs/outputs device-resident (Phase 2 round 2). Ports
+    /// `gdn_gates_kernel`.
+    fn gdn_gates(&self, h: &HybridModel, alpha_raw: &CudaSlice<f32>, beta_raw: &CudaSlice<f32>, dt: &CudaSlice<f32>, a: &CudaSlice<f32>, num_v_heads: usize) -> Result<(CudaSlice<f32>, CudaSlice<f32>), String> {
         let mut dev_decay = self.device.alloc_zeros::<f32>(num_v_heads).map_err(|e| format!("gdn_gates alloc decay: {e}"))?;
         let mut dev_beta = self.device.alloc_zeros::<f32>(num_v_heads).map_err(|e| format!("gdn_gates alloc beta: {e}"))?;
 
@@ -1081,25 +1137,21 @@ impl Model {
             h.gdn_gates_k
                 .function
                 .clone()
-                .launch(launch_cfg, (&dev_alpha, &dev_beta_raw, dt, a, &mut dev_decay, &mut dev_beta, num_v_heads as u32))
+                .launch(launch_cfg, (alpha_raw, beta_raw, dt, a, &mut dev_decay, &mut dev_beta, num_v_heads as u32))
                 .map_err(|e| format!("gdn_gates launch: {e}"))?;
         }
-        let decay = self.device.dtoh_sync_copy(&dev_decay).map_err(|e| format!("gdn_gates dtoh decay: {e}"))?;
-        let beta = self.device.dtoh_sync_copy(&dev_beta).map_err(|e| format!("gdn_gates dtoh beta: {e}"))?;
-        Ok((beta, decay))
+        Ok((dev_beta, dev_decay))
     }
 
-    /// The delta rule, mutating `recurrent` (`S`, host-resident, see
-    /// `HybridLayerState`) in place and returning the `value_dim` mixer
-    /// output. `qkv_normed` is the post-conv/SiLU/L2-norm fused buffer (q at
-    /// offset 0, k at `key_dim`, v at `2*key_dim`). Ports `gdn_delta_kernel`.
+    /// The delta rule, mutating `recurrent` (`S`, device-resident, see
+    /// `HybridLayerState`) in place on-device and returning the `value_dim`
+    /// mixer output (also device-resident, Phase 2 round 2 -- no
+    /// upload/download per call, unlike the pre-round-2 convention).
+    /// `qkv_normed` is the post-conv/SiLU/L2-norm fused buffer (q at offset
+    /// 0, k at `key_dim`, v at `2*key_dim`). Ports `gdn_delta_kernel`.
     #[allow(clippy::too_many_arguments)]
-    fn gdn_delta(&self, h: &HybridModel, recurrent: &mut Vec<f32>, qkv_normed: &[f32], key_dim: usize, beta: &[f32], decay: &[f32]) -> Result<Vec<f32>, String> {
+    fn gdn_delta(&self, h: &HybridModel, recurrent: &mut CudaSlice<f32>, qkv_normed: &CudaSlice<f32>, key_dim: usize, beta: &CudaSlice<f32>, decay: &CudaSlice<f32>) -> Result<CudaSlice<f32>, String> {
         let cfg = &h.gdn_cfg;
-        let mut dev_s = self.device.htod_sync_copy(recurrent).map_err(|e| format!("gdn_delta htod S: {e}"))?;
-        let dev_qkv = self.device.htod_sync_copy(qkv_normed).map_err(|e| format!("gdn_delta htod qkv: {e}"))?;
-        let dev_beta = self.device.htod_sync_copy(beta).map_err(|e| format!("gdn_delta htod beta: {e}"))?;
-        let dev_decay = self.device.htod_sync_copy(decay).map_err(|e| format!("gdn_delta htod decay: {e}"))?;
         let mut dev_o = self.device.alloc_zeros::<f32>(cfg.value_dim()).map_err(|e| format!("gdn_delta alloc o: {e}"))?;
 
         let launch_cfg = LaunchConfig { grid_dim: (cfg.num_v_heads as u32, 1, 1), block_dim: (cfg.head_dim as u32, 1, 1), shared_mem_bytes: 0 };
@@ -1110,13 +1162,13 @@ impl Model {
                 .launch(
                     launch_cfg,
                     (
-                        &mut dev_s,
-                        &dev_qkv,
+                        recurrent,
+                        qkv_normed,
                         0u32,
                         key_dim as u32,
                         (2 * key_dim) as u32,
-                        &dev_beta,
-                        &dev_decay,
+                        beta,
+                        decay,
                         &mut dev_o,
                         cfg.head_dim as u32,
                         cfg.num_k_heads as u32,
@@ -1125,16 +1177,13 @@ impl Model {
                 )
                 .map_err(|e| format!("gdn_delta launch: {e}"))?;
         }
-        let updated_s = self.device.dtoh_sync_copy(&dev_s).map_err(|e| format!("gdn_delta dtoh S: {e}"))?;
-        recurrent.copy_from_slice(&updated_s);
-        self.device.dtoh_sync_copy(&dev_o).map_err(|e| format!("gdn_delta dtoh o: {e}"))
+        Ok(dev_o)
     }
 
-    /// `y = RMSNorm(o, ssm_norm) * silu(z)`. Ports `gdn_gated_norm_kernel`.
-    fn gdn_gated_norm(&self, h: &HybridModel, o: &[f32], z: &[f32], norm_w: &CudaSlice<f32>, eps: f32) -> Result<Vec<f32>, String> {
+    /// `y = RMSNorm(o, ssm_norm) * silu(z)`, all device-resident (Phase 2
+    /// round 2). Ports `gdn_gated_norm_kernel`.
+    fn gdn_gated_norm(&self, h: &HybridModel, o: &CudaSlice<f32>, z: &CudaSlice<f32>, norm_w: &CudaSlice<f32>, eps: f32) -> Result<CudaSlice<f32>, String> {
         let cfg = &h.gdn_cfg;
-        let dev_o = self.device.htod_sync_copy(o).map_err(|e| format!("gdn_gated_norm htod o: {e}"))?;
-        let dev_z = self.device.htod_sync_copy(z).map_err(|e| format!("gdn_gated_norm htod z: {e}"))?;
         let mut dev_y = self.device.alloc_zeros::<f32>(cfg.value_dim()).map_err(|e| format!("gdn_gated_norm alloc y: {e}"))?;
 
         let launch_cfg =
@@ -1143,10 +1192,10 @@ impl Model {
             h.gdn_gated_norm_k
                 .function
                 .clone()
-                .launch(launch_cfg, (&dev_o, &dev_z, norm_w, &mut dev_y, cfg.head_dim as u32, eps))
+                .launch(launch_cfg, (o, z, norm_w, &mut dev_y, cfg.head_dim as u32, eps))
                 .map_err(|e| format!("gdn_gated_norm launch: {e}"))?;
         }
-        self.device.dtoh_sync_copy(&dev_y).map_err(|e| format!("gdn_gated_norm dtoh: {e}"))
+        Ok(dev_y)
     }
 
     /// One token through a Gated DeltaNet mixer (see `reference/
@@ -1156,40 +1205,42 @@ impl Model {
     /// SiLU -> per-head L2-norm (q scaled by `1/sqrt(head_dim)`, k not) ->
     /// delta rule -> gated RMSNorm -> output projection -> residual add
     /// (`x + out_proj`, matching `forward_gated_attn_mixer`'s convention).
-    /// Mutates `conv_state`/`recurrent` in place.
+    /// Mutates `conv_state`/`recurrent` in place; everything stays
+    /// device-resident end to end (Phase 2 round 2), including the
+    /// per-head L2-norm step, which used to be the only part of this
+    /// function already avoiding a host round-trip.
     fn forward_gdn_mixer(
         &self,
         h: &HybridModel,
         w: &GatedDeltaNetLayerWeights,
-        x: &[f32],
-        conv_state: &mut Vec<f32>,
-        recurrent: &mut Vec<f32>,
-    ) -> Result<Vec<f32>, String> {
+        mut x: CudaSlice<f32>,
+        conv_state: &mut CudaSlice<f32>,
+        recurrent: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
         let cfg = &h.gdn_cfg;
         let key_dim = cfg.key_dim();
         let conv_dim = cfg.conv_dim();
 
-        let normed = self.rmsnorm(x, &w.attn_norm.data, 1, h.attn_cfg.hidden_size, cfg.eps)?;
+        let normed = self.rmsnorm(&x, &w.attn_norm.data, 1, h.attn_cfg.hidden_size, cfg.eps)?;
         let qkv = self.gemv(&normed, &w.attn_qkv)?;
         let z = self.gemv(&normed, &w.attn_gate)?;
         let beta_raw = self.gemv(&normed, &w.ssm_beta)?;
         let alpha_raw = self.gemv(&normed, &w.ssm_alpha)?;
 
         let (beta, decay) = self.gdn_gates(h, &alpha_raw, &beta_raw, &w.ssm_dt.data, &w.ssm_a.data, cfg.num_v_heads)?;
-        let conv_out = self.gdn_conv(h, &qkv, &w.ssm_conv1d.data, conv_state, conv_dim)?;
+        let mut conv_out = self.gdn_conv(h, &qkv, &w.ssm_conv1d.data, conv_state, conv_dim)?;
 
-        // Split q/k, L2-normalize both (q additionally scaled), v left raw --
-        // done as one device round trip covering both per-head norm calls.
-        let mut dev_qkv = self.device.htod_sync_copy(&conv_out).map_err(|e| format!("gdn qk-norm htod: {e}"))?;
+        // Split q/k, L2-normalize both (q additionally scaled), v left raw,
+        // in place on the same device buffer `gdn_conv` just produced.
         let q_scale = 1.0 / (cfg.head_dim as f32).sqrt();
-        self.gdn_l2_norm(h, &mut dev_qkv, 0, cfg.num_k_heads, cfg.head_dim, cfg.eps, q_scale)?;
-        self.gdn_l2_norm(h, &mut dev_qkv, key_dim, cfg.num_k_heads, cfg.head_dim, cfg.eps, 1.0)?;
-        let qkv_normed = self.device.dtoh_sync_copy(&dev_qkv).map_err(|e| format!("gdn qk-norm dtoh: {e}"))?;
+        self.gdn_l2_norm(h, &mut conv_out, 0, cfg.num_k_heads, cfg.head_dim, cfg.eps, q_scale)?;
+        self.gdn_l2_norm(h, &mut conv_out, key_dim, cfg.num_k_heads, cfg.head_dim, cfg.eps, 1.0)?;
 
-        let o = self.gdn_delta(h, recurrent, &qkv_normed, key_dim, &beta, &decay)?;
+        let o = self.gdn_delta(h, recurrent, &conv_out, key_dim, &beta, &decay)?;
         let y = self.gdn_gated_norm(h, &o, &z, &w.ssm_norm.data, cfg.eps)?;
         let out_proj = self.gemv(&y, &w.ssm_out)?;
-        Ok(x.iter().zip(out_proj.iter()).map(|(&hh, &o)| hh + o).collect())
+        self.add_inplace(&mut x, &out_proj)?;
+        Ok(x)
     }
 
     /// One token through a Gated Attention mixer (see `reference/
@@ -1197,29 +1248,36 @@ impl Model {
     /// to the dense/MoE path's attention block, except `attn_q` is a fused
     /// query+gate projection (split per head into `[q(head_dim),
     /// gate(head_dim)]`) and the attention output is gated by
-    /// `sigmoid(gate)` (host-side, cheap -- same precedent as MoE's
-    /// host-side router) before the output projection.
+    /// `sigmoid(gate)` before the output projection. The head split and
+    /// sigmoid gating stay host-side (small, same precedent as MoE's
+    /// host-side router; Phase 2 round 2 only tackles the primary
+    /// dense/MoE-benchmarked path's device residency, not this smaller,
+    /// Gated-Attention-sublayer-only round trip) -- everything else in this
+    /// function (RMSNorm/QKV/QK-Norm/RoPE/attention/O-proj/residual) is
+    /// device-resident like `forward_attn_block`.
     fn forward_gated_attn_mixer(
         &self,
         h: &HybridModel,
         w: &GatedAttnLayerWeights,
-        hidden: &[f32],
+        mut hidden: CudaSlice<f32>,
         position: usize,
-        k_cache: &mut Vec<f32>,
-        v_cache: &mut Vec<f32>,
-    ) -> Result<Vec<f32>, String> {
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
         let cfg = &h.attn_cfg;
-        let normed = self.rmsnorm(hidden, &w.attn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let normed = self.rmsnorm(&hidden, &w.attn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
 
         let qg = self.gemv(&normed, &w.attn_q)?;
+        let qg_host = self.device.dtoh_sync_copy(&qg).map_err(|e| format!("gated-attn qg dtoh: {e}"))?;
         let q_dim = cfg.num_q_heads * cfg.head_dim;
-        let mut q = vec![0.0f32; q_dim];
+        let mut q_host = vec![0.0f32; q_dim];
         let mut gate = vec![0.0f32; q_dim];
         for head in 0..cfg.num_q_heads {
             let base = head * 2 * cfg.head_dim;
-            q[head * cfg.head_dim..(head + 1) * cfg.head_dim].copy_from_slice(&qg[base..base + cfg.head_dim]);
-            gate[head * cfg.head_dim..(head + 1) * cfg.head_dim].copy_from_slice(&qg[base + cfg.head_dim..base + 2 * cfg.head_dim]);
+            q_host[head * cfg.head_dim..(head + 1) * cfg.head_dim].copy_from_slice(&qg_host[base..base + cfg.head_dim]);
+            gate[head * cfg.head_dim..(head + 1) * cfg.head_dim].copy_from_slice(&qg_host[base + cfg.head_dim..base + 2 * cfg.head_dim]);
         }
+        let mut q = self.device.htod_sync_copy(&q_host).map_err(|e| format!("gated-attn q htod: {e}"))?;
 
         let mut k = self.gemv(&normed, &w.attn_k)?;
         let v = self.gemv(&normed, &w.attn_v)?;
@@ -1230,17 +1288,31 @@ impl Model {
         self.rope(&mut q, cfg.num_q_heads, cfg.head_dim, cfg.rotary_dim, position, cfg.rope_base)?;
         self.rope(&mut k, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim, position, cfg.rope_base)?;
 
-        k_cache.extend_from_slice(&k);
-        v_cache.extend_from_slice(&v);
+        let kv_stride = cfg.num_kv_heads * cfg.head_dim;
+        let offset = position * kv_stride;
+        {
+            let mut dst = k_cache.slice_mut(offset..offset + kv_stride);
+            self.device.dtod_copy(&k, &mut dst).map_err(|e| format!("gated-attn kv-cache dtod k: {e}"))?;
+        }
+        {
+            let mut dst = v_cache.slice_mut(offset..offset + kv_stride);
+            self.device.dtod_copy(&v, &mut dst).map_err(|e| format!("gated-attn kv-cache dtod v: {e}"))?;
+        }
         let seq_len = position + 1;
 
-        let mut attn_out = self.attention(&q, k_cache, v_cache, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, seq_len)?;
-        for (a, &g) in attn_out.iter_mut().zip(gate.iter()) {
+        let k_view = k_cache.slice(0..seq_len * kv_stride);
+        let v_view = v_cache.slice(0..seq_len * kv_stride);
+        let attn_out = self.attention(&q, &k_view, &v_view, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, seq_len)?;
+
+        let mut attn_out_host = self.device.dtoh_sync_copy(&attn_out).map_err(|e| format!("gated-attn out dtoh: {e}"))?;
+        for (a, &g) in attn_out_host.iter_mut().zip(gate.iter()) {
             *a *= 1.0 / (1.0 + (-g).exp());
         }
+        let attn_out = self.device.htod_sync_copy(&attn_out_host).map_err(|e| format!("gated-attn out htod: {e}"))?;
 
         let o_proj = self.gemv(&attn_out, &w.attn_output)?;
-        Ok(hidden.iter().zip(o_proj.iter()).map(|(&hh, &o)| hh + o).collect())
+        self.add_inplace(&mut hidden, &o_proj)?;
+        Ok(hidden)
     }
 
     /// Shared post-mixer FFN tail for both hybrid layer kinds: RMSNorm
@@ -1251,13 +1323,14 @@ impl Model {
     /// `GatedAttnLayerWeights`'s doc comment), and touching the already
     /// hardware-verified dense/MoE path is not worth the risk for a few
     /// shared lines.
-    fn forward_hybrid_ffn(&self, post_mixer: &[f32], norm: &Weight, ffn_gate: &Weight, ffn_up: &Weight, ffn_down: &Weight, hidden_size: usize, ffn_hidden_size: usize, eps: f32) -> Result<Vec<f32>, String> {
-        let normed = self.rmsnorm(post_mixer, &norm.data, 1, hidden_size, eps)?;
+    fn forward_hybrid_ffn(&self, mut post_mixer: CudaSlice<f32>, norm: &Weight, ffn_gate: &Weight, ffn_up: &Weight, ffn_down: &Weight, hidden_size: usize, ffn_hidden_size: usize, eps: f32) -> Result<CudaSlice<f32>, String> {
+        let normed = self.rmsnorm(&post_mixer, &norm.data, 1, hidden_size, eps)?;
         let gate = self.gemv(&normed, ffn_gate)?;
         let up = self.gemv(&normed, ffn_up)?;
         let activated = self.silu_and_mul(&gate, &up, ffn_hidden_size)?;
         let down = self.gemv(&activated, ffn_down)?;
-        Ok(post_mixer.iter().zip(down.iter()).map(|(&hh, &d)| hh + d).collect())
+        self.add_inplace(&mut post_mixer, &down)?;
+        Ok(post_mixer)
     }
 
     /// Hybrid-model counterpart to [`Self::forward_prompt`]: same encode ->
@@ -1277,42 +1350,61 @@ impl Model {
             return Err("encode produced no tokens".to_string());
         }
 
+        // Preallocated up front (Phase 2 round 2), same rationale as
+        // `forward_prompt`'s `k_caches`/`v_caches`: the full prompt's token
+        // count is already known before the per-position loop starts.
+        let attn_kv_cache_len = ids.len() * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
         let mut states: Vec<HybridLayerState> = h
             .layers
             .iter()
-            .map(|l| match l {
-                HybridLayerWeights::GatedAttention(_) => HybridLayerState::Attn { k_cache: Vec::new(), v_cache: Vec::new() },
-                HybridLayerWeights::GatedDeltaNet(_) => {
-                    HybridLayerState::Gdn { conv_state: vec![0.0; h.gdn_cfg.conv_state_len()], recurrent: vec![0.0; h.gdn_cfg.recurrent_len()] }
+            .map(|l| -> Result<HybridLayerState, String> {
+                match l {
+                    HybridLayerWeights::GatedAttention(_) => {
+                        let k_cache = self.device.alloc_zeros::<f32>(attn_kv_cache_len).map_err(|e| format!("alloc k_cache: {e}"))?;
+                        let v_cache = self.device.alloc_zeros::<f32>(attn_kv_cache_len).map_err(|e| format!("alloc v_cache: {e}"))?;
+                        Ok(HybridLayerState::Attn { k_cache, v_cache })
+                    }
+                    HybridLayerWeights::GatedDeltaNet(_) => {
+                        let conv_state =
+                            self.device.alloc_zeros::<f32>(h.gdn_cfg.conv_state_len()).map_err(|e| format!("alloc conv_state: {e}"))?;
+                        let recurrent =
+                            self.device.alloc_zeros::<f32>(h.gdn_cfg.recurrent_len()).map_err(|e| format!("alloc recurrent: {e}"))?;
+                        Ok(HybridLayerState::Gdn { conv_state, recurrent })
+                    }
                 }
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
 
         let hidden_size = h.attn_cfg.hidden_size;
         let ffn_hidden_size = h.attn_cfg.ffn_hidden_size;
         let eps = h.attn_cfg.rmsnorm_eps;
-        let mut hidden = vec![0.0f32; hidden_size];
+        let mut hidden_host = vec![0.0f32; hidden_size];
+        let mut hidden_dev: Option<CudaSlice<f32>> = None;
         for (position, &token_id) in ids.iter().enumerate() {
             let embd_base = token_id as usize * hidden_size;
-            hidden.copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
+            hidden_host.copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
+            let mut hidden = self.device.htod_sync_copy(&hidden_host).map_err(|e| format!("embedding htod: {e}"))?;
 
             for (layer, state) in h.layers.iter().zip(states.iter_mut()) {
                 hidden = match (layer, state) {
                     (HybridLayerWeights::GatedAttention(w), HybridLayerState::Attn { k_cache, v_cache }) => {
-                        let post_mixer = self.forward_gated_attn_mixer(h, w, &hidden, position, k_cache, v_cache)?;
-                        self.forward_hybrid_ffn(&post_mixer, &w.post_attn_norm, &w.ffn_gate, &w.ffn_up, &w.ffn_down, hidden_size, ffn_hidden_size, eps)?
+                        let post_mixer = self.forward_gated_attn_mixer(h, w, hidden, position, k_cache, v_cache)?;
+                        self.forward_hybrid_ffn(post_mixer, &w.post_attn_norm, &w.ffn_gate, &w.ffn_up, &w.ffn_down, hidden_size, ffn_hidden_size, eps)?
                     }
                     (HybridLayerWeights::GatedDeltaNet(w), HybridLayerState::Gdn { conv_state, recurrent }) => {
-                        let post_mixer = self.forward_gdn_mixer(h, w, &hidden, conv_state, recurrent)?;
-                        self.forward_hybrid_ffn(&post_mixer, &w.post_attn_norm, &w.ffn_gate, &w.ffn_up, &w.ffn_down, hidden_size, ffn_hidden_size, eps)?
+                        let post_mixer = self.forward_gdn_mixer(h, w, hidden, conv_state, recurrent)?;
+                        self.forward_hybrid_ffn(post_mixer, &w.post_attn_norm, &w.ffn_gate, &w.ffn_up, &w.ffn_down, hidden_size, ffn_hidden_size, eps)?
                     }
                     _ => return Err("internal error: hybrid layer/state kind mismatch".to_string()),
                 };
             }
+            hidden_dev = Some(hidden);
         }
+        let hidden = hidden_dev.ok_or("no tokens processed")?;
 
         let normed = self.rmsnorm(&hidden, &self.output_norm.data, 1, hidden_size, eps)?;
-        let logits = self.gemv(&normed, &self.lm_head)?;
+        let logits_dev = self.gemv(&normed, &self.lm_head)?;
+        let logits = self.device.dtoh_sync_copy(&logits_dev).map_err(|e| format!("logits dtoh: {e}"))?;
 
         let next_id = logits
             .iter()

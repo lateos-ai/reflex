@@ -370,5 +370,58 @@ of correctness for a new architecture path -- get an independent ground truth (h
 fresh llama.cpp build) before trusting it, the same posture this project already takes
 toward its own kernels.
 
-Next: DeepSeek-V2/V3 MLA (MVP step 4, deliberately last per the MVP order above), or a
-second Phase 2 round on the remaining cold-start gap -- open call, not yet decided.
+### Phase 2 (Fast IO), round 2: device-resident activations across a layer
+
+Round 1 (above) fixed weights being re-uploaded on every kernel call; the remaining
+~1.7x gap was attributed to two candidates, neither yet attempted: an on-GPU dequant
+kernel, and keeping activations device-resident across a whole layer instead of
+round-tripping between every op. This round tackled the second one only, since it's a
+refactor of existing kernel call sites (no new CUDA math), unlike the dequant kernel's
+new-kernel-writing project.
+
+Every kernel-wrapper method in `model.rs` (`rmsnorm`, `gemv`/`gemv_expert`, `rope`,
+`silu_and_mul`, `attention`, and the Qwen3.5 hybrid's `gdn_conv`/`gdn_gates`/`gdn_delta`/
+`gdn_gated_norm`) used to do its own `htod_sync_copy` before and `dtoh_sync_copy` after
+-- i.e. every op in the forward pass round-tripped its activation vector over PCIe and
+paid a sync latency hit, even though only weight buffers needed to be GPU-resident.
+Fixed by converting every op wrapper to take/return `CudaSlice<f32>` directly (the
+pattern `gdn_l2_norm` already used: mutate a device buffer in place) and chaining
+device buffers through each of the six forward functions (`forward_attn_block`/
+`forward_layer_dense`/`forward_layer_moe`/`forward_gdn_mixer`/
+`forward_gated_attn_mixer`/`forward_hybrid_ffn`) without touching host memory
+mid-layer. Residual adds moved to a new `add_kernel` (`kernels_cuda/elementwise.cu`) so
+they stay device-resident too; `rope_kernel` now takes `position` as a plain scalar
+instead of an uploaded device array (`batch_size` is permanently 1, so there was never
+more than one position to pass); `silu_and_mul_kernel` takes `gate`/`up` as two
+separate buffers instead of requiring a host-side concatenation into one. The single
+largest remaining round-trip -- `attention()` re-uploading the *entire* K/V cache
+history on every token position -- is also fixed: `k_cache`/`v_cache` are now
+preallocated device buffers (sized to the known prompt length up front) that
+`forward_attn_block`/`forward_gated_attn_mixer` write into via device-to-device copy
+(`CudaDevice::dtod_copy`), never touching the host. Left out of scope, flagged for a
+future round: MoE's per-expert weighted-sum accumulation and the Gated Attention
+mixer's fused-qg head split/sigmoid gating both still round-trip through the host
+(small, low-value relative to the primary dense/MoE path this benchmarks).
+
+Re-verified byte-exact against the same golden tokens as before (dense `"Once upon a
+time"` -> `","` id 11, `"The capital of France is"` -> `" Paris"`; MoE `Tiny-Moe` -> id
+4036; hybrid `"Once upon a time"` -> `","` id 11, `"The capital of France is"` -> `"
+the"` id 279) plus all 55 existing unit tests, on the same A6000 hardware. Re-measured
+the same way as round 1 (`/usr/bin/time -v`, same `Qwen3-0.6B-Q4_K_M.gguf`, same
+prompt, three runs, fresh `llama.cpp` build at `ce8caa6`):
+
+| | run 1 | run 2 | run 3 | peak RSS | user+sys CPU time |
+|---|---|---|---|---|---|
+| **llama.cpp** (unchanged) | 6.45s | 6.44s | 6.46s | 887 MB | 1.01s + 1.19s |
+| **coldstart-infer, round 1** | 11.31s | 11.70s | 10.44s | 1.33 GB | ~3.2s + ~4.0s |
+| **coldstart-infer, round 2** | 6.43s | 6.47s | 8.51s | 1.35 GB | ~2.1s + ~3.5s |
+
+Gap closed from ~1.7x to **~1.1x slower than llama.cpp** (two of three runs landed
+within llama.cpp's own run-to-run noise). Peak RSS is unchanged from round 1 (this
+round didn't touch the weight-loading path) and system time is still ~2.9x llama.cpp's
+-- both point at the same remaining cause round 1 already named: the CPU-bound
+host-side dequant-to-`f32` step at load time, which only an on-GPU dequant kernel (not
+attempted this round) would remove.
+
+Next: DeepSeek-V2/V3 MLA (MVP step 4), or the on-GPU dequant kernel to close the
+remaining ~1.1x gap -- open call, not yet decided.
