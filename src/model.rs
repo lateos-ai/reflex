@@ -1749,7 +1749,17 @@ impl Model {
         if let Some(m) = &self.mla {
             return self.forward_prompt_mla(m, prompt);
         }
+        let (next_id, text, _k_caches, _v_caches, _seq_len) = self.forward_prompt_dense_impl(prompt)?;
+        Ok((next_id, text))
+    }
 
+    /// Same dense/MoE forward pass as `forward_prompt`, but also returns the
+    /// device-resident per-layer K/V caches and the prompt's token count, so
+    /// `forward_prompt_capture_kv` can download them for `--export-kv`
+    /// (Phase 3 round 1, `kv_io.rs`). Kept separate from `forward_prompt` so
+    /// the common case (no export) doesn't pay for the extra return
+    /// plumbing or risk diverging cache-handling logic between two copies.
+    fn forward_prompt_dense_impl(&self, prompt: &str) -> Result<(u32, String, Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>, usize), String> {
         let mut ids = self.tokenizer.encode(prompt)?;
         if let Some(bos) = self.tokenizer.bos_token_id {
             if ids.first() != Some(&bos) {
@@ -1802,7 +1812,36 @@ impl Model {
             .ok_or("cannot argmax an empty logits slice")?;
 
         let text = self.tokenizer.decode(&[next_id]);
-        Ok((next_id, text))
+        Ok((next_id, text, k_caches, v_caches, ids.len()))
+    }
+
+    /// Dense/MoE-only (Phase 3 round 1 -- see `kv_io.rs`'s doc comment for
+    /// why hybrid/MLA aren't supported yet): runs the same forward pass as
+    /// `forward_prompt` but also downloads the per-layer K/V caches to host
+    /// memory for `--export-kv` to serialize.
+    pub fn forward_prompt_capture_kv(&self, prompt: &str) -> Result<((u32, String), crate::kv_io::DenseKvCache), String> {
+        if self.hybrid.is_some() || self.mla.is_some() {
+            return Err("--export-kv is only supported for dense/MoE Qwen3 models in this round (see kv_io.rs)".to_string());
+        }
+        let (next_id, text, k_caches, v_caches, seq_len) = self.forward_prompt_dense_impl(prompt)?;
+
+        let k_caches = k_caches
+            .iter()
+            .map(|c| self.device.dtoh_sync_copy(c).map_err(|e| format!("k_cache dtoh: {e}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let v_caches = v_caches
+            .iter()
+            .map(|c| self.device.dtoh_sync_copy(c).map_err(|e| format!("v_cache dtoh: {e}")))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let cache = crate::kv_io::DenseKvCache {
+            seq_len,
+            num_kv_heads: self.cfg.num_kv_heads,
+            head_dim: self.cfg.head_dim,
+            k_caches,
+            v_caches,
+        };
+        Ok(((next_id, text), cache))
     }
 
     /// Causal depthwise conv1d + SiLU over the fused qkv, advancing

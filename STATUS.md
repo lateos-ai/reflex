@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `README.md` — this file is the
 short, current-state summary; README is the log.
 
-_Last updated: 2026-09-21 (Phase 2 round 3 session)_
+_Last updated: 2026-09-21 (Phase 3 round 1 session)_
 
 ## MVP progress
 
@@ -62,16 +62,31 @@ separate rotation-vs-attention-scale formulas) that each produced silently-wrong
 (non-crashing) output before being caught by byte-exact comparison against real
 llama.cpp builds.
 
+## Phase 3 (State I/O), round 1
+
+`--export-kv <file>`/`--import-kv <file>` added to `qwen3_coldstart`, dense/MoE Qwen3
+only (`src/kv_io.rs`, new `Model::forward_prompt_capture_kv` in `model.rs`). Round 1 is
+scoped to raw buffer export/import only — no resume-generation-from-cache, since there's
+no per-token generation loop or `start_pos` anywhere in `model.rs` yet for a cache to
+resume into (see README.md's "Phase 3, round 1" section and DECISIONS.md for the full
+scope rationale). `--import-kv` proves the file round-trips byte-identical through a
+device upload/download instead. Real-hardware-verified on the A6000 (`kgevfmca`
+instance, still running from the Phase 2 round 3 session): `cargo test` (57 tests, incl.
+2 new `kv_io` tests) plus real `--export-kv`/`--import-kv` runs against both
+`Qwen3-0.6B-Q4_K_M.gguf` (dense) and `Tiny-Moe.Q4_K_M.gguf` (MoE).
+
 ## Open decision (not yet resolved)
 
-None currently open. Phase 2 (Fast IO) round 3 (the last item on the prior list, an
-on-GPU dequant kernel) is done — see "Performance" above. Remaining low-priority
+None currently open. Phase 3 round 1 (above) is done as scoped. Remaining low-priority
 follow-ups (not blocking, not actively planned): a real small `qwen3moe`-architecture
 GGUF fixture (see "Known debt" below), on-device dequant coverage for the 15+ GGUF
 block types still on the host path (Q4_0/1, Q5_0/1, Q8_0/1, Q2_K/Q3_K/Q5_K/Q8_K, the
-IQ-family formats — none exercised by a local fixture's bulk weight bytes), and MoE's
+IQ-family formats — none exercised by a local fixture's bulk weight bytes), MoE's
 per-expert weighted-sum accumulation / the Gated Attention mixer's fused-qg gating
-still round-tripping through the host (flagged, not measured as worth closing).
+still round-tripping through the host (flagged, not measured as worth closing), and
+Phase 3 round 2 (hybrid/MLA KV-cache export formats, plus the generation loop +
+`start_pos` plumbing needed for `--import-kv` to actually resume generation — see
+README.md's Phase 3 section).
 
 ## Known debt / limitations
 

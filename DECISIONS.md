@@ -4,6 +4,38 @@ A log of the project's non-obvious technical and scope decisions, and why they w
 made. For current state see `STATUS.md`; for full narrative/benchmark detail see
 `README.md`.
 
+## Phase 3 (State I/O) round 1 scope: dense/MoE only, export/import-the-buffers only
+
+**Decision**: `--export-kv`/`--import-kv` round 1 supports only the dense/MoE Qwen3
+forward path's `k_cache`/`v_cache` pair (not the Qwen3.5 hybrid's per-layer
+`Attn`/`Gdn` split, not MLA's single compressed cache), and does not wire an imported
+cache back into a forward pass — `--import-kv` proves the file round-trips
+byte-identical through a device upload/download and stops there, rather than resuming
+generation from it.
+
+**Why**: confirmed with the user before implementing (two explicit open questions,
+matching this project's practice of confirming scope before starting rather than after).
+Dense-only matches the established "narrow first" precedent from every prior MVP step
+(dense before MoE before hybrid before MLA). The export/import-only cut came from what
+investigating `model.rs` actually found, not just caution: `forward_prompt` (all three
+architecture paths) always starts at position 0, and there is no per-token generation
+loop anywhere in `model.rs` or `qwen3_coldstart.rs` — each run does one full prompt pass
+and returns exactly one token, then the process exits. "Resume generation past position
+0" therefore isn't a small `start_pos: usize` plumb-through; it needs (a) a generation
+loop that doesn't exist yet, and (b) each path's K/V cache allocation changed from
+"sized to exactly this call's token count" (`alloc_zeros(ids.len() * ...)`, fresh per
+call) to something sized for `start_pos + new_tokens`, at three separate call sites
+(dense/MoE, hybrid, MLA don't share the position loop). Scoping that out of round 1
+kept this round verifiable on its own terms (a lossless byte-exact round trip) instead
+of half-building a resume path with no generation loop to plug it into.
+
+**How to apply**: round 2 of this phase is where the generation loop + `start_pos`
+plumbing belongs, together — building one without the other leaves either a resume
+path nothing can call, or a loop nothing can resume. Do both in the same round, and
+revisit whether hybrid `Gdn` state (already streaming-friendly — fixed-size, not
+indexed by position) can piggyback on the same file-format version bump used for
+hybrid `Attn`/MLA's cache shapes.
+
 ## Hybrid Qwen3.5 MVP scope: dense `qwen35` only, single-token dispatch, no MTP
 
 **Decision**: MVP step 3 supports only the dense `qwen35` architecture string. The

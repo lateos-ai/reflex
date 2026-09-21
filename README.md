@@ -102,7 +102,10 @@ cold compute into one output token, then getting out of the way.
   `--import-kv <file>`, doing raw binary dump/load of the K/V cache to/from a file
   descriptor. coldstart-infer stays ignorant of *where* that file lives or how it got
   there (NVMe, an S3-backed FUSE mount, tmpfs) — that's the orchestrator's job. No
-  caching policy, no cache-hit logic, inside this engine.
+  caching policy, no cache-hit logic, inside this engine. **Round 1 done** (dense/MoE
+  export/import of the raw buffers, verified byte-exact round trip on real hardware —
+  see the "Phase 3, round 1" section below); resuming generation from an imported cache,
+  and hybrid/MLA cache shapes, are round 2+.
 - **Phase 4 — Embeddability**: a single `--lora <path>` CLI flag (load-time adapter
   application only, no runtime hot-swap multiplexer — process spin-up is already cheap
   enough that a fresh process per adapter is the scale-from-zero answer, not in-process
@@ -647,3 +650,49 @@ round-trips (MoE's per-expert weighted-sum accumulation, the Gated Attention mix
 fused-qg head split/sigmoid gating, and the 15+ block types still on the host dequant
 path) are believed low-value against this project's actual `Q4_K_M`-fixture workload,
 not verified to be free of further gains.
+
+### Phase 3 (State I/O), round 1: raw KV-cache export/import (dense/MoE only)
+
+Scoped narrowly before implementation, matching this project's "narrow first" MVP
+precedent: round 1 covers **dense/MoE Qwen3 only** (not the Qwen3.5 hybrid's per-layer
+`Attn`/`Gdn` split, not MLA's single compressed cache), and covers **export/import of
+the raw K/V buffers only** — it does not wire an imported cache back into a forward pass.
+That's a deliberate deferral, not an oversight: `forward_prompt` (all three
+architecture paths) always starts at position 0 and has no per-token generation loop
+anywhere in `model.rs` or `qwen3_coldstart.rs` today — each run does one full prompt
+pass and returns exactly one next token, then the process exits. "Resume generation from
+an imported cache" needs that generation loop plus a `start_pos` threaded through each
+path's cache allocation/indexing (currently `alloc_zeros`'d fresh per call, sized to
+exactly that call's token count, not a max-context length) — real work belonging to a
+later round, once the loop exists for a cache to resume *into*.
+
+New `src/kv_io.rs` module: a flat, home-grown binary format (`b"CSKV"` magic, `u32`
+version, then `num_layers`/`seq_len`/`num_kv_heads`/`head_dim` header fields, then each
+layer's `k_cache` and `v_cache` as raw little-endian `f32`) — intentionally
+version-gated so a later round can add per-architecture variants (hybrid `Gdn`
+conv/recurrent state isn't even indexed by position, so it round-trips as a fixed-size
+buffer directly; MLA's compressed cache is a different single-buffer shape) without
+breaking round-1 files. `Model::forward_prompt_capture_kv` (new, `model.rs`) is the same
+dense/MoE forward pass as `forward_prompt`, refactored to share one inner
+`forward_prompt_dense_impl` so the common no-export case doesn't pay for the extra
+return plumbing, but also downloads the per-layer device K/V caches to host memory for
+export; it returns a clean error for hybrid/MLA models rather than silently exporting
+the wrong shape.
+
+`qwen3_coldstart` gained two flags: `--export-kv <file>` (after the forward pass,
+serialize the cache to `<file>`) and `--import-kv <file>` (load `<file>`, upload each
+buffer to the GPU, download it back, and assert the round trip is byte-identical —
+proving the bytes an orchestrator hands back later are exactly usable as device-resident
+KV state once a generation loop exists to consume them; it does *not* resume generation,
+so it skips loading a GGUF/model entirely). The engine stays ignorant of where the file
+lives or how it got there (NVMe, S3-backed FUSE, tmpfs) or any caching policy — an
+orchestrator's job, per Non-goals.
+
+Verified on the real A6000 instance: `cargo test` (57 tests, including two new
+`kv_io` tests — an export-then-import byte-exact round trip on synthetic cache data, and
+a bad-magic rejection check) plus real end-to-end runs against `Qwen3-0.6B-Q4_K_M.gguf`
+(dense) and `Tiny-Moe.Q4_K_M.gguf` (MoE): `--export-kv` produces the same next-token as
+a plain run (`"Once upon a time"` -> `","` id 11, both with and without `--export-kv`),
+`--import-kv` reports `KV_IMPORT_OK` with the correct shape and a verified device round
+trip, and both error paths (malformed file, hybrid-architecture GGUF) fail with a clear
+message instead of silently producing wrong output.
