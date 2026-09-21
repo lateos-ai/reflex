@@ -31,6 +31,18 @@
 /// softmax/top-k probability mass is non-finite or non-positive (e.g. every
 /// logit is `-inf`).
 pub fn route_top_k(logits: &[f32], k: usize) -> Result<Vec<(usize, f32)>, String> {
+    route_top_k_with_norm(logits, k, true)
+}
+
+/// Like [`route_top_k`], but `normalize` controls whether the selected top-`k`
+/// probabilities are renormalized to sum to 1 (Qwen3-MoE's convention, `norm_w =
+/// true`) or left as raw softmax probabilities (real DeepSeek-V2-Lite's
+/// convention -- confirmed against a real GGUF: `expert_weights_norm` is absent,
+/// and llama.cpp's own converter only ever writes that key when the source
+/// model's `norm_topk_prob` is truthy, so absence there means "don't
+/// renormalize"). See `crate::model::MlaMoeConfig`'s doc comment for how this
+/// gets threaded from GGUF metadata.
+pub fn route_top_k_with_norm(logits: &[f32], k: usize, normalize: bool) -> Result<Vec<(usize, f32)>, String> {
     if logits.is_empty() {
         return Err("route_top_k: logits must not be empty".to_string());
     }
@@ -49,6 +61,10 @@ pub fn route_top_k(logits: &[f32], k: usize) -> Result<Vec<(usize, f32)>, String
     let mut order: Vec<usize> = (0..probs.len()).collect();
     order.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
     let top = &order[..k];
+
+    if !normalize {
+        return Ok(top.iter().map(|&i| (i, probs[i])).collect());
+    }
 
     let top_sum: f32 = top.iter().map(|&i| probs[i]).sum();
     if !top_sum.is_finite() || top_sum <= 0.0 {

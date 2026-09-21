@@ -206,6 +206,61 @@ Gated DeltaNet mixer's residual-add bug):
    `rope_kernel` — **don't assume RoPE convention is architecture-independent** when
    adding another model family later; check `llama_model_rope_type` first.
 
+## MLA extended to real DeepSeek-V2-Lite: MoE + shared experts + YaRN, same session
+
+**Decision**: after the synthetic-fixture-only MLA work above landed, it was
+extended the same session to the real `deepseek-ai/DeepSeek-V2-Lite` checkpoint on a
+rented 80GB A100 (the VRAM estimate from the entry above held: fits 80GB with
+headroom, doesn't fit the A6000's 48GB). This added routed-MoE + always-on
+shared-expert FFN (`MlaFfn::Moe`) and YaRN RoPE scaling (`MlaYarnConfig`,
+`rope_norm_yarn_kernel`) to the previously dense-only, no-YaRN implementation.
+
+**Why extend in the same session rather than treat it as separate future work**: the
+user explicitly chose full scope (MoE+shared-experts+YaRN together) after being told
+YaRN was a real, separate chunk of work beyond the originally-scoped MoE addition —
+see the "genuinely blocked, decision only they can make" judgment call this
+represented; once approved, there was no reason to artificially split the work across
+sessions.
+
+**Three more real, silently-wrong-not-crashing bugs/gotchas found via byte-exact
+comparison against a real llama.cpp build on the real model** (extending the pattern
+from the entry above):
+1. **DeepSeek-V2-Lite's router does not renormalize top-k probabilities**
+   (`norm_topk_prob: false` in the source HF config) — unlike Qwen3-MoE's convention
+   this codebase's `route_top_k` already assumed everywhere. The tell in the GGUF is
+   subtle: llama.cpp's converter only writes `expert_weights_norm` when the source
+   value is *truthy*, so **the key's absence means "don't renormalize," not "key
+   missing, assume the usual true default"** — the opposite of how most other
+   optional metadata keys in this codebase behave. Fixed via `route_top_k_with_norm`
+   (`moe.rs`), `route_top_k` now a thin wrapper over it.
+2. **The shared expert(s) are a single fused dense FFN**, not
+   `expert_shared_count` separate per-expert calls — confirmed from the real
+   converted GGUF's own tensor shapes (`ffn_gate_shexp`: `{hidden, n_ff_exp *
+   expert_shared_count}`). Assuming a per-expert loop (the natural pattern-match
+   from the routed-expert code right next to it) would have been extra unneeded
+   complexity, not just a performance issue.
+3. **Every pre-quantized DeepSeek-V2-Lite GGUF found publicly (mradermacher,
+   tensorblock, duyntnet, bartowski's Coder-V2-Lite) predates llama.cpp's MLA
+   tensor-split conversion change** — legacy unsplit `attn_kv_b`, no
+   `key_length_mla`/`value_length_mla` metadata at all. **Don't assume a downloaded
+   or found GGUF for an architecture with an evolving tensor format is current** —
+   check for the format-defining metadata keys (an HTTP range request for just the
+   header, ~20MB, is enough) before committing to a multi-GB full download. The
+   reliable fix was converting fresh from the original safetensors checkpoint with
+   this project's own pinned, confirmed-current `convert_hf_to_gguf.py`.
+
+**Also required, less novel but worth noting**: YaRN's math is genuinely separate
+from a simple RoPE scale tweak — it blends interpolated/extrapolated rotation angles
+per frequency (a correction ramp from `beta_fast`/`beta_slow`-derived dimension
+bounds) and applies a magnitude correction to both the rotation itself *and*,
+independently, the attention softmax scale (a second, different formula, involving
+`deepseek2`'s own `rope_yarn_log_mul` metadata — itself stored pre-multiplied by
+`0.1` by the converter and undone by the loader, `[TAG_DEEPSEEK2_YARN_LOG_MUL_FIX]`,
+a detail this project's `parse_mla_config` had to replicate exactly). Ported by
+reading `ggml`'s own CUDA `rope_yarn()`, `llama-context.cpp`'s YaRN `cparams` setup,
+and `deepseek2.cpp`'s `kq_scale` computation in full, not derived from first
+principles or copied from a simplified description.
+
 ## Cold-start-vs-llama.cpp benchmark methodology
 
 **Decision**: measure with external wall-clock (`/usr/bin/time -v`, process launch to

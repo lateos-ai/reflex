@@ -13,7 +13,7 @@ _Last updated: 2026-09-21 (MLA session)_
 | 1. Dense Qwen3 | Done — real-hardware-verified (A6000) |
 | 2. Qwen3-MoE | Done — real-hardware-verified (A6000), against a synthetic (non-Qwen3) MoE fixture |
 | 3. Qwen3.5 hybrid Gated DeltaNet mixer | Done — real-hardware-verified (A6000) against a real `Qwen3.5-0.8B-Q4_K_M.gguf` fixture, cross-checked byte-exact against a fresh `llama.cpp` build. Scope: dense `qwen35` only (`qwen35moe`, MTP/NextN unsupported), single-token sequential dispatch (no chunked prefill). |
-| 4. DeepSeek-V2/V3 MLA | Done, narrowly scoped (dense-only, no Q-LoRA/YaRN/MTP) — verified against a synthetic fixture, not a real pretrained model (see below) |
+| 4. DeepSeek-V2/V3 MLA | Done — dense-only, MoE+shared-expert, and YaRN RoPE scaling all supported (only Q-LoRA/MTP still rejected); verified against both a synthetic fixture and the real `DeepSeek-V2-Lite` checkpoint on an 80GB A100 (see below) |
 
 ## Performance
 
@@ -42,38 +42,46 @@ materializing a full-`f32` host copy at all).
 
 ## MLA (MVP step 4)
 
-DeepSeek-V2/V3 support is real but narrow: dense-only (no MoE FFN/shared experts), no
-Q-LoRA query decomposition, no YaRN RoPE scaling, no MTP — `parse_mla_config` in
-`model.rs` hard-errors with a clear message on any of these. Verified against a fully
-synthetic `deepseek2` GGUF (`test-data/deepseek-tiny-mla.gguf`), not a real pretrained
-model — no small real `deepseek2`-architecture GGUF exists publicly, and the smallest
-real one (DeepSeek-V2-Lite) needs ~63GB of `f32` device memory under this project's
-GPU-residency design, more than the A6000 this project develops against. See
-README.md's MLA section for the full writeup, including two easy-to-miss correctness
-details (the attention scale's dimension, and MLA's different RoPE rotation
-convention) that produced silently-wrong (non-crashing) output before being caught by
-byte-exact comparison against a real llama.cpp build.
+DeepSeek-V2/V3 support covers dense-lead layers, routed-MoE + always-on shared-expert
+FFN, and YaRN RoPE scaling — the actual shape of every real DeepSeek-V2/V3 checkpoint.
+Only Q-LoRA query decomposition and MTP/NextN are still rejected with a clear error
+(`parse_mla_config` in `model.rs`); no real file needing either has been seen. First
+verified against a fully synthetic `deepseek2` GGUF
+(`test-data/deepseek-tiny-mla.gguf`, dense-only, no real fixture exists publicly),
+then extended the same session to the real `deepseek-ai/DeepSeek-V2-Lite` checkpoint
+(converted fresh from source with a current `convert_hf_to_gguf.py` — every
+pre-quantized community GGUF found predates llama.cpp's MLA tensor-split format) on a
+rented 80GB A100 (needed for the ~63GB of `f32` device-resident weights; doesn't fit
+the A6000's 48GB). See README.md's MLA sections for the full writeup, including
+several easy-to-miss correctness details (attention scale dimension, MLA's different
+RoPE rotation convention, DeepSeek-V2-Lite's un-renormalized router weights, YaRN's
+separate rotation-vs-attention-scale formulas) that each produced silently-wrong
+(non-crashing) output before being caught by byte-exact comparison against real
+llama.cpp builds.
 
 ## Open decision (not yet resolved)
 
-Next work is unresolved between two options — ask the user before picking one:
-1. Phase 2 Fast IO round 3: an on-GPU dequant kernel, to close the remaining ~1.1x
-   cold-start gap vs. llama.cpp.
-2. Extend MLA to real DeepSeek-V2-Lite (MoE FFN + shared experts + an ~80GB H100
-   instance, since it won't fit the A6000 — see above).
+Only one item left on the list: Phase 2 Fast IO round 3 (an on-GPU dequant kernel, to
+close the remaining ~1.1x cold-start gap vs. llama.cpp) — MLA now covers both a
+synthetic fixture and a real, full-scale MoE+YaRN model, so it's no longer competing
+for priority. Confirm with the user before starting, per this project's usual practice.
 
 ## Known debt / limitations
 
-- **Remote instance git state**: the ThunderCompute dev instance is now a fresh instance
-  (`2xhxwa87`, created 2026-09-21, replacing the prior `pn6lxmbv` instance — Thunder
-  Compute instances are ephemeral across sessions, confirmed again this session). Its
-  `~/coldstart-infer` working tree has no git history at all (populated by `rsync` from
-  local, not `git clone`/`scp`); local remains the only git-tracked copy. A real
-  `ggml-org/llama.cpp` checkout was built from source there (`~/llama.cpp` at `ce8caa6`,
-  CUDA enabled, `examples/simple`'s `llama-simple` built) for the Phase 2 round 2 A/B
-  benchmark — worth reusing rather than rebuilding if the instance survives to the next
-  session. `cmake`/GNU `time` were not preinstalled on this instance and had to be
-  `apt-get install`ed.
+- **Remote instance git state**: the MLA-extension work used a *second*, separate
+  ThunderCompute instance for this session (`fl1uh6dt`, an 80GB A100, created
+  2026-09-21 specifically for the real-DeepSeek-V2-Lite VRAM requirement — the Phase
+  2 round 2 A/B benchmark earlier in the same session used a different A6000 instance,
+  `2xhxwa87`; ThunderCompute instances are ephemeral and per-purpose, not assumed to
+  persist or be reused across even the same session's different tasks). Its
+  `~/coldstart-infer` working tree has no git history at all (populated by `rsync`
+  from local, not `git clone`/`scp`); local remains the only git-tracked copy. A real
+  `ggml-org/llama.cpp` checkout was built from source there (`~/llama.cpp`, CUDA
+  enabled, `examples/simple`'s `llama-simple` built, `-DCMAKE_CUDA_ARCHITECTURES=80`
+  for the A100) — worth reusing rather than rebuilding if the instance survives to the
+  next session. `cmake`, GNU `time`, and the full `requirements-convert_hf_to_gguf.txt`
+  Python stack (torch, transformers, etc. — needed to run `convert_hf_to_gguf.py`) were
+  not preinstalled on this instance and had to be installed fresh.
 - **`llama-cli`'s newer conversational mode always applies the model's chat template**,
   even when a raw prompt is passed via `-p` — no `--no-cnv` flag exists in the current
   build. Use `examples/simple`'s `llama-simple` binary instead for true prompt-in/
@@ -88,3 +96,16 @@ Next work is unresolved between two options — ask the user before picking one:
   `target/release/<bin-name>` — only `target/release/deps/`. After any source change,
   run `cargo build --release --bin <name>` explicitly before trusting a binary run
   against real hardware.
+- **Real DeepSeek-V2-Lite GGUF not preserved locally**: unlike every other fixture,
+  the real `DeepSeek-V2-Lite.gguf` (16.7GB, `--outtype q8_0`) used to verify MLA's
+  MoE/shared-expert/YaRN path was left on the A100 instance (`fl1uh6dt`) rather than
+  copied to local `test-data/` — too large to be worth preserving the way the tiny
+  synthetic fixtures are. Regenerating it needs: download
+  `deepseek-ai/DeepSeek-V2-Lite`'s safetensors (~30GB,
+  `huggingface_hub.snapshot_download`), then `python3 convert_hf_to_gguf.py
+  <dir> --outfile DeepSeek-V2-Lite.gguf --outtype q8_0` with this project's pinned
+  llama.cpp checkout (needs `requirements-convert_hf_to_gguf.txt` installed). Every
+  pre-quantized community GGUF checked (mradermacher, tensorblock, duyntnet,
+  bartowski) predates the MLA tensor-split conversion format and will be silently
+  rejected by `parse_mla_config` (no `key_length_mla`/`value_length_mla` metadata) —
+  don't assume a downloaded GGUF is usable without checking for those keys first.

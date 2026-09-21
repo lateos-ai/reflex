@@ -507,6 +507,76 @@ expected from random weights -- the value is architectural correctness, exactly 
 `Tiny-Moe.Q4_K_M.gguf`'s own non-linguistic verification). All 55 existing unit tests
 and the dense/MoE/hybrid golden-token checks were re-verified unaffected.
 
+### MLA extended to real DeepSeek-V2-Lite: MoE + shared experts + YaRN
+
+The synthetic-fixture MLA work above was extended, same session, to the real
+`deepseek-ai/DeepSeek-V2-Lite` checkpoint on a rented 80GB A100 (the VRAM math from
+the synthetic-fixture section held: ~63GB of `f32` weights fits with headroom on
+80GB, not on the A6000's 48GB). Three things had to be added that the synthetic
+fixture's narrower scope had deliberately deferred:
+
+**MoE + shared-expert FFN** (`src/model.rs`'s new `MlaFfn` enum, `Dense` for the
+`leading_dense_block_count` lead layers or `Moe` for the rest -- real DeepSeek-V2-Lite
+has 1 dense layer, 26 MoE layers). Routed-expert dispatch reuses
+`forward_layer_moe`'s existing shape (router GEMM, `crate::moe::route_top_k`-family,
+per-expert `gemv_expert`, host-side weighted accumulate -- same "stays host-driven"
+convention Phase 2 round 2 already carved out for MoE specifically). The
+always-on shared expert turned out to need no new dispatch machinery at all: real
+DeepSeek-V2-Lite's `ffn_{gate,up,down}_shexp` tensors already fuse every shared
+expert into *one* bigger dense FFN matmul (`ffn_gate_shexp` shape `{hidden,
+n_ff_exp * expert_shared_count}`, confirmed from the real converted GGUF), so it's
+just one more dense-FFN-shaped computation added unconditionally to the routed
+experts' accumulator, not `expert_shared_count` separate calls.
+
+**`route_top_k_with_norm`** (`src/moe.rs`, `route_top_k` is now a thin wrapper over
+it): real DeepSeek-V2-Lite's router does *not* renormalize its selected top-k
+probabilities (`norm_topk_prob: false` in the source HF config), unlike Qwen3-MoE's
+convention this codebase already assumed everywhere. The tell in the GGUF itself is
+subtle and worth recording: llama.cpp's converter only ever writes the
+`expert_weights_norm` metadata key when the source model's `norm_topk_prob` is
+*truthy* -- so the key's **absence** means "don't renormalize," not "key missing,
+assume the usual default." Getting this backwards would have silently produced
+plausible-but-wrong combination weights, not a crash.
+
+**YaRN RoPE scaling** (`src/kernels_cuda/rope.cu`'s new `rope_norm_yarn_kernel` +
+`src/model.rs`'s `MlaYarnConfig`, both new, `rope_norm_kernel` untouched): real
+DeepSeek-V2-Lite's `rope_scaling.type == "yarn"` (`factor: 40`, `beta_fast: 32`,
+`beta_slow: 1`, `original_context_length: 4096`) -- discovered only by checking the
+real HF config's *full* `rope_scaling` dict, not just its `type` field, after an
+initial pass assumed (wrongly) that DeepSeek-V2-Lite needed no RoPE scaling at all.
+YaRN blends interpolated and extrapolated rotation angles per frequency (a
+correction ramp between `beta_fast`/`beta_slow`-derived dimension bounds) and applies
+a magnitude correction (`mscale`) to both the rotation itself and, via a *separate*
+formula involving `deepseek2`'s own `rope_yarn_log_mul` metadata, the attention
+softmax scale -- ported by reading `ggml`'s own CUDA `rope_yarn()`
+(`ggml/src/ggml-cuda/rope.cu`), `llama-context.cpp`'s YaRN `cparams` setup, and
+`deepseek2.cpp`'s `kq_scale` computation, all in full, since this is genuinely
+separate math from everything else in this codebase, not a simple scale-factor
+tweak. One real gotcha worth recording: the GGUF stores `rope_yarn_log_mul`
+pre-multiplied by `0.1` by the converter, and llama.cpp's own loader divides it back
+out before use (`[TAG_DEEPSEEK2_YARN_LOG_MUL_FIX]`) -- every downstream formula
+assumes the *undone* value, so this codebase's `parse_mla_config` replicates that
+same undo.
+
+**Fixture-finding gotcha, worth recording**: every pre-quantized DeepSeek-V2-Lite
+GGUF found on Hugging Face (`mradermacher`, `tensorblock`, `duyntnet`, `bartowski`'s
+Coder-V2-Lite variant) predates llama.cpp's MLA tensor-split conversion change --
+they still ship the legacy unsplit `attn_kv_b` tensor and lack
+`key_length_mla`/`value_length_mla` metadata entirely, so `parse_mla_config` rejects
+them outright with a clear message rather than silently misreading them. Checking
+this cheaply (an HTTP range request for just the first ~20MB of each candidate,
+enough to read the GGUF header/metadata before the tensor-data-bounds check fails)
+avoided several unnecessary multi-GB downloads. The real fix was converting fresh
+from the original `deepseek-ai/DeepSeek-V2-Lite` safetensors checkpoint with this
+session's own confirmed-current `convert_hf_to_gguf.py` (`--outtype q8_0`, ~16.7GB
+output) rather than trusting any third-party quantization's age.
+
+Verified byte-exact against a real llama.cpp build on the real model, three prompts,
+this time genuine (not random-weight) completions: `"Hello"` -> `","`, `"Once upon a
+time"` -> `","`, `"The capital of France is"` -> `" Paris"` (correct!). All 55 unit
+tests and every prior architecture path's golden-token check (dense, MoE, hybrid,
+synthetic MLA) re-verified unaffected.
+
 Next: on-GPU dequant kernel (Phase 2 round 3, closing the remaining ~1.1x cold-start
-gap), or extending MLA to real DeepSeek-V2-Lite (MoE FFN + shared experts + an ~80GB
-H100 instance) -- open call, not yet decided.
+gap) -- the only item left on the open-call list now that MLA covers both a
+synthetic fixture and a real, full-scale MoE+YaRN model.

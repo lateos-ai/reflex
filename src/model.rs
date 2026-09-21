@@ -45,7 +45,7 @@
 use crate::aot::{self, AotKernel};
 use crate::dequant;
 use crate::gguf::{GgufFile, GgufValue};
-use crate::moe::route_top_k;
+use crate::moe::{route_top_k, route_top_k_with_norm};
 use crate::tokenizer::Tokenizer;
 use cudarc::driver::{CudaDevice, CudaSlice, CudaView, DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
@@ -246,18 +246,15 @@ fn parse_hybrid_layer_kinds(file: &GgufFile, architecture: &str, block_count: us
 }
 
 /// Derives [`MlaConfig`] and the layer count from a GGUF file's `deepseek2.*`
-/// metadata. Scope deliberately narrowed to what's needed for a first, narrow MLA
-/// implementation (same "naive/narrow first" precedent as every prior MVP step),
-/// each rejected case matching existing precedent (`qwen35moe`/MTP rejection):
-/// hard errors on Q-LoRA query decomposition (`attention.q_lora_rank` present and
-/// nonzero), MoE layers (`leading_dense_block_count < block_count` -- a real
-/// DeepSeek-V2/V3 file always has MoE layers past its dense-lead layers; only a
-/// dense-only file, like this MVP step's synthetic test fixture, is in scope),
-/// YaRN RoPE scaling, and MTP/NextN blocks. No small real `deepseek2`-architecture
-/// GGUF exists publicly (see README.md) -- verified against a synthetic fixture
-/// built via llama.cpp's own real `convert_hf_to_gguf.py` (authentic tensor
-/// layout, random weights), cross-checked against a real llama.cpp build.
-fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize), String> {
+/// metadata. Scope narrowed to real DeepSeek-V2/V3 files' actual shape (confirmed
+/// against a real `DeepSeek-V2-Lite` GGUF's metadata while extending this from the
+/// MVP-step-4 synthetic-fixture-only version): dense-lead + MoE-with-shared-expert
+/// FFN, `is_lite`-style direct `wq` (no Q-LoRA), and YaRN RoPE scaling are all
+/// supported now. Still hard-errors (matching existing `qwen35moe`/MTP rejection
+/// precedent) on: Q-LoRA query decomposition (`attention.q_lora_rank` present and
+/// nonzero -- no real small file needing this has been seen yet), MTP/NextN
+/// blocks, and any RoPE scaling type other than `"none"`/`"yarn"`.
+fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usize), String> {
     let architecture = "deepseek2";
     let key = |suffix: &str| format!("{architecture}.{suffix}");
 
@@ -273,20 +270,9 @@ fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize), String> {
 
     let leading_dense = u64_meta(file, &key("leading_dense_block_count"))
         .ok_or_else(|| format!("missing {}", key("leading_dense_block_count")))? as usize;
-    if leading_dense < block_count {
-        return Err(format!(
-            "{} ({leading_dense}) < block_count ({block_count}): MoE layers present, not supported by this MVP (dense-only deepseek2 files only)",
-            key("leading_dense_block_count")
-        ));
-    }
 
     if u64_meta(file, &key("attention.q_lora_rank")).filter(|&n| n > 0).is_some() {
         return Err(format!("{} (Q-LoRA query decomposition) is not supported by this MVP", key("attention.q_lora_rank")));
-    }
-
-    let rope_scaling_type = file.metadata.get(&key("rope.scaling.type")).and_then(GgufValue::as_str);
-    if matches!(rope_scaling_type, Some(t) if t != "none") {
-        return Err(format!("{} = {rope_scaling_type:?} (YaRN/RoPE scaling) is not supported by this MVP", key("rope.scaling.type")));
     }
 
     let hidden_size = u64_meta(file, &key("embedding_length")).ok_or_else(|| format!("missing {}", key("embedding_length")))? as usize;
@@ -294,7 +280,7 @@ fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize), String> {
     let kv_lora_rank =
         u64_meta(file, &key("attention.kv_lora_rank")).ok_or_else(|| format!("missing {}", key("attention.kv_lora_rank")))? as usize;
     let n_embd_head_k_mla = u64_meta(file, &key("attention.key_length_mla"))
-        .ok_or_else(|| format!("missing {}", key("attention.key_length_mla")))? as usize;
+        .ok_or_else(|| format!("missing {} (a legacy pre-MLA-split deepseek2 GGUF -- unsplit attn_kv_b, no key_length_mla/value_length_mla metadata -- is not supported by this MVP; reconvert from the original checkpoint with a current convert_hf_to_gguf.py)", key("attention.key_length_mla")))? as usize;
     let v_head_dim = u64_meta(file, &key("attention.value_length_mla"))
         .ok_or_else(|| format!("missing {}", key("attention.value_length_mla")))? as usize;
     let qk_rope_head_dim =
@@ -307,10 +293,14 @@ fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize), String> {
         ));
     }
     let qk_nope_head_dim = n_embd_head_k_mla - qk_rope_head_dim;
+    let rope_base = f32_meta(file, &key("rope.freq_base")).unwrap_or(10000.0);
 
+    // At least one dense-lead layer is required by this MVP step (true of every
+    // real DeepSeek-V2/V3 file seen, and of the synthetic all-dense test fixture) --
+    // an all-MoE deepseek2 file (leading_dense == 0) is not supported.
     let ffn_gate_info = file
         .tensor_info("blk.0.ffn_gate.weight")
-        .ok_or("missing blk.0.ffn_gate.weight tensor (MoE-only deepseek2 files are not supported by this MVP)")?;
+        .ok_or("missing blk.0.ffn_gate.weight tensor (an all-MoE deepseek2 file, leading_dense_block_count == 0, is not supported by this MVP)")?;
     let ffn_hidden_size = match ffn_gate_info.shape.as_slice() {
         [_in_features, out_features] => *out_features as usize,
         other => return Err(format!("blk.0.ffn_gate.weight has unexpected shape {other:?}")),
@@ -326,12 +316,78 @@ fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize), String> {
         other => return Err(format!("blk.0.attn_v_b.weight shape {other:?} doesn't match {} ({v_head_dim})", key("attention.value_length_mla"))),
     }
 
-    let rope_base = f32_meta(file, &key("rope.freq_base")).unwrap_or(10000.0);
+    let moe = if leading_dense < block_count {
+        let expert_used_count = u64_meta(file, &key("expert_used_count"))
+            .ok_or_else(|| format!("missing {} (expert_count > 0 implied by leading_dense_block_count < block_count)", key("expert_used_count")))?
+            as usize;
+        let ffn_gate_exps_info = file
+            .tensor_info(&format!("blk.{leading_dense}.ffn_gate_exps.weight"))
+            .ok_or_else(|| format!("missing blk.{leading_dense}.ffn_gate_exps.weight tensor"))?;
+        let n_ff_exp = match ffn_gate_exps_info.shape.as_slice() {
+            [_in_features, out_features, _expert_count] => *out_features as usize,
+            other => return Err(format!("blk.{leading_dense}.ffn_gate_exps.weight has unexpected shape {other:?}")),
+        };
+        let routed_scaling_factor = f32_meta(file, &key("expert_weights_scale")).unwrap_or(1.0);
+        // The converter only ever writes this key when the source model's
+        // `norm_topk_prob` is truthy (see `MlaMoeConfig`'s doc comment) -- absence
+        // means "don't renormalize", not "assume the usual true default".
+        let normalize_top_k = matches!(file.metadata.get(&key("expert_weights_norm")), Some(GgufValue::Bool(true)));
+        Some(MlaMoeConfig { expert_used_count, n_ff_exp, routed_scaling_factor, normalize_top_k })
+    } else {
+        None
+    };
+
+    let rope_scaling_type = file.metadata.get(&key("rope.scaling.type")).and_then(GgufValue::as_str);
+    let yarn = match rope_scaling_type {
+        None | Some("none") => None,
+        Some("yarn") => {
+            let factor = f32_meta(file, &key("rope.scaling.factor"))
+                .ok_or_else(|| format!("missing {}", key("rope.scaling.factor")))?;
+            let orig_ctx_len = u64_meta(file, &key("rope.scaling.original_context_length"))
+                .ok_or_else(|| format!("missing {}", key("rope.scaling.original_context_length")))? as f32;
+            // llama.cpp's own CLI-settable defaults (32.0/1.0), used when the GGUF
+            // doesn't override them -- real DeepSeek-V2-Lite doesn't set these keys
+            // either, relying on the same defaults.
+            let beta_fast = f32_meta(file, &key("rope.scaling.yarn_beta_fast")).unwrap_or(32.0);
+            let beta_slow = f32_meta(file, &key("rope.scaling.yarn_beta_slow")).unwrap_or(1.0);
+            // Stored pre-multiplied by 0.1 by the converter; the loader undoes that
+            // ([TAG_DEEPSEEK2_YARN_LOG_MUL_FIX] in a real llama.cpp build's
+            // `deepseek2.cpp` `load_arch_hparams`) before using it -- replicate that
+            // exactly, since every downstream formula assumes the undone value.
+            let yarn_log_mul_raw = f32_meta(file, &key("rope.scaling.yarn_log_multiplier")).unwrap_or(0.0) / 0.1;
+
+            let freq_scale = 1.0 / factor;
+            let ext_factor = 1.0f32;
+            let factor_ln = factor.ln();
+            // `cparams.yarn_attn_factor` after `llama-context.cpp`'s DEEPSEEK2
+            // special case (the ratio `get_mscale(factor,mscale)/get_mscale(factor,mscale_all_dims)`
+            // cancels to 1.0 whenever `mscale == mscale_all_dims`, which that special
+            // case forces) followed by its own `*= 1/(1+0.1*ln(factor))` cancellation.
+            let attn_factor = 1.0 / (1.0 + 0.1 * factor_ln);
+            // deepseek2.cpp's own "cancel the adjustment to get the original
+            // attn_factor" step -- reconstructs ~1.0 by construction, but computed
+            // explicitly (not hardcoded) to mirror the reference exactly.
+            let attn_factor_org = attn_factor * (1.0 + 0.1 * factor_ln);
+            let mscale_kq = attn_factor_org * (1.0 + 0.1 * yarn_log_mul_raw * factor_ln);
+            let attention_scale = mscale_kq * mscale_kq / (n_embd_head_k_mla as f32).sqrt();
+
+            // ggml_rope_yarn_corr_dims: start/end correction dims over the rotated
+            // width (qk_rope_head_dim), from beta_fast/beta_slow.
+            let corr_dim = |n_rot: f32| qk_rope_head_dim as f32 * (orig_ctx_len / (n_rot * 2.0 * std::f32::consts::PI)).ln() / (2.0 * rope_base.ln());
+            let corr_dim_start = corr_dim(beta_fast).floor().max(0.0);
+            let corr_dim_end = corr_dim(beta_slow).ceil().min(qk_rope_head_dim as f32 - 1.0);
+
+            Some(MlaYarnConfig { freq_scale, ext_factor, attn_factor, corr_dim_start, corr_dim_end, attention_scale })
+        }
+        Some(other) => return Err(format!("{} = {other:?} (only \"none\"/\"yarn\" RoPE scaling is supported by this MVP)", key("rope.scaling.type"))),
+    };
+
     let rmsnorm_eps = f32_meta(file, &key("attention.layer_norm_rms_epsilon")).unwrap_or(1e-6);
 
     Ok((
-        MlaConfig { hidden_size, num_heads, qk_rope_head_dim, qk_nope_head_dim, kv_lora_rank, ffn_hidden_size, rope_base, rmsnorm_eps },
+        MlaConfig { hidden_size, num_heads, qk_rope_head_dim, qk_nope_head_dim, kv_lora_rank, ffn_hidden_size, rope_base, rmsnorm_eps, moe, yarn },
         block_count,
+        leading_dense,
     ))
 }
 
@@ -411,9 +467,92 @@ struct MlaConfig {
     /// of "latent" attention. Also the per-head width of `Vcur` before
     /// decompression via `wv_b`.
     kv_lora_rank: usize,
+    /// FFN hidden size of the dense-lead layers (`leading_dense_block_count`
+    /// layers at the start of the model, always at least 1 for every real
+    /// DeepSeek-V2/V3 file this MVP step targets). Layers past that use `moe`'s
+    /// `n_ff_exp` instead (see `MlaFfn::Moe`).
     ffn_hidden_size: usize,
     rope_base: f32,
     rmsnorm_eps: f32,
+    /// `Some` iff this file has MoE layers past its dense-lead layers (a real
+    /// DeepSeek-V2/V3 file always does; the synthetic MVP-step-4 test fixture is
+    /// dense-only, so `None` there).
+    moe: Option<MlaMoeConfig>,
+    /// `Some` iff `deepseek2.rope.scaling.type == "yarn"` (every real DeepSeek-V2/V3
+    /// file this MVP step has seen; the synthetic test fixture sets no rope scaling
+    /// at all, so `None` there).
+    yarn: Option<MlaYarnConfig>,
+}
+
+/// MoE routing config for MLA layers past `leading_dense_block_count`. Mirrors
+/// [`MoeMetaConfig`]'s role for the dense/GQA path, plus the two things real
+/// DeepSeek-V2/V3 adds beyond Qwen3-MoE's convention (see
+/// `Model::forward_mla_moe_ffn`): an always-on shared expert (not gated by the
+/// router) and `normalize_top_k = false` (confirmed against a real
+/// `DeepSeek-V2-Lite` GGUF: `expert_weights_norm` is absent, and the converter only
+/// ever writes that key when the source `norm_topk_prob` is truthy -- so its
+/// absence here means "don't renormalize", not "key missing, assume default true"
+/// the way most other optional keys in this codebase work).
+struct MlaMoeConfig {
+    expert_used_count: usize,
+    /// Routed-expert FFN hidden size (`blk.{first_moe_layer}.ffn_gate_exps.weight`'s
+    /// shape) -- distinct from `MlaConfig::ffn_hidden_size` (the dense-lead layers').
+    n_ff_exp: usize,
+    /// `expert_weights_scale` metadata (default `1.0`, a no-op) -- see
+    /// `crate::moe`'s doc comment for the identical Qwen3-MoE convention.
+    routed_scaling_factor: f32,
+    /// `expert_weights_norm` metadata, default `false` if absent (see this
+    /// struct's own doc comment for why the default differs from most other
+    /// optional keys in this codebase).
+    normalize_top_k: bool,
+}
+
+/// Precomputed YaRN RoPE-scaling parameters for MLA's `q_pe`/`k_pe` rotation
+/// (`Model::rope_norm_yarn`) and attention softmax scale
+/// (`Model::forward_mla_attn_block`). Derived once at load time
+/// (`parse_mla_config`) from `deepseek2.rope.scaling.*` metadata, mirroring
+/// `llama-context.cpp`'s YaRN setup and `deepseek2.cpp`'s own `kq_scale`
+/// computation (both read in full while implementing this -- see DECISIONS.md).
+struct MlaYarnConfig {
+    /// `1 / rope.scaling.factor`.
+    freq_scale: f32,
+    /// Always `1.0` when YaRN is active (matches llama.cpp's own default when no
+    /// CLI override is given) -- this codebase has no CLI, so always `1.0` here.
+    ext_factor: f32,
+    /// The (already-`DEEPSEEK2`-special-cased) `attn_factor` fed into the rotation
+    /// itself -- **not** the same value as `deepseek2.cpp`'s own `kq_scale`
+    /// computation, which independently reconstructs and further adjusts it (see
+    /// `attention_scale` below).
+    attn_factor: f32,
+    corr_dim_start: f32,
+    corr_dim_end: f32,
+    /// Precomputed final attention softmax scale, replacing the non-YaRN
+    /// `1/sqrt(qk_nope_head_dim+qk_rope_head_dim)` -- see `Model::mla_attention`'s
+    /// doc comment for why this dimension (not the compressed one) is scaled, and
+    /// `parse_mla_config` for the YaRN-specific `mscale^2/sqrt(...)` derivation.
+    attention_scale: f32,
+}
+
+/// One MLA layer's FFN: dense SwiGLU for the `leading_dense_block_count` lead
+/// layers (identical in shape/meaning to `DenseLayerWeights`'s), or routed MoE +
+/// an always-on shared expert for every layer past that (real DeepSeek-V2/V3
+/// files always have both kinds; the synthetic MVP-step-4 fixture is
+/// `Dense`-only). See `Model::forward_mla_moe_ffn` for the shared-expert math --
+/// its weights (`ffn_{gate,up,down}_shexp`) are a *single* fused dense FFN over
+/// `n_ff_exp * expert_shared_count` hidden units (every shared expert's weights
+/// concatenated into one bigger matmul), not `expert_shared_count` separate
+/// per-expert calls -- confirmed against `deepseek2.cpp`'s own tensor shapes.
+enum MlaFfn {
+    Dense { ffn_gate: Weight, ffn_up: Weight, ffn_down: Weight },
+    Moe {
+        ffn_gate_inp: Weight,
+        ffn_gate_exps: Weight,
+        ffn_up_exps: Weight,
+        ffn_down_exps: Weight,
+        ffn_gate_shexp: Weight,
+        ffn_up_shexp: Weight,
+        ffn_down_shexp: Weight,
+    },
 }
 
 /// One MLA layer's weights. Tensor names/shapes confirmed against a real
@@ -423,8 +562,8 @@ struct MlaConfig {
 /// per-head-stacked tensors (`[in_features, out_features, n_head]`, the same
 /// layout convention as MoE's per-expert tensors -- see `Model::gemv_expert`'s doc
 /// comment -- just "expert" -> "head"; every head is always used here, unlike MoE's
-/// top-k selection). Dense SwiGLU FFN (`ffn_gate`/`ffn_up`/`ffn_down`), identical in
-/// shape/meaning to `DenseLayerWeights`'s (MoE FFN is out of scope this round).
+/// top-k selection). `ffn` is dense SwiGLU for the lead layers or routed-MoE +
+/// shared-expert for the rest -- see [`MlaFfn`].
 struct MlaLayerWeights {
     attn_norm: Weight,
     /// `[hidden, n_head*(qk_nope_head_dim+qk_rope_head_dim)]` -- direct projection,
@@ -441,9 +580,7 @@ struct MlaLayerWeights {
     /// `[n_head*v_head_dim, hidden]`.
     wo: Weight,
     ffn_norm: Weight,
-    ffn_gate: Weight,
-    ffn_up: Weight,
-    ffn_down: Weight,
+    ffn: MlaFfn,
 }
 
 /// A loaded DeepSeek-V2/V3 MLA model's extra state, layered on top of the same
@@ -460,6 +597,11 @@ struct MlaModel {
     /// `LLAMA_ROPE_TYPE_NORM` (consecutive-pair rotation), not the
     /// `LLAMA_ROPE_TYPE_NEOX` (half-split) convention Qwen3/Qwen3.5 use.
     rope_norm_k: AotKernel,
+    /// `rope_norm_yarn_kernel` -- used instead of `rope_norm_k` whenever
+    /// `cfg.yarn.is_some()` (see `Model::forward_mla_attn_block`). Always loaded
+    /// (even for the synthetic, YaRN-free MVP-step-4 fixture) since the tiny
+    /// extra load cost isn't worth an `Option`.
+    rope_norm_yarn_k: AotKernel,
 }
 
 /// Per-sequence recurrent state for one hybrid layer, matching
@@ -832,12 +974,11 @@ impl Model {
     }
 
     /// Loads a DeepSeek-V2/V3 MLA model (MVP step 4). See [`parse_mla_config`] for
-    /// the scope this supports (dense-only, no Q-LoRA, no YaRN, no MTP).
-    /// `cfg`/`layers`/`expert_used_count` below are unused garbage (matching the
-    /// `hybrid` path's own convention) -- `forward_prompt` branches on `self.mla`
-    /// before touching them.
+    /// the scope this supports. `cfg`/`layers`/`expert_used_count` below are
+    /// unused garbage (matching the `hybrid` path's own convention) --
+    /// `forward_prompt` branches on `self.mla` before touching them.
     fn load_mla(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
-        let (mla_cfg, block_count) = parse_mla_config(file)?;
+        let (mla_cfg, block_count, leading_dense) = parse_mla_config(file)?;
 
         let rmsnorm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_RMSNORM"), "rmsnorm", "rmsnorm_kernel")?;
         let rope_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope", "rope_kernel")?;
@@ -849,6 +990,8 @@ impl Model {
         let mla_attn_k =
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_MLA_ATTENTION"), "mla_attention", "mla_attention_kernel")?;
         let rope_norm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_norm", "rope_norm_kernel")?;
+        let rope_norm_yarn_k =
+            aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_norm_yarn", "rope_norm_yarn_kernel")?;
 
         let load_weight = |name: &str| -> Result<Weight, String> {
             let info = file.tensor_info(name).ok_or_else(|| format!("missing weight '{name}'"))?;
@@ -860,6 +1003,23 @@ impl Model {
 
         let mut layers = Vec::with_capacity(block_count);
         for i in 0..block_count {
+            let ffn = if i < leading_dense {
+                MlaFfn::Dense {
+                    ffn_gate: load_weight(&format!("blk.{i}.ffn_gate.weight"))?,
+                    ffn_up: load_weight(&format!("blk.{i}.ffn_up.weight"))?,
+                    ffn_down: load_weight(&format!("blk.{i}.ffn_down.weight"))?,
+                }
+            } else {
+                MlaFfn::Moe {
+                    ffn_gate_inp: load_weight(&format!("blk.{i}.ffn_gate_inp.weight"))?,
+                    ffn_gate_exps: load_weight(&format!("blk.{i}.ffn_gate_exps.weight"))?,
+                    ffn_up_exps: load_weight(&format!("blk.{i}.ffn_up_exps.weight"))?,
+                    ffn_down_exps: load_weight(&format!("blk.{i}.ffn_down_exps.weight"))?,
+                    ffn_gate_shexp: load_weight(&format!("blk.{i}.ffn_gate_shexp.weight"))?,
+                    ffn_up_shexp: load_weight(&format!("blk.{i}.ffn_up_shexp.weight"))?,
+                    ffn_down_shexp: load_weight(&format!("blk.{i}.ffn_down_shexp.weight"))?,
+                }
+            };
             layers.push(MlaLayerWeights {
                 attn_norm: load_weight(&format!("blk.{i}.attn_norm.weight"))?,
                 wq: load_weight(&format!("blk.{i}.attn_q.weight"))?,
@@ -869,9 +1029,7 @@ impl Model {
                 wv_b: load_weight(&format!("blk.{i}.attn_v_b.weight"))?,
                 wo: load_weight(&format!("blk.{i}.attn_output.weight"))?,
                 ffn_norm: load_weight(&format!("blk.{i}.ffn_norm.weight"))?,
-                ffn_gate: load_weight(&format!("blk.{i}.ffn_gate.weight"))?,
-                ffn_up: load_weight(&format!("blk.{i}.ffn_up.weight"))?,
-                ffn_down: load_weight(&format!("blk.{i}.ffn_down.weight"))?,
+                ffn,
             });
         }
 
@@ -928,7 +1086,7 @@ impl Model {
             lm_head,
             tokenizer,
             hybrid: None,
-            mla: Some(MlaModel { cfg: mla_cfg, layers, mla_attn_k, rope_norm_k }),
+            mla: Some(MlaModel { cfg: mla_cfg, layers, mla_attn_k, rope_norm_k, rope_norm_yarn_k }),
         })
     }
 
@@ -1059,6 +1217,53 @@ impl Model {
                 .clone()
                 .launch(launch_cfg, (t, position as u32, num_heads as u32, head_dim as u32, rotary_dim as u32, base))
                 .map_err(|e| format!("rope_norm launch: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::rope_norm`], but launches `m.rope_norm_yarn_k`
+    /// (`rope_norm_yarn_kernel`) with the extra YaRN parameters from
+    /// `cfg.yarn` (see `MlaYarnConfig`'s doc comment). Used instead of
+    /// `Self::rope_norm` whenever `cfg.yarn.is_some()`.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_norm_yarn(
+        &self,
+        m: &MlaModel,
+        yarn: &MlaYarnConfig,
+        t: &mut CudaSlice<f32>,
+        num_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        position: usize,
+        base: f32,
+    ) -> Result<(), String> {
+        let half_rotary = rotary_dim / 2;
+        let total_pairs = (num_heads * half_rotary) as u32;
+        let threads = 256u32;
+        let blocks = total_pairs.div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+
+        unsafe {
+            m.rope_norm_yarn_k
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (
+                        t,
+                        position as u32,
+                        num_heads as u32,
+                        head_dim as u32,
+                        rotary_dim as u32,
+                        base,
+                        yarn.freq_scale,
+                        yarn.ext_factor,
+                        yarn.attn_factor,
+                        yarn.corr_dim_start,
+                        yarn.corr_dim_end,
+                    ),
+                )
+                .map_err(|e| format!("rope_norm_yarn launch: {e}"))?;
         }
         Ok(())
     }
@@ -1769,7 +1974,10 @@ impl Model {
             let src = kv_cmpr_pe.slice(kv_lora..kv_lora + qk_rope);
             self.device.dtod_copy(&src, &mut k_pe).map_err(|e| format!("mla k_pe dtod: {e}"))?;
         }
-        self.rope_norm(m, &mut k_pe, 1, qk_rope, qk_rope, position, cfg.rope_base)?;
+        match &cfg.yarn {
+            Some(yarn) => self.rope_norm_yarn(m, yarn, &mut k_pe, 1, qk_rope, qk_rope, position, cfg.rope_base)?,
+            None => self.rope_norm(m, &mut k_pe, 1, qk_rope, qk_rope, position, cfg.rope_base)?,
+        }
 
         let mut kv_cmpr_owned = self.device.alloc_zeros::<f32>(kv_lora).map_err(|e| format!("mla kv_cmpr alloc: {e}"))?;
         {
@@ -1788,7 +1996,10 @@ impl Model {
             let mut dst = q_pe.slice_mut(h * qk_rope..(h + 1) * qk_rope);
             self.device.dtod_copy(&src, &mut dst).map_err(|e| format!("mla q_pe dtod head {h}: {e}"))?;
         }
-        self.rope_norm(m, &mut q_pe, n_head, qk_rope, qk_rope, position, cfg.rope_base)?;
+        match &cfg.yarn {
+            Some(yarn) => self.rope_norm_yarn(m, yarn, &mut q_pe, n_head, qk_rope, qk_rope, position, cfg.rope_base)?,
+            None => self.rope_norm(m, &mut q_pe, n_head, qk_rope, qk_rope, position, cfg.rope_base)?,
+        }
 
         // Per head: absorb q_nope via wk_b, then concat with the (already-roped)
         // q_pe slice into Qcur's per-head [qk_dim]-wide row.
@@ -1822,8 +2033,12 @@ impl Model {
 
         let kv_view = kv_cache.slice(0..seq_len * qk_dim);
         // Scale uses the *uncompressed* per-head dim (n_embd_head_k_mla), not
-        // qk_dim -- see `Self::mla_attention`'s doc comment.
-        let scale = 1.0 / (n_embd_head_k_mla as f32).sqrt();
+        // qk_dim -- see `Self::mla_attention`'s doc comment. YaRN adjusts this via
+        // its own precomputed mscale^2/sqrt(...) (see `MlaYarnConfig`).
+        let scale = match &cfg.yarn {
+            Some(yarn) => yarn.attention_scale,
+            None => 1.0 / (n_embd_head_k_mla as f32).sqrt(),
+        };
         let compressed_out = self.mla_attention(m, &qcur, &kv_view, n_head, qk_dim, v_dim, seq_len, scale)?;
 
         let decompressed = self.gemv_per_head(&compressed_out, &w.wv_b, n_head)?;
@@ -1925,6 +2140,64 @@ impl Model {
     /// rationale as `forward_prompt`'s/`forward_prompt_hybrid`'s own caches: the
     /// full prompt's token count is already known before the per-position loop
     /// starts).
+    /// MLA's routed-MoE + shared-expert FFN tail (real DeepSeek-V2/V3 layers past
+    /// `leading_dense_block_count` -- see `MlaFfn::Moe`). Structurally
+    /// `forward_layer_moe`'s router+per-expert dispatch (`crate::moe::route_top_k_with_norm`,
+    /// `Self::gemv_expert`, host-side weighted accumulate -- same "stays
+    /// host-driven, small expert count, not addressed by Phase 2 round 2"
+    /// convention), plus one addition real DeepSeek-V2/V3 has and Qwen3-MoE
+    /// doesn't: an always-on shared expert, computed as a single dense FFN (its
+    /// `ffn_{gate,up,down}_shexp` weights already fuse every shared expert into
+    /// one bigger matmul -- see `MlaFfn`'s doc comment) and added to the
+    /// accumulator unconditionally, not gated by the router.
+    fn forward_mla_moe_ffn(
+        &self,
+        layer: &MlaLayerWeights,
+        mut post_attn: CudaSlice<f32>,
+        hidden_size: usize,
+        moe_cfg: &MlaMoeConfig,
+        eps: f32,
+    ) -> Result<CudaSlice<f32>, String> {
+        let MlaFfn::Moe { ffn_gate_inp, ffn_gate_exps, ffn_up_exps, ffn_down_exps, ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp } = &layer.ffn
+        else {
+            return Err("internal error: forward_mla_moe_ffn called on a Dense layer".to_string());
+        };
+
+        let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, 1, hidden_size, eps)?;
+
+        let router_logits_dev = self.gemv(&ffn_normed, ffn_gate_inp)?;
+        let router_logits = self.device.dtoh_sync_copy(&router_logits_dev).map_err(|e| format!("mla moe router dtoh: {e}"))?;
+        let routed = route_top_k_with_norm(&router_logits, moe_cfg.expert_used_count, moe_cfg.normalize_top_k)?;
+
+        let mut ffn_out = vec![0.0f32; hidden_size];
+        for (expert_idx, weight) in routed {
+            let gate = self.gemv_expert(&ffn_normed, ffn_gate_exps, expert_idx)?;
+            let up = self.gemv_expert(&ffn_normed, ffn_up_exps, expert_idx)?;
+            let activated = self.silu_and_mul(&gate, &up, moe_cfg.n_ff_exp)?;
+            let down = self.gemv_expert(&activated, ffn_down_exps, expert_idx)?;
+            let down_host = self.device.dtoh_sync_copy(&down).map_err(|e| format!("mla moe expert down dtoh: {e}"))?;
+            for (o, d) in ffn_out.iter_mut().zip(down_host.iter()) {
+                *o += weight * moe_cfg.routed_scaling_factor * d;
+            }
+        }
+
+        // Always-on shared expert(s) -- a single fused dense FFN, not gated by the
+        // router, added unconditionally.
+        let shared_hidden_size = ffn_gate_shexp.shape[1] as usize;
+        let shared_gate = self.gemv(&ffn_normed, ffn_gate_shexp)?;
+        let shared_up = self.gemv(&ffn_normed, ffn_up_shexp)?;
+        let shared_activated = self.silu_and_mul(&shared_gate, &shared_up, shared_hidden_size)?;
+        let shared_down = self.gemv(&shared_activated, ffn_down_shexp)?;
+        let shared_down_host = self.device.dtoh_sync_copy(&shared_down).map_err(|e| format!("mla moe shared down dtoh: {e}"))?;
+        for (o, d) in ffn_out.iter_mut().zip(shared_down_host.iter()) {
+            *o += d;
+        }
+
+        let ffn_out_dev = self.device.htod_sync_copy(&ffn_out).map_err(|e| format!("mla moe ffn_out htod: {e}"))?;
+        self.add_inplace(&mut post_attn, &ffn_out_dev)?;
+        Ok(post_attn)
+    }
+
     fn forward_prompt_mla(&self, m: &MlaModel, prompt: &str) -> Result<(u32, String), String> {
         let mut ids = self.tokenizer.encode(prompt)?;
         if let Some(bos) = self.tokenizer.bos_token_id {
@@ -1956,16 +2229,15 @@ impl Model {
 
             for (layer_idx, layer) in m.layers.iter().enumerate() {
                 let post_attn = self.forward_mla_attn_block(m, layer, hidden, position, &mut kv_caches[layer_idx])?;
-                hidden = self.forward_hybrid_ffn(
-                    post_attn,
-                    &layer.ffn_norm,
-                    &layer.ffn_gate,
-                    &layer.ffn_up,
-                    &layer.ffn_down,
-                    hidden_size,
-                    ffn_hidden_size,
-                    eps,
-                )?;
+                hidden = match &layer.ffn {
+                    MlaFfn::Dense { ffn_gate, ffn_up, ffn_down } => {
+                        self.forward_hybrid_ffn(post_attn, &layer.ffn_norm, ffn_gate, ffn_up, ffn_down, hidden_size, ffn_hidden_size, eps)?
+                    }
+                    MlaFfn::Moe { .. } => {
+                        let moe_cfg = cfg.moe.as_ref().ok_or("internal error: MlaFfn::Moe layer but MlaConfig::moe is None")?;
+                        self.forward_mla_moe_ffn(layer, post_attn, hidden_size, moe_cfg, eps)?
+                    }
+                };
             }
             hidden_dev = Some(hidden);
         }
