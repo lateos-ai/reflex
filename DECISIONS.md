@@ -261,6 +261,32 @@ reading `ggml`'s own CUDA `rope_yarn()`, `llama-context.cpp`'s YaRN `cparams` se
 and `deepseek2.cpp`'s `kq_scale` computation in full, not derived from first
 principles or copied from a simplified description.
 
+## On-GPU dequant kernel: only Q4_K/Q6_K, not all 18 block types
+
+**Decision**: Phase 2 (Fast IO) round 3's on-device dequant kernels
+(`kernels_cuda/dequant.cu`) cover only `Q4_K` and `Q6_K`. Every other GGUF block type
+this project supports on the host (`Q4_0/1`, `Q5_0/1`, `Q8_0/1`, `Q2_K`/`Q3_K`/`Q5_K`/
+`Q8_K`, all 8 IQ-family formats) still dequantizes via the existing
+`dequant::dequantize`/`dequant_iq::dequantize_block_*` host path, unchanged.
+`model.rs`'s new `dequantize_tensor_to_device` dispatches on `ggml_type` per tensor and
+falls back to the host path for anything that isn't `Q4_K`/`Q6_K`.
+
+**Why**: this project's only three local `Q4_K_M` GGUF fixtures (`Qwen3-0.6B`,
+`Tiny-Moe`, `Qwen3.5-0.8B`) use `Q4_K`/`Q6_K` for the overwhelming majority of weight
+bytes — writing GPU kernels for the other 16 types would be real new-kernel-writing
+work with no local fixture able to prove them byte-exact (the synthetic MLA fixture and
+the real DeepSeek-V2-Lite checkpoint both use F16/F32 and Q8_0 respectively, neither of
+which needed a new kernel to begin with — Q8_0's dequant is already a trivial `x = d*q`
+per-element multiply, not a meaningful CPU-time contributor next to K-quant's bit-
+unpacking). Confirmed with the user before starting (this project's usual practice for
+open-ended follow-up work — see STATUS.md's prior "Open decision" entries) with this
+exact scope question asked explicitly, rather than assumed.
+
+**How to apply**: if a future fixture or real deployment target exercises another
+block type for the bulk of its weight bytes, extend `dequantize_tensor_to_device`
+(`model.rs`) and `dequant.cu` for that type specifically, verified byte-exact against
+that fixture — don't add speculative coverage for types nothing here can verify.
+
 ## Cold-start-vs-llama.cpp benchmark methodology
 
 **Decision**: measure with external wall-clock (`/usr/bin/time -v`, process launch to

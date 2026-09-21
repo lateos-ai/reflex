@@ -44,7 +44,7 @@
 
 use crate::aot::{self, AotKernel};
 use crate::dequant;
-use crate::gguf::{GgufFile, GgufValue};
+use crate::gguf::{GgmlType, GgufFile, GgufValue};
 use crate::moe::{route_top_k, route_top_k_with_norm};
 use crate::tokenizer::Tokenizer;
 use cudarc::driver::{CudaDevice, CudaSlice, CudaView, DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig};
@@ -90,6 +90,99 @@ pub struct LayerConfig {
 struct Weight {
     data: CudaSlice<f32>,
     shape: Vec<u64>,
+}
+
+/// GGUF super-block sizes for the two block types dequantized on-device
+/// (`src/kernels_cuda/dequant.cu`, Phase 2 round 3) -- must match
+/// `dequant.rs`'s `QK_K` and the block-byte-size table
+/// `gguf.rs::ggml_type_size_bytes` computes independently for the same types.
+const QK_K: usize = 256;
+const Q4K_BLOCK_BYTES: usize = 144;
+const Q6K_BLOCK_BYTES: usize = 210;
+
+/// Dequantizes one tensor's raw quantized bytes straight to a device-resident
+/// `f32` buffer. Q4_K/Q6_K (Phase 2 round 3: the block types this project's
+/// local Q4_K_M fixtures exercise for the bulk of weight bytes) dequantize
+/// on-device via `src/kernels_cuda/dequant.cu` -- no host `f32` copy is ever
+/// materialized for these, closing the gap with llama.cpp's CUDA backend,
+/// which never materializes one either (see README.md's Phase 2 round 3
+/// writeup). Every other block type still falls back to the existing host
+/// `dequant::dequantize` path (`src/dequant.rs`/`dequant_iq.rs`) -- correct
+/// but not (yet) GPU-accelerated.
+fn dequantize_tensor_to_device(
+    device: &Arc<CudaDevice>,
+    dequant_q4k_k: &AotKernel,
+    dequant_q6k_k: &AotKernel,
+    ggml_type: GgmlType,
+    bytes: &[u8],
+    element_count: u64,
+) -> Result<CudaSlice<f32>, String> {
+    match ggml_type {
+        GgmlType::Q4K => dequantize_on_device(device, dequant_q4k_k, Q4K_BLOCK_BYTES, bytes, element_count),
+        GgmlType::Q6K => dequantize_on_device(device, dequant_q6k_k, Q6K_BLOCK_BYTES, bytes, element_count),
+        other => {
+            let host = dequant::dequantize(other, bytes, element_count)?;
+            device.htod_sync_copy(&host).map_err(|e| format!("upload weight to device: {e}"))
+        }
+    }
+}
+
+/// Uploads `bytes` (raw quantized block bytes, unmodified) to device memory
+/// and launches `kernel` (`dequantize_q4k_kernel`/`dequantize_q6k_kernel`) to
+/// unpack them into a fresh `f32` buffer, one CUDA thread per `QK_K`-element
+/// block. Truncates to `element_count` if the last block is only partially
+/// used (ggml's own invariant is that a quantized tensor's element count is
+/// always a block-size multiple, so this is defensive, matching
+/// `dequant::dequantize`'s own truncation).
+fn dequantize_on_device(
+    device: &Arc<CudaDevice>,
+    kernel: &AotKernel,
+    block_bytes: usize,
+    bytes: &[u8],
+    element_count: u64,
+) -> Result<CudaSlice<f32>, String> {
+    let num_blocks = bytes.len() / block_bytes;
+    let raw = device.htod_sync_copy(bytes).map_err(|e| format!("upload raw quantized bytes: {e}"))?;
+    let out_len = num_blocks * QK_K;
+    let mut dev_out = device.alloc_zeros::<f32>(out_len).map_err(|e| format!("alloc dequant output: {e}"))?;
+
+    let threads = 256u32;
+    let blocks = (num_blocks as u32).div_ceil(threads).max(1);
+    let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+    unsafe {
+        kernel
+            .function
+            .clone()
+            .launch(launch_cfg, (&raw, &mut dev_out, num_blocks as u32))
+            .map_err(|e| format!("dequant kernel launch: {e}"))?;
+    }
+
+    if out_len as u64 == element_count {
+        return Ok(dev_out);
+    }
+    let n = element_count as usize;
+    let mut truncated = device.alloc_zeros::<f32>(n).map_err(|e| format!("alloc truncated dequant output: {e}"))?;
+    let src = dev_out.slice(0..n);
+    device.dtod_copy(&src, &mut truncated).map_err(|e| format!("truncate dequant output: {e}"))?;
+    Ok(truncated)
+}
+
+/// Loads and dequantizes weight `name` straight to a device-resident `f32`
+/// buffer -- shared by `Model::load`/`load_hybrid`/`load_mla`'s own
+/// `load_weight` closures (see [`dequantize_tensor_to_device`] for the
+/// on-device-vs-host dispatch).
+fn load_weight_device(
+    device: &Arc<CudaDevice>,
+    dequant_q4k_k: &AotKernel,
+    dequant_q6k_k: &AotKernel,
+    file: &GgufFile,
+    name: &str,
+) -> Result<Weight, String> {
+    let info = file.tensor_info(name).ok_or_else(|| format!("missing weight '{name}'"))?;
+    let bytes = file.tensor_bytes(info)?;
+    let data = dequantize_tensor_to_device(device, dequant_q4k_k, dequant_q6k_k, info.ggml_type, bytes, info.element_count())
+        .map_err(|e| format!("load weight '{name}': {e}"))?;
+    Ok(Weight { data, shape: info.shape.clone() })
 }
 
 struct DenseLayerWeights {
@@ -699,18 +792,24 @@ impl Model {
         let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
         let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
         let add_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ELEMENTWISE"), "elementwise", "add_kernel")?;
+        let mut dequant_fns = aot::load_kernel_module(
+            &device,
+            env!("COLDSTART_KERNEL_DEQUANT"),
+            "dequant",
+            &["dequantize_q4k_kernel", "dequantize_q6k_kernel"],
+        )?
+        .into_iter();
+        let dequant_q4k_k = dequant_fns.next().ok_or("missing dequantize_q4k_kernel")?;
+        let dequant_q6k_k = dequant_fns.next().ok_or("missing dequantize_q6k_kernel")?;
 
-        // Dequantizes straight from the mmap'd GGUF bytes into a scratch host
-        // `Vec<f32>`, uploads it to device memory, then drops the host copy
-        // (goes out of scope) -- unlike before, no dequantized weight stays
-        // host-resident for the model's lifetime, and no forward-pass call
-        // re-uploads it (see `Weight`'s doc comment).
+        // Dequantizes straight from the mmap'd GGUF bytes (on-device for
+        // Q4_K/Q6_K, Phase 2 round 3; host `Vec<f32>` scratch, immediately
+        // dropped, for every other type) into device memory -- unlike
+        // before round 1, no dequantized weight stays host-resident for the
+        // model's lifetime, and no forward-pass call re-uploads it (see
+        // `Weight`'s doc comment).
         let load_weight = |name: &str| -> Result<Weight, String> {
-            let info = file.tensor_info(name).ok_or_else(|| format!("missing weight '{name}'"))?;
-            let bytes = file.tensor_bytes(info)?;
-            let host = dequant::dequantize(info.ggml_type, bytes, info.element_count())?;
-            let data = device.htod_sync_copy(&host).map_err(|e| format!("upload weight '{name}' to device: {e}"))?;
-            Ok(Weight { data, shape: info.shape.clone() })
+            load_weight_device(&device, &dequant_q4k_k, &dequant_q6k_k, file, name)
         };
 
         let mut layers = Vec::with_capacity(block_count);
@@ -771,9 +870,15 @@ impl Model {
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
-                let host = dequant::dequantize(info.ggml_type, bytes, info.element_count())?;
-                let data =
-                    device.htod_sync_copy(&host).map_err(|e| format!("upload weight 'output.weight' to device: {e}"))?;
+                let data = dequantize_tensor_to_device(
+                    &device,
+                    &dequant_q4k_k,
+                    &dequant_q6k_k,
+                    info.ggml_type,
+                    bytes,
+                    info.element_count(),
+                )
+                .map_err(|e| format!("load weight 'output.weight': {e}"))?;
                 Weight { data, shape: info.shape.clone() }
             }
             None => {
@@ -875,13 +980,18 @@ impl Model {
         let gdn_gates_k = gdn_fns.next().ok_or("missing gdn_gates_kernel")?;
         let gdn_delta_k = gdn_fns.next().ok_or("missing gdn_delta_kernel")?;
         let gdn_gated_norm_k = gdn_fns.next().ok_or("missing gdn_gated_norm_kernel")?;
+        let mut dequant_fns = aot::load_kernel_module(
+            &device,
+            env!("COLDSTART_KERNEL_DEQUANT"),
+            "dequant",
+            &["dequantize_q4k_kernel", "dequantize_q6k_kernel"],
+        )?
+        .into_iter();
+        let dequant_q4k_k = dequant_fns.next().ok_or("missing dequantize_q4k_kernel")?;
+        let dequant_q6k_k = dequant_fns.next().ok_or("missing dequantize_q6k_kernel")?;
 
         let load_weight = |name: &str| -> Result<Weight, String> {
-            let info = file.tensor_info(name).ok_or_else(|| format!("missing weight '{name}'"))?;
-            let bytes = file.tensor_bytes(info)?;
-            let host = dequant::dequantize(info.ggml_type, bytes, info.element_count())?;
-            let data = device.htod_sync_copy(&host).map_err(|e| format!("upload weight '{name}' to device: {e}"))?;
-            Ok(Weight { data, shape: info.shape.clone() })
+            load_weight_device(&device, &dequant_q4k_k, &dequant_q6k_k, file, name)
         };
 
         let mut layers = Vec::with_capacity(block_count);
@@ -938,9 +1048,15 @@ impl Model {
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
-                let host = dequant::dequantize(info.ggml_type, bytes, info.element_count())?;
-                let data =
-                    device.htod_sync_copy(&host).map_err(|e| format!("upload weight 'output.weight' to device: {e}"))?;
+                let data = dequantize_tensor_to_device(
+                    &device,
+                    &dequant_q4k_k,
+                    &dequant_q6k_k,
+                    info.ggml_type,
+                    bytes,
+                    info.element_count(),
+                )
+                .map_err(|e| format!("load weight 'output.weight': {e}"))?;
                 Weight { data, shape: info.shape.clone() }
             }
             None => {
@@ -992,13 +1108,18 @@ impl Model {
         let rope_norm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_norm", "rope_norm_kernel")?;
         let rope_norm_yarn_k =
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_norm_yarn", "rope_norm_yarn_kernel")?;
+        let mut dequant_fns = aot::load_kernel_module(
+            &device,
+            env!("COLDSTART_KERNEL_DEQUANT"),
+            "dequant",
+            &["dequantize_q4k_kernel", "dequantize_q6k_kernel"],
+        )?
+        .into_iter();
+        let dequant_q4k_k = dequant_fns.next().ok_or("missing dequantize_q4k_kernel")?;
+        let dequant_q6k_k = dequant_fns.next().ok_or("missing dequantize_q6k_kernel")?;
 
         let load_weight = |name: &str| -> Result<Weight, String> {
-            let info = file.tensor_info(name).ok_or_else(|| format!("missing weight '{name}'"))?;
-            let bytes = file.tensor_bytes(info)?;
-            let host = dequant::dequantize(info.ggml_type, bytes, info.element_count())?;
-            let data = device.htod_sync_copy(&host).map_err(|e| format!("upload weight '{name}' to device: {e}"))?;
-            Ok(Weight { data, shape: info.shape.clone() })
+            load_weight_device(&device, &dequant_q4k_k, &dequant_q6k_k, file, name)
         };
 
         let mut layers = Vec::with_capacity(block_count);
@@ -1044,9 +1165,15 @@ impl Model {
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
-                let host = dequant::dequantize(info.ggml_type, bytes, info.element_count())?;
-                let data =
-                    device.htod_sync_copy(&host).map_err(|e| format!("upload weight 'output.weight' to device: {e}"))?;
+                let data = dequantize_tensor_to_device(
+                    &device,
+                    &dequant_q4k_k,
+                    &dequant_q6k_k,
+                    info.ggml_type,
+                    bytes,
+                    info.element_count(),
+                )
+                .map_err(|e| format!("load weight 'output.weight': {e}"))?;
                 Weight { data, shape: info.shape.clone() }
             }
             None => {

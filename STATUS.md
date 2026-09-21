@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `README.md` — this file is the
 short, current-state summary; README is the log.
 
-_Last updated: 2026-09-21 (MLA session)_
+_Last updated: 2026-09-21 (Phase 2 round 3 session)_
 
 ## MVP progress
 
@@ -20,11 +20,11 @@ _Last updated: 2026-09-21 (MLA session)_
 First real cold-start A/B benchmark vs. `llama.cpp` (`972d231`, same A6000, same
 `Qwen3-0.6B-Q4_K_M.gguf`, same prompt, full GPU offload, `n=3`):
 
-| | coldstart-infer (initial) | coldstart-infer (after Phase 2 round 1) | coldstart-infer (after Phase 2 round 2) | llama.cpp |
-|---|---|---|---|---|
-| wall clock | 28–30s | 10.4–11.7s | 6.4–8.5s | 6.44–6.46s |
-| peak RSS | 3.68 GB | 1.33 GB | 1.35 GB | 887 MB |
-| user+sys CPU time | 5.13s + 14.02s | ~3.2s + ~4.0s | ~2.1s + ~3.5s | ~1.0s + ~1.2s |
+| | coldstart-infer (initial) | round 1 | round 2 | round 3 | llama.cpp |
+|---|---|---|---|---|---|
+| wall clock | 28–30s | 10.4–11.7s | 6.4–8.5s | 6.38–6.46s | 6.44–6.67s |
+| peak RSS | 3.68 GB | 1.33 GB | 1.35 GB | 1.35 GB | ~887 MB |
+| user+sys CPU time | 5.13s + 14.02s | ~3.2s + ~4.0s | ~2.1s + ~3.5s | ~1.3s + ~2.2s | ~1.3s + ~1.4s |
 
 Root cause of the initial 4.3x gap: `model.rs`'s weight-loading path dequantized every
 tensor to a host `f32` buffer *and* re-uploaded that buffer to the GPU on every single
@@ -34,11 +34,14 @@ Phase 2 round 2 then converted every kernel-wrapper op (`rmsnorm`/`gemv`/`rope`/
 `silu_and_mul`/`attention`/the GDN mixer's kernels) to chain `CudaSlice<f32>` device
 buffers through a whole layer instead of round-tripping each op's activations over
 PCIe, and made the K/V cache device-resident (written via device-to-device copy)
-instead of re-uploading its full history every token position. Current gap: **~1.1x
-slower than llama.cpp** (peak RSS/CPU time gap unchanged from round 1 — round 2 didn't
-touch weight loading — so the residual gap is still attributed to the CPU-bound
-host-side dequant step, per llama.cpp's on-GPU dequant/matmul approach never
-materializing a full-`f32` host copy at all).
+instead of re-uploading its full history every token position, closing the gap to
+~1.1x. Phase 2 round 3 added on-GPU dequant kernels for `Q4_K`/`Q6_K` (the block types
+this project's `Q4_K_M` fixtures use for the bulk of weight bytes —
+`kernels_cuda/dequant.cu`, one CUDA thread per 256-element super-block), removing the
+CPU-bound host-side dequant-to-`f32` step from the load path for those types (every
+other block type still uses the existing host path). **Current gap: ~1.0x — parity with
+llama.cpp, within run-to-run noise** (see README.md's "Phase 2, round 3" section for
+the full writeup and per-run numbers).
 
 ## MLA (MVP step 4)
 
@@ -61,13 +64,24 @@ llama.cpp builds.
 
 ## Open decision (not yet resolved)
 
-Only one item left on the list: Phase 2 Fast IO round 3 (an on-GPU dequant kernel, to
-close the remaining ~1.1x cold-start gap vs. llama.cpp) — MLA now covers both a
-synthetic fixture and a real, full-scale MoE+YaRN model, so it's no longer competing
-for priority. Confirm with the user before starting, per this project's usual practice.
+None currently open. Phase 2 (Fast IO) round 3 (the last item on the prior list, an
+on-GPU dequant kernel) is done — see "Performance" above. Remaining low-priority
+follow-ups (not blocking, not actively planned): a real small `qwen3moe`-architecture
+GGUF fixture (see "Known debt" below), on-device dequant coverage for the 15+ GGUF
+block types still on the host path (Q4_0/1, Q5_0/1, Q8_0/1, Q2_K/Q3_K/Q5_K/Q8_K, the
+IQ-family formats — none exercised by a local fixture's bulk weight bytes), and MoE's
+per-expert weighted-sum accumulation / the Gated Attention mixer's fused-qg gating
+still round-tripping through the host (flagged, not measured as worth closing).
 
 ## Known debt / limitations
 
+- **Phase 2 round 3 on-device dequant scope**: only `Q4_K`/`Q6_K` dequantize on-GPU
+  (`kernels_cuda/dequant.cu`). Every other GGUF block type (`Q4_0/1`, `Q5_0/1`,
+  `Q8_0/1`, `Q2_K`/`Q3_K`/`Q5_K`/`Q8_K`, all 8 IQ-family formats, plus F32/F16/Bf16/int
+  passthrough) still dequantizes on the host, unchanged from before this round — correct,
+  just not GPU-accelerated. This round's instance (`kgevfmca`, A6000) has no git history
+  either (populated by `rsync`, not `git clone`) — local remains the only git-tracked
+  copy; a fresh `ggml-org/llama.cpp` (`9655061`) was built there for the A/B benchmark.
 - **Remote instance git state**: the MLA-extension work used a *second*, separate
   ThunderCompute instance for this session (`fl1uh6dt`, an 80GB A100, created
   2026-09-21 specifically for the real-DeepSeek-V2-Lite VRAM requirement — the Phase

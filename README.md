@@ -580,3 +580,70 @@ synthetic MLA) re-verified unaffected.
 Next: on-GPU dequant kernel (Phase 2 round 3, closing the remaining ~1.1x cold-start
 gap) -- the only item left on the open-call list now that MLA covers both a
 synthetic fixture and a real, full-scale MoE+YaRN model.
+
+### Phase 2 (Fast IO), round 3: on-GPU dequant kernel
+
+Round 2 closed activations' host round-trips but left the one candidate it deliberately
+skipped: `model.rs`'s `load_weight` still dequantized every tensor to a host `f32` `Vec`
+(`dequant::dequantize`, CPU-bound bit-unpacking) before uploading it, unlike llama.cpp's
+CUDA backend, which uploads quantized bytes as-is and dequantizes/matmuls entirely
+on-GPU, never materializing a full-`f32` host copy at all. This round closes that gap
+for the two block types that actually matter for it: `Q4_K` and `Q6_K`, the types this
+project's local `Q4_K_M` fixtures (`Qwen3-0.6B`, `Tiny-Moe`, `Qwen3.5-0.8B`) use for the
+overwhelming majority of weight bytes. Every other GGUF block type this project supports
+(`Q4_0/1`, `Q5_0/1`, `Q8_0/1`, `Q2_K`/`Q3_K`/`Q5_K`/`Q8_K`, all 8 IQ-family formats, plus
+F32/F16/Bf16/int passthrough) still falls back to the existing host `dequant::dequantize`
+path -- correct, unchanged, just not (yet) GPU-accelerated, since no fixture available to
+this project actually exercises them for the bulk of a real model's weight bytes (see
+DECISIONS.md for the full scope rationale).
+
+Two new AOT kernels, `dequantize_q4k_kernel`/`dequantize_q6k_kernel`
+(`kernels_cuda/dequant.cu`), are line-for-line ports of `dequant.rs`'s
+`dequantize_block_q4_k`/`dequantize_block_q6_k` (themselves line-for-line ports of
+upstream `ggml-quants.c`) -- variable names (`d`, `dmin`, `sc`, `m`, `ql`, `qh`, `is`,
+`shift`, ...) kept identical on purpose so the CUDA and Rust versions can be diffed by
+eye. One CUDA thread dequantizes one whole 256-element super-block (correctness-first,
+matching this project's existing `gemv_kernel`/`rmsnorm_kernel` style -- no warp-level
+tricks), parallelized across the tens of thousands of blocks a typical weight tensor
+has. `model.rs`'s three `load_weight` closures (`load`/`load_hybrid`/`load_mla`) were
+consolidated into one shared `load_weight_device`/`dequantize_tensor_to_device`
+dispatch (previously near-identical duplicated code) that routes `Q4_K`/`Q6_K` straight
+from raw mmap'd GGUF bytes -> device upload -> on-device dequant kernel -> the same
+`CudaSlice<f32>` `Weight.data` every other path already expected, and falls back to the
+unchanged host path for every other type. `output.weight` (the LM head, when untied from
+the embedding table) goes through the same dispatch; `token_embd` stays on the host path
+unchanged, since it must stay host-resident for the embedding-lookup gather regardless of
+where its dequant happens.
+
+Re-verified byte-exact against every existing golden-token check (dense `"Once upon a
+time"` -> `","` id 11, `"The capital of France is"` -> `" Paris"` id 12095; MoE
+`Tiny-Moe` -> id 4036; hybrid `"Once upon a time"` -> `","` id 11, `"The capital of
+France is"` -> `" the"` id 279; synthetic MLA `"Hello"` -> `" hern"`, `"Once upon a
+time"` -> `" removeFrom"`, `"The capital of France is"` -> `" NavLink"`) plus all 55
+unit tests, on a fresh A6000 instance with a freshly built `llama.cpp` @ `9655061`.
+Re-measured the same way as rounds 1-2 (`/usr/bin/time -v`, same
+`Qwen3-0.6B-Q4_K_M.gguf`, same prompt, three runs each):
+
+| | run 1 | run 2 | run 3 | peak RSS | user+sys CPU time |
+|---|---|---|---|---|---|
+| **llama.cpp** | 11.24s\* | 6.67s | 6.46s | ~887 MB | ~1.3s + ~1.4s |
+| **coldstart-infer, round 2** | 6.43s | 6.47s | 8.51s | 1.35 GB | ~2.1s + ~3.5s |
+| **coldstart-infer, round 3** | 6.38s | 6.46s | 6.40s | 1.35 GB | ~1.3s + ~2.2s |
+
+\*llama.cpp's own run 1 is a first-run outlier (cold page/file-cache effects on this
+fresh instance, same pattern this project's own runs have shown before) -- runs 2-3
+(6.46-6.67s) are the representative baseline.
+
+**Gap closed from ~1.1x to ~1.0x -- parity with llama.cpp, within run-to-run noise**
+(coldstart-infer's three runs, 6.38-6.46s, sit inside/below llama.cpp's own 6.46-6.67s
+range). System time dropped from ~3.5s to ~2.2s, consistent with removing the CPU-bound
+host dequant step from the hot load path; peak RSS is unchanged from round 2 (expected --
+this round moves *compute*, not host allocations, off the CPU; the on-device raw-bytes
+upload buffer is freed immediately after the dequant kernel runs and was never the
+dominant RSS contributor). This closes Phase 2 (Fast IO) as originally scoped in the
+round-1 writeup above -- the two named candidates (per-call weight/activation
+re-uploads, host-side dequant) are both addressed. Remaining, smaller, unaddressed
+round-trips (MoE's per-expert weighted-sum accumulation, the Gated Attention mixer's
+fused-qg head split/sigmoid gating, and the 15+ block types still on the host dequant
+path) are believed low-value against this project's actual `Q4_K_M`-fixture workload,
+not verified to be free of further gains.
