@@ -281,14 +281,14 @@ conversation.
   `target/release/<bin-name>` — only `target/release/deps/`. After any source change,
   run `cargo build --release --bin <name>` explicitly before trusting a binary run
   against real hardware.
-- **Phase 3 round 3 MLA resume, dense-only fixture**: `--import-kv` resume was verified
-  byte-exact only against the synthetic dense-only `test-data/deepseek-tiny-mla.gguf`
-  fixture. The resume/cache mechanism (`generate_mla_impl`/`forward_mla_attn_block`)
-  operates purely on the attention block's single compressed `kv_cache`, independent of
-  whether a layer's FFN tail is `MlaFfn::Dense` or `MlaFfn::Moe` — the same reasoning
-  round 2 used to scope hybrid's `GatedDeltaNet` state — but this hasn't been confirmed
-  end to end against real DeepSeek-V2-Lite's MoE+shared-expert+YaRN path. Not planned
-  as follow-up unless a specific need comes up (see DECISIONS.md's round 3 entry).
+- ~~**Phase 3 round 3 MLA resume, dense-only fixture**~~ — **closed**: originally only
+  verified byte-exact against the synthetic dense-only `test-data/deepseek-tiny-mla.gguf`
+  fixture. Now confirmed against real DeepSeek-V2-Lite's MoE+shared-expert+YaRN path too
+  (`model::mla_batching_tests::prefill_mla_batched_import_kv_resume_matches_sequential`,
+  see the batched-prefill re-verification entry below) — the resume/cache mechanism
+  (`generate_mla_impl`/`forward_mla_attn_block`) does operate purely on the attention
+  block's single compressed `kv_cache`, independent of the FFN tail, as originally
+  reasoned; that reasoning is now backed by a real run, not just architectural inference.
 - **Real DeepSeek-V2-Lite GGUF not preserved locally**: unlike every other fixture,
   the real `DeepSeek-V2-Lite.gguf` (16.7GB, `--outtype q8_0`) used to verify MLA's
   MoE/shared-expert/YaRN path was left on the A100 instance (`fl1uh6dt`) rather than
@@ -330,3 +330,23 @@ conversation.
   `","`), and `model::hybrid_batching_tests::prefill_hybrid_batched_matches_sequential`
   passed in both PTX and cubin modes. All three architecture families are now
   confirmed against the kernel-embedding refactor in both build modes.
+- **MLA batched-prefill (`prefill_mla_batched`) re-verified against the real
+  DeepSeek-V2-Lite checkpoint, closing the gap its own test doc comments flagged**:
+  the batched-prefill MLA work's own tests (`model::mla_batching_tests`) originally
+  ran only against the synthetic, dense-lead-only, no-YaRN
+  `test-data/deepseek-tiny-mla.gguf` fixture — explicitly noted in those tests' doc
+  comments as not exercising `MlaFfn::Moe`'s per-row loop or
+  `rope_norm_yarn_batch_kernel`. Re-verified on a fresh 80GB A100 instance
+  (`igr3ptbb`): `deepseek-ai/DeepSeek-V2-Lite` downloaded (~30GB safetensors,
+  `huggingface_hub.snapshot_download`) and converted fresh (`convert_hf_to_gguf.py
+  --outtype q8_0`, current `ggml-org/llama.cpp`, 16.7GB output) — same recipe as the
+  original MLA verification. `qwen3_coldstart` against the real checkpoint produced
+  `"The capital of France is" -> " Paris"`, independently reproduced byte-exact by a
+  fresh CUDA-enabled `llama-simple` build (`-DCMAKE_CUDA_ARCHITECTURES=80`) from the
+  same checkpoint. All three `mla_batching_tests` (including the batched-vs-sequential
+  diff and the `--import-kv` resume test) passed against the real file (573.73s
+  total, mostly repeated `Model::load` cost — `Q8_0` isn't on the on-GPU dequant
+  kernel path, unlike `Q4_K`/`Q6_K`). This is the first time the batched-prefill MLA
+  path has been exercised against real MoE routing, the always-on shared expert, and
+  YaRN RoPE scaling together, not just architecturally reasoned to be independent of
+  them.
