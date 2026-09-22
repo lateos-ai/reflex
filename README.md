@@ -937,18 +937,22 @@ built `libcoldstart_infer.so`, linked via `-lcoldstart_infer` + `LD_LIBRARY_PATH
 - `cargo build --release`/`cargo test --release` both clean (59 tests passing,
   unchanged) with the new `[lib]` crate-types added, and `src/bin/*` unaffected.
 
-**Known limitation, not closed this round**: the `staticlib` (`libcoldstart_infer.a`)
-output builds without error, and a C binary links against it (needing
-`-Wl,--allow-multiple-definition` to resolve duplicate symbols against system libs —
-itself a sign of an unresolved rough edge, not a clean link), but the resulting binary
-hangs at runtime rather than crashing or completing (root cause not investigated this
-round — plausibly a `libc`/threading-runtime duplication between the archive and the
-system libraries `cudarc`'s driver-loading path also pulls in). **`cdylib` is the
-verified, recommended way to embed this crate** — a real GPU-inference host needs
-`libcuda.so` present and dynamically resolvable at runtime regardless of how
-`coldstart-infer` itself is linked, so `cdylib` carries no real downside over
-`staticlib` here. Flagged in STATUS.md's known-debt list; not blocking this round, since
-no embedding host asked specifically for static linking.
+**`staticlib` (round 2 follow-up, resolved)**: an earlier same-day session saw a C
+binary linked against `libcoldstart_infer.a` need `-Wl,--allow-multiple-definition` and
+then hang at runtime, and flagged it as an unresolved known limitation. A dedicated
+debugging pass found neither symptom reproduces: `gcc -I include -o smoke_test_static
+ffi-test/smoke_test.c -L target/release -l:libcoldstart_infer.a -ldl -lpthread -lm`
+(no extra flags) links clean with zero duplicate-symbol warnings, and the resulting
+binary produced the same byte-exact output as the `cdylib`/CLI runs above for both the
+dense (`token_ids=[13,576,3974,13876,38835]`) and hybrid
+(`token_ids=[0,353,1044]`) fixtures, completing in a few seconds each. The original
+hang's actual cause was almost certainly the ThunderCompute GPU-capacity contention
+already documented elsewhere in this project's session notes (queued GPU-driver calls
+that clear on their own after some minutes) — the process was killed at ~90s on the
+assumption it was stuck, before it had a chance to clear. **Both `cdylib` and
+`staticlib` are verified working embedding paths**; `cdylib` remains the simpler
+default (no need to reason about symbol collisions with a host's other static
+dependencies), but `staticlib` is no longer flagged as broken.
 
 This closes Phase 4 (Embeddability) entirely — both its CLI-facing half (`--lora`,
 round 1) and its embedding-facing half (the C-FFI surface, this round) are done.

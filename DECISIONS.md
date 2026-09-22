@@ -595,15 +595,47 @@ cross-checked byte-exact against `qwen3_coldstart` on the same GGUF+prompt+
 just "it compiles and links". The error path (a nonexistent GGUF path) was also
 verified: `coldstart_load` returns `NULL`, no crash, and `coldstart_last_error()`
 names the missing file. `staticlib` linking was attempted too (not part of the
-confirmed scope, but cheap to try since the crate-type was already added) and found to
-have a real, unresolved problem — see STATUS.md's "Known debt" entry — so `cdylib` is
-documented as the recommended path rather than claiming both work equally.
+confirmed scope, but cheap to try since the crate-type was already added) and *appeared*
+to have a real, unresolved problem in this same session — flagged as known debt at the
+time — but a follow-up debugging pass the same day found it doesn't reproduce (see the
+round-2-follow-up entry below): both `cdylib` and `staticlib` are verified working.
 
 **How to apply**: a future round wanting Phase 3 state I/O (`--export-kv`/
 `--import-kv`) through the FFI needs to design an explicit buffer-ownership convention
 for KV-cache blobs crossing the C boundary (who allocates, who frees, whether it's a
 raw byte buffer or a path to a file this crate itself writes) — treat that as new
 scope requiring its own confirm-before-starting conversation, not a small addition to
-`coldstart_load`/`coldstart_generate`. If `staticlib` linking is ever needed for real,
-root-cause the runtime hang (start by checking for duplicate `libc`/pthread symbols
-between the archive and the CUDA driver's dynamic loading path) before trusting it.
+`coldstart_load`/`coldstart_generate`.
+
+## Phase 4 round 2 follow-up: the `staticlib` "hang" was GPU-capacity contention, not a linking bug
+
+**Decision**: no code change. The `staticlib` linking issue flagged as known debt right
+after Phase 4 round 2 (`-Wl,--allow-multiple-definition` needed to link,
+then a runtime hang) is retracted — a dedicated debugging session (same day, same
+`bkzn3giz` instance) could not reproduce either symptom.
+
+**What was actually found**: `gcc -I include -o smoke_test_static ffi-test/smoke_test.c
+-L target/release -l:libcoldstart_infer.a -ldl -lpthread -lm` — the exact same command
+as before, *minus* `-Wl,--allow-multiple-definition` — linked with zero duplicate-symbol
+warnings. The resulting binary ran successfully against both the dense
+(`Qwen3-0.6B-Q4_K_M.gguf`, `token_ids=[13,576,3974,13876,38835]`) and hybrid
+(`Qwen3.5-0.8B-Q4_K_M.gguf`, `token_ids=[0,353,1044]`) fixtures, byte-exact against the
+`cdylib`/CLI runs from the original round, completing in single-digit seconds each —
+not a hang.
+
+**Why the original session saw what it saw**: almost certainly this project's
+already-documented ThunderCompute GPU-capacity-contention pattern (see
+STATUS.md/memory: SSH commands touching the GPU driver can queue for tens of minutes
+under `"all requested GPU capacity is currently busy"` platform-side scheduling, then
+clear on their own) — the original attempt was killed after only ~90 seconds on the
+assumption it was permanently stuck, which was too short a wait to distinguish
+"queued" from "actually hung." The `--allow-multiple-definition` flag was added
+defensively in the same original session without first testing whether the link
+actually required it — it didn't.
+
+**How to apply**: don't assume a single failed run on a shared/ephemeral GPU instance
+proves a code-level bug, especially one that manifests as "stuck, not crashed" — that
+signature matches GPU-capacity contention as easily as a real hang. Wait longer (or
+check `nvidia-smi`/process state for whether it's still making progress) before
+concluding it's broken, particularly for anything touching `CudaDevice::new` or other
+first GPU-driver contact in a fresh process.

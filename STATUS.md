@@ -213,10 +213,14 @@ reused the still-running `bkzn3giz` A6000 — see DECISIONS.md's Phase 4 round 2
   (`token_ids=[13,576,3974,13876,38835]`) and the hybrid `Qwen3.5-0.8B-Q4_K_M.gguf`
   fixture (`token_ids=[0,353,1044]`), plus a clean (no-crash) error path for a
   nonexistent GGUF path.
-- **Known limitation**: `staticlib` output builds and links (needing
-  `-Wl,--allow-multiple-definition`, itself a bad sign) but the resulting binary hangs
-  at runtime — not root-caused this round. `cdylib` is the verified, recommended
-  embedding path; see "Known debt" below and README's Phase 4 round 2 section.
+- **`staticlib` follow-up (resolved)**: a same-day debugging pass (see README's Phase 4
+  round 2 section) found the originally-reported link-needs-`--allow-multiple-definition`
+  / runtime-hang symptoms don't reproduce — a clean link with no extra flags produces a
+  binary that runs correctly, byte-exact against `cdylib`/CLI on both fixtures. The
+  original hang was very likely this project's already-documented ThunderCompute
+  GPU-capacity-contention pattern (a queued GPU-driver call that clears on its own after
+  some minutes), not a linking defect — the process was killed prematurely at ~90s.
+  Both `cdylib` and `staticlib` are now verified working embedding paths.
 
 This closes Phase 4 (Embeddability) entirely.
 
@@ -231,27 +235,15 @@ Q8_0/1, Q2_K/Q3_K/Q5_K/Q8_K, the IQ-family formats — none exercised by a local
 fixture's bulk weight bytes), MoE's per-expert weighted-sum accumulation / the Gated
 Attention mixer's fused-qg gating still round-tripping through the host (flagged, not
 measured as worth closing), Phase 3 round 3's own resume path verified only against
-the dense-only synthetic MLA fixture (see DECISIONS.md's round 3 entry), Phase 4 round
-1's own LoRA MoE/hybrid accept/reject paths verified only against synthetic hand-built
-adapters, not a real adapter trained against those architectures (none found publicly
-— see DECISIONS.md's Phase 4 round 1 entry), and Phase 4 round 2's `staticlib` hang
-(above, not root-caused). No further Phase 4/post-MVP work is currently planned —
-next steps, if any, are a separate confirm-before-starting conversation.
+the dense-only synthetic MLA fixture (see DECISIONS.md's round 3 entry), and Phase 4
+round 1's own LoRA MoE/hybrid accept/reject paths verified only against synthetic
+hand-built adapters, not a real adapter trained against those architectures (none
+found publicly — see DECISIONS.md's Phase 4 round 1 entry). No further Phase 4/post-MVP
+work is currently planned — next steps, if any, are a separate confirm-before-starting
+conversation.
 
 ## Known debt / limitations
 
-- **Phase 4 round 2 `staticlib` linking hangs at runtime**: `cargo build --release`
-  produces `libcoldstart_infer.a` without error, and a C binary links against it, but
-  needed `-Wl,--allow-multiple-definition` to resolve duplicate symbols (a sign of an
-  unresolved rough edge, not a clean link) and the resulting binary hung rather than
-  running or crashing when actually executed (`ffi-test/smoke_test.c`, real A6000
-  hardware). Not root-caused — plausibly a `libc`/threading-runtime duplication between
-  the static archive and system libs `cudarc`'s driver-loading path also pulls in.
-  `cdylib` (fully verified byte-exact against `qwen3_coldstart`, see the Phase 4 round 2
-  section above) is the recommended embedding path; a real host needs `libcuda.so`
-  dynamically resolvable at runtime regardless of how `coldstart-infer` itself links, so
-  `cdylib` has no real downside here. Revisit only if a host specifically needs static
-  linking.
 - **Phase 2 round 3 on-device dequant scope**: only `Q4_K`/`Q6_K` dequantize on-GPU
   (`kernels_cuda/dequant.cu`). Every other GGUF block type (`Q4_0/1`, `Q5_0/1`,
   `Q8_0/1`, `Q2_K`/`Q3_K`/`Q5_K`/`Q8_K`, all 8 IQ-family formats, plus F32/F16/Bf16/int
