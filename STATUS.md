@@ -316,3 +316,17 @@ conversation.
   real `docker build` + `docker run --gpus all` pass on a standard VM-based Docker
   host (not a nested-container instance) before publishing this image to Docker Hub/
   GHCR or otherwise treating it as release-ready.**
+- **Kernel-byte-embedding refactor re-verified against the Qwen3.5 hybrid fixture,
+  closing the one gap the MVP-release round's own hardware pass left open**: the
+  initial verification (previous session) re-ran the dense/MoE and MLA paths against
+  `src/aot.rs`'s new `include_bytes!`-based kernel loading in both PTX and
+  `COLDSTART_CUDA_ARCH=sm_86` cubin modes, but not hybrid's `gated_deltanet.cu`
+  module, since that fixture (`Qwen3.5-0.8B-Q4_K_M.gguf`) wasn't present on that
+  session's instance. Downloaded fresh via this project's own `--model` hf-hub
+  integration (`unsloth/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q4_K_M.gguf` — a real,
+  publicly hosted GGUF, confirmed via the HF Hub search API, not a guess) on a new
+  A6000 instance (`344497bl`): `qwen3_coldstart --model ... "Once upon a time"`
+  reproduced this project's own documented historical result exactly (token id `11`,
+  `","`), and `model::hybrid_batching_tests::prefill_hybrid_batched_matches_sequential`
+  passed in both PTX and cubin modes. All three architecture families are now
+  confirmed against the kernel-embedding refactor in both build modes.
