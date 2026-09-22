@@ -956,3 +956,137 @@ dependencies), but `staticlib` is no longer flagged as broken.
 
 This closes Phase 4 (Embeddability) entirely — both its CLI-facing half (`--lora`,
 round 1) and its embedding-facing half (the C-FFI surface, this round) are done.
+
+### System1: single-pass, non-autoregressive candidate scoring
+
+Every existing entry point (`forward_prompt`/`generate`) pays the full sequential
+per-token decode loop even when the caller only wants a score for a small, known set of
+candidate continuations (a Yes/No answer, an A-D choice, a 1-10 scale) — the
+argmax-then-feed-back loop and a full-vocab GEMV + vocab-sized D2H transfer per step are
+both unnecessary work for that case. `Model::system1_evaluate` (`src/model.rs`) instead
+runs `prompt` through the shared prefill path exactly once, then scores every candidate
+from that single prefill: single-token candidates are scored in one batched gather-GEMV
+(`kernels_cuda/gemv_gather.cu`'s `gemv_gather_kernel`, which computes only the
+candidates' own lm_head logit rows instead of the whole vocab), and multi-token
+candidates via a short teacher-forced continuation (feeding each candidate's own known
+next token, never a sampled one). `score`/`probability` are relative to the candidate
+set in one call only, not vocab-normalized log-probabilities — computing the latter
+would reintroduce the exact full-vocab cost this feature exists to avoid.
+
+**Rust API** (`src/model.rs`):
+
+```rust
+pub struct System1Candidate { pub text: String }
+pub struct System1CandidateResult { pub text: String, pub token_ids: Vec<u32>, pub score: f32 }
+pub struct System1Response { pub results: Vec<System1CandidateResult>, pub probabilities: Vec<f32> }
+
+pub fn Model::system1_evaluate(
+    &self,
+    prompt: &str,
+    candidates: &[System1Candidate],
+    temperature: f32,          // 1.0 = no-op; scales the softmax over `results[i].score`
+) -> Result<System1Response, String>
+```
+
+Dense/MoE Qwen3 models only — hybrid Qwen3.5 and DeepSeek-V2/V3 MLA are rejected with a
+clear error, the same scope line every other MLA-adjacent feature in this project uses.
+
+**C-FFI** (`src/ffi.rs`, `include/coldstart_infer.h`), layered on the same
+`ColdstartModel` handle `coldstart_load`/`coldstart_generate`/`coldstart_free` already
+use (Phase 4 round 2 above):
+
+```c
+int coldstart_system1_evaluate(
+    ColdstartModel *handle,
+    const char *prompt,
+    const char *const *candidate_texts, size_t num_candidates,
+    float temperature,
+    ColdstartSystem1Result *out);   // 0 on success, -1 on failure (see coldstart_last_error)
+
+void coldstart_free_system1_result(ColdstartSystem1Result *result);
+```
+
+`ColdstartSystem1Result` holds a heap `candidates` array of
+`ColdstartSystem1CandidateResult { text, token_ids, num_token_ids, score, probability }`
+— owned by this crate, freed only via `coldstart_free_system1_result`, never by the C
+caller's own `free`. Every entry point wraps its body in `catch_unwind`, same
+panic-never-crosses-the-FFI-boundary contract as the rest of `src/ffi.rs`.
+
+**CLI**: `system1_coldstart <path-to-gguf> <prompt> --candidate <text> [--candidate
+<text> ...] [--temperature T] [--lora <adapter.gguf>]` (`src/bin/system1_coldstart.rs`).
+
+**Verified** against the real `Qwen3-1.7B` model on GPU hardware: the gather-GEMV path
+agrees with the full-vocab GEMV to 1e-4 at matching rows, the teacher-forced
+multi-token path reproduces the model's own real greedy continuation and ranks it far
+above a wrong one, and the FFI entry points round-trip cleanly (including the
+zeroed-after-free/double-free-safe contract `coldstart_free_system1_result` documents).
+A warm microbenchmark (`bench_coldstart --candidate ...`) showed the gather-GEMV win
+was real (up to ~226ms saved at 449 prompt tokens) but small relative to total
+latency at the time — the sequential per-token *prefill* loop still dominated by
+orders of magnitude, so sub-50ms warm latency wasn't reached yet. That prefill loop,
+not System1's LM-head path, was flagged as the next bottleneck — see "Batched Prefill
+GEMM" below.
+
+### Batched Prefill GEMM: cuBLAS-batched dense/MoE prefill
+
+Every forward path up to this point ran the prompt through the model **one token at a
+time**: `prefill_dense` looped `forward_one_token_dense` once per prompt token, and
+every op inside it (`gemv_kernel`, `rope_kernel`, `attention_kernel`) processed exactly
+one row. That's the sequential-decode convention every architecture needs anyway for
+generating *new* tokens (feeding each sampled id back in), but the *prompt* — already
+fully known up front — doesn't need to pay it: a 1-row `gemv_kernel` launch reads an
+entire weight matrix from global memory to produce one output row, so for an
+`M`-token prompt the same weight bytes get re-read from GMEM `M` times instead of
+once. Measured cost on an A6000 (`Qwen3-0.6B-Q4_K_M.gguf`): **~9.1s for a 113-token
+prompt, ~37.7s for a 449-token prompt** — prefill, not decode, was overwhelmingly the
+dominant cold-start cost, exactly what System1's benchmark above flagged as the real
+next bottleneck.
+
+**Fix**: treat the prompt's `M` positions as a GEMM batch dimension instead of `M`
+separate GEMV launches, for every projection in the shared attention block and the
+dense FFN (`Model::gemm`, `src/model.rs` — `cudarc`'s `cublas` Cargo feature was already
+declared in `Cargo.toml` but had zero call sites before this; math mode pinned to
+`CUBLAS_PEDANTIC_MATH` at handle creation so cuBLAS's summation order can't silently
+drift from `gemv_kernel`'s naive per-row dot product via a TF32/reduced-precision
+tensor-core path). Two new batched kernels: `rope_batch_kernel`
+(`kernels_cuda/rope.cu`) rotates every prompt row in one launch, each at its own
+absolute position, instead of one `rope_kernel` launch per row; `attention_prefill_kernel`
+(new `kernels_cuda/attention_prefill.cu`) scores every query row against the shared K/V
+cache in one launch (the grid gains a query-row dimension), each row causally masked to
+its own position. RMSNorm/SiLU-and-mul/residual-add needed **no** kernel changes —
+already row/flat-generic. New `Model::prefill_dense_batched` runs every prompt token
+through each layer in one batched pass; the old sequential path
+(`prefill_dense`/`forward_one_token_dense`) is unchanged and still used for the
+per-token *decode* loop after the first token (a GEMM with one row buys nothing there)
+and as the verification oracle below.
+
+MoE layers batch the same shared attention block, but each row can still route to a
+different top-k expert subset, so the FFN itself stays a per-row loop reusing the
+existing per-expert `gemv_expert` calls (`forward_layer_moe_batched`) — turning that
+into a single GEMM needs a token→expert grouping/permutation step (grouped GEMM, the
+way vLLM/TensorRT-LLM batch MoE FFNs), a distinct, larger follow-on not attempted here.
+
+**Verified on real hardware** (ThunderCompute A6000, `Qwen3-0.6B-Q4_K_M.gguf`):
+- A new `#[ignore]`d GPU test,
+  `model::prefill_batching_tests::prefill_dense_batched_matches_sequential_prefill`,
+  diffs every row of the batched hidden state against the sequential path's
+  corresponding position and checks the final greedy-argmax token matches — **passed**.
+- `--import-kv` resume (`start_pos > 0` through the batched path) was checked against a
+  one-shot equivalent: exporting a cache after `"The capital of France is Paris."`
+  (`seq_len=7`) then resuming with `--import-kv` + continuation `" The capital of
+  Germany is"` produced token ids `[19846,13,576,6722,315]` (`" Berlin. The capital
+  of"`), **identical** to running the whole concatenated prompt in one shot with
+  `start_pos=0`.
+
+**Benchmark result** (`bench_coldstart`, same instance/model, `--warmup 2 --iters 5`,
+`COLDSTART_CUDA_ARCH=sm_86`):
+
+| prompt tokens | sequential prefill (before) | batched prefill (after) | speedup |
+|---:|---:|---:|---:|
+| 113 | ~9.1s | 40.6ms (p50) | **~224x** |
+| 449 | ~37.7s | 141.0ms (p50) | **~267x** |
+
+Sub-50ms warm latency is reached at 113 prompt tokens; the 449-token case (141ms) is
+still a large win but not sub-50ms — the target depends on prompt length, not met
+universally yet. MoE's per-row FFN loop (see above) is the next named candidate if
+MoE prefill latency becomes the bottleneck once batched.
