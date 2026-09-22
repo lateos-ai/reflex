@@ -1090,3 +1090,76 @@ Sub-50ms warm latency is reached at 113 prompt tokens; the 449-token case (141ms
 still a large win but not sub-50ms — the target depends on prompt length, not met
 universally yet. MoE's per-row FFN loop (see above) is the next named candidate if
 MoE prefill latency becomes the bottleneck once batched.
+
+### Batched Prefill GEMM extended to Qwen3.5 hybrid's GatedAttention sublayers
+
+Extended the same batching to the Qwen3.5 hybrid architecture's `GatedAttention`
+sublayers only. The hybrid model has two sublayer kinds and they are not equally
+batchable: `GatedAttention` (`forward_gated_attn_mixer`) is the same
+RMSNorm→QKV→QK-Norm→RoPE→causal-attention→O-proj shape as dense's attention block,
+directly batchable with the same `Model::gemm`/`rope_batch`/`attention_prefill`
+helpers above. `GatedDeltaNet` (`forward_gdn_mixer`) has no `position` parameter at
+all — `gdn_conv`/`gdn_delta` mutate `conv_state`/`recurrent` sequentially, each
+token's state depending on the previous token's output, a real recurrence rather
+than a batchable GEMV-per-row pattern. Reformulating it as a parallel/chunked scan
+(the technique the Gated DeltaNet paper and flash-linear-attention use) is a
+separate, materially larger project — **`GatedDeltaNet` stays sequential and
+unmodified this round**.
+
+Because the two sublayer kinds are heterogeneous, the token-major loop
+(`forward_one_token_hybrid`, one token through every layer before the next) can't
+just switch to GEMMs the way dense's could: a `GatedAttention` layer only ever sees
+one token's hidden vector at a time under token-major iteration, so there's no way
+to batch its projections without first restructuring to be **layer-major** — for
+each layer in order, run all `M` prompt rows through it before moving to the next
+layer. This is valid because a layer's output at position `p` depends only on
+position `p`'s input plus that layer's own carried state (`k_cache`/`v_cache` or
+`conv_state`/`recurrent`), never on another position's intermediate value at the
+same layer — the same reassociation the dense batched-prefill path above already
+relies on. `Model::prefill_hybrid_batched` (new) runs every prompt token through
+each layer in this layer-major order: `GatedAttention` layers batch all `M` rows in
+one GEMM pass each (`Model::forward_gated_attn_mixer_batched`, plus two small new
+kernels — `split_qg_kernel`/`sigmoid_gate_kernel` in `kernels_cuda/elementwise.cu`
+— replacing what was a per-token host round trip for this mixer's fused
+query+gate split and post-attention sigmoid gating); `GatedDeltaNet` layers loop
+`M` times sequentially through the *unmodified* `forward_gdn_mixer`, extracting/
+writing one row at a time out of the shared `[rows, hidden_size]` buffer. Total GDN
+work is unchanged from the token-major loop, just grouped by layer instead of
+interleaved. `Model::prefill_hybrid` (the original token-major sequential loop) is
+kept unchanged as the verification oracle; `generate_hybrid_impl` now calls
+`prefill_hybrid_batched` for the prompt phase, same switchover
+`generate_dense_impl` made to `prefill_dense_batched` above. Decode (one new token
+at a time after the first) is untouched — a GEMM with one row buys nothing there.
+
+**Verified on real hardware** (ThunderCompute A6000, `Qwen3.5-0.8B-Q4_K_M.gguf`, a
+real checkpoint, not a synthetic fixture):
+- A new `#[ignore]`d GPU test,
+  `model::hybrid_batching_tests::prefill_hybrid_batched_matches_sequential`, diffs
+  the batched path's final hidden vector against the sequential path's and checks
+  the final greedy-argmax token matches — **passed**, and the produced first token
+  (`" the"`, id 279) matches this project's existing golden-token record for this
+  exact prompt/model.
+- `--import-kv` resume (`start_pos > 0` through the batched hybrid path) checked
+  against a one-shot equivalent, same pattern as the dense check above: exporting a
+  cache after `"The capital of France is Paris."` (`seq_len=7`) then resuming with
+  `--import-kv` + continuation `" The capital of Germany is"` produced token ids
+  `[19241,13,561,6511,314]` (`" Berlin. The capital of"`), **identical** to running
+  the whole concatenated prompt in one shot with `start_pos=0`.
+
+**Benchmark result** (`bench_coldstart`, same instance, `--warmup 2 --iters 5`,
+`COLDSTART_CUDA_ARCH=sm_86`, warm `forward_prompt` latency — the "before" number
+is `generate_hybrid_impl` temporarily pointed at the unmodified `prefill_hybrid`
+oracle instead of `prefill_hybrid_batched`, same model/prompts otherwise):
+
+| prompt tokens | token-major sequential (before) | layer-major batched (after) | speedup |
+|---:|---:|---:|---:|
+| 29 | 1463.1ms (p50) | 915.4ms (p50) | **~1.60x** |
+| 113 | 5694.3ms (p50) | 3517.6ms (p50) | **~1.62x** |
+| 449 | 23005.4ms (p50) | 14068.4ms (p50) | **~1.64x** |
+
+A much smaller win than dense's ~224-267x, exactly as the design above predicts:
+only 6 of this fixture's 24 layers are `GatedAttention` (the rest are the
+untouched, still-sequential `GatedDeltaNet`), so only that fraction of total
+per-token cost gets GEMM-batched. Batching `GatedDeltaNet` itself (the chunked-scan
+reformulation) is the next named candidate if hybrid prefill latency needs to close
+the gap with dense's.

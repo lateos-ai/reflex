@@ -37,18 +37,22 @@ fn main() {
     println!("cargo:rerun-if-env-changed=COLDSTART_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=COLDSTART_SKIP_CUDA");
 
-    if env::var("COLDSTART_SKIP_CUDA").is_ok() {
+    let skip_cuda = env::var("COLDSTART_SKIP_CUDA").is_ok();
+    if skip_cuda {
         println!("cargo:warning=COLDSTART_SKIP_CUDA set, skipping AOT kernel compilation (dev-machine-without-CUDA path)");
-        return;
     }
 
-    let nvcc = match find_nvcc() {
-        Some(p) => p,
-        None => {
-            panic!(
-                "nvcc not found (checked CUDA_PATH/CUDA_HOME and PATH). Install the CUDA toolkit, \
-                 or set COLDSTART_SKIP_CUDA=1 to build without GPU kernels (dev-only, no inference)."
-            );
+    let nvcc = if skip_cuda {
+        None
+    } else {
+        match find_nvcc() {
+            Some(p) => Some(p),
+            None => {
+                panic!(
+                    "nvcc not found (checked CUDA_PATH/CUDA_HOME and PATH). Install the CUDA toolkit, \
+                     or set COLDSTART_SKIP_CUDA=1 to build without GPU kernels (dev-only, no inference)."
+                );
+            }
         }
     };
 
@@ -76,17 +80,22 @@ fn main() {
         };
         let out_file = out_dir.join(format!("{stem}.{out_ext}"));
 
-        let mut cmd = Command::new(&nvcc);
-        cmd.arg(mode_flag).arg(&path).arg("-o").arg(&out_file);
-        if let Some(a) = &arch {
-            cmd.arg(format!("-arch={a}"));
-        }
+        // In COLDSTART_SKIP_CUDA mode, still expose the COLDSTART_KERNEL_<NAME>
+        // env var every model.rs `env!(...)` call needs to compile, but skip the
+        // nvcc invocation itself -- the referenced file is never created, so no
+        // inference binary can actually load kernels in this mode (type-check
+        // only, per CLAUDE.md's "COLDSTART_SKIP_CUDA=1 cargo build" doc).
+        if let Some(nvcc) = &nvcc {
+            let mut cmd = Command::new(nvcc);
+            cmd.arg(mode_flag).arg(&path).arg("-o").arg(&out_file);
+            if let Some(a) = &arch {
+                cmd.arg(format!("-arch={a}"));
+            }
 
-        let status = cmd
-            .status()
-            .unwrap_or_else(|e| panic!("failed to invoke nvcc at {}: {e}", nvcc.display()));
-        if !status.success() {
-            panic!("nvcc failed compiling {}", path.display());
+            let status = cmd.status().unwrap_or_else(|e| panic!("failed to invoke nvcc at {}: {e}", nvcc.display()));
+            if !status.success() {
+                panic!("nvcc failed compiling {}", path.display());
+            }
         }
         println!("cargo:rustc-env=COLDSTART_KERNEL_{}={}", stem.to_uppercase(), out_file.display());
     }

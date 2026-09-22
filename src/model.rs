@@ -769,6 +769,16 @@ pub struct Model {
     /// -- keeps residual-stream adds device-resident (Phase 2 round 2)
     /// instead of downloading both operands to host just to add two vectors.
     add_k: AotKernel,
+    /// Splits Qwen3.5 hybrid Gated Attention's fused query+gate projection
+    /// output into separate q/gate buffers (`split_qg_kernel`, same
+    /// `kernels_cuda/elementwise.cu` module as `add_k`) -- used by
+    /// `Model::forward_gated_attn_mixer`/`forward_gated_attn_mixer_batched`
+    /// instead of a per-call host round trip.
+    split_qg_k: AotKernel,
+    /// In-place `out[i] *= sigmoid(gate[i])` (`sigmoid_gate_kernel`) -- Gated
+    /// Attention's post-attention gating, row-count-agnostic like `add_k` so
+    /// the same kernel serves both the decode step and batched prefill.
+    sigmoid_gate_k: AotKernel,
     cfg: LayerConfig,
     layers: Vec<LayerWeights>,
     /// `k` (top-k expert count), `Some` iff this is an MoE model.
@@ -1027,7 +1037,16 @@ impl Model {
             "attention_prefill",
             "attention_prefill_kernel",
         )?;
-        let add_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ELEMENTWISE"), "elementwise", "add_kernel")?;
+        let mut elementwise_fns = aot::load_kernel_module(
+            &device,
+            env!("COLDSTART_KERNEL_ELEMENTWISE"),
+            "elementwise",
+            &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel"],
+        )?
+        .into_iter();
+        let add_k = elementwise_fns.next().ok_or("missing add_kernel")?;
+        let split_qg_k = elementwise_fns.next().ok_or("missing split_qg_kernel")?;
+        let sigmoid_gate_k = elementwise_fns.next().ok_or("missing sigmoid_gate_kernel")?;
         let mut dequant_fns = aot::load_kernel_module(
             &device,
             env!("COLDSTART_KERNEL_DEQUANT"),
@@ -1139,6 +1158,8 @@ impl Model {
             attn_k,
             attn_prefill_k,
             add_k,
+            split_qg_k,
+            sigmoid_gate_k,
             cfg,
             layers,
             expert_used_count,
@@ -1226,7 +1247,16 @@ impl Model {
             "attention_prefill",
             "attention_prefill_kernel",
         )?;
-        let add_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ELEMENTWISE"), "elementwise", "add_kernel")?;
+        let mut elementwise_fns = aot::load_kernel_module(
+            &device,
+            env!("COLDSTART_KERNEL_ELEMENTWISE"),
+            "elementwise",
+            &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel"],
+        )?
+        .into_iter();
+        let add_k = elementwise_fns.next().ok_or("missing add_kernel")?;
+        let split_qg_k = elementwise_fns.next().ok_or("missing split_qg_kernel")?;
+        let sigmoid_gate_k = elementwise_fns.next().ok_or("missing sigmoid_gate_kernel")?;
         let mut gdn_fns = aot::load_kernel_module(
             &device,
             env!("COLDSTART_KERNEL_GATED_DELTANET"),
@@ -1340,6 +1370,8 @@ impl Model {
             attn_k,
             attn_prefill_k,
             add_k,
+            split_qg_k,
+            sigmoid_gate_k,
             cfg: attn_cfg.clone(),
             layers: Vec::new(),
             expert_used_count: None,
@@ -1384,7 +1416,16 @@ impl Model {
             "attention_prefill",
             "attention_prefill_kernel",
         )?;
-        let add_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ELEMENTWISE"), "elementwise", "add_kernel")?;
+        let mut elementwise_fns = aot::load_kernel_module(
+            &device,
+            env!("COLDSTART_KERNEL_ELEMENTWISE"),
+            "elementwise",
+            &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel"],
+        )?
+        .into_iter();
+        let add_k = elementwise_fns.next().ok_or("missing add_kernel")?;
+        let split_qg_k = elementwise_fns.next().ok_or("missing split_qg_kernel")?;
+        let sigmoid_gate_k = elementwise_fns.next().ok_or("missing sigmoid_gate_kernel")?;
         let mla_attn_k =
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_MLA_ATTENTION"), "mla_attention", "mla_attention_kernel")?;
         let rope_norm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_norm", "rope_norm_kernel")?;
@@ -1491,6 +1532,8 @@ impl Model {
             attn_k,
             attn_prefill_k,
             add_k,
+            split_qg_k,
+            sigmoid_gate_k,
             cfg: dummy_cfg,
             layers: Vec::new(),
             expert_used_count: None,
@@ -2638,6 +2681,30 @@ impl Model {
         Ok(out)
     }
 
+    /// Like [`Self::last_row`], but for any row index -- used by the hybrid
+    /// model's layer-major batched prefill (`Self::forward_hybrid_layer_batched`)
+    /// to pull one position's hidden vector out of a `[rows, hidden_size]`
+    /// buffer before feeding it through a `GatedDeltaNet` layer's sequential
+    /// per-token recurrence (`Self::forward_gdn_mixer` takes ownership of a
+    /// single-row `CudaSlice`, not a view into a larger batch).
+    fn extract_row(&self, batched: &CudaSlice<f32>, row: usize, hidden_size: usize) -> Result<CudaSlice<f32>, String> {
+        let offset = row * hidden_size;
+        let mut out = self.device.alloc_zeros::<f32>(hidden_size).map_err(|e| format!("extract_row alloc: {e}"))?;
+        let src = batched.slice(offset..offset + hidden_size);
+        self.device.dtod_copy(&src, &mut out).map_err(|e| format!("extract_row dtod: {e}"))?;
+        Ok(out)
+    }
+
+    /// Inverse of [`Self::extract_row`]: writes `src` (one position's hidden
+    /// vector) back into row `row` of a `[rows, hidden_size]` buffer -- same
+    /// device-to-device copy convention `Self::forward_attn_block` already
+    /// uses for kv-cache writes, never a host round trip.
+    fn write_row(&self, batched: &mut CudaSlice<f32>, row: usize, hidden_size: usize, src: &CudaSlice<f32>) -> Result<(), String> {
+        let offset = row * hidden_size;
+        let mut dst = batched.slice_mut(offset..offset + hidden_size);
+        self.device.dtod_copy(src, &mut dst).map_err(|e| format!("write_row dtod: {e}"))
+    }
+
     /// Shared dense/MoE implementation behind `forward_prompt`,
     /// `forward_prompt_capture_kv`, and `generate` (Phase 3 round 2):
     /// decodes new tokens one at a time (via `Self::prefill_dense` for the
@@ -3073,6 +3140,95 @@ impl Model {
         Ok(hidden)
     }
 
+    /// Batched-prefill variant of [`Self::forward_gated_attn_mixer`]: normalizes,
+    /// projects, RoPEs, and attends over `rows` positions at once (`Self::gemm`/
+    /// `Self::rope_batch`/`Self::attention_prefill`, same shape as
+    /// `Self::forward_attn_block_batched`), plus the two extra steps this mixer
+    /// needs beyond dense's attention block -- splitting the fused query+gate
+    /// projection and post-attention sigmoid gating -- done via the
+    /// `Self::split_qg_k`/`Self::sigmoid_gate_k` kernels instead of a per-row
+    /// host round trip. `start_pos` is this batch's first row's absolute
+    /// position (row `r` is `start_pos + r`), matching
+    /// `Self::forward_attn_block_batched`'s resume convention.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_gated_attn_mixer_batched(
+        &self,
+        h: &HybridModel,
+        w: &GatedAttnLayerWeights,
+        mut hidden: CudaSlice<f32>,
+        start_pos: usize,
+        rows: usize,
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
+        let cfg = &h.attn_cfg;
+        let normed = self.rmsnorm(&hidden, &w.attn_norm.data, rows, cfg.hidden_size, cfg.rmsnorm_eps)?;
+
+        let qg = self.gemm(&normed, &w.attn_q, rows)?;
+        let q_elems = rows * cfg.num_q_heads * cfg.head_dim;
+        let mut q =
+            self.device.alloc_zeros::<f32>(q_elems).map_err(|e| format!("gated-attn-batched q alloc: {e}"))?;
+        let mut gate =
+            self.device.alloc_zeros::<f32>(q_elems).map_err(|e| format!("gated-attn-batched gate alloc: {e}"))?;
+        {
+            let threads = 256u32;
+            let blocks = (q_elems as u32).div_ceil(threads).max(1);
+            let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            unsafe {
+                self.split_qg_k
+                    .function
+                    .clone()
+                    .launch(launch_cfg, (&qg, &mut q, &mut gate, cfg.num_q_heads as u32, cfg.head_dim as u32, rows as u32))
+                    .map_err(|e| format!("split_qg launch: {e}"))?;
+            }
+        }
+
+        let mut k = self.gemm(&normed, &w.attn_k, rows)?;
+        let v = self.gemm(&normed, &w.attn_v, rows)?;
+
+        q = self.rmsnorm(&q, &w.attn_q_norm.data, rows * cfg.num_q_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
+        k = self.rmsnorm(&k, &w.attn_k_norm.data, rows * cfg.num_kv_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
+
+        self.rope_batch(&mut q, start_pos, cfg.num_q_heads, cfg.head_dim, cfg.rotary_dim, rows, cfg.rope_base)?;
+        self.rope_batch(&mut k, start_pos, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim, rows, cfg.rope_base)?;
+
+        let kv_stride = cfg.num_kv_heads * cfg.head_dim;
+        let offset = start_pos * kv_stride;
+        let write_len = rows * kv_stride;
+        {
+            let mut dst = k_cache.slice_mut(offset..offset + write_len);
+            self.device.dtod_copy(&k, &mut dst).map_err(|e| format!("gated-attn-batched kv-cache dtod k: {e}"))?;
+        }
+        {
+            let mut dst = v_cache.slice_mut(offset..offset + write_len);
+            self.device.dtod_copy(&v, &mut dst).map_err(|e| format!("gated-attn-batched kv-cache dtod v: {e}"))?;
+        }
+        let seq_len = start_pos + rows;
+
+        let k_view = k_cache.slice(0..seq_len * kv_stride);
+        let v_view = v_cache.slice(0..seq_len * kv_stride);
+        let mut attn_out =
+            self.attention_prefill(&q, &k_view, &v_view, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, start_pos, rows)?;
+
+        {
+            let n = q_elems as u32;
+            let threads = 256u32;
+            let blocks = n.div_ceil(threads).max(1);
+            let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            unsafe {
+                self.sigmoid_gate_k
+                    .function
+                    .clone()
+                    .launch(launch_cfg, (&mut attn_out, &gate, n))
+                    .map_err(|e| format!("sigmoid_gate launch: {e}"))?;
+            }
+        }
+
+        let o_proj = self.gemm(&attn_out, &w.attn_output, rows)?;
+        self.add_inplace(&mut hidden, &o_proj)?;
+        Ok(hidden)
+    }
+
     /// Shared post-mixer FFN tail for both hybrid layer kinds: RMSNorm
     /// (`post_attn_norm`) -> SwiGLU -> residual. Identical math to
     /// `forward_layer_dense`'s tail, kept as a separate small copy rather
@@ -3089,6 +3245,96 @@ impl Model {
         let down = self.gemv(&activated, ffn_down)?;
         self.add_inplace(&mut post_mixer, &down)?;
         Ok(post_mixer)
+    }
+
+    /// Batched-prefill variant of [`Self::forward_hybrid_ffn`]: identical
+    /// SwiGLU shape, `Self::gemv`->`Self::gemm(..., rows)` and RMSNorm's
+    /// row count `1`->`rows`, same as `Self::forward_layer_dense_batched`'s
+    /// FFN tail. Used for the `GatedAttention` sublayer only -- `GatedDeltaNet`
+    /// still calls the unbatched `Self::forward_hybrid_ffn` once per row (see
+    /// `Self::forward_hybrid_layer_batched`).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_hybrid_ffn_batched(
+        &self,
+        mut post_mixer: CudaSlice<f32>,
+        norm: &Weight,
+        ffn_gate: &Weight,
+        ffn_up: &Weight,
+        ffn_down: &Weight,
+        hidden_size: usize,
+        ffn_hidden_size: usize,
+        rows: usize,
+        eps: f32,
+    ) -> Result<CudaSlice<f32>, String> {
+        let normed = self.rmsnorm(&post_mixer, &norm.data, rows, hidden_size, eps)?;
+        let gate = self.gemm(&normed, ffn_gate, rows)?;
+        let up = self.gemm(&normed, ffn_up, rows)?;
+        let activated = self.silu_and_mul(&gate, &up, rows * ffn_hidden_size)?;
+        let down = self.gemm(&activated, ffn_down, rows)?;
+        self.add_inplace(&mut post_mixer, &down)?;
+        Ok(post_mixer)
+    }
+
+    /// Layer-major dispatcher for hybrid batched prefill (`Self::prefill_hybrid_batched`):
+    /// runs all `rows` prompt positions through one layer at once, before the
+    /// next layer sees any of them (unlike `Self::forward_one_token_hybrid`'s
+    /// token-major loop, which runs one position through every layer before
+    /// the next position). Valid because a layer's output at position `p`
+    /// depends only on position `p`'s input plus that layer's own carried
+    /// state (`k_cache`/`v_cache` or `conv_state`/`recurrent`), never on
+    /// another position's intermediate value at the same layer -- the same
+    /// reassociation `Self::prefill_dense_batched` already relies on.
+    /// `GatedAttention` batches its mixer + FFN over all `rows` in one GEMM
+    /// pass each (`Self::forward_gated_attn_mixer_batched`/
+    /// `Self::forward_hybrid_ffn_batched`). `GatedDeltaNet` is a real
+    /// recurrence (`conv_state`/`recurrent` carry position-to-position
+    /// dependencies) and is **not** batched -- it loops `rows` times over the
+    /// *unmodified* `Self::forward_gdn_mixer`/`Self::forward_hybrid_ffn`,
+    /// extracting/writing one row at a time (`Self::extract_row`/`Self::write_row`)
+    /// from the shared `[rows, hidden_size]` buffer. Total GDN work is
+    /// unchanged from the token-major loop, just grouped by layer instead of
+    /// interleaved.
+    fn forward_hybrid_layer_batched(
+        &self,
+        h: &HybridModel,
+        layer: &HybridLayerWeights,
+        hidden: CudaSlice<f32>,
+        start_pos: usize,
+        rows: usize,
+        state: &mut HybridLayerState,
+    ) -> Result<CudaSlice<f32>, String> {
+        let hidden_size = h.attn_cfg.hidden_size;
+        let ffn_hidden_size = h.attn_cfg.ffn_hidden_size;
+        let eps = h.attn_cfg.rmsnorm_eps;
+
+        match (layer, state) {
+            (HybridLayerWeights::GatedAttention(w), HybridLayerState::Attn { k_cache, v_cache }) => {
+                let post_mixer = self.forward_gated_attn_mixer_batched(h, w, hidden, start_pos, rows, k_cache, v_cache)?;
+                self.forward_hybrid_ffn_batched(
+                    post_mixer,
+                    &w.post_attn_norm,
+                    &w.ffn_gate,
+                    &w.ffn_up,
+                    &w.ffn_down,
+                    hidden_size,
+                    ffn_hidden_size,
+                    rows,
+                    eps,
+                )
+            }
+            (HybridLayerWeights::GatedDeltaNet(w), HybridLayerState::Gdn { conv_state, recurrent }) => {
+                let mut out = hidden;
+                for row in 0..rows {
+                    let row_hidden = self.extract_row(&out, row, hidden_size)?;
+                    let post_mixer = self.forward_gdn_mixer(h, w, row_hidden, conv_state, recurrent)?;
+                    let row_out =
+                        self.forward_hybrid_ffn(post_mixer, &w.post_attn_norm, &w.ffn_gate, &w.ffn_up, &w.ffn_down, hidden_size, ffn_hidden_size, eps)?;
+                    self.write_row(&mut out, row, hidden_size, &row_out)?;
+                }
+                Ok(out)
+            }
+            _ => Err("internal error: hybrid layer/state kind mismatch".to_string()),
+        }
     }
 
     /// One DeepSeek-V2/V3 MLA attention block (see `MlaConfig`'s doc comment for
@@ -3218,42 +3464,21 @@ impl Model {
         Ok((generated[0], text))
     }
 
-    /// Hybrid counterpart to [`Self::generate_dense_impl`] (Phase 3 round
-    /// 2): same encode -> seed-from-`imported` -> per-position loop ->
-    /// decode-more-tokens shape, but each layer dispatches to
-    /// [`Self::forward_gated_attn_mixer`] or [`Self::forward_gdn_mixer`]
-    /// (never both) based on its [`HybridLayerWeights`] variant, carrying
-    /// the matching [`HybridLayerState`] variant across positions. Only the
-    /// `GatedAttention` sublayers' `k_cache`/`v_cache` need `imported`'s
-    /// `seq_len` offset treatment (sized with headroom for
-    /// `max_new_tokens`, same convention as `generate_dense_impl`'s
-    /// buffers); the `GatedDeltaNet` sublayers' `conv_state`/`recurrent`
-    /// are fixed-size and get uploaded as-is when resuming.
-    fn generate_hybrid_impl(
+    /// Shared per-layer state allocation/import behind [`Self::prefill_hybrid`]
+    /// and [`Self::prefill_hybrid_batched`]: allocates each layer's
+    /// `HybridLayerState` (`GatedAttention`'s `k_cache`/`v_cache` sized for
+    /// `start_pos + rows + extra_headroom` positions, `GatedDeltaNet`'s
+    /// fixed-size `conv_state`/`recurrent`) and seeds it from `imported` when
+    /// resuming -- identical between the sequential and batched prefill paths,
+    /// so factored out once rather than duplicated.
+    fn alloc_hybrid_states(
         &self,
         h: &HybridModel,
-        prompt: &str,
         imported: Option<&crate::kv_io::HybridKvCache>,
-        max_new_tokens: usize,
-        mut on_first_token: impl FnMut(),
-    ) -> Result<(Vec<u32>, String, Vec<HybridLayerState>, usize), String> {
-        let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
-
-        let mut ids = self.tokenizer.encode(prompt)?;
-        if start_pos == 0 {
-            if let Some(bos) = self.tokenizer.bos_token_id {
-                if ids.first() != Some(&bos) {
-                    ids.insert(0, bos);
-                }
-            }
-        }
-        if ids.is_empty() {
-            return Err("encode produced no tokens".to_string());
-        }
-        if max_new_tokens == 0 {
-            return Err("max_new_tokens must be at least 1".to_string());
-        }
-
+        start_pos: usize,
+        rows: usize,
+        extra_headroom: usize,
+    ) -> Result<Vec<HybridLayerState>, String> {
         if let Some(cache) = imported {
             if cache.attn_num_kv_heads != h.attn_cfg.num_kv_heads || cache.attn_head_dim != h.attn_cfg.head_dim {
                 return Err("imported hybrid KV cache's GatedAttention shape doesn't match this model".to_string());
@@ -3263,9 +3488,8 @@ impl Model {
             }
         }
 
-        let attn_kv_cache_len = (start_pos + ids.len() + max_new_tokens) * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
-        let mut states: Vec<HybridLayerState> = h
-            .layers
+        let attn_kv_cache_len = (start_pos + rows + extra_headroom) * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
+        h.layers
             .iter()
             .enumerate()
             .map(|(layer_idx, l)| -> Result<HybridLayerState, String> {
@@ -3303,10 +3527,41 @@ impl Model {
                     }
                 }
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, String>>()
+    }
 
-        let hidden_size = h.attn_cfg.hidden_size;
-        let eps = h.attn_cfg.rmsnorm_eps;
+    /// Sequential hybrid prefill: encodes `prompt`, seeds state from `imported`
+    /// (see [`Self::alloc_hybrid_states`]), then runs every prompt token
+    /// through every layer one position at a time via
+    /// [`Self::forward_one_token_hybrid`] -- the pre-batching behavior,
+    /// kept unchanged as the verification oracle for
+    /// [`Self::prefill_hybrid_batched`] (`hybrid_batching_tests` below), the
+    /// same role [`Self::prefill_dense`] plays for `prefill_dense_batched`.
+    /// Not used by [`Self::generate_hybrid_impl`] any more (see that
+    /// function's doc comment) -- kept only for the oracle role and any
+    /// future direct caller.
+    fn prefill_hybrid(
+        &self,
+        h: &HybridModel,
+        prompt: &str,
+        imported: Option<&crate::kv_io::HybridKvCache>,
+        extra_headroom: usize,
+    ) -> Result<(Vec<u32>, CudaSlice<f32>, Vec<HybridLayerState>, usize), String> {
+        let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
+
+        let mut ids = self.tokenizer.encode(prompt)?;
+        if start_pos == 0 {
+            if let Some(bos) = self.tokenizer.bos_token_id {
+                if ids.first() != Some(&bos) {
+                    ids.insert(0, bos);
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Err("encode produced no tokens".to_string());
+        }
+
+        let mut states = self.alloc_hybrid_states(h, imported, start_pos, ids.len(), extra_headroom)?;
 
         let mut position = start_pos;
         let mut hidden_dev: Option<CudaSlice<f32>> = None;
@@ -3314,7 +3569,84 @@ impl Model {
             hidden_dev = Some(self.forward_one_token_hybrid(h, token_id, position, &mut states)?);
             position += 1;
         }
-        let mut hidden = hidden_dev.ok_or("no tokens processed")?;
+        let hidden = hidden_dev.ok_or("no tokens processed")?;
+
+        Ok((ids, hidden, states, position))
+    }
+
+    /// Batched-prefill variant of [`Self::prefill_hybrid`]: same
+    /// signature/state-allocation logic (`Self::alloc_hybrid_states`), but
+    /// runs every prompt token through each layer in one layer-major batched
+    /// pass (`Self::forward_hybrid_layer_batched`, `rows = ids.len()`)
+    /// instead of looping `forward_one_token_hybrid` once per token. Like
+    /// `Self::prefill_dense_batched`, returns the *whole* `[rows,
+    /// hidden_size]` batched hidden state -- callers wanting only the last
+    /// prompt position must slice it out with [`Self::last_row`].
+    fn prefill_hybrid_batched(
+        &self,
+        h: &HybridModel,
+        prompt: &str,
+        imported: Option<&crate::kv_io::HybridKvCache>,
+        extra_headroom: usize,
+    ) -> Result<(Vec<u32>, CudaSlice<f32>, Vec<HybridLayerState>, usize), String> {
+        let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
+
+        let mut ids = self.tokenizer.encode(prompt)?;
+        if start_pos == 0 {
+            if let Some(bos) = self.tokenizer.bos_token_id {
+                if ids.first() != Some(&bos) {
+                    ids.insert(0, bos);
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Err("encode produced no tokens".to_string());
+        }
+        let rows = ids.len();
+
+        let mut states = self.alloc_hybrid_states(h, imported, start_pos, rows, extra_headroom)?;
+
+        let hidden_size = h.attn_cfg.hidden_size;
+        let mut host_embd = vec![0.0f32; rows * hidden_size];
+        for (row, &token_id) in ids.iter().enumerate() {
+            let embd_base = token_id as usize * hidden_size;
+            host_embd[row * hidden_size..(row + 1) * hidden_size]
+                .copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
+        }
+        let mut hidden = self.device.htod_sync_copy(&host_embd).map_err(|e| format!("embedding htod: {e}"))?;
+
+        for (layer, state) in h.layers.iter().zip(states.iter_mut()) {
+            hidden = self.forward_hybrid_layer_batched(h, layer, hidden, start_pos, rows, state)?;
+        }
+
+        Ok((ids, hidden, states, start_pos + rows))
+    }
+
+    /// Hybrid counterpart to [`Self::generate_dense_impl`] (Phase 3 round 2;
+    /// switched to the layer-major batched prefill path in the batched-prefill
+    /// round that added [`Self::prefill_hybrid_batched`], mirroring
+    /// `generate_dense_impl`'s own switch to `prefill_dense_batched`): prompt
+    /// positions are batched through `GatedAttention` layers and looped
+    /// sequentially through `GatedDeltaNet` layers' recurrence
+    /// (`Self::prefill_hybrid_batched`), then new tokens are decoded one at a
+    /// time (`rows == 1`, a GEMM buys nothing there) via the unchanged
+    /// per-token per-layer loop, [`Self::forward_one_token_hybrid`].
+    fn generate_hybrid_impl(
+        &self,
+        h: &HybridModel,
+        prompt: &str,
+        imported: Option<&crate::kv_io::HybridKvCache>,
+        max_new_tokens: usize,
+        mut on_first_token: impl FnMut(),
+    ) -> Result<(Vec<u32>, String, Vec<HybridLayerState>, usize), String> {
+        if max_new_tokens == 0 {
+            return Err("max_new_tokens must be at least 1".to_string());
+        }
+
+        let (ids, hidden_batched, mut states, mut position) = self.prefill_hybrid_batched(h, prompt, imported, max_new_tokens)?;
+        let hidden_size = h.attn_cfg.hidden_size;
+        let eps = h.attn_cfg.rmsnorm_eps;
+        let mut hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
 
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
         let mut next_id = self.lm_head_argmax(&hidden, hidden_size, eps)?;
@@ -3660,6 +3992,59 @@ mod prefill_batching_tests {
 
         let seq_argmax = model.lm_head_argmax(&seq_hidden, hidden_size, model.cfg.rmsnorm_eps).expect("seq argmax failed");
         let batch_argmax = model.lm_head_argmax(&batch_last_row, hidden_size, model.cfg.rmsnorm_eps).expect("batch argmax failed");
+        assert_eq!(seq_argmax, batch_argmax, "greedy-argmax next token must match between the two prefill paths");
+    }
+}
+
+#[cfg(test)]
+mod hybrid_batching_tests {
+    use super::*;
+    use crate::gguf::GgufFile;
+    use cudarc::driver::CudaDevice;
+
+    /// Byte-exact-ish cross-check of `prefill_hybrid_batched` (layer-major
+    /// GatedAttention batching, GatedDeltaNet left sequential -- see
+    /// `Model::forward_hybrid_layer_batched`'s doc comment) against
+    /// `prefill_hybrid` (the original token-major sequential loop) on the
+    /// same prompt/weights -- the blocking check before trusting the batched
+    /// hybrid prefill path, same role
+    /// `prefill_dense_batched_matches_sequential_prefill` plays for dense/MoE.
+    /// Real GGUF fixtures live outside this repo (gitignored), so this is
+    /// `#[ignore]`d by default -- run with:
+    /// `COLDSTART_TEST_GGUF=<path to a Qwen3.5 hybrid GGUF> cargo test --release -- --ignored prefill_hybrid_batched_matches_sequential`
+    #[test]
+    #[ignore]
+    fn prefill_hybrid_batched_matches_sequential() {
+        let gguf_path = std::env::var("COLDSTART_TEST_GGUF")
+            .expect("set COLDSTART_TEST_GGUF to a real local Qwen3.5 hybrid GGUF path to run this test");
+        let prompt = "The capital of France is";
+
+        let file = GgufFile::open(&gguf_path).expect("failed to open COLDSTART_TEST_GGUF");
+        let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+        let model = Model::load_hybrid(device, &file).expect("failed to load hybrid model");
+        let h = model.hybrid.as_ref().expect("loaded model is not hybrid");
+
+        let (seq_ids, seq_hidden, _, seq_position) = model.prefill_hybrid(h, prompt, None, 0).expect("prefill_hybrid failed");
+        let (batch_ids, batch_hidden, _, batch_position) =
+            model.prefill_hybrid_batched(h, prompt, None, 0).expect("prefill_hybrid_batched failed");
+
+        assert_eq!(seq_ids, batch_ids, "tokenization must match between the two prefill paths");
+        assert_eq!(seq_position, batch_position, "final position must match between the two prefill paths");
+
+        let rows = batch_ids.len();
+        let hidden_size = h.attn_cfg.hidden_size;
+        let batch_last_row = model.last_row(&batch_hidden, rows, hidden_size).expect("last_row failed");
+
+        let seq_host = model.device.dtoh_sync_copy(&seq_hidden).expect("seq hidden dtoh failed");
+        let batch_host = model.device.dtoh_sync_copy(&batch_last_row).expect("batch hidden dtoh failed");
+        assert_eq!(seq_host.len(), batch_host.len());
+        for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-3, "hidden[{i}]: sequential={a}, batched={b}");
+        }
+
+        let eps = h.attn_cfg.rmsnorm_eps;
+        let seq_argmax = model.lm_head_argmax(&seq_hidden, hidden_size, eps).expect("seq argmax failed");
+        let batch_argmax = model.lm_head_argmax(&batch_last_row, hidden_size, eps).expect("batch argmax failed");
         assert_eq!(seq_argmax, batch_argmax, "greedy-argmax next token must match between the two prefill paths");
     }
 }
