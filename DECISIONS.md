@@ -537,3 +537,73 @@ the mixer's own non-Linear parameterization), not just widening
 `--lora-scaled` flag supports) was deliberately left out of round 1 as unrequested
 scope; add it as a plain `f32` multiplier into `LoraTarget::delta`'s scale computation
 if a future need comes up.
+
+## Phase 4 (Embeddability) round 2 scope: C-FFI is load/generate/free only, cbindgen, reused instance
+
+**Decision**: the Rust C-FFI surface (`src/ffi.rs`) exposes exactly three operations —
+`coldstart_load` (GGUF path + optional LoRA adapter path), `coldstart_generate` (prompt
+in, token ids + text out), `coldstart_free` — plus `coldstart_last_error` for the
+error-string convention and `coldstart_free_generate_result` for the generate call's
+output buffers. Phase 3's `--export-kv`/`--import-kv` state I/O is **not** exposed
+through this FFI round. The header is generated with `cbindgen` from `src/ffi.rs`
+(config in `cbindgen.toml`) into a checked-in `include/coldstart_infer.h`, regenerated
+by hand rather than wired into `build.rs`. The already-running `bkzn3giz` A6000
+instance (confirmed `RUNNING` via `tnr status --json`, not assumed) was reused for
+real-hardware verification.
+
+**Why**: confirmed with the user before starting (three explicit questions, matching
+this project's practice: API surface, header-generation approach, GPU instance).
+Load/generate/free-only matches this project's narrow-first precedent one more time —
+`--lora`'s adapter path was folded into `coldstart_load` as an optional parameter
+rather than given its own FFI call, since round 1 already made it load-time-only (no
+separate "apply LoRA" step exists to expose); state I/O was left out because no
+embedding host had asked for it yet and adding it means designing a buffer-ownership
+convention across the FFI boundary for KV blobs, which is new scope beyond "wrap the
+existing load/generate calls in a C-safe shell". `cbindgen` was chosen over a
+hand-written header because it's the standard convention for a Rust crate exposing a C
+ABI and keeps the header in sync with `src/ffi.rs` automatically as the surface
+evolves, rather than risking hand-transcription drift (the kind of raw-source-vs.-
+paraphrase mismatch that already caused a real bug in Phase 4 round 1's LoRA parsing,
+see above) between the two.
+
+**Error-boundary mechanism**: every `extern "C"` function wraps its body in
+`std::panic::catch_unwind`, converting both a caught panic and this crate's existing
+`Result<_, String>` convention (`model.rs`/`lora.rs`, unchanged) into the same
+thread-local last-error string read via `coldstart_last_error`. This was necessary,
+not optional caution: unwinding a Rust panic across an `extern "C"` boundary is
+undefined behavior in the C caller, and this crate's existing code already reaches for
+`.expect()`/panics in a few places (e.g. the `env!()` kernel-path macros, GGUF parsing
+edge cases) that a naive `extern "C"` wrapper without `catch_unwind` would let escape
+directly into the host process's control flow.
+
+**Compiles as**: `Cargo.toml`'s `[lib]` section gained `crate-type = ["rlib", "cdylib",
+"staticlib"]` — `rlib` had to stay in the list (not just be replaced) because Cargo
+only auto-links a package's own lib target into its `src/bin/*.rs` targets when a
+Rust-linkable crate-type (`lib`/`rlib`/`dylib`) is present; dropping it to `["cdylib",
+"staticlib"]` alone would have broken `qwen3_coldstart`/`smoke_coldstart`. No
+`build.rs` changes were needed — the AOT kernel-compilation pipeline governs `.cu` →
+PTX/cubin, entirely orthogonal to which Rust crate-types `rustc` emits from the
+already-built kernels.
+
+**Verification**: real hardware (A6000, `bkzn3giz`), a real C program
+(`ffi-test/smoke_test.c`, plain `gcc`, not a Rust test) linked against the built
+`libcoldstart_infer.so`, exercising the full `load` → `generate` → `free` surface and
+cross-checked byte-exact against `qwen3_coldstart` on the same GGUF+prompt+
+`max_new_tokens` for two architectures: dense `Qwen3-0.6B-Q4_K_M.gguf`
+(`token_ids=[13,576,3974,13876,38835]`, identical decoded text) and Qwen3.5 hybrid
+`Qwen3.5-0.8B-Q4_K_M.gguf` (`token_ids=[0,353,1044]`, identical decoded text) — not
+just "it compiles and links". The error path (a nonexistent GGUF path) was also
+verified: `coldstart_load` returns `NULL`, no crash, and `coldstart_last_error()`
+names the missing file. `staticlib` linking was attempted too (not part of the
+confirmed scope, but cheap to try since the crate-type was already added) and found to
+have a real, unresolved problem — see STATUS.md's "Known debt" entry — so `cdylib` is
+documented as the recommended path rather than claiming both work equally.
+
+**How to apply**: a future round wanting Phase 3 state I/O (`--export-kv`/
+`--import-kv`) through the FFI needs to design an explicit buffer-ownership convention
+for KV-cache blobs crossing the C boundary (who allocates, who frees, whether it's a
+raw byte buffer or a path to a file this crate itself writes) — treat that as new
+scope requiring its own confirm-before-starting conversation, not a small addition to
+`coldstart_load`/`coldstart_generate`. If `staticlib` linking is ever needed for real,
+root-cause the runtime hang (start by checking for duplicate `libc`/pthread symbols
+between the archive and the CUDA driver's dynamic loading path) before trusting it.

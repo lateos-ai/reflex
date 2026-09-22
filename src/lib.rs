@@ -6,6 +6,7 @@ pub mod aot;
 pub mod dequant;
 pub mod dequant_iq;
 pub mod dequant_iq_tables;
+pub mod ffi;
 pub mod gated_deltanet;
 pub mod gguf;
 pub mod kv_io;

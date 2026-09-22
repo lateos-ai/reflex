@@ -5,6 +5,13 @@ edition = "2021"
 license = "MIT"
 build = "build.rs"
 
+[lib]
+# Phase 4 (Embeddability) round 2: cdylib/staticlib alongside the default
+# rlib so `src/ffi.rs`'s extern "C" surface is actually linkable from a C
+# host, while keeping rlib so the existing `src/bin/*.rs` targets still link
+# against this crate unmodified.
+crate-type = ["rlib", "cdylib", "staticlib"]
+
 [dependencies]
 cudarc = { version = "0.11", features = ["driver", "cublas", "cuda-12000", "f16"] }
 half = "2.3"
