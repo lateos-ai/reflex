@@ -5,8 +5,8 @@
 //!
 //! Also the CLI entry point for Phase 3 (State I/O)'s KV-cache export/
 //! import: `--export-kv <file>` downloads the K/V cache produced by this
-//! run's initial prompt pass and writes it to `<file>` (dense/MoE and
-//! hybrid Qwen3.5 models; not yet MLA -- round 3). `--import-kv <file>`
+//! run's initial prompt pass and writes it to `<file>` (dense/MoE, hybrid
+//! Qwen3.5, and DeepSeek-V2/V3 MLA models). `--import-kv <file>`
 //! loads a previously-exported cache, uploads it as the starting state, and
 //! resumes generation from it -- `prompt` is then the continuation text
 //! appended after the cached positions, not a fresh prompt. `--max-tokens N`
@@ -88,7 +88,16 @@ fn main() {
                 kv_io::export_dense_kv(export_path, &cache).expect("failed to export KV cache");
                 (token_id, text)
             }
-            ArchitectureKind::Mla => panic!("--export-kv is not yet supported for MLA models (round 3, see kv_io.rs)"),
+            ArchitectureKind::Mla => {
+                let ((token_id, text), cache) = model.forward_prompt_capture_kv_mla(&prompt).expect("forward_prompt_capture_kv_mla failed");
+                println!(
+                    "COLDSTART_QWEN3_KV_EXPORT_OK path={export_path:?} kind=mla seq_len={} num_layers={}",
+                    cache.seq_len,
+                    cache.kv_caches.len()
+                );
+                kv_io::export_mla_kv(export_path, &cache).expect("failed to export MLA KV cache");
+                (token_id, text)
+            }
         };
         let elapsed = t0.elapsed();
         println!(

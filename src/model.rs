@@ -1785,13 +1785,10 @@ impl Model {
     /// callers can capture accurate "time to first token" timing even when
     /// `max_new_tokens > 1` keeps the call running past that point.
     ///
-    /// Dense/MoE and the Qwen3.5 hybrid mixer both support resume as of
-    /// round 2 (the hybrid `GatedDeltaNet` sublayers' `conv_state`/
-    /// `recurrent` need no `start_pos` handling at all -- see
-    /// `kv_io.rs`'s doc comment). MLA is deliberately not extended yet
-    /// (round 3) -- both resuming from an imported cache and multi-token
-    /// generation past the first token are rejected for it here, matching
-    /// this project's narrow-first precedent from every prior MVP step.
+    /// Dense/MoE and the Qwen3.5 hybrid mixer support resume as of round 2
+    /// (the hybrid `GatedDeltaNet` sublayers' `conv_state`/`recurrent` need
+    /// no `start_pos` handling at all -- see `kv_io.rs`'s doc comment); MLA
+    /// as of round 3, via `generate_mla_impl`.
     pub fn generate(
         &self,
         prompt: &str,
@@ -1815,19 +1812,19 @@ impl Model {
                 let (generated, text, _, _) = self.generate_hybrid_impl(h, prompt, Some(cache), max_new_tokens, on_first_token)?;
                 Ok((generated, text))
             }
+            Some(crate::kv_io::ImportedKv::Mla(cache)) => {
+                let m = self.mla.as_ref().ok_or("imported KV cache file is MLA format, but this model is not an MLA model")?;
+                let (generated, text, _, _) = self.generate_mla_impl(m, prompt, Some(cache), max_new_tokens, on_first_token)?;
+                Ok((generated, text))
+            }
             None => {
                 if let Some(h) = &self.hybrid {
                     let (generated, text, _, _) = self.generate_hybrid_impl(h, prompt, None, max_new_tokens, on_first_token)?;
                     return Ok((generated, text));
                 }
-                if self.mla.is_some() {
-                    if max_new_tokens != 1 {
-                        return Err("multi-token generation is not yet supported for MLA models (round 3) -- use max_new_tokens=1".to_string());
-                    }
-                    let mut on_first_token = on_first_token;
-                    let (id, text) = self.forward_prompt(prompt)?;
-                    on_first_token();
-                    return Ok((vec![id], text));
+                if let Some(m) = &self.mla {
+                    let (generated, text, _, _) = self.generate_mla_impl(m, prompt, None, max_new_tokens, on_first_token)?;
+                    return Ok((generated, text));
                 }
                 let (generated, text, _, _, _) = self.generate_dense_impl(prompt, None, max_new_tokens, on_first_token)?;
                 Ok((generated, text))
@@ -1974,14 +1971,14 @@ impl Model {
     /// positions actually written -- `generate_dense_impl`'s buffers carry
     /// extra headroom this capture doesn't use) to host memory for
     /// `--export-kv` to serialize. Hybrid models use
-    /// `forward_prompt_capture_kv_hybrid` instead; MLA isn't supported yet
-    /// (round 3).
+    /// `forward_prompt_capture_kv_hybrid` instead, MLA models
+    /// `forward_prompt_capture_kv_mla`.
     pub fn forward_prompt_capture_kv(&self, prompt: &str) -> Result<((u32, String), crate::kv_io::DenseKvCache), String> {
         if self.hybrid.is_some() {
             return Err("--export-kv on a hybrid Qwen3.5 model needs forward_prompt_capture_kv_hybrid, not this function".to_string());
         }
         if self.mla.is_some() {
-            return Err("--export-kv is not yet supported for MLA models (round 3, see kv_io.rs)".to_string());
+            return Err("--export-kv on an MLA model needs forward_prompt_capture_kv_mla, not this function".to_string());
         }
         let (generated, text, k_caches, v_caches, seq_len) = self.generate_dense_impl(prompt, None, 1, || {})?;
 
@@ -2629,63 +2626,149 @@ impl Model {
         Ok(post_attn)
     }
 
+    /// MLA-model counterpart to [`Self::forward_prompt_hybrid`]: thin wrapper
+    /// over [`Self::generate_mla_impl`] with no import and exactly one
+    /// generated token.
     fn forward_prompt_mla(&self, m: &MlaModel, prompt: &str) -> Result<(u32, String), String> {
+        let (generated, text, _kv_caches, _seq_len) = self.generate_mla_impl(m, prompt, None, 1, || {})?;
+        Ok((generated[0], text))
+    }
+
+    /// MLA counterpart to [`Self::generate_dense_impl`]/[`Self::generate_hybrid_impl`]
+    /// (Phase 3 round 3): same encode -> seed-from-`imported` -> per-position
+    /// loop -> decode-more-tokens shape, but each layer's single compressed
+    /// `kv_cache` (`[seq_len, kv_lora_rank + qk_rope_head_dim]`, no separate
+    /// K/V pair -- see [`Self::forward_mla_attn_block`]) gets the same
+    /// `start_pos`-offset treatment dense/MoE's `k_cache`/`v_cache` and
+    /// hybrid's `GatedAttention` sublayers already do: preallocated for
+    /// `start_pos + prompt_len + max_new_tokens`, seeded from `imported` at
+    /// offset 0 before the per-position loop starts, then indexed by
+    /// absolute position exactly like a from-scratch run just offset by
+    /// `imported`'s `seq_len`.
+    fn generate_mla_impl(
+        &self,
+        m: &MlaModel,
+        prompt: &str,
+        imported: Option<&crate::kv_io::MlaKvCache>,
+        max_new_tokens: usize,
+        mut on_first_token: impl FnMut(),
+    ) -> Result<(Vec<u32>, String, Vec<CudaSlice<f32>>, usize), String> {
+        let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
+
         let mut ids = self.tokenizer.encode(prompt)?;
-        if let Some(bos) = self.tokenizer.bos_token_id {
-            if ids.first() != Some(&bos) {
-                ids.insert(0, bos);
+        if start_pos == 0 {
+            if let Some(bos) = self.tokenizer.bos_token_id {
+                if ids.first() != Some(&bos) {
+                    ids.insert(0, bos);
+                }
             }
         }
         if ids.is_empty() {
             return Err("encode produced no tokens".to_string());
         }
+        if max_new_tokens == 0 {
+            return Err("max_new_tokens must be at least 1".to_string());
+        }
 
         let cfg = &m.cfg;
         let qk_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim;
-        let kv_cache_len = ids.len() * qk_dim;
+        let total_len = start_pos + ids.len() + max_new_tokens;
         let mut kv_caches: Vec<CudaSlice<f32>> = (0..m.layers.len())
-            .map(|_| self.device.alloc_zeros::<f32>(kv_cache_len))
+            .map(|_| self.device.alloc_zeros::<f32>(total_len * qk_dim))
             .collect::<Result<_, _>>()
             .map_err(|e| format!("alloc mla kv_cache: {e}"))?;
 
+        if let Some(cache) = imported {
+            if cache.qk_dim != qk_dim {
+                return Err(format!(
+                    "imported KV cache shape mismatch: file has qk_dim={}, model expects qk_dim={}",
+                    cache.qk_dim, qk_dim
+                ));
+            }
+            if cache.kv_caches.len() != m.layers.len() {
+                return Err(format!("imported KV cache has {} layers, model has {}", cache.kv_caches.len(), m.layers.len()));
+            }
+            let imported_len = cache.seq_len * qk_dim;
+            for (layer_idx, kv_host) in cache.kv_caches.iter().enumerate() {
+                let mut dst = kv_caches[layer_idx].slice_mut(0..imported_len);
+                self.device.htod_sync_copy_into(kv_host, &mut dst).map_err(|e| format!("import mla kv_cache htod layer {layer_idx}: {e}"))?;
+            }
+        }
+
+        let hidden_size = cfg.hidden_size;
+        let eps = cfg.rmsnorm_eps;
+
+        let mut position = start_pos;
+        let mut hidden_dev: Option<CudaSlice<f32>> = None;
+        for &token_id in &ids {
+            hidden_dev = Some(self.forward_one_token_mla(m, token_id, position, &mut kv_caches)?);
+            position += 1;
+        }
+        let mut hidden = hidden_dev.ok_or("no tokens processed")?;
+
+        let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
+        let mut next_id = self.lm_head_argmax(&hidden, hidden_size, eps)?;
+        on_first_token();
+        generated.push(next_id);
+
+        while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
+            hidden = self.forward_one_token_mla(m, next_id, position, &mut kv_caches)?;
+            position += 1;
+            next_id = self.lm_head_argmax(&hidden, hidden_size, eps)?;
+            generated.push(next_id);
+        }
+
+        let text = self.tokenizer.decode(&generated);
+        Ok((generated, text, kv_caches, position))
+    }
+
+    /// Embeds `token_id` and runs it through every MLA layer at absolute
+    /// `position`, writing this position's compressed `Kcur` into
+    /// `kv_caches` (preallocated device buffers, see `generate_mla_impl`).
+    fn forward_one_token_mla(&self, m: &MlaModel, token_id: u32, position: usize, kv_caches: &mut [CudaSlice<f32>]) -> Result<CudaSlice<f32>, String> {
+        let cfg = &m.cfg;
         let hidden_size = cfg.hidden_size;
         let ffn_hidden_size = cfg.ffn_hidden_size;
         let eps = cfg.rmsnorm_eps;
-        let mut hidden_host = vec![0.0f32; hidden_size];
-        let mut hidden_dev: Option<CudaSlice<f32>> = None;
-        for (position, &token_id) in ids.iter().enumerate() {
-            let embd_base = token_id as usize * hidden_size;
-            hidden_host.copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
-            let mut hidden = self.device.htod_sync_copy(&hidden_host).map_err(|e| format!("embedding htod: {e}"))?;
+        let embd_base = token_id as usize * hidden_size;
+        let mut hidden = self
+            .device
+            .htod_sync_copy(&self.token_embd[embd_base..embd_base + hidden_size])
+            .map_err(|e| format!("embedding htod: {e}"))?;
 
-            for (layer_idx, layer) in m.layers.iter().enumerate() {
-                let post_attn = self.forward_mla_attn_block(m, layer, hidden, position, &mut kv_caches[layer_idx])?;
-                hidden = match &layer.ffn {
-                    MlaFfn::Dense { ffn_gate, ffn_up, ffn_down } => {
-                        self.forward_hybrid_ffn(post_attn, &layer.ffn_norm, ffn_gate, ffn_up, ffn_down, hidden_size, ffn_hidden_size, eps)?
-                    }
-                    MlaFfn::Moe { .. } => {
-                        let moe_cfg = cfg.moe.as_ref().ok_or("internal error: MlaFfn::Moe layer but MlaConfig::moe is None")?;
-                        self.forward_mla_moe_ffn(layer, post_attn, hidden_size, moe_cfg, eps)?
-                    }
-                };
-            }
-            hidden_dev = Some(hidden);
+        for (layer_idx, layer) in m.layers.iter().enumerate() {
+            let post_attn = self.forward_mla_attn_block(m, layer, hidden, position, &mut kv_caches[layer_idx])?;
+            hidden = match &layer.ffn {
+                MlaFfn::Dense { ffn_gate, ffn_up, ffn_down } => {
+                    self.forward_hybrid_ffn(post_attn, &layer.ffn_norm, ffn_gate, ffn_up, ffn_down, hidden_size, ffn_hidden_size, eps)?
+                }
+                MlaFfn::Moe { .. } => {
+                    let moe_cfg = cfg.moe.as_ref().ok_or("internal error: MlaFfn::Moe layer but MlaConfig::moe is None")?;
+                    self.forward_mla_moe_ffn(layer, post_attn, hidden_size, moe_cfg, eps)?
+                }
+            };
         }
-        let hidden = hidden_dev.ok_or("no tokens processed")?;
+        Ok(hidden)
+    }
 
-        let normed = self.rmsnorm(&hidden, &self.output_norm.data, 1, hidden_size, eps)?;
-        let logits_dev = self.gemv(&normed, &self.lm_head)?;
-        let logits = self.device.dtoh_sync_copy(&logits_dev).map_err(|e| format!("logits dtoh: {e}"))?;
+    /// MLA counterpart to [`Self::forward_prompt_capture_kv`]/
+    /// [`Self::forward_prompt_capture_kv_hybrid`]: runs the same forward pass
+    /// as `forward_prompt` on an MLA model but also downloads every layer's
+    /// single compressed `kv_cache` (sliced to exactly the positions
+    /// actually written -- `generate_mla_impl`'s buffers carry extra
+    /// headroom this capture doesn't use) to host memory for `--export-kv`.
+    pub fn forward_prompt_capture_kv_mla(&self, prompt: &str) -> Result<((u32, String), crate::kv_io::MlaKvCache), String> {
+        let m = self.mla.as_ref().ok_or("forward_prompt_capture_kv_mla called on a non-MLA model")?;
+        let (generated, text, kv_caches, seq_len) = self.generate_mla_impl(m, prompt, None, 1, || {})?;
 
-        let next_id = logits
+        let qk_dim = m.cfg.kv_lora_rank + m.cfg.qk_rope_head_dim;
+        let per_layer_len = seq_len * qk_dim;
+        let kv_caches = kv_caches
             .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .ok_or("cannot argmax an empty logits slice")?;
+            .map(|c| self.device.dtoh_sync_copy(&c.slice(0..per_layer_len)).map_err(|e| format!("mla kv_cache dtoh: {e}")))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let text = self.tokenizer.decode(&[next_id]);
-        Ok((next_id, text))
+        let cache = crate::kv_io::MlaKvCache { seq_len, qk_dim, kv_caches };
+        Ok(((generated[0], text), cache))
     }
 }

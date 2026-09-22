@@ -8,16 +8,20 @@
 //! `GatedAttention` sublayers' `k_cache`/`v_cache` need the same
 //! `start_pos`-offset treatment as dense/MoE's; the `GatedDeltaNet`
 //! sublayers' `conv_state`/`recurrent` are already streaming-friendly --
-//! fixed-size, not indexed by position -- so they round-trip as-is). MLA's
-//! single compressed cache is still unsupported (round 3). The engine stays
-//! ignorant of where the file lives (NVMe, S3-backed FUSE, tmpfs) -- see
-//! CLAUDE.md's Non-goals.
+//! fixed-size, not indexed by position -- so they round-trip as-is). Round 3
+//! adds MLA's single compressed latent-KV cache (`MlaKvCache` -- one buffer
+//! per layer, shape `[seq_len, kv_lora_rank + qk_rope_head_dim]`, unlike
+//! dense/MoE's separate K/V pair or hybrid's per-layer Attn/Gdn split), the
+//! last of the three cache shapes this project's architectures produce. The
+//! engine stays ignorant of where the file lives (NVMe, S3-backed FUSE,
+//! tmpfs) -- see CLAUDE.md's Non-goals.
 //!
 //! File format is a flat, home-grown binary layout, not a stable public
 //! spec: magic + version-gated, so the version-1 dense/MoE-only layout
 //! round-1 shipped stays readable unchanged (`import_dense_kv`) while
-//! version 2 adds the hybrid layout alongside it (`import_hybrid_kv`) --
-//! `import_kv` dispatches on the version field to pick between them.
+//! version 2 adds the hybrid layout (`import_hybrid_kv`) and version 3 adds
+//! the MLA layout (`import_mla_kv`) alongside it -- `import_kv` dispatches
+//! on the version field to pick between them.
 //!
 //! Version 1 (dense/MoE) layout: `b"CSKV"` | version:u32 LE (=1) |
 //! num_layers:u32 LE | seq_len:u32 LE | num_kv_heads:u32 LE | head_dim:u32
@@ -33,12 +37,19 @@
 //! attn_head_dim` f32 LE values); if GatedDeltaNet, conv_state
 //! (`gdn_conv_state_len` f32 LE values) then recurrent (`gdn_recurrent_len`
 //! f32 LE values).
+//!
+//! Version 3 (MLA) layout: `b"CSKV"` | version:u32 LE (=3) | num_layers:u32
+//! LE | seq_len:u32 LE | qk_dim:u32 LE (`kv_lora_rank + qk_rope_head_dim`) |
+//! per layer, one `seq_len * qk_dim` f32 LE `kv_cache` (the compressed
+//! `Kcur == kv_cmpr_normed ++ k_pe` latent, no separate V -- see
+//! `Model::forward_mla_attn_block`).
 
 use std::io::{Read, Write};
 
 const MAGIC: &[u8; 4] = b"CSKV";
 const VERSION_DENSE: u32 = 1;
 const VERSION_HYBRID: u32 = 2;
+const VERSION_MLA: u32 = 3;
 
 #[derive(Debug)]
 pub struct DenseKvCache {
@@ -67,6 +78,19 @@ pub struct HybridKvCache {
     pub layers: Vec<HybridLayerCacheData>,
 }
 
+/// MLA's per-layer compressed latent-KV cache, matching
+/// `Model::forward_mla_attn_block`'s `kv_cache` shape one-to-one: a single
+/// `[seq_len, qk_dim]` buffer per layer (`qk_dim == kv_lora_rank +
+/// qk_rope_head_dim`), not a separate K/V pair -- MLA's whole point is that
+/// the compressed latent is shared and decompressed on the fly by `wk_b`/
+/// `wv_b`, so there's nothing else to cache.
+#[derive(Debug)]
+pub struct MlaKvCache {
+    pub seq_len: usize,
+    pub qk_dim: usize,
+    pub kv_caches: Vec<Vec<f32>>,
+}
+
 /// What `import_kv` found in the file -- dispatched on by `Model::generate`
 /// to pick the matching resume path (and to reject a format/architecture
 /// mismatch with a clear error instead of silently misreading bytes).
@@ -74,6 +98,7 @@ pub struct HybridKvCache {
 pub enum ImportedKv {
     Dense(DenseKvCache),
     Hybrid(HybridKvCache),
+    Mla(MlaKvCache),
 }
 
 pub fn export_dense_kv(path: &str, cache: &DenseKvCache) -> Result<(), String> {
@@ -146,16 +171,42 @@ pub fn import_hybrid_kv(path: &str) -> Result<HybridKvCache, String> {
     read_hybrid_body(&mut f)
 }
 
+pub fn export_mla_kv(path: &str, cache: &MlaKvCache) -> Result<(), String> {
+    let mut f = std::fs::File::create(path).map_err(|e| format!("create {path}: {e}"))?;
+    f.write_all(MAGIC).map_err(|e| format!("write magic: {e}"))?;
+    f.write_all(&VERSION_MLA.to_le_bytes()).map_err(|e| format!("write version: {e}"))?;
+    f.write_all(&(cache.kv_caches.len() as u32).to_le_bytes()).map_err(|e| format!("write num_layers: {e}"))?;
+    f.write_all(&(cache.seq_len as u32).to_le_bytes()).map_err(|e| format!("write seq_len: {e}"))?;
+    f.write_all(&(cache.qk_dim as u32).to_le_bytes()).map_err(|e| format!("write qk_dim: {e}"))?;
+
+    for kv in &cache.kv_caches {
+        write_f32_slice(&mut f, kv)?;
+    }
+    Ok(())
+}
+
+pub fn import_mla_kv(path: &str) -> Result<MlaKvCache, String> {
+    let mut f = open_and_check_magic(path)?;
+    let version = read_u32(&mut f)?;
+    if version != VERSION_MLA {
+        return Err(format!("{path}: unsupported MLA KV cache format version {version} (expected {VERSION_MLA})"));
+    }
+    read_mla_body(&mut f)
+}
+
 /// Reads the magic + version header once and dispatches on the version to
 /// the matching body reader, so the CLI doesn't need to know in advance
-/// whether a file holds a dense/MoE or hybrid cache.
+/// whether a file holds a dense/MoE, hybrid, or MLA cache.
 pub fn import_kv(path: &str) -> Result<ImportedKv, String> {
     let mut f = open_and_check_magic(path)?;
     let version = read_u32(&mut f)?;
     match version {
         VERSION_DENSE => Ok(ImportedKv::Dense(read_dense_body(&mut f)?)),
         VERSION_HYBRID => Ok(ImportedKv::Hybrid(read_hybrid_body(&mut f)?)),
-        other => Err(format!("{path}: unsupported KV cache format version {other} (expected {VERSION_DENSE} or {VERSION_HYBRID})")),
+        VERSION_MLA => Ok(ImportedKv::Mla(read_mla_body(&mut f)?)),
+        other => Err(format!(
+            "{path}: unsupported KV cache format version {other} (expected {VERSION_DENSE}, {VERSION_HYBRID}, or {VERSION_MLA})"
+        )),
     }
 }
 
@@ -218,6 +269,20 @@ fn read_hybrid_body(f: &mut std::fs::File) -> Result<HybridKvCache, String> {
     Ok(HybridKvCache { seq_len, attn_num_kv_heads, attn_head_dim, gdn_conv_state_len, gdn_recurrent_len, layers })
 }
 
+fn read_mla_body(f: &mut std::fs::File) -> Result<MlaKvCache, String> {
+    let num_layers = read_u32(f)? as usize;
+    let seq_len = read_u32(f)? as usize;
+    let qk_dim = read_u32(f)? as usize;
+    let per_layer_len = seq_len * qk_dim;
+
+    let mut kv_caches = Vec::with_capacity(num_layers);
+    for _ in 0..num_layers {
+        kv_caches.push(read_f32_vec(f, per_layer_len)?);
+    }
+
+    Ok(MlaKvCache { seq_len, qk_dim, kv_caches })
+}
+
 fn write_f32_slice(f: &mut std::fs::File, data: &[f32]) -> Result<(), String> {
     let mut buf = Vec::with_capacity(data.len() * 4);
     for x in data {
@@ -265,7 +330,7 @@ mod tests {
         let reimported = import_dense_kv(path_str).expect("import failed");
         let via_import_kv = match import_kv(path_str).expect("import_kv failed") {
             ImportedKv::Dense(c) => c,
-            ImportedKv::Hybrid(_) => panic!("import_kv misdetected a dense file as hybrid"),
+            _ => panic!("import_kv misdetected a dense file"),
         };
         std::fs::remove_file(&path).ok();
 
@@ -304,7 +369,7 @@ mod tests {
         let reimported = import_hybrid_kv(path_str).expect("import failed");
         let via_import_kv = match import_kv(path_str).expect("import_kv failed") {
             ImportedKv::Hybrid(c) => c,
-            ImportedKv::Dense(_) => panic!("import_kv misdetected a hybrid file as dense"),
+            _ => panic!("import_kv misdetected a hybrid file"),
         };
         std::fs::remove_file(&path).ok();
 
@@ -328,6 +393,35 @@ mod tests {
             2 => {}
             other => panic!("import_kv returned {other} layers, expected 2"),
         }
+    }
+
+    #[test]
+    fn export_then_import_mla_is_byte_exact() {
+        let cache = MlaKvCache {
+            seq_len: 4,
+            qk_dim: 6,
+            kv_caches: vec![
+                (0..24).map(|i| i as f32 * 0.3 - 1.0).collect(),
+                (0..24).map(|i| -(i as f32) * 0.7).collect(),
+                (0..24).map(|i| (i as f32).cos()).collect(),
+            ],
+        };
+
+        let path = std::env::temp_dir().join(format!("coldstart_kv_io_test_mla_{}.bin", std::process::id()));
+        let path_str = path.to_str().unwrap();
+
+        export_mla_kv(path_str, &cache).expect("export failed");
+        let reimported = import_mla_kv(path_str).expect("import failed");
+        let via_import_kv = match import_kv(path_str).expect("import_kv failed") {
+            ImportedKv::Mla(c) => c,
+            _ => panic!("import_kv misdetected an MLA file"),
+        };
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(reimported.seq_len, cache.seq_len);
+        assert_eq!(reimported.qk_dim, cache.qk_dim);
+        assert_eq!(reimported.kv_caches, cache.kv_caches);
+        assert_eq!(via_import_kv.kv_caches, cache.kv_caches);
     }
 
     #[test]

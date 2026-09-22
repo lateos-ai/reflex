@@ -100,6 +100,60 @@ byte-exact text-continuation check against whichever tokenizer the MLA fixture(s
 plus a determinism check as a fallback if that fixture also turns out to be
 SentencePiece-based.
 
+## Phase 3 (State I/O) round 3 scope: MLA resume, synthetic fixture not real DeepSeek-V2-Lite
+
+**Decision**: round 3 extends `--import-kv` resume + `--max-tokens` to MLA models,
+closing Phase 3's architecture coverage (dense/MoE, hybrid, and now MLA all support
+export/import/resume). Verification uses the synthetic `test-data/deepseek-tiny-mla.gguf`
+fixture (dense-lead layers only), not the real `deepseek-ai/DeepSeek-V2-Lite` checkpoint's
+MoE+shared-expert+YaRN path.
+
+**Why**: confirmed with the user before starting (two explicit open questions: which
+fixture(s), and whether to reuse or create a ThunderCompute instance — `tnr status --json`
+showed none running, so a fresh A6000 was created). The synthetic fixture was chosen over
+real DeepSeek-V2-Lite because round 3's actual code delta is cache/`start_pos` plumbing at
+the attention-block level (`forward_mla_attn_block` already took an absolute `position`
+argument and indexed its single `kv_cache` by it, unchanged by this round), not new
+math — the routed-MoE/shared-expert/YaRN correctness was already byte-exact-verified
+against real DeepSeek-V2-Lite in the MVP step 4 session, and `forward_one_token_mla`'s
+per-layer loop dispatches to `MlaFfn::Dense` or `MlaFfn::Moe` identically regardless of
+`position`/cache state (same "cache mechanism is FFN-routing-independent" reasoning round
+2 used to justify not re-verifying hybrid's `GatedDeltaNet` state against every FFN
+variant). The synthetic fixture is also free to run (already on disk, needs only an
+A6000) versus the real checkpoint's rented-80GB-A100 + from-source-conversion cost, which
+would have been disproportionate to what this round is actually testing. See STATUS.md's
+"Known debt" for the resulting gap (resume unverified specifically against the MoE+YaRN
+combination) — flagged, not planned as follow-up unless a real need comes up.
+
+**Implementation note**: mechanically identical to round 2's dense/hybrid extension --
+`generate_mla_impl` preallocates each layer's `kv_cache` for `start_pos + prompt_len +
+max_new_tokens` (instead of exactly the prompt length), uploads an imported cache into
+the front of that buffer via `htod_sync_copy_into`/`slice_mut` before the per-position
+loop starts, and `forward_prompt_capture_kv_mla` (the `--export-kv` capture path) slices
+to `0..seq_len * qk_dim` before downloading, same as the dense/hybrid capture functions
+already do. `kv_io.rs`'s MLA format is a new version (3, `MlaKvCache` -- one buffer per
+layer, no separate K/V pair since MLA's compressed latent is shared and decompressed by
+`wk_b`/`wv_b` on the fly), read-dispatched by `import_kv`/`ImportedKv` alongside the
+untouched version-1/2 formats.
+
+**Verification finding, not a defect**: unlike `Tiny-Moe` in round 2, the synthetic MLA
+fixture's `tokenizer.ggml.model` is `gpt2` (confirmed by reading the GGUF's own metadata
+bytes before relying on it, following the fixture-recipe memory's HTTP-range-request
+pattern applied locally instead) -- the same tokenizer family dense/hybrid verified round
+2's byte-exact bar with, and not SentencePiece's implicit-leading-space property that
+made `Tiny-Moe` need a determinism fallback instead. Byte-exact text-continuation
+verification therefore worked directly, no fallback needed: `[69344,10420,40306,145381,
+87488]` in both the single uninterrupted run and the export→import→continue run, split
+at `"The quick brown fox jumps over the lazy dog"` + `" and runs"`.
+
+**How to apply**: this closes Phase 3's architecture-coverage scope entirely -- no round
+4 of this phase is currently planned. If real DeepSeek-V2-Lite's MoE+YaRN resume path
+ever needs verifying specifically (e.g. before relying on it for a real deployment),
+budget for the rented-A100 + from-source-conversion cost the MVP step 4 MLA-extension
+session already paid once (see STATUS.md's "Real DeepSeek-V2-Lite GGUF not preserved
+locally" entry for the exact regeneration steps) rather than assuming the dense-fixture
+verification generalizes untested.
+
 ## Hybrid Qwen3.5 MVP scope: dense `qwen35` only, single-token dispatch, no MTP
 
 **Decision**: MVP step 3 supports only the dense `qwen35` architecture string. The

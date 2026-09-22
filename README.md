@@ -107,7 +107,9 @@ cold compute into one output token, then getting out of the way.
   see the "Phase 3, round 1" section below). **Round 2 done**: `--import-kv` actually
   resumes generation (a real per-token generation loop, `--max-tokens N`, was added
   alongside it), for dense/MoE and the Qwen3.5 hybrid mixer — see the "Phase 3, round 2"
-  section below. MLA's single compressed cache is round 3.
+  section below. **Round 3 done**: extended to MLA's single compressed latent-KV cache,
+  closing out Phase 3's architecture coverage entirely — see the "Phase 3, round 3"
+  section below.
 - **Phase 4 — Embeddability**: a single `--lora <path>` CLI flag (load-time adapter
   application only, no runtime hot-swap multiplexer — process spin-up is already cheap
   enough that a fresh process per adapter is the scale-from-zero answer, not in-process
@@ -752,3 +754,46 @@ for both — `forward_layer_moe`'s FFN dispatch has no position/cache logic to d
 in). Verified instead by determinism (identical resume inputs, run twice, produced
 byte-identical `[4014,4052,4034,262,308]` both times) plus the code-sharing argument.
 See DECISIONS.md for the full three-part reasoning.
+
+### Phase 3 (State I/O), round 3: real resume, MLA — closes Phase 3's architecture coverage
+
+Confirmed scope with the user before starting: fixture choice was the synthetic
+`test-data/deepseek-tiny-mla.gguf` (already on disk, uses the `gpt2`-style Qwen
+tokenizer so byte-exact text-continuation verification applies, same as dense/hybrid
+in round 2 — not real DeepSeek-V2-Lite, since round 3's actual delta is cache/
+`start_pos` plumbing, already exercised structurally by round 2's other two
+architectures, not new MoE/YaRN math which round 3 isn't touching), on a fresh A6000
+instance (`tnr status --json` showed none running at session start).
+
+Same shape as round 2, one more time: `generate_mla_impl` (mirroring
+`generate_dense_impl`/`generate_hybrid_impl`) seeds MLA's single per-layer compressed
+`kv_cache` (`[seq_len, kv_lora_rank + qk_rope_head_dim]`, no separate K/V pair — MLA's
+whole point is that the compressed latent is shared and decompressed on the fly by
+`wk_b`/`wv_b`) from an imported cache at `start_pos`, allocates it with headroom for
+`start_pos + prompt_len + max_new_tokens` instead of exactly the prompt length, and
+runs the same per-position-loop-then-keep-decoding shape `forward_mla_attn_block`
+already supported (it already took an absolute `position` argument and indexed into
+`kv_cache` by it — this round only needed to call it in a loop with a preallocated,
+`start_pos`-offset buffer, not change its own logic). `forward_prompt_mla` is now a
+thin wrapper over `generate_mla_impl`, matching `forward_prompt`/`forward_prompt_hybrid`.
+`kv_io.rs` gained a version-3 `MlaKvCache` format (one buffer per layer, not the dense
+pair or hybrid's tagged `Attn`/`Gdn` split) alongside the untouched version-1/2
+formats; `import_kv`/`ImportedKv` and `Model::generate`/`architecture_kind()`'s `Mla`
+arm now dispatch to it instead of erroring "round 3" as they did through round 2.
+`forward_prompt_capture_kv_mla` fills the same role for `--export-kv` that
+`forward_prompt_capture_kv`/`forward_prompt_capture_kv_hybrid` do for dense/hybrid.
+
+Verified on a fresh A6000 instance (`bkzn3giz`): `cargo test` (60 tests, incl. a new
+MLA `kv_io` round-trip test) plus the same byte-exact bar rounds 1-2 used — a single
+uninterrupted run vs. export→import→continue over the same concatenated prompt, split
+at a clean sentence boundary (`"The quick brown fox jumps over the lazy dog"` +
+`" and runs"`): both paths produced `[69344,10420,40306,145381,87488]`. No
+determinism-fallback needed (unlike `Tiny-Moe` in round 2) since this fixture's
+`tokenizer.ggml.model` is `gpt2`, confirmed by reading the GGUF's own metadata bytes
+before relying on it.
+
+This closes Phase 3's architecture-coverage scope entirely — `--export-kv`/
+`--import-kv`/`--max-tokens` now cover all three cache shapes this project's
+architectures produce (dense/MoE's K/V pair, hybrid's per-layer tagged state, MLA's
+single compressed latent). Phase 4 (Embeddability) is next per the roadmap above, a
+separate confirm-before-starting conversation.

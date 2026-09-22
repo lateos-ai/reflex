@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `README.md` — this file is the
 short, current-state summary; README is the log.
 
-_Last updated: 2026-09-21 (Phase 3 round 2 session)_
+_Last updated: 2026-09-21 (Phase 3 round 3 session)_
 
 ## MVP progress
 
@@ -122,19 +122,54 @@ starting (MLA stays round 3, matching this project's narrow-first precedent).
   doesn't have this property, which is why the dense/hybrid byte-exact checks above
   work as designed. See DECISIONS.md for the full writeup.
 
+## Phase 3 (State I/O), round 3
+
+`--import-kv` now resumes MLA models too, closing out Phase 3's architecture coverage
+entirely (dense/MoE's K/V pair, hybrid's per-layer tagged state, and now MLA's single
+compressed latent cache all support export/import/resume). Scope: extend round 2's
+generation-loop + `start_pos` pattern to MLA's `kv_cache`, not new math — confirmed
+with the user before starting (fixture and GPU-instance choice both explicitly asked).
+
+- `generate_mla_impl` (`model.rs`, mirrors `generate_dense_impl`/`generate_hybrid_impl`)
+  is the new entry point; `forward_prompt_mla` becomes a thin
+  `max_new_tokens=1, imported=None` wrapper over it, matching `forward_prompt`/
+  `forward_prompt_hybrid`. `forward_mla_attn_block` needed no change at all — it already
+  took an absolute `position` and indexed `kv_cache` by it; only the caller needed to
+  loop over positions with a preallocated, `start_pos`-offset buffer instead of running
+  once per call.
+- `kv_io.rs` gained a version-3 `MlaKvCache` format (one `[seq_len, kv_lora_rank +
+  qk_rope_head_dim]` buffer per layer, no separate K/V pair) alongside the unchanged
+  version-1/2 formats; `import_kv`/`ImportedKv`, `Model::generate`, and
+  `forward_prompt_capture_kv_mla` (the `--export-kv` capture function, matching
+  `forward_prompt_capture_kv`/`forward_prompt_capture_kv_hybrid`) all dispatch to it.
+- **Real-hardware-verified on a fresh A6000 instance** (`bkzn3giz`; `tnr status --json`
+  showed none running at session start): `cargo test` (60 tests, incl. a new MLA
+  `kv_io` round-trip test) plus **byte-exact** export→import→continue vs. a single
+  uninterrupted run against the synthetic `test-data/deepseek-tiny-mla.gguf` fixture
+  (chosen over real DeepSeek-V2-Lite — see DECISIONS.md's round 3 entry for why),
+  tokens `[69344,10420,40306,145381,87488]` in both, prompt
+  `"The quick brown fox jumps over the lazy dog"` + continuation `" and runs"`. Confirmed
+  this fixture's `tokenizer.ggml.model` is `gpt2` (by reading the GGUF's own metadata
+  bytes) before relying on the byte-exact-not-determinism-only verification bar round
+  2 established for `gpt2`-tokenizer fixtures.
+
 ## Open decision (not yet resolved)
 
-None currently open. Phase 3 round 2 (above) is done as scoped. Remaining low-priority
-follow-ups (not blocking, not actively planned): a real small `qwen3moe`-architecture
-GGUF fixture with a `gpt2`-style tokenizer (see "Known debt" below — would also make
-MoE's resume path byte-exact-testable at the text level, unlike `Tiny-Moe`), on-device
-dequant coverage for the 15+ GGUF block types still on the host path (Q4_0/1, Q5_0/1,
-Q8_0/1, Q2_K/Q3_K/Q5_K/Q8_K, the IQ-family formats — none exercised by a local
-fixture's bulk weight bytes), MoE's per-expert weighted-sum accumulation / the Gated
-Attention mixer's fused-qg gating still round-tripping through the host (flagged, not
-measured as worth closing), and Phase 3 round 3 (MLA's single compressed cache —
-`start_pos` plumbing for `forward_prompt_mla`/`forward_mla_attn_block`, still
-completely unstarted).
+None currently open. Phase 3 round 3 (above) is done as scoped, closing Phase 3's
+architecture-coverage scope entirely. Remaining low-priority follow-ups (not blocking,
+not actively planned): a real small `qwen3moe`-architecture GGUF fixture with a
+`gpt2`-style tokenizer (see "Known debt" below — would also make MoE's resume path
+byte-exact-testable at the text level, unlike `Tiny-Moe`), on-device dequant coverage
+for the 15+ GGUF block types still on the host path (Q4_0/1, Q5_0/1, Q8_0/1,
+Q2_K/Q3_K/Q5_K/Q8_K, the IQ-family formats — none exercised by a local fixture's bulk
+weight bytes), MoE's per-expert weighted-sum accumulation / the Gated Attention mixer's
+fused-qg gating still round-tripping through the host (flagged, not measured as worth
+closing), and Phase 3 round 3's own resume path verified only against the dense-only
+synthetic MLA fixture, not real DeepSeek-V2-Lite's MoE+shared-expert+YaRN path (the
+resume/cache mechanism is FFN-routing-independent by construction, but this specific
+combination hasn't been run end to end — see DECISIONS.md's round 3 entry). Phase 4
+(Embeddability) is next per README's roadmap, a separate confirm-before-starting
+conversation.
 
 ## Known debt / limitations
 
@@ -175,6 +210,14 @@ completely unstarted).
   `target/release/<bin-name>` — only `target/release/deps/`. After any source change,
   run `cargo build --release --bin <name>` explicitly before trusting a binary run
   against real hardware.
+- **Phase 3 round 3 MLA resume, dense-only fixture**: `--import-kv` resume was verified
+  byte-exact only against the synthetic dense-only `test-data/deepseek-tiny-mla.gguf`
+  fixture. The resume/cache mechanism (`generate_mla_impl`/`forward_mla_attn_block`)
+  operates purely on the attention block's single compressed `kv_cache`, independent of
+  whether a layer's FFN tail is `MlaFfn::Dense` or `MlaFfn::Moe` — the same reasoning
+  round 2 used to scope hybrid's `GatedDeltaNet` state — but this hasn't been confirmed
+  end to end against real DeepSeek-V2-Lite's MoE+shared-expert+YaRN path. Not planned
+  as follow-up unless a specific need comes up (see DECISIONS.md's round 3 entry).
 - **Real DeepSeek-V2-Lite GGUF not preserved locally**: unlike every other fixture,
   the real `DeepSeek-V2-Lite.gguf` (16.7GB, `--outtype q8_0`) used to verify MLA's
   MoE/shared-expert/YaRN path was left on the A100 instance (`fl1uh6dt`) rather than
