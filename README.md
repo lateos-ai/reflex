@@ -75,6 +75,25 @@ orchestrator*, not in this engine:
 This mirrors RustFeference's own `serve_http.rs`, which drew this same line once before
 ("explicitly out of scope: gRPC, auth/rate-limiting, multi-model serving").
 
+**No in-core HTTP/gRPC server, ever, not deferred.** This is not a separate exception
+to the rule above — a concurrent HTTP listener is the exact same violation
+("`batch_size` always 1... never a thread pool") under a different name, and an
+adoption/UX ask asking for one doesn't get to reopen it. If HTTP access to this engine
+is ever genuinely needed, the pattern is a **separate, optional sidecar binary** (e.g.
+`system1-openai-adapter`) that talks to this core engine over local IPC only — the core
+engine itself never grows a network socket. Building that sidecar is out of scope for
+now; this paragraph only records the escape-hatch pattern so a future HTTP ask gets
+routed there instead of back into this engine.
+
+For local, non-network ergonomics, this engine may instead expose: a **stdio JSON-line
+mode** (`--stdio`, one JSON request per stdin line, fully processed before the next
+line is read) and a **Unix Domain Socket mode** (`--uds <path>`, Unix-only, one
+connection fully processed before the next is accepted) — both strictly sequential,
+never a thread pool, mirroring the same request/response protocol. A shared-memory
+ring-buffer transport was considered and deliberately deferred — crash-safety and
+synchronization design is disproportionate complexity for the ergonomics it would buy
+— recorded here as a future-work idea only, not designed.
+
 ## Post-architecture-MVP roadmap: productization
 
 Once the model-architecture MVP above proves the engine handles the target model

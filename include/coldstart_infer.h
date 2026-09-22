@@ -41,6 +41,37 @@ typedef struct {
 } ColdstartGenerateResult;
 
 /**
+ * One candidate's scored result within a `ColdstartSystem1Result`. `text`/
+ * `token_ids` are heap buffers owned by this crate, freed only via the
+ * outer struct's `coldstart_free_system1_result` -- never individually.
+ * `score`/`probability` are relative to the candidate set in this one
+ * call, not vocab-normalized log-probabilities -- see
+ * `crate::model::Model::system1_evaluate`'s doc comment.
+ */
+typedef struct {
+    char *text;
+    uint32_t *token_ids;
+    uintptr_t num_token_ids;
+    float score;
+    float probability;
+} ColdstartSystem1CandidateResult;
+
+/**
+ * Output of `coldstart_system1_evaluate`. `candidates` is a heap buffer
+ * owned by this crate -- free it (and reset this struct to all-zero/NULL)
+ * with `coldstart_free_system1_result`, never with the C caller's own
+ * `free`/`libc::free`. `entropy` (Shannon entropy, bits, of the `probability`
+ * distribution across `candidates`) is a single confidence/escalation signal
+ * alongside the per-candidate probabilities -- see
+ * `crate::model::System1Response::entropy`'s doc comment.
+ */
+typedef struct {
+    ColdstartSystem1CandidateResult *candidates;
+    uintptr_t num_candidates;
+    float entropy;
+} ColdstartSystem1Result;
+
+/**
  * Returns the last error message set by this thread's most recent failing
  * `coldstart_*` call, or NULL if the most recent call succeeded (or none
  * has run yet on this thread). The returned pointer is valid only until the
@@ -95,6 +126,46 @@ int coldstart_generate(ColdstartModel *handle,
  * same non-zeroed struct (double free).
  */
 void coldstart_free_generate_result(ColdstartGenerateResult *result);
+
+/**
+ * Runs System1 (single-pass, non-autoregressive candidate scoring, see
+ * `crate::model::Model::system1_evaluate`'s doc comment) against `prompt`
+ * for each of `num_candidates` candidate strings in `candidate_texts`. No
+ * argmax-then-feedback decode loop runs -- single-token candidates are
+ * scored in one batched gather-GEMV, multi-token candidates via a short
+ * teacher-forced continuation. Dense/MoE Qwen3 models only; hybrid Qwen3.5
+ * and DeepSeek-V2/V3 MLA are rejected with an error (call
+ * `coldstart_last_error` for why).
+ *
+ * `handle` must come from `coldstart_load` and not have been freed yet.
+ * `prompt` must be a non-NULL, NUL-terminated UTF-8 C string. `candidate_texts`
+ * must be a non-NULL pointer to `num_candidates` non-NULL, NUL-terminated
+ * UTF-8 C string pointers, with `num_candidates` at least 1. `temperature`
+ * (`1.0` = no-op) is passed through to the calibrated `probability` field
+ * on each result. `out` must be a non-NULL pointer to a
+ * `ColdstartSystem1Result` the caller owns (its initial contents are
+ * ignored, not read).
+ *
+ * On success, fills `*out` and returns 0 -- the caller must eventually pass
+ * `out` to `coldstart_free_system1_result`. On failure, leaves `*out`
+ * untouched and returns -1 (call `coldstart_last_error` for why).
+ */
+int coldstart_system1_evaluate(ColdstartModel *handle,
+                               const char *prompt,
+                               const char *const *candidate_texts,
+                               uintptr_t num_candidates,
+                               float temperature,
+                               ColdstartSystem1Result *out);
+
+/**
+ * Frees the buffers inside a `ColdstartSystem1Result` previously filled by
+ * `coldstart_system1_evaluate` (including every candidate's own `text`/
+ * `token_ids`), and zeroes the struct out. Safe to call on a zeroed/
+ * all-NULL struct (no-op), and safe to call more than once on the same
+ * struct for that reason -- but never on two different copies of the same
+ * non-zeroed struct (double free).
+ */
+void coldstart_free_system1_result(ColdstartSystem1Result *result);
 
 /**
  * Frees a handle obtained from `coldstart_load`. Safe to call with NULL

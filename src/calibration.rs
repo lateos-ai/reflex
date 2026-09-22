@@ -33,6 +33,29 @@ pub fn softmax_scores_with_temperature(scores: &[f32], temperature: f32) -> Resu
     Ok(exps.iter().map(|&e| e / sum).collect())
 }
 
+/// Shannon entropy (base-2, bits) of a probability distribution -- `0.0` for a
+/// one-hot distribution (fully confident), `log2(probabilities.len())` for a
+/// uniform one (fully uncertain). Intended for `System1Response::entropy`
+/// (`crate::model`), so local agents have a single scalar confidence/escalation
+/// signal alongside the raw `probabilities` vector. `0 * log2(0)` is treated as
+/// `0.0` (the standard convention), never `NaN`. Errs under the same conditions
+/// [`softmax_scores`]'s output can never actually produce (empty input, a
+/// non-finite entry) -- defensive, since this is a public function any caller
+/// could hand a hand-built distribution to, not just `system1_evaluate`'s own
+/// already-validated output.
+pub fn shannon_entropy(probabilities: &[f32]) -> Result<f32, String> {
+    if probabilities.is_empty() {
+        return Err("shannon_entropy: probabilities must not be empty".to_string());
+    }
+    if probabilities.iter().any(|p| !p.is_finite()) {
+        return Err("shannon_entropy: probabilities must all be finite".to_string());
+    }
+    Ok(-probabilities
+        .iter()
+        .map(|&p| if p <= 0.0 { 0.0 } else { p * p.log2() })
+        .sum::<f32>())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +100,35 @@ mod tests {
         assert!(softmax_scores_with_temperature(&[1.0, 2.0], -1.0).is_err());
         assert!(softmax_scores_with_temperature(&[1.0, 2.0], f32::NAN).is_err());
         assert!(softmax_scores_with_temperature(&[1.0, 2.0], f32::INFINITY).is_err());
+    }
+
+    #[test]
+    fn test_shannon_entropy_one_hot_is_zero() {
+        let entropy = shannon_entropy(&[1.0, 0.0, 0.0, 0.0]).expect("should succeed");
+        assert!((entropy - 0.0).abs() < 1e-6, "got {entropy}");
+    }
+
+    #[test]
+    fn test_shannon_entropy_uniform_is_log2_n() {
+        let entropy = shannon_entropy(&[0.25, 0.25, 0.25, 0.25]).expect("should succeed");
+        assert!((entropy - 2.0).abs() < 1e-5, "got {entropy}, expected log2(4) = 2.0");
+    }
+
+    #[test]
+    fn test_shannon_entropy_matches_hand_computed_value() {
+        // H([0.5, 0.5]) = -(0.5*log2(0.5) + 0.5*log2(0.5)) = 1.0 bit exactly.
+        let entropy = shannon_entropy(&[0.5, 0.5]).expect("should succeed");
+        assert!((entropy - 1.0).abs() < 1e-6, "got {entropy}");
+    }
+
+    #[test]
+    fn test_shannon_entropy_errs_on_empty_input() {
+        assert!(shannon_entropy(&[]).is_err());
+    }
+
+    #[test]
+    fn test_shannon_entropy_errs_on_non_finite_input() {
+        assert!(shannon_entropy(&[0.5, f32::NAN]).is_err());
+        assert!(shannon_entropy(&[0.5, f32::INFINITY]).is_err());
     }
 }

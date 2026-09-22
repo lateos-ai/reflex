@@ -15,9 +15,9 @@
 //! clear error, same as every other unsupported-architecture case in this
 //! project.
 
+use coldstart_infer::diagnostics;
 use coldstart_infer::gguf::GgufFile;
 use coldstart_infer::model::{Model, System1Candidate};
-use cudarc::driver::CudaDevice;
 use std::time::Instant;
 
 fn main() {
@@ -55,7 +55,10 @@ fn main() {
     }
 
     let file = GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
-    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
+    if let Ok(diag) = diagnostics::probe(&device) {
+        eprintln!("{diag}");
+    }
     let mut model = Model::load(device, &file).expect("failed to load model");
 
     if let Some(lora_path) = &lora_path {
@@ -87,9 +90,10 @@ fn main() {
 
     let elapsed = t0.elapsed();
     println!(
-        "COLDSTART_SYSTEM1_OK process_start_to_result_ms={:.3} num_candidates={} best_idx={best_idx} best_text={:?}",
+        "COLDSTART_SYSTEM1_OK process_start_to_result_ms={:.3} num_candidates={} best_idx={best_idx} best_text={:?} entropy={:.6}",
         elapsed.as_secs_f64() * 1000.0,
         response.results.len(),
         best.text,
+        response.entropy,
     );
 }

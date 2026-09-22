@@ -198,7 +198,7 @@ pub extern "C" fn coldstart_generate(
             .map_err(|e| format!("coldstart_generate: prompt is not valid UTF-8: {e}"))?;
         let model = unsafe { &(*handle).model };
 
-        let (tokens, text) = model.generate(prompt_str, max_new_tokens, None, || {})?;
+        let (tokens, text) = model.generate(prompt_str, max_new_tokens, None, |_logits| {})?;
 
         let mut boxed_tokens = tokens.into_boxed_slice();
         let token_ids = boxed_tokens.as_mut_ptr();
@@ -266,11 +266,15 @@ pub struct ColdstartSystem1CandidateResult {
 /// Output of `coldstart_system1_evaluate`. `candidates` is a heap buffer
 /// owned by this crate -- free it (and reset this struct to all-zero/NULL)
 /// with `coldstart_free_system1_result`, never with the C caller's own
-/// `free`/`libc::free`.
+/// `free`/`libc::free`. `entropy` (Shannon entropy, bits, of the `probability`
+/// distribution across `candidates`) is a single confidence/escalation signal
+/// alongside the per-candidate probabilities -- see
+/// `crate::model::System1Response::entropy`'s doc comment.
 #[repr(C)]
 pub struct ColdstartSystem1Result {
     pub candidates: *mut ColdstartSystem1CandidateResult,
     pub num_candidates: usize,
+    pub entropy: f32,
 }
 
 /// Runs System1 (single-pass, non-autoregressive candidate scoring, see
@@ -341,6 +345,7 @@ pub extern "C" fn coldstart_system1_evaluate(
 
         let model = unsafe { &(*handle).model };
         let response = model.system1_evaluate(prompt_str, &candidates, temperature)?;
+        let entropy = response.entropy;
 
         let mut boxed_candidates: Vec<ColdstartSystem1CandidateResult> = response
             .results
@@ -359,7 +364,7 @@ pub extern "C" fn coldstart_system1_evaluate(
         let num_candidates = boxed_candidates.len();
         std::mem::forget(boxed_candidates);
 
-        Ok(ColdstartSystem1Result { candidates: candidates_ptr, num_candidates })
+        Ok(ColdstartSystem1Result { candidates: candidates_ptr, num_candidates, entropy })
     }));
 
     match result {

@@ -11,10 +11,43 @@ build = "build.rs"
 # host, while keeping rlib so the existing `src/bin/*.rs` targets still link
 # against this crate unmodified.
 crate-type = ["rlib", "cdylib", "staticlib"]
+# Explicit (rather than relying on the `[package] name`'s auto hyphen->underscore
+# conversion) because `maturin build --features python` (see src/python.rs) reads
+# this literally and rejects a hyphenated module name outright -- it must match the
+# `#[pymodule] fn coldstart_infer` symbol name in src/python.rs.
+name = "coldstart_infer"
 
 [dependencies]
 cudarc = { version = "0.11", features = ["driver", "cublas", "cuda-12000", "f16"] }
 half = "2.3"
 memmap2 = "0.9"
+# Local IPC (--stdio/--uds, see src/ipc.rs), feature-gated: this project's default
+# `cargo build` stays at its original 3-dependency footprint for users who never
+# touch the IPC binaries.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+# Python bindings (see src/python.rs), feature-gated for the same reason as `ipc`
+# above. abi3-py38 targets the stable/limited Python C API so one build works
+# across CPython 3.8+ without a per-version build matrix.
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optional = true }
+# hf-hub as a GGUF downloader/cache only (see src/hf.rs) -- never a new tensor-format
+# ingestion path (no safetensors parsing). Feature-gated for the same reason as
+# `ipc`/`python` above.
+hf-hub = { version = "0.3", optional = true }
+
+[features]
+ipc = ["dep:serde", "dep:serde_json"]
+python = ["dep:pyo3"]
+download = ["dep:hf-hub"]
+
+[[bin]]
+name = "coldstart_stdio"
+path = "src/bin/coldstart_stdio.rs"
+required-features = ["ipc"]
+
+[[bin]]
+name = "coldstart_uds"
+path = "src/bin/coldstart_uds.rs"
+required-features = ["ipc"]
 
 [dev-dependencies]

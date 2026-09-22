@@ -20,22 +20,51 @@
 //! llama.cpp-format LoRA adapter to the loaded model's weights once, at load
 //! time, before any forward pass runs (see `model::Model::apply_lora` and
 //! `lora`'s module doc comment for the file format and scope).
+//!
+//! `--model <repo_id[:filename]>` and `--quickstart` (both require `cargo build
+//! --features download`) resolve a Hugging Face repo spec to a local GGUF path via
+//! `coldstart_infer::hf::resolve_gguf_path`/`resolve_quickstart` *before* the usual
+//! `GgufFile::open` -- hf-hub is used strictly as a downloader/cache here, never a
+//! new tensor-format ingestion path; see `src/hf.rs`'s module doc comment. Exactly
+//! one of a positional `<path-to-gguf>`, `--model`, or `--quickstart` must be given.
 
+use coldstart_infer::diagnostics;
 use coldstart_infer::gguf::GgufFile;
 use coldstart_infer::kv_io;
 use coldstart_infer::model::{ArchitectureKind, Model};
-use cudarc::driver::CudaDevice;
 use std::time::Instant;
+
+/// Resolves `--model`/`--quickstart` to a local GGUF path, or returns `None` if
+/// neither was passed (the caller falls back to the positional `<path-to-gguf>`
+/// argument in that case). Panics with a clear "rebuild with --features download"
+/// message if either flag is used on a binary built without that feature, rather
+/// than failing to compile at all (the flags themselves always parse).
+fn resolve_model_flag(model_spec: Option<&str>, quickstart: bool) -> Option<String> {
+    if !quickstart && model_spec.is_none() {
+        return None;
+    }
+    #[cfg(feature = "download")]
+    {
+        let resolved = if quickstart { coldstart_infer::hf::resolve_quickstart() } else { coldstart_infer::hf::resolve_gguf_path(model_spec.unwrap()) };
+        Some(resolved.unwrap_or_else(|e| panic!("{e}")).to_string_lossy().into_owned())
+    }
+    #[cfg(not(feature = "download"))]
+    {
+        let _ = (model_spec, quickstart);
+        panic!("--model/--quickstart require this binary to be built with `cargo build --features download`");
+    }
+}
 
 fn main() {
     let t0 = Instant::now();
 
-    let mut gguf_path: Option<String> = None;
-    let mut prompt: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
     let mut export_kv: Option<String> = None;
     let mut import_kv: Option<String> = None;
     let mut max_tokens: usize = 1;
     let mut lora_path: Option<String> = None;
+    let mut model_spec: Option<String> = None;
+    let mut quickstart = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -43,21 +72,31 @@ fn main() {
             "--export-kv" => export_kv = Some(args.next().expect("--export-kv requires a file path")),
             "--import-kv" => import_kv = Some(args.next().expect("--import-kv requires a file path")),
             "--lora" => lora_path = Some(args.next().expect("--lora requires a file path")),
+            "--model" => model_spec = Some(args.next().expect("--model requires a repo spec, e.g. org/repo:file.gguf")),
+            "--quickstart" => quickstart = true,
             "--max-tokens" => {
                 let raw = args.next().expect("--max-tokens requires a number");
                 max_tokens = raw.parse().unwrap_or_else(|_| panic!("--max-tokens must be a positive integer, got {raw:?}"));
             }
-            _ if gguf_path.is_none() => gguf_path = Some(arg),
-            _ if prompt.is_none() => prompt = Some(arg),
-            other => panic!("unexpected argument: {other}"),
+            other => positional.push(other.to_string()),
         }
     }
-    let gguf_path = gguf_path.unwrap_or_else(|| {
-        panic!(
-            "usage: qwen3_coldstart <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>] [--lora <adapter.gguf>] | \
-             qwen3_coldstart <path-to-gguf> [continuation-prompt] [--max-tokens N] --import-kv <file> [--lora <adapter.gguf>]"
-        )
-    });
+    if quickstart && model_spec.is_some() {
+        panic!("--quickstart and --model cannot be combined in the same run");
+    }
+    let mut positional = positional.into_iter();
+    let (gguf_path, prompt) = match resolve_model_flag(model_spec.as_deref(), quickstart) {
+        Some(resolved_path) => (resolved_path, positional.next()),
+        None => {
+            let gguf_path = positional.next().unwrap_or_else(|| {
+                panic!(
+                    "usage: qwen3_coldstart <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>] [--lora <adapter.gguf>] | \
+                     qwen3_coldstart --model <org/repo:file.gguf> [prompt] | qwen3_coldstart --quickstart [prompt]"
+                )
+            });
+            (gguf_path, positional.next())
+        }
+    };
     let prompt = prompt.unwrap_or_else(|| "Once upon a time".to_string());
     if max_tokens == 0 {
         panic!("--max-tokens must be at least 1");
@@ -70,7 +109,10 @@ fn main() {
     }
 
     let file = GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
-    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
+    if let Ok(diag) = diagnostics::probe(&device) {
+        eprintln!("{diag}");
+    }
     let mut model = Model::load(device, &file).expect("failed to load model");
 
     if let Some(lora_path) = &lora_path {
@@ -123,7 +165,7 @@ fn main() {
 
     let mut first_token_ms: Option<f64> = None;
     let (tokens, text) = model
-        .generate(&prompt, max_tokens, imported.as_ref(), || {
+        .generate(&prompt, max_tokens, imported.as_ref(), |_logits| {
             first_token_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
         })
         .expect("generate failed");

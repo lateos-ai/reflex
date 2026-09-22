@@ -15,9 +15,9 @@
 //! Usage: `bench_coldstart <path-to-gguf> [--warmup N] [--iters N]
 //! [--candidate <text> ...] [--lora <adapter.gguf>]`
 
+use coldstart_infer::diagnostics;
 use coldstart_infer::gguf::GgufFile;
 use coldstart_infer::model::{Model, System1Candidate};
-use cudarc::driver::CudaDevice;
 use std::time::Instant;
 
 /// Approximate token-count buckets this bench reports latency for. Built by
@@ -82,8 +82,26 @@ fn main() {
     }
 
     let file = GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
-    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
+    if let Ok(diag) = diagnostics::probe(&device) {
+        eprintln!("{diag}");
+    }
+    // Snapshot free VRAM before/after `Model::load` for `COLDSTART_BENCH_VRAM_OK`
+    // below -- a load-time free/total snapshot (`cuMemGetInfo`), not a true
+    // allocator-tracked peak (that would need NVML polling, out of scope here).
+    let vram_before = diagnostics::probe(&device).ok();
+    let device_for_vram = device.clone();
     let mut model = Model::load(device, &file).expect("failed to load model");
+    if let Some(before) = vram_before {
+        if let Ok(after) = diagnostics::probe(&device_for_vram) {
+            let resident_mib = before.vram_free_bytes.saturating_sub(after.vram_free_bytes) / (1024 * 1024);
+            println!(
+                "COLDSTART_BENCH_VRAM_OK model_resident_mib={resident_mib} free_before_load_mib={} free_after_load_mib={}",
+                before.vram_free_bytes / (1024 * 1024),
+                after.vram_free_bytes / (1024 * 1024),
+            );
+        }
+    }
 
     if let Some(lora_path) = &lora_path {
         let applied = model.apply_lora(std::path::Path::new(lora_path)).expect("failed to apply LoRA adapter");
@@ -106,6 +124,38 @@ fn main() {
             samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
         print_stats("COLDSTART_BENCH_WARM_OK", prompt_tokens, warmup, iters, samples_ms);
+
+        // Decode throughput: `generate` past the first token measures pure per-token
+        // decode cost, isolated from the one-time prefill via `on_first_token`.
+        const DECODE_STEPS: usize = 16;
+        for _ in 0..warmup {
+            model.generate(&prompt, DECODE_STEPS + 1, None, |_logits| {}).expect("generate failed (throughput warmup)");
+        }
+        let mut ms_per_token_samples = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            let mut first_token_ms = 0.0;
+            let t0 = Instant::now();
+            let (tokens, _text) = model
+                .generate(&prompt, DECODE_STEPS + 1, None, |_logits| {
+                    first_token_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                })
+                .expect("generate failed (throughput)");
+            let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let decode_count = tokens.len().saturating_sub(1);
+            if decode_count > 0 {
+                ms_per_token_samples.push((total_ms - first_token_ms) / decode_count as f64);
+            }
+        }
+        if !ms_per_token_samples.is_empty() {
+            ms_per_token_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let ms_per_token = percentile(&ms_per_token_samples, 0.50);
+            println!(
+                "COLDSTART_BENCH_THROUGHPUT_OK prompt_tokens={prompt_tokens} decode_tokens={DECODE_STEPS} warmup={warmup} iters={iters} \
+                 tokens_per_sec={:.3} ms_per_token={:.3}",
+                1000.0 / ms_per_token,
+                ms_per_token,
+            );
+        }
 
         if !candidates.is_empty() {
             for _ in 0..warmup {

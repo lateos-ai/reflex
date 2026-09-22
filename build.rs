@@ -59,6 +59,13 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let arch = env::var("COLDSTART_CUDA_ARCH").ok();
 
+    // `src/aot.rs` embeds every kernel's bytes at compile time
+    // (`include_bytes!(env!("COLDSTART_KERNEL_<NAME>"))` at each call site) and
+    // needs to know, once, crate-wide, which of build.rs's two output modes
+    // produced those bytes -- both modes always agree for a single build (the
+    // `-cubin`/`-ptx` flag below is chosen once, not per file).
+    println!("cargo:rustc-env=COLDSTART_KERNEL_FORMAT={}", if arch.is_some() { "cubin" } else { "ptx" });
+
     let entries = match std::fs::read_dir(src_dir) {
         Ok(e) => e,
         Err(_) => {
@@ -81,10 +88,13 @@ fn main() {
         let out_file = out_dir.join(format!("{stem}.{out_ext}"));
 
         // In COLDSTART_SKIP_CUDA mode, still expose the COLDSTART_KERNEL_<NAME>
-        // env var every model.rs `env!(...)` call needs to compile, but skip the
-        // nvcc invocation itself -- the referenced file is never created, so no
-        // inference binary can actually load kernels in this mode (type-check
-        // only, per CLAUDE.md's "COLDSTART_SKIP_CUDA=1 cargo build" doc).
+        // env var every `include_bytes!(env!(...))` call needs to compile, but
+        // skip the nvcc invocation itself and write an empty placeholder file in
+        // its place instead -- `include_bytes!` (unlike the old design's runtime
+        // `Ptx::from_file`) needs *some* file to exist at compile time, but its
+        // contents are never a real kernel in this mode, so no inference binary
+        // can actually load/launch kernels here (type-check only, per CLAUDE.md's
+        // "COLDSTART_SKIP_CUDA=1 cargo build" doc).
         if let Some(nvcc) = &nvcc {
             let mut cmd = Command::new(nvcc);
             cmd.arg(mode_flag).arg(&path).arg("-o").arg(&out_file);
@@ -96,6 +106,8 @@ fn main() {
             if !status.success() {
                 panic!("nvcc failed compiling {}", path.display());
             }
+        } else {
+            std::fs::write(&out_file, []).unwrap_or_else(|e| panic!("failed to write placeholder kernel file {}: {e}", out_file.display()));
         }
         println!("cargo:rustc-env=COLDSTART_KERNEL_{}={}", stem.to_uppercase(), out_file.display());
     }

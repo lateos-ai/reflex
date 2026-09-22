@@ -159,6 +159,16 @@ inside this engine — see README's "Non-goals" section for the full rationale b
 proposing anything in this direction. If a warm-context mode is ever added, it accepts
 one job at a time, strictly sequentially, never a thread pool.
 
+No in-core HTTP/gRPC server, ever — this is the same rule as `batch_size`-always-1/
+no-thread-pool above, not a separate exception any adoption/UX ask gets to reopen. If
+HTTP access to this engine is ever needed, the pattern is a separate, optional sidecar
+binary (e.g. an OpenAI-compatible adapter) that talks to this engine over local IPC —
+the core engine itself never grows a network socket. The local-ergonomics surface this
+engine may grow directly is limited to sequential, non-network-stack IPC (`--stdio`
+JSON-line mode, `--uds` Unix Domain Socket mode — see README's "Non-goals" section for
+detail) plus in-process bindings (the existing C FFI, and PyO3 Python bindings) — never
+a thread pool, never a queue.
+
 ## Known test-fixture limitation
 
 There is no small real `qwen3moe`-architecture GGUF available locally for fast

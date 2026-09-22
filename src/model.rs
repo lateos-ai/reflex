@@ -698,6 +698,32 @@ struct MlaModel {
     /// (even for the synthetic, YaRN-free MVP-step-4 fixture) since the tiny
     /// extra load cost isn't worth an `Option`.
     rope_norm_yarn_k: AotKernel,
+    /// Batched-prefill variant of `mla_attn_k` (`mla_attention_prefill_kernel`,
+    /// `kernels_cuda/mla_attention_prefill.cu`) -- see
+    /// `Model::forward_mla_attn_block_batched`.
+    mla_attn_prefill_k: AotKernel,
+    /// Batched-prefill variant of `rope_norm_k` (`rope_norm_batch_kernel`,
+    /// `kernels_cuda/rope.cu`).
+    rope_norm_batch_k: AotKernel,
+    /// Batched-prefill variant of `rope_norm_yarn_k` (`rope_norm_yarn_batch_kernel`,
+    /// `kernels_cuda/rope.cu`).
+    rope_norm_yarn_batch_k: AotKernel,
+    /// Batched-prefill variant of `Model::gemv_per_head`'s per-head-loop-of-`gemv_k`
+    /// (`gemv_per_head_batch_kernel`, `kernels_cuda/gemv_per_head_batch.cu`) --
+    /// applies MLA's per-head-stacked `wk_b`/`wv_b` weights to every head of every
+    /// batched row in one launch. See `Model::gemv_per_head_batch`.
+    gemv_per_head_batch_k: AotKernel,
+    /// Extracts a per-head sub-slice out of a wider batched per-head buffer in one
+    /// launch (`mla_extract_batch_kernel`, `kernels_cuda/elementwise.cu`) -- used for
+    /// q_pe/k_pe/kv_cmpr extraction ahead of RoPE/RMSNorm in
+    /// `Model::forward_mla_attn_block_batched`.
+    mla_extract_batch_k: AotKernel,
+    /// Merges absorbed q_nope and RoPE'd q_pe into Qcur's per-head row in one launch
+    /// (`mla_concat_qcur_batch_kernel`, `kernels_cuda/elementwise.cu`).
+    mla_concat_qcur_batch_k: AotKernel,
+    /// Writes a batch's compressed Kcur into the preallocated `kv_cache` in one
+    /// launch (`mla_write_kv_cache_batch_kernel`, `kernels_cuda/elementwise.cu`).
+    mla_write_kv_cache_batch_k: AotKernel,
 }
 
 /// Per-sequence recurrent state for one hybrid layer, matching
@@ -845,6 +871,11 @@ pub struct System1Response {
     pub results: Vec<System1CandidateResult>,
     /// `crate::calibration::softmax_scores_with_temperature` over `results[i].score`.
     pub probabilities: Vec<f32>,
+    /// `crate::calibration::shannon_entropy` of `probabilities` (bits) -- `0.0` when
+    /// one candidate completely dominates, `log2(probabilities.len())` when every
+    /// candidate is equally likely. A single scalar confidence/escalation signal
+    /// alongside the raw distribution.
+    pub entropy: f32,
 }
 
 impl Model {
@@ -864,6 +895,15 @@ impl Model {
     /// without exposing the private `tokenizer` field itself.
     pub fn encoded_prompt_len(&self, prompt: &str) -> Result<usize, String> {
         Ok(self.tokenizer.encode(prompt)?.len())
+    }
+
+    /// Decodes each id in `ids` to its own individual text piece (unlike
+    /// `Model::generate`'s combined whole-sequence `text`, which merges every
+    /// generated id's bytes into one string) -- for callers like
+    /// `check_correctness` that want to display/compare each generated token
+    /// separately, without exposing the private `tokenizer` field itself.
+    pub fn decode_tokens(&self, ids: &[u32]) -> Vec<String> {
+        ids.iter().map(|&id| self.tokenizer.decode(&[id])).collect()
     }
 
     /// Applies a llama.cpp-format LoRA adapter GGUF (see `crate::lora`'s
@@ -1022,24 +1062,24 @@ impl Model {
                 .result()
                 .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
         }
-        let rmsnorm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_RMSNORM"), "rmsnorm", "rmsnorm_kernel")?;
-        let rope_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope", "rope_kernel")?;
-        let rope_batch_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_batch", "rope_batch_kernel")?;
+        let rmsnorm_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_RMSNORM")), "rmsnorm", "rmsnorm_kernel")?;
+        let rope_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope", "rope_kernel")?;
+        let rope_batch_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope_batch", "rope_batch_kernel")?;
         let silu_k =
-            aot::load_kernel(&device, env!("COLDSTART_KERNEL_SILU_AND_MUL"), "silu_and_mul", "silu_and_mul_kernel")?;
-        let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_SILU_AND_MUL")), "silu_and_mul", "silu_and_mul_kernel")?;
+        let gemv_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_GEMV")), "gemv", "gemv_kernel")?;
         let gemv_gather_k =
-            aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV_GATHER"), "gemv_gather", "gemv_gather_kernel")?;
-        let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_GEMV_GATHER")), "gemv_gather", "gemv_gather_kernel")?;
+        let attn_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ATTENTION")), "attention", "attention_kernel")?;
         let attn_prefill_k = aot::load_kernel(
             &device,
-            env!("COLDSTART_KERNEL_ATTENTION_PREFILL"),
+            include_bytes!(env!("COLDSTART_KERNEL_ATTENTION_PREFILL")),
             "attention_prefill",
             "attention_prefill_kernel",
         )?;
         let mut elementwise_fns = aot::load_kernel_module(
             &device,
-            env!("COLDSTART_KERNEL_ELEMENTWISE"),
+            include_bytes!(env!("COLDSTART_KERNEL_ELEMENTWISE")),
             "elementwise",
             &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel"],
         )?
@@ -1049,7 +1089,7 @@ impl Model {
         let sigmoid_gate_k = elementwise_fns.next().ok_or("missing sigmoid_gate_kernel")?;
         let mut dequant_fns = aot::load_kernel_module(
             &device,
-            env!("COLDSTART_KERNEL_DEQUANT"),
+            include_bytes!(env!("COLDSTART_KERNEL_DEQUANT")),
             "dequant",
             &["dequantize_q4k_kernel", "dequantize_q6k_kernel"],
         )?
@@ -1069,6 +1109,7 @@ impl Model {
 
         let mut layers = Vec::with_capacity(block_count);
         for i in 0..block_count {
+            eprint!("\rLoading weights: layer {}/{block_count}", i + 1);
             let attn_norm = load_weight(&format!("blk.{i}.attn_norm.weight"))?;
             let attn_q = load_weight(&format!("blk.{i}.attn_q.weight"))?;
             let attn_k = load_weight(&format!("blk.{i}.attn_k.weight"))?;
@@ -1110,6 +1151,7 @@ impl Model {
             };
             layers.push(layer);
         }
+        eprintln!();
 
         let token_embd_info =
             file.tensor_info("token_embd.weight").ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
@@ -1232,24 +1274,24 @@ impl Model {
                 .result()
                 .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
         }
-        let rmsnorm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_RMSNORM"), "rmsnorm", "rmsnorm_kernel")?;
-        let rope_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope", "rope_kernel")?;
-        let rope_batch_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_batch", "rope_batch_kernel")?;
+        let rmsnorm_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_RMSNORM")), "rmsnorm", "rmsnorm_kernel")?;
+        let rope_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope", "rope_kernel")?;
+        let rope_batch_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope_batch", "rope_batch_kernel")?;
         let silu_k =
-            aot::load_kernel(&device, env!("COLDSTART_KERNEL_SILU_AND_MUL"), "silu_and_mul", "silu_and_mul_kernel")?;
-        let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_SILU_AND_MUL")), "silu_and_mul", "silu_and_mul_kernel")?;
+        let gemv_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_GEMV")), "gemv", "gemv_kernel")?;
         let gemv_gather_k =
-            aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV_GATHER"), "gemv_gather", "gemv_gather_kernel")?;
-        let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_GEMV_GATHER")), "gemv_gather", "gemv_gather_kernel")?;
+        let attn_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ATTENTION")), "attention", "attention_kernel")?;
         let attn_prefill_k = aot::load_kernel(
             &device,
-            env!("COLDSTART_KERNEL_ATTENTION_PREFILL"),
+            include_bytes!(env!("COLDSTART_KERNEL_ATTENTION_PREFILL")),
             "attention_prefill",
             "attention_prefill_kernel",
         )?;
         let mut elementwise_fns = aot::load_kernel_module(
             &device,
-            env!("COLDSTART_KERNEL_ELEMENTWISE"),
+            include_bytes!(env!("COLDSTART_KERNEL_ELEMENTWISE")),
             "elementwise",
             &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel"],
         )?
@@ -1259,7 +1301,7 @@ impl Model {
         let sigmoid_gate_k = elementwise_fns.next().ok_or("missing sigmoid_gate_kernel")?;
         let mut gdn_fns = aot::load_kernel_module(
             &device,
-            env!("COLDSTART_KERNEL_GATED_DELTANET"),
+            include_bytes!(env!("COLDSTART_KERNEL_GATED_DELTANET")),
             "gated_deltanet",
             &["gdn_conv_kernel", "gdn_l2_norm_kernel", "gdn_gates_kernel", "gdn_delta_kernel", "gdn_gated_norm_kernel"],
         )?
@@ -1271,7 +1313,7 @@ impl Model {
         let gdn_gated_norm_k = gdn_fns.next().ok_or("missing gdn_gated_norm_kernel")?;
         let mut dequant_fns = aot::load_kernel_module(
             &device,
-            env!("COLDSTART_KERNEL_DEQUANT"),
+            include_bytes!(env!("COLDSTART_KERNEL_DEQUANT")),
             "dequant",
             &["dequantize_q4k_kernel", "dequantize_q6k_kernel"],
         )?
@@ -1285,6 +1327,7 @@ impl Model {
 
         let mut layers = Vec::with_capacity(block_count);
         for i in 0..block_count {
+            eprint!("\rLoading weights: layer {}/{block_count}", i + 1);
             let attn_norm = load_weight(&format!("blk.{i}.attn_norm.weight"))?;
             let post_attn_norm = load_weight(&format!("blk.{i}.post_attention_norm.weight"))?;
             let ffn_gate = load_weight(&format!("blk.{i}.ffn_gate.weight"))?;
@@ -1325,6 +1368,7 @@ impl Model {
             };
             layers.push(layer);
         }
+        eprintln!();
 
         let token_embd_info =
             file.tensor_info("token_embd.weight").ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
@@ -1401,39 +1445,69 @@ impl Model {
                 .result()
                 .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
         }
-        let rmsnorm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_RMSNORM"), "rmsnorm", "rmsnorm_kernel")?;
-        let rope_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope", "rope_kernel")?;
-        let rope_batch_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_batch", "rope_batch_kernel")?;
+        let rmsnorm_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_RMSNORM")), "rmsnorm", "rmsnorm_kernel")?;
+        let rope_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope", "rope_kernel")?;
+        let rope_batch_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope_batch", "rope_batch_kernel")?;
         let silu_k =
-            aot::load_kernel(&device, env!("COLDSTART_KERNEL_SILU_AND_MUL"), "silu_and_mul", "silu_and_mul_kernel")?;
-        let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_SILU_AND_MUL")), "silu_and_mul", "silu_and_mul_kernel")?;
+        let gemv_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_GEMV")), "gemv", "gemv_kernel")?;
         let gemv_gather_k =
-            aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV_GATHER"), "gemv_gather", "gemv_gather_kernel")?;
-        let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_GEMV_GATHER")), "gemv_gather", "gemv_gather_kernel")?;
+        let attn_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ATTENTION")), "attention", "attention_kernel")?;
         let attn_prefill_k = aot::load_kernel(
             &device,
-            env!("COLDSTART_KERNEL_ATTENTION_PREFILL"),
+            include_bytes!(env!("COLDSTART_KERNEL_ATTENTION_PREFILL")),
             "attention_prefill",
             "attention_prefill_kernel",
         )?;
         let mut elementwise_fns = aot::load_kernel_module(
             &device,
-            env!("COLDSTART_KERNEL_ELEMENTWISE"),
+            include_bytes!(env!("COLDSTART_KERNEL_ELEMENTWISE")),
             "elementwise",
-            &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel"],
+            &[
+                "add_kernel",
+                "split_qg_kernel",
+                "sigmoid_gate_kernel",
+                "mla_extract_batch_kernel",
+                "mla_concat_qcur_batch_kernel",
+                "mla_write_kv_cache_batch_kernel",
+            ],
         )?
         .into_iter();
         let add_k = elementwise_fns.next().ok_or("missing add_kernel")?;
         let split_qg_k = elementwise_fns.next().ok_or("missing split_qg_kernel")?;
         let sigmoid_gate_k = elementwise_fns.next().ok_or("missing sigmoid_gate_kernel")?;
+        let mla_extract_batch_k = elementwise_fns.next().ok_or("missing mla_extract_batch_kernel")?;
+        let mla_concat_qcur_batch_k = elementwise_fns.next().ok_or("missing mla_concat_qcur_batch_kernel")?;
+        let mla_write_kv_cache_batch_k = elementwise_fns.next().ok_or("missing mla_write_kv_cache_batch_kernel")?;
         let mla_attn_k =
-            aot::load_kernel(&device, env!("COLDSTART_KERNEL_MLA_ATTENTION"), "mla_attention", "mla_attention_kernel")?;
-        let rope_norm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_norm", "rope_norm_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_MLA_ATTENTION")), "mla_attention", "mla_attention_kernel")?;
+        let mla_attn_prefill_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("COLDSTART_KERNEL_MLA_ATTENTION_PREFILL")),
+            "mla_attention_prefill",
+            "mla_attention_prefill_kernel",
+        )?;
+        let rope_norm_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope_norm", "rope_norm_kernel")?;
         let rope_norm_yarn_k =
-            aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_norm_yarn", "rope_norm_yarn_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope_norm_yarn", "rope_norm_yarn_kernel")?;
+        let rope_norm_batch_k =
+            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope_norm_batch", "rope_norm_batch_kernel")?;
+        let rope_norm_yarn_batch_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("COLDSTART_KERNEL_ROPE")),
+            "rope_norm_yarn_batch",
+            "rope_norm_yarn_batch_kernel",
+        )?;
+        let gemv_per_head_batch_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("COLDSTART_KERNEL_GEMV_PER_HEAD_BATCH")),
+            "gemv_per_head_batch",
+            "gemv_per_head_batch_kernel",
+        )?;
         let mut dequant_fns = aot::load_kernel_module(
             &device,
-            env!("COLDSTART_KERNEL_DEQUANT"),
+            include_bytes!(env!("COLDSTART_KERNEL_DEQUANT")),
             "dequant",
             &["dequantize_q4k_kernel", "dequantize_q6k_kernel"],
         )?
@@ -1447,6 +1521,7 @@ impl Model {
 
         let mut layers = Vec::with_capacity(block_count);
         for i in 0..block_count {
+            eprint!("\rLoading weights: layer {}/{block_count}", i + 1);
             let ffn = if i < leading_dense {
                 MlaFfn::Dense {
                     ffn_gate: load_weight(&format!("blk.{i}.ffn_gate.weight"))?,
@@ -1476,6 +1551,7 @@ impl Model {
                 ffn,
             });
         }
+        eprintln!();
 
         let token_embd_info =
             file.tensor_info("token_embd.weight").ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
@@ -1542,7 +1618,20 @@ impl Model {
             lm_head,
             tokenizer,
             hybrid: None,
-            mla: Some(MlaModel { cfg: mla_cfg, layers, mla_attn_k, rope_norm_k, rope_norm_yarn_k }),
+            mla: Some(MlaModel {
+                cfg: mla_cfg,
+                layers,
+                mla_attn_k,
+                rope_norm_k,
+                rope_norm_yarn_k,
+                mla_attn_prefill_k,
+                rope_norm_batch_k,
+                rope_norm_yarn_batch_k,
+                gemv_per_head_batch_k,
+                mla_extract_batch_k,
+                mla_concat_qcur_batch_k,
+                mla_write_kv_cache_batch_k,
+            }),
         })
     }
 
@@ -1848,6 +1937,88 @@ impl Model {
         Ok(())
     }
 
+    /// Batched-prefill variant of [`Self::rope_norm`]: rotates `rows` rows of `t` in
+    /// one launch, row `r` at absolute position `start_pos + r` (`rope_norm_batch_kernel`,
+    /// same batching idea as [`Self::rope_batch`] applied to the consecutive-pair
+    /// rotation). `t` is row-major `[rows, num_heads, head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_norm_batch(
+        &self,
+        m: &MlaModel,
+        t: &mut CudaSlice<f32>,
+        num_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        start_pos: usize,
+        rows: usize,
+        base: f32,
+    ) -> Result<(), String> {
+        let half_rotary = rotary_dim / 2;
+        let total_pairs = (rows * num_heads * half_rotary) as u32;
+        let threads = 256u32;
+        let blocks = total_pairs.div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+
+        unsafe {
+            m.rope_norm_batch_k
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (t, start_pos as u32, num_heads as u32, head_dim as u32, rotary_dim as u32, rows as u32, base),
+                )
+                .map_err(|e| format!("rope_norm_batch launch: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Batched-prefill variant of [`Self::rope_norm_yarn`]: like [`Self::rope_norm_batch`],
+    /// plus the extra YaRN parameters from `cfg.yarn` (`rope_norm_yarn_batch_kernel`).
+    #[allow(clippy::too_many_arguments)]
+    fn rope_norm_yarn_batch(
+        &self,
+        m: &MlaModel,
+        yarn: &MlaYarnConfig,
+        t: &mut CudaSlice<f32>,
+        num_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        start_pos: usize,
+        rows: usize,
+        base: f32,
+    ) -> Result<(), String> {
+        let half_rotary = rotary_dim / 2;
+        let total_pairs = (rows * num_heads * half_rotary) as u32;
+        let threads = 256u32;
+        let blocks = total_pairs.div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+
+        unsafe {
+            m.rope_norm_yarn_batch_k
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (
+                        t,
+                        start_pos as u32,
+                        num_heads as u32,
+                        head_dim as u32,
+                        rotary_dim as u32,
+                        rows as u32,
+                        base,
+                        yarn.freq_scale,
+                        yarn.ext_factor,
+                        yarn.attn_factor,
+                        yarn.corr_dim_start,
+                        yarn.corr_dim_end,
+                    ),
+                )
+                .map_err(|e| format!("rope_norm_yarn_batch launch: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// `gate`/`up` are already device-resident, separate (not concatenated)
     /// buffers -- `silu_and_mul_kernel` takes them as two pointers, so no
     /// device-side concatenation step is needed either (Phase 2 round 2).
@@ -2040,6 +2211,69 @@ impl Model {
         Ok(out)
     }
 
+    /// Batched-prefill variant of [`Self::gemv_per_head`]: applies a per-head-stacked
+    /// weight tensor `w` to every head of every row of a batched `rows`-row input in
+    /// one launch (`gemv_per_head_batch_kernel`) instead of `rows` separate
+    /// `Self::gemv_per_head` calls (each of which itself loops `n_head` times --
+    /// looping this per row would mean `rows * n_head` launches, the exact
+    /// launch-count blowup this kernel exists to avoid; see
+    /// `Self::forward_mla_attn_block_batched`'s doc comment for the math). Unlike
+    /// `gemv_per_head`, `x` need not be a contiguous `[rows, n_head, in_features]`
+    /// buffer -- `x_row_stride`/`x_head_stride`/`x_head_offset` let the caller read
+    /// directly out of a wider strided buffer (MLA's absorption step reads q_nope
+    /// straight out of the `wq` projection output, which interleaves q_nope/q_pe per
+    /// head, with no separate gather step). `out` is always a freshly allocated,
+    /// contiguous `[rows, n_head, out_features]` buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_per_head_batch(
+        &self,
+        m: &MlaModel,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+        rows: usize,
+        n_head: usize,
+        x_row_stride: usize,
+        x_head_stride: usize,
+        x_head_offset: usize,
+    ) -> Result<CudaSlice<f32>, String> {
+        let (in_features, out_features, head_count) = match w.shape.as_slice() {
+            [i, o, h] => (*i as usize, *o as usize, *h as usize),
+            other => return Err(format!("gemv_per_head_batch: expected 3-D per-head tensor shape, got {other:?}")),
+        };
+        if head_count != n_head {
+            return Err(format!("gemv_per_head_batch: tensor's head dim {head_count} != n_head {n_head}"));
+        }
+        let mut out =
+            self.device.alloc_zeros::<f32>(rows * n_head * out_features).map_err(|e| format!("gemv_per_head_batch alloc: {e}"))?;
+
+        let threads = 256u32;
+        let out_blocks = (out_features as u32).div_ceil(threads).max(1);
+        let launch_cfg =
+            LaunchConfig { grid_dim: (out_blocks, n_head as u32, rows as u32), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            m.gemv_per_head_batch_k
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (
+                        x,
+                        &w.data,
+                        &mut out,
+                        rows as u32,
+                        n_head as u32,
+                        in_features as u32,
+                        out_features as u32,
+                        x_row_stride as u32,
+                        x_head_stride as u32,
+                        x_head_offset as u32,
+                    ),
+                )
+                .map_err(|e| format!("gemv_per_head_batch launch: {e}"))?;
+        }
+        Ok(out)
+    }
+
     /// DeepSeek-V2/V3 MLA's MQA-style attention: `num_q_heads` query heads (each
     /// `qk_dim` wide) attend against a single shared compressed KV "head"
     /// (`kv_cache` view, `[seq_len, qk_dim]` row-major, one row per cached
@@ -2080,6 +2314,156 @@ impl Model {
                 .map_err(|e| format!("mla_attn launch: {e}"))?;
         }
         Ok(dev_out)
+    }
+
+    /// Batched-prefill variant of [`Self::mla_attention`]: scores `rows` new query
+    /// rows against the shared compressed MQA KV cache in one launch (grid gains a
+    /// query-row dimension), each row causally masked to its own `start_pos + row +
+    /// 1` positions -- same relationship [`Self::attention_prefill`] has to
+    /// [`Self::attention`], applied to MLA's MQA/compressed-KV shape. `q` is
+    /// row-major `[rows, num_q_heads, qk_dim]`; returns row-major `[rows,
+    /// num_q_heads, v_dim]`. `kv_cache` must already cover `0..start_pos+rows`
+    /// positions (this batch's own compressed KV, written by the caller before this
+    /// call -- `Self::forward_mla_attn_block_batched`).
+    #[allow(clippy::too_many_arguments)]
+    fn mla_attention_prefill(
+        &self,
+        m: &MlaModel,
+        q: &CudaSlice<f32>,
+        kv_cache: &CudaView<f32>,
+        num_q_heads: usize,
+        qk_dim: usize,
+        v_dim: usize,
+        start_pos: usize,
+        rows: usize,
+        scale: f32,
+    ) -> Result<CudaSlice<f32>, String> {
+        let mut dev_out =
+            self.device.alloc_zeros::<f32>(rows * num_q_heads * v_dim).map_err(|e| format!("mla_attn_prefill alloc out: {e}"))?;
+        let block_dim = (qk_dim as u32).next_power_of_two();
+        let max_seq_len = start_pos + rows;
+        let launch_cfg = LaunchConfig {
+            grid_dim: (num_q_heads as u32, rows as u32, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: (max_seq_len * std::mem::size_of::<f32>()) as u32,
+        };
+        unsafe {
+            m.mla_attn_prefill_k
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (
+                        q,
+                        kv_cache,
+                        &mut dev_out,
+                        num_q_heads as u32,
+                        qk_dim as u32,
+                        v_dim as u32,
+                        start_pos as u32,
+                        rows as u32,
+                        scale,
+                    ),
+                )
+                .map_err(|e| format!("mla_attn_prefill launch: {e}"))?;
+        }
+        Ok(dev_out)
+    }
+
+    /// Batched-prefill helper: extracts a fixed-width, fixed-offset sub-slice of
+    /// every (row, head) entry of `src` into its own contiguous output
+    /// (`mla_extract_batch_kernel`) -- see that kernel's doc comment
+    /// (`kernels_cuda/elementwise.cu`) for the exact layout contract.
+    #[allow(clippy::too_many_arguments)]
+    fn mla_extract_batch(
+        &self,
+        m: &MlaModel,
+        src: &CudaSlice<f32>,
+        rows: usize,
+        num_heads: usize,
+        src_head_width: usize,
+        dst_width: usize,
+        src_head_offset: usize,
+    ) -> Result<CudaSlice<f32>, String> {
+        let mut dst = self
+            .device
+            .alloc_zeros::<f32>(rows * num_heads * dst_width)
+            .map_err(|e| format!("mla_extract_batch alloc: {e}"))?;
+        let n = (rows * num_heads * dst_width) as u32;
+        let threads = 256u32;
+        let blocks = n.div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            m.mla_extract_batch_k
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (src, &mut dst, rows as u32, num_heads as u32, src_head_width as u32, dst_width as u32, src_head_offset as u32),
+                )
+                .map_err(|e| format!("mla_extract_batch launch: {e}"))?;
+        }
+        Ok(dst)
+    }
+
+    /// Batched-prefill helper: merges per-head `absorbed` (kv_lora-wide) and
+    /// already-RoPE'd `q_pe` (qk_rope-wide) into Qcur's per-head row
+    /// (`mla_concat_qcur_batch_kernel`).
+    fn mla_concat_qcur_batch(
+        &self,
+        m: &MlaModel,
+        absorbed: &CudaSlice<f32>,
+        q_pe: &CudaSlice<f32>,
+        rows: usize,
+        n_head: usize,
+        kv_lora: usize,
+        qk_rope: usize,
+    ) -> Result<CudaSlice<f32>, String> {
+        let qk_dim = kv_lora + qk_rope;
+        let mut out =
+            self.device.alloc_zeros::<f32>(rows * n_head * qk_dim).map_err(|e| format!("mla_concat_qcur_batch alloc: {e}"))?;
+        let n = (rows * n_head * qk_dim) as u32;
+        let threads = 256u32;
+        let blocks = n.div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            m.mla_concat_qcur_batch_k
+                .function
+                .clone()
+                .launch(launch_cfg, (absorbed, q_pe, &mut out, rows as u32, n_head as u32, kv_lora as u32, qk_rope as u32))
+                .map_err(|e| format!("mla_concat_qcur_batch launch: {e}"))?;
+        }
+        Ok(out)
+    }
+
+    /// Batched-prefill helper: writes this batch's compressed Kcur (`kv_cmpr` concat
+    /// `k_pe`) into `kv_cache` at rows `start_pos..start_pos+rows`
+    /// (`mla_write_kv_cache_batch_kernel`).
+    #[allow(clippy::too_many_arguments)]
+    fn mla_write_kv_cache_batch(
+        &self,
+        m: &MlaModel,
+        kv_cache: &mut CudaSlice<f32>,
+        kv_cmpr: &CudaSlice<f32>,
+        k_pe: &CudaSlice<f32>,
+        start_pos: usize,
+        rows: usize,
+        kv_lora: usize,
+        qk_rope: usize,
+    ) -> Result<(), String> {
+        let qk_dim = kv_lora + qk_rope;
+        let n = (rows * qk_dim) as u32;
+        let threads = 256u32;
+        let blocks = n.div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            m.mla_write_kv_cache_batch_k
+                .function
+                .clone()
+                .launch(launch_cfg, (kv_cache, kv_cmpr, k_pe, start_pos as u32, rows as u32, kv_lora as u32, qk_rope as u32))
+                .map_err(|e| format!("mla_write_kv_cache_batch launch: {e}"))?;
+        }
+        Ok(())
     }
 
     /// RMSNorm -> QKV -> QK-Norm (if present) -> RoPE -> causal attention ->
@@ -2442,7 +2826,7 @@ impl Model {
         if let Some(m) = &self.mla {
             return self.forward_prompt_mla(m, prompt);
         }
-        let (generated, text, _k_caches, _v_caches, _seq_len) = self.generate_dense_impl(prompt, None, 1, || {})?;
+        let (generated, text, _k_caches, _v_caches, _seq_len) = self.generate_dense_impl(prompt, None, 1, |_logits| {})?;
         Ok((generated[0], text))
     }
 
@@ -2454,9 +2838,12 @@ impl Model {
     /// instead of starting at position 0 -- `prompt` is then the
     /// continuation text appended after the imported cache's positions, not
     /// a fresh prompt (no BOS is inserted). `on_first_token` is called
-    /// exactly once, right after the first new token is produced, so
-    /// callers can capture accurate "time to first token" timing even when
-    /// `max_new_tokens > 1` keeps the call running past that point.
+    /// exactly once, right after the first new token is produced, with that
+    /// token's full logits vector -- callers can ignore the argument to just
+    /// capture accurate "time to first token" timing (as `src/bin/qwen3_coldstart.rs`
+    /// does), or inspect the logits themselves (as `src/bin/check_correctness.rs`
+    /// does) -- even when `max_new_tokens > 1` keeps the call running past that
+    /// point.
     ///
     /// Dense/MoE and the Qwen3.5 hybrid mixer support resume as of round 2
     /// (the hybrid `GatedDeltaNet` sublayers' `conv_state`/`recurrent` need
@@ -2467,7 +2854,7 @@ impl Model {
         prompt: &str,
         max_new_tokens: usize,
         imported: Option<&crate::kv_io::ImportedKv>,
-        on_first_token: impl FnMut(),
+        on_first_token: impl FnMut(&[f32]),
     ) -> Result<(Vec<u32>, String), String> {
         match imported {
             Some(crate::kv_io::ImportedKv::Dense(cache)) => {
@@ -2721,7 +3108,7 @@ impl Model {
         prompt: &str,
         imported: Option<&crate::kv_io::DenseKvCache>,
         max_new_tokens: usize,
-        mut on_first_token: impl FnMut(),
+        mut on_first_token: impl FnMut(&[f32]),
     ) -> Result<(Vec<u32>, String, Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>, usize), String> {
         if max_new_tokens == 0 {
             return Err("max_new_tokens must be at least 1".to_string());
@@ -2732,8 +3119,9 @@ impl Model {
         let mut hidden = self.last_row(&hidden_batched, ids.len(), self.cfg.hidden_size)?;
 
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
-        let mut next_id = self.lm_head_argmax(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
-        on_first_token();
+        let first_logits = self.lm_head_logits(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
+        let mut next_id = Self::argmax(&first_logits)?;
+        on_first_token(&first_logits);
         generated.push(next_id);
 
         while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
@@ -2825,13 +3213,14 @@ impl Model {
         }
 
         let probabilities = crate::calibration::softmax_scores_with_temperature(&scores, temperature)?;
+        let entropy = crate::calibration::shannon_entropy(&probabilities)?;
         let results = candidates
             .iter()
             .zip(resolved)
             .zip(scores)
             .map(|((c, token_ids), score)| System1CandidateResult { text: c.text.clone(), token_ids, score })
             .collect();
-        Ok(System1Response { results, probabilities })
+        Ok(System1Response { results, probabilities, entropy })
     }
 
     /// Embeds `token_id` and runs it through every dense/MoE layer at
@@ -2860,9 +3249,24 @@ impl Model {
     /// generation loop (`hidden_size`/`eps` differ by architecture; the
     /// `output_norm`/`lm_head` weights are shared across all of them).
     fn lm_head_argmax(&self, hidden: &CudaSlice<f32>, hidden_size: usize, eps: f32) -> Result<u32, String> {
+        let logits = self.lm_head_logits(hidden, hidden_size, eps)?;
+        Self::argmax(&logits)
+    }
+
+    /// Like [`Self::lm_head_argmax`], but returns the full host-resident logits
+    /// vector instead of collapsing it to an argmax index -- used by the first
+    /// generated token's step only (see `Self::generate_dense_impl`/
+    /// `generate_hybrid_impl`/`generate_mla_impl`'s `on_first_token` call sites),
+    /// so `Model::generate`'s callers (e.g. `check_correctness`, see
+    /// `src/bin/check_correctness.rs`) can inspect the real logits a byte-exact
+    /// verification needs without adding a second full generation API.
+    fn lm_head_logits(&self, hidden: &CudaSlice<f32>, hidden_size: usize, eps: f32) -> Result<Vec<f32>, String> {
         let normed = self.rmsnorm(hidden, &self.output_norm.data, 1, hidden_size, eps)?;
         let logits_dev = self.gemv(&normed, &self.lm_head)?;
-        let logits = self.device.dtoh_sync_copy(&logits_dev).map_err(|e| format!("logits dtoh: {e}"))?;
+        self.device.dtoh_sync_copy(&logits_dev).map_err(|e| format!("logits dtoh: {e}"))
+    }
+
+    fn argmax(logits: &[f32]) -> Result<u32, String> {
         logits
             .iter()
             .enumerate()
@@ -2885,7 +3289,7 @@ impl Model {
         if self.mla.is_some() {
             return Err("--export-kv on an MLA model needs forward_prompt_capture_kv_mla, not this function".to_string());
         }
-        let (generated, text, k_caches, v_caches, seq_len) = self.generate_dense_impl(prompt, None, 1, || {})?;
+        let (generated, text, k_caches, v_caches, seq_len) = self.generate_dense_impl(prompt, None, 1, |_logits| {})?;
 
         let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
         let per_layer_len = seq_len * kv_stride;
@@ -3456,11 +3860,162 @@ impl Model {
         Ok(hidden)
     }
 
+    /// Batched-prefill variant of [`Self::forward_mla_attn_block`]: normalizes,
+    /// projects, RoPEs, absorbs/decompresses, and attends over `rows` positions at
+    /// once instead of one position per call. `wq`/`wkv_a_mqa`/`wo` (the dominant
+    /// FLOP cost, same role QKV/O-proj play in the dense path) become one
+    /// [`Self::gemm`] call each over all `rows` rows. Absorption (`wk_b`) and
+    /// decompression (`wv_b`) are NOT left as a per-row loop over the sequential
+    /// per-head calls: looping `Self::gemv_per_head`/`Self::gemv_view` `rows` times
+    /// would mean `rows * n_head` kernel launches for absorption alone (plus as many
+    /// device-to-device copies), the same order of magnitude as the exact
+    /// per-call-overhead regression CLAUDE.md documents for Phase 2 round 1 -- e.g.
+    /// ~14k launches per layer at a 449-row prefill with 16 heads, ~28k counting
+    /// decompression too. [`Self::gemv_per_head_batch`] does both in one launch each
+    /// instead. The three small `Self::mla_extract_batch`/`Self::mla_concat_qcur_batch`/
+    /// `Self::mla_write_kv_cache_batch` helpers replace the sequential path's
+    /// per-head/per-row `dtod_copy` loops the same way, each in one launch. `start_pos`
+    /// is this batch's first row's absolute position (row `r` is `start_pos + r`),
+    /// matching [`Self::forward_attn_block_batched`]'s resume convention.
+    fn forward_mla_attn_block_batched(
+        &self,
+        m: &MlaModel,
+        w: &MlaLayerWeights,
+        mut hidden: CudaSlice<f32>,
+        start_pos: usize,
+        rows: usize,
+        kv_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
+        let cfg = &m.cfg;
+        let n_head = cfg.num_heads;
+        let qk_nope = cfg.qk_nope_head_dim;
+        let qk_rope = cfg.qk_rope_head_dim;
+        let n_embd_head_k_mla = qk_nope + qk_rope;
+        let kv_lora = cfg.kv_lora_rank;
+        let qk_dim = kv_lora + qk_rope;
+        let v_dim = kv_lora;
+
+        let normed = self.rmsnorm(&hidden, &w.attn_norm.data, rows, cfg.hidden_size, cfg.rmsnorm_eps)?;
+
+        // q_batched: [rows, n_head, n_embd_head_k_mla] flat (plain gemm -- is_lite
+        // path, no Q-LoRA).
+        let q_batched = self.gemm(&normed, &w.wq, rows)?;
+
+        // kv_cmpr_pe_batched: [rows, kv_lora_rank + qk_rope_head_dim] flat (single
+        // shared "head" per row).
+        let kv_cmpr_pe_batched = self.gemm(&normed, &w.wkv_a_mqa, rows)?;
+
+        // Extract k_pe/kv_cmpr into their own contiguous [rows, 1, width] buffers
+        // (num_heads=1: the whole fused wkv_a_mqa row is treated as a single head).
+        let mut k_pe_batched = self.mla_extract_batch(m, &kv_cmpr_pe_batched, rows, 1, kv_lora + qk_rope, qk_rope, kv_lora)?;
+        let kv_cmpr_batched = self.mla_extract_batch(m, &kv_cmpr_pe_batched, rows, 1, kv_lora + qk_rope, kv_lora, 0)?;
+
+        match &cfg.yarn {
+            Some(yarn) => self.rope_norm_yarn_batch(m, yarn, &mut k_pe_batched, 1, qk_rope, qk_rope, start_pos, rows, cfg.rope_base)?,
+            None => self.rope_norm_batch(m, &mut k_pe_batched, 1, qk_rope, qk_rope, start_pos, rows, cfg.rope_base)?,
+        }
+
+        let kv_cmpr_normed_batched = self.rmsnorm(&kv_cmpr_batched, &w.attn_kv_a_norm.data, rows, kv_lora, cfg.rmsnorm_eps)?;
+
+        // Extract q_pe (all heads, all rows) into its own contiguous
+        // [rows, n_head, qk_rope] buffer before RoPE -- q_pe is a strided sub-slice
+        // of each head's [n_embd_head_k_mla]-wide row in q_batched, not itself
+        // contiguous across heads.
+        let mut q_pe_batched = self.mla_extract_batch(m, &q_batched, rows, n_head, n_embd_head_k_mla, qk_rope, qk_nope)?;
+        match &cfg.yarn {
+            Some(yarn) => {
+                self.rope_norm_yarn_batch(m, yarn, &mut q_pe_batched, n_head, qk_rope, qk_rope, start_pos, rows, cfg.rope_base)?
+            }
+            None => self.rope_norm_batch(m, &mut q_pe_batched, n_head, qk_rope, qk_rope, start_pos, rows, cfg.rope_base)?,
+        }
+
+        // Absorption: q_nope (read directly out of q_batched via strides -- no
+        // separate gather) times wk_b's per-head slice, batched over every row and
+        // head in one launch.
+        let absorbed_batched = self.gemv_per_head_batch(
+            m,
+            &q_batched,
+            &w.wk_b,
+            rows,
+            n_head,
+            n_head * n_embd_head_k_mla,
+            n_embd_head_k_mla,
+            0,
+        )?;
+
+        // Qcur = absorbed (nope, now in compressed kv_lora space) ++ q_pe (roped),
+        // per head, per row.
+        let qcur_batched = self.mla_concat_qcur_batch(m, &absorbed_batched, &q_pe_batched, rows, n_head, kv_lora, qk_rope)?;
+
+        // Write this batch's compressed Kcur into the preallocated per-layer cache.
+        self.mla_write_kv_cache_batch(m, kv_cache, &kv_cmpr_normed_batched, &k_pe_batched, start_pos, rows, kv_lora, qk_rope)?;
+        let seq_len = start_pos + rows;
+
+        let kv_view = kv_cache.slice(0..seq_len * qk_dim);
+        let scale = match &cfg.yarn {
+            Some(yarn) => yarn.attention_scale,
+            None => 1.0 / (n_embd_head_k_mla as f32).sqrt(),
+        };
+        let compressed_out_batched = self.mla_attention_prefill(m, &qcur_batched, &kv_view, n_head, qk_dim, v_dim, start_pos, rows, scale)?;
+
+        // Decompression: already-contiguous [rows, n_head, v_dim] input, standard
+        // strides.
+        let decompressed_batched =
+            self.gemv_per_head_batch(m, &compressed_out_batched, &w.wv_b, rows, n_head, n_head * v_dim, v_dim, 0)?;
+
+        let o_proj = self.gemm(&decompressed_batched, &w.wo, rows)?;
+        self.add_inplace(&mut hidden, &o_proj)?;
+        Ok(hidden)
+    }
+
+    /// Layer dispatcher for MLA batched prefill (`Self::prefill_mla_batched`): runs
+    /// the attention block batched (`Self::forward_mla_attn_block_batched`), then the
+    /// FFN tail. The dense-lead layers' FFN batches too (`Self::forward_hybrid_ffn_batched`,
+    /// already generic over which norm/gate/up/down weights it's given -- see
+    /// `MlaLayerWeights`'s doc comment). The routed-MoE + shared-expert tail stays a
+    /// per-row loop over the unmodified per-token `Self::forward_mla_moe_ffn`
+    /// (`Self::extract_row`/`Self::write_row`) -- same precedent
+    /// `Self::forward_layer_moe_batched` already set for dense/MoE's own MoE FFN;
+    /// grouped-GEMM MoE batching is a separate, already-flagged follow-on, not
+    /// attempted here.
+    fn forward_mla_layer_batched(
+        &self,
+        m: &MlaModel,
+        layer: &MlaLayerWeights,
+        hidden: CudaSlice<f32>,
+        start_pos: usize,
+        rows: usize,
+        kv_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
+        let post_attn = self.forward_mla_attn_block_batched(m, layer, hidden, start_pos, rows, kv_cache)?;
+
+        let cfg = &m.cfg;
+        let hidden_size = cfg.hidden_size;
+        let ffn_hidden_size = cfg.ffn_hidden_size;
+        let eps = cfg.rmsnorm_eps;
+
+        match &layer.ffn {
+            MlaFfn::Dense { ffn_gate, ffn_up, ffn_down } => {
+                self.forward_hybrid_ffn_batched(post_attn, &layer.ffn_norm, ffn_gate, ffn_up, ffn_down, hidden_size, ffn_hidden_size, rows, eps)
+            }
+            MlaFfn::Moe { .. } => {
+                let moe_cfg = cfg.moe.as_ref().ok_or("internal error: MlaFfn::Moe layer but MlaConfig::moe is None")?;
+                let mut out = post_attn;
+                for row in 0..rows {
+                    let row_hidden = self.extract_row(&out, row, hidden_size)?;
+                    let row_out = self.forward_mla_moe_ffn(layer, row_hidden, hidden_size, moe_cfg, eps)?;
+                    self.write_row(&mut out, row, hidden_size, &row_out)?;
+                }
+                Ok(out)
+            }
+        }
+    }
+
     /// Hybrid-model counterpart to [`Self::forward_prompt`]: thin wrapper
     /// over [`Self::generate_hybrid_impl`] with no import and exactly one
     /// generated token.
     fn forward_prompt_hybrid(&self, h: &HybridModel, prompt: &str) -> Result<(u32, String), String> {
-        let (generated, text, _states, _seq_len) = self.generate_hybrid_impl(h, prompt, None, 1, || {})?;
+        let (generated, text, _states, _seq_len) = self.generate_hybrid_impl(h, prompt, None, 1, |_logits| {})?;
         Ok((generated[0], text))
     }
 
@@ -3637,7 +4192,7 @@ impl Model {
         prompt: &str,
         imported: Option<&crate::kv_io::HybridKvCache>,
         max_new_tokens: usize,
-        mut on_first_token: impl FnMut(),
+        mut on_first_token: impl FnMut(&[f32]),
     ) -> Result<(Vec<u32>, String, Vec<HybridLayerState>, usize), String> {
         if max_new_tokens == 0 {
             return Err("max_new_tokens must be at least 1".to_string());
@@ -3649,8 +4204,9 @@ impl Model {
         let mut hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
 
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
-        let mut next_id = self.lm_head_argmax(&hidden, hidden_size, eps)?;
-        on_first_token();
+        let first_logits = self.lm_head_logits(&hidden, hidden_size, eps)?;
+        let mut next_id = Self::argmax(&first_logits)?;
+        on_first_token(&first_logits);
         generated.push(next_id);
 
         while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
@@ -3699,7 +4255,7 @@ impl Model {
     /// since they're already fixed-size) to host memory for `--export-kv`.
     pub fn forward_prompt_capture_kv_hybrid(&self, prompt: &str) -> Result<((u32, String), crate::kv_io::HybridKvCache), String> {
         let h = self.hybrid.as_ref().ok_or("forward_prompt_capture_kv_hybrid called on a non-hybrid model")?;
-        let (generated, text, states, seq_len) = self.generate_hybrid_impl(h, prompt, None, 1, || {})?;
+        let (generated, text, states, seq_len) = self.generate_hybrid_impl(h, prompt, None, 1, |_logits| {})?;
 
         let attn_len = seq_len * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
         let mut layers = Vec::with_capacity(states.len());
@@ -3800,49 +4356,26 @@ impl Model {
     /// over [`Self::generate_mla_impl`] with no import and exactly one
     /// generated token.
     fn forward_prompt_mla(&self, m: &MlaModel, prompt: &str) -> Result<(u32, String), String> {
-        let (generated, text, _kv_caches, _seq_len) = self.generate_mla_impl(m, prompt, None, 1, || {})?;
+        let (generated, text, _kv_caches, _seq_len) = self.generate_mla_impl(m, prompt, None, 1, |_logits| {})?;
         Ok((generated[0], text))
     }
 
-    /// MLA counterpart to [`Self::generate_dense_impl`]/[`Self::generate_hybrid_impl`]
-    /// (Phase 3 round 3): same encode -> seed-from-`imported` -> per-position
-    /// loop -> decode-more-tokens shape, but each layer's single compressed
-    /// `kv_cache` (`[seq_len, kv_lora_rank + qk_rope_head_dim]`, no separate
-    /// K/V pair -- see [`Self::forward_mla_attn_block`]) gets the same
-    /// `start_pos`-offset treatment dense/MoE's `k_cache`/`v_cache` and
-    /// hybrid's `GatedAttention` sublayers already do: preallocated for
-    /// `start_pos + prompt_len + max_new_tokens`, seeded from `imported` at
-    /// offset 0 before the per-position loop starts, then indexed by
-    /// absolute position exactly like a from-scratch run just offset by
-    /// `imported`'s `seq_len`.
-    fn generate_mla_impl(
+    /// Shared per-layer `kv_cache` allocation/import behind [`Self::prefill_mla`] and
+    /// [`Self::prefill_mla_batched`]: allocates each layer's compressed `[total_len,
+    /// qk_dim]` cache (`total_len = start_pos + rows + extra_headroom`) and seeds it
+    /// from `imported` when resuming -- identical between the sequential and batched
+    /// prefill paths, so factored out once rather than duplicated (same role
+    /// `Self::alloc_hybrid_states` plays for the hybrid path).
+    fn alloc_mla_kv_caches(
         &self,
         m: &MlaModel,
-        prompt: &str,
         imported: Option<&crate::kv_io::MlaKvCache>,
-        max_new_tokens: usize,
-        mut on_first_token: impl FnMut(),
-    ) -> Result<(Vec<u32>, String, Vec<CudaSlice<f32>>, usize), String> {
-        let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
-
-        let mut ids = self.tokenizer.encode(prompt)?;
-        if start_pos == 0 {
-            if let Some(bos) = self.tokenizer.bos_token_id {
-                if ids.first() != Some(&bos) {
-                    ids.insert(0, bos);
-                }
-            }
-        }
-        if ids.is_empty() {
-            return Err("encode produced no tokens".to_string());
-        }
-        if max_new_tokens == 0 {
-            return Err("max_new_tokens must be at least 1".to_string());
-        }
-
-        let cfg = &m.cfg;
-        let qk_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim;
-        let total_len = start_pos + ids.len() + max_new_tokens;
+        start_pos: usize,
+        rows: usize,
+        extra_headroom: usize,
+    ) -> Result<Vec<CudaSlice<f32>>, String> {
+        let qk_dim = m.cfg.kv_lora_rank + m.cfg.qk_rope_head_dim;
+        let total_len = start_pos + rows + extra_headroom;
         let mut kv_caches: Vec<CudaSlice<f32>> = (0..m.layers.len())
             .map(|_| self.device.alloc_zeros::<f32>(total_len * qk_dim))
             .collect::<Result<_, _>>()
@@ -3864,9 +4397,39 @@ impl Model {
                 self.device.htod_sync_copy_into(kv_host, &mut dst).map_err(|e| format!("import mla kv_cache htod layer {layer_idx}: {e}"))?;
             }
         }
+        Ok(kv_caches)
+    }
 
-        let hidden_size = cfg.hidden_size;
-        let eps = cfg.rmsnorm_eps;
+    /// Sequential MLA prefill: encodes `prompt`, seeds `kv_caches` from `imported`
+    /// (see [`Self::alloc_mla_kv_caches`]), then runs every prompt token through
+    /// every layer one position at a time via [`Self::forward_one_token_mla`] -- the
+    /// pre-batching behavior, kept unchanged as the verification oracle for
+    /// [`Self::prefill_mla_batched`] (`mla_batching_tests` below), the same role
+    /// [`Self::prefill_hybrid`] plays for `prefill_hybrid_batched`. Not used by
+    /// [`Self::generate_mla_impl`] any more (see that function's doc comment) --
+    /// kept only for the oracle role and any future direct caller.
+    fn prefill_mla(
+        &self,
+        m: &MlaModel,
+        prompt: &str,
+        imported: Option<&crate::kv_io::MlaKvCache>,
+        extra_headroom: usize,
+    ) -> Result<(Vec<u32>, CudaSlice<f32>, Vec<CudaSlice<f32>>, usize), String> {
+        let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
+
+        let mut ids = self.tokenizer.encode(prompt)?;
+        if start_pos == 0 {
+            if let Some(bos) = self.tokenizer.bos_token_id {
+                if ids.first() != Some(&bos) {
+                    ids.insert(0, bos);
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Err("encode produced no tokens".to_string());
+        }
+
+        let mut kv_caches = self.alloc_mla_kv_caches(m, imported, start_pos, ids.len(), extra_headroom)?;
 
         let mut position = start_pos;
         let mut hidden_dev: Option<CudaSlice<f32>> = None;
@@ -3874,11 +4437,92 @@ impl Model {
             hidden_dev = Some(self.forward_one_token_mla(m, token_id, position, &mut kv_caches)?);
             position += 1;
         }
-        let mut hidden = hidden_dev.ok_or("no tokens processed")?;
+        let hidden = hidden_dev.ok_or("no tokens processed")?;
+
+        Ok((ids, hidden, kv_caches, position))
+    }
+
+    /// Batched-prefill variant of [`Self::prefill_mla`]: same signature/state-
+    /// allocation logic (`Self::alloc_mla_kv_caches`), but runs every prompt token
+    /// through each layer in one layer-major batched pass
+    /// (`Self::forward_mla_layer_batched`, `rows = ids.len()`) instead of looping
+    /// `Self::forward_one_token_mla` once per token. Like `Self::prefill_dense_batched`/
+    /// `Self::prefill_hybrid_batched`, returns the *whole* `[rows, hidden_size]`
+    /// batched hidden state -- callers wanting only the last prompt position must
+    /// slice it out with [`Self::last_row`].
+    fn prefill_mla_batched(
+        &self,
+        m: &MlaModel,
+        prompt: &str,
+        imported: Option<&crate::kv_io::MlaKvCache>,
+        extra_headroom: usize,
+    ) -> Result<(Vec<u32>, CudaSlice<f32>, Vec<CudaSlice<f32>>, usize), String> {
+        let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
+
+        let mut ids = self.tokenizer.encode(prompt)?;
+        if start_pos == 0 {
+            if let Some(bos) = self.tokenizer.bos_token_id {
+                if ids.first() != Some(&bos) {
+                    ids.insert(0, bos);
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Err("encode produced no tokens".to_string());
+        }
+        let rows = ids.len();
+
+        let mut kv_caches = self.alloc_mla_kv_caches(m, imported, start_pos, rows, extra_headroom)?;
+
+        let hidden_size = m.cfg.hidden_size;
+        let mut host_embd = vec![0.0f32; rows * hidden_size];
+        for (row, &token_id) in ids.iter().enumerate() {
+            let embd_base = token_id as usize * hidden_size;
+            host_embd[row * hidden_size..(row + 1) * hidden_size]
+                .copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
+        }
+        let mut hidden = self.device.htod_sync_copy(&host_embd).map_err(|e| format!("embedding htod: {e}"))?;
+
+        for (layer_idx, layer) in m.layers.iter().enumerate() {
+            hidden = self.forward_mla_layer_batched(m, layer, hidden, start_pos, rows, &mut kv_caches[layer_idx])?;
+        }
+
+        Ok((ids, hidden, kv_caches, start_pos + rows))
+    }
+
+    /// MLA counterpart to [`Self::generate_dense_impl`]/[`Self::generate_hybrid_impl`]
+    /// (Phase 3 round 3; switched to the layer-major batched prefill path in the
+    /// batched-prefill round that added [`Self::prefill_mla_batched`], mirroring
+    /// `generate_dense_impl`'s/`generate_hybrid_impl`'s own switch): prompt positions
+    /// are batched through every layer (`Self::prefill_mla_batched`), then new
+    /// tokens are decoded one at a time (`rows == 1`, a GEMM buys nothing there) via
+    /// the unchanged per-token per-layer loop, [`Self::forward_one_token_mla`]. Each
+    /// layer's single compressed `kv_cache` (`[seq_len, kv_lora_rank +
+    /// qk_rope_head_dim]`, no separate K/V pair -- see
+    /// [`Self::forward_mla_attn_block`]) gets the same `start_pos`-offset treatment
+    /// dense/MoE's `k_cache`/`v_cache` and hybrid's `GatedAttention` sublayers
+    /// already do.
+    fn generate_mla_impl(
+        &self,
+        m: &MlaModel,
+        prompt: &str,
+        imported: Option<&crate::kv_io::MlaKvCache>,
+        max_new_tokens: usize,
+        mut on_first_token: impl FnMut(&[f32]),
+    ) -> Result<(Vec<u32>, String, Vec<CudaSlice<f32>>, usize), String> {
+        if max_new_tokens == 0 {
+            return Err("max_new_tokens must be at least 1".to_string());
+        }
+
+        let (ids, hidden_batched, mut kv_caches, mut position) = self.prefill_mla_batched(m, prompt, imported, max_new_tokens)?;
+        let hidden_size = m.cfg.hidden_size;
+        let eps = m.cfg.rmsnorm_eps;
+        let mut hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
 
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
-        let mut next_id = self.lm_head_argmax(&hidden, hidden_size, eps)?;
-        on_first_token();
+        let first_logits = self.lm_head_logits(&hidden, hidden_size, eps)?;
+        let mut next_id = Self::argmax(&first_logits)?;
+        on_first_token(&first_logits);
         generated.push(next_id);
 
         while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
@@ -3929,7 +4573,7 @@ impl Model {
     /// headroom this capture doesn't use) to host memory for `--export-kv`.
     pub fn forward_prompt_capture_kv_mla(&self, prompt: &str) -> Result<((u32, String), crate::kv_io::MlaKvCache), String> {
         let m = self.mla.as_ref().ok_or("forward_prompt_capture_kv_mla called on a non-MLA model")?;
-        let (generated, text, kv_caches, seq_len) = self.generate_mla_impl(m, prompt, None, 1, || {})?;
+        let (generated, text, kv_caches, seq_len) = self.generate_mla_impl(m, prompt, None, 1, |_logits| {})?;
 
         let qk_dim = m.cfg.kv_lora_rank + m.cfg.qk_rope_head_dim;
         let per_layer_len = seq_len * qk_dim;
@@ -4046,6 +4690,141 @@ mod hybrid_batching_tests {
         let seq_argmax = model.lm_head_argmax(&seq_hidden, hidden_size, eps).expect("seq argmax failed");
         let batch_argmax = model.lm_head_argmax(&batch_last_row, hidden_size, eps).expect("batch argmax failed");
         assert_eq!(seq_argmax, batch_argmax, "greedy-argmax next token must match between the two prefill paths");
+    }
+}
+
+#[cfg(test)]
+mod mla_batching_tests {
+    use super::*;
+    use crate::gguf::GgufFile;
+    use cudarc::driver::CudaDevice;
+
+    const MLA_FIXTURE: &str = "test-data/deepseek-tiny-mla.gguf";
+
+    /// Lowest-level sanity check before trusting the full attention-block test
+    /// below: `Self::gemv_per_head_batch` at `rows=1` (a novel 3-D-grid kernel with
+    /// no direct single-token analogue to diff row-by-row, unlike `Self::gemm`,
+    /// which `prefill_dense_batched_matches_sequential_prefill` could check against
+    /// `gemv_raw`) must reproduce `Self::gemv_per_head`'s existing, already-
+    /// hardware-verified output exactly against the same real `wk_b` weight tensor.
+    /// `test-data/deepseek-tiny-mla.gguf` (synthetic, hand-built via llama.cpp's
+    /// real converter -- see README.md's MLA fixture section) is already local, so
+    /// this doesn't need `COLDSTART_TEST_GGUF`; still `#[ignore]`d since it needs a
+    /// real GPU -- run with `cargo test --release -- --ignored
+    /// gemv_per_head_batch_matches_gemv_per_head_at_rows_one`.
+    #[test]
+    #[ignore]
+    fn gemv_per_head_batch_matches_gemv_per_head_at_rows_one() {
+        let file = GgufFile::open(MLA_FIXTURE).expect("failed to open MLA fixture");
+        let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+        let model = Model::load(device, &file).expect("failed to load MLA model");
+        let m = model.mla.as_ref().expect("loaded model is not MLA");
+        let layer = &m.layers[0];
+
+        let n_head = m.cfg.num_heads;
+        let in_features = m.cfg.qk_nope_head_dim;
+
+        let host_x: Vec<f32> = (0..n_head * in_features).map(|i| (i as f32) * 0.01 - 0.5).collect();
+        let x = model.device.htod_sync_copy(&host_x).expect("x htod failed");
+
+        let single = model.gemv_per_head(&x, &layer.wk_b, n_head).expect("gemv_per_head failed");
+        let batched = model
+            .gemv_per_head_batch(m, &x, &layer.wk_b, 1, n_head, n_head * in_features, in_features, 0)
+            .expect("gemv_per_head_batch failed");
+
+        let single_host = model.device.dtoh_sync_copy(&single).expect("single dtoh failed");
+        let batched_host = model.device.dtoh_sync_copy(&batched).expect("batched dtoh failed");
+        assert_eq!(single_host.len(), batched_host.len());
+        for (i, (a, b)) in single_host.iter().zip(batched_host.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-4, "out[{i}]: gemv_per_head={a}, gemv_per_head_batch={b}");
+        }
+    }
+
+    /// Byte-exact-ish cross-check of `prefill_mla_batched` (layer-major batched
+    /// attention block, MoE FFN tail -- if present -- left as a per-row loop; see
+    /// `Model::forward_mla_layer_batched`'s doc comment) against `prefill_mla` (the
+    /// original token-major sequential loop) on the same prompt/weights -- the
+    /// blocking check before trusting the batched MLA prefill path, same role
+    /// `prefill_hybrid_batched_matches_sequential` plays for the hybrid path. NOTE:
+    /// `test-data/deepseek-tiny-mla.gguf` is dense-lead-only with no YaRN scaling
+    /// (see README.md's MLA fixture section), so this test does not exercise
+    /// `MlaFfn::Moe`'s per-row loop or `rope_norm_yarn_batch_kernel` -- only the real
+    /// `deepseek-ai/DeepSeek-V2-Lite` checkpoint does (see CLAUDE.md's "Known
+    /// test-fixture limitation"), which is a stretch-goal deeper verification, not
+    /// required to trust this round's change. Run with `cargo test --release --
+    /// --ignored prefill_mla_batched_matches_sequential`.
+    #[test]
+    #[ignore]
+    fn prefill_mla_batched_matches_sequential() {
+        let prompt = "The capital of France is";
+
+        let file = GgufFile::open(MLA_FIXTURE).expect("failed to open MLA fixture");
+        let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+        let model = Model::load(device, &file).expect("failed to load MLA model");
+        let m = model.mla.as_ref().expect("loaded model is not MLA");
+
+        let (seq_ids, seq_hidden, _, seq_position) = model.prefill_mla(m, prompt, None, 0).expect("prefill_mla failed");
+        let (batch_ids, batch_hidden, _, batch_position) =
+            model.prefill_mla_batched(m, prompt, None, 0).expect("prefill_mla_batched failed");
+
+        assert_eq!(seq_ids, batch_ids, "tokenization must match between the two prefill paths");
+        assert_eq!(seq_position, batch_position, "final position must match between the two prefill paths");
+
+        let rows = batch_ids.len();
+        let hidden_size = m.cfg.hidden_size;
+        let batch_last_row = model.last_row(&batch_hidden, rows, hidden_size).expect("last_row failed");
+
+        let seq_host = model.device.dtoh_sync_copy(&seq_hidden).expect("seq hidden dtoh failed");
+        let batch_host = model.device.dtoh_sync_copy(&batch_last_row).expect("batch hidden dtoh failed");
+        assert_eq!(seq_host.len(), batch_host.len());
+        for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-3, "hidden[{i}]: sequential={a}, batched={b}");
+        }
+
+        let eps = m.cfg.rmsnorm_eps;
+        let seq_argmax = model.lm_head_argmax(&seq_hidden, hidden_size, eps).expect("seq argmax failed");
+        let batch_argmax = model.lm_head_argmax(&batch_last_row, hidden_size, eps).expect("batch argmax failed");
+        assert_eq!(seq_argmax, batch_argmax, "greedy-argmax next token must match between the two prefill paths");
+    }
+
+    /// `--import-kv` resume equivalence: captures a short prompt's compressed
+    /// `kv_cache` via the already-hardware-verified `forward_prompt_capture_kv_mla`,
+    /// then continues generation from it through both `prefill_mla` and
+    /// `prefill_mla_batched` (`start_pos > 0`) and diffs the two continuations --
+    /// the same `imported.is_some()` case `prefill_hybrid_batched`'s test coverage
+    /// doesn't separately exercise but this round's plan calls out explicitly (the
+    /// batched KV-cache write path, `Self::mla_write_kv_cache_batch`, must offset by
+    /// `start_pos` correctly, not just `0`). Run with `cargo test --release --
+    /// --ignored prefill_mla_batched_import_kv_resume_matches_sequential`.
+    #[test]
+    #[ignore]
+    fn prefill_mla_batched_import_kv_resume_matches_sequential() {
+        let file = GgufFile::open(MLA_FIXTURE).expect("failed to open MLA fixture");
+        let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+        let model = Model::load(device, &file).expect("failed to load MLA model");
+        let m = model.mla.as_ref().expect("loaded model is not MLA");
+
+        let (_, cache) = model.forward_prompt_capture_kv_mla("The capital of France is").expect("capture_kv failed");
+
+        let continuation = " Paris";
+        let (seq_ids, seq_hidden, _, seq_position) =
+            model.prefill_mla(m, continuation, Some(&cache), 0).expect("prefill_mla resume failed");
+        let (batch_ids, batch_hidden, _, batch_position) =
+            model.prefill_mla_batched(m, continuation, Some(&cache), 0).expect("prefill_mla_batched resume failed");
+
+        assert_eq!(seq_ids, batch_ids, "tokenization must match between the two resumed prefill paths");
+        assert_eq!(seq_position, batch_position, "final position must match between the two resumed prefill paths");
+
+        let rows = batch_ids.len();
+        let hidden_size = m.cfg.hidden_size;
+        let batch_last_row = model.last_row(&batch_hidden, rows, hidden_size).expect("last_row failed");
+
+        let seq_host = model.device.dtoh_sync_copy(&seq_hidden).expect("seq hidden dtoh failed");
+        let batch_host = model.device.dtoh_sync_copy(&batch_last_row).expect("batch hidden dtoh failed");
+        assert_eq!(seq_host.len(), batch_host.len());
+        for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-3, "resumed hidden[{i}]: sequential={a}, batched={b}");
+        }
     }
 }
 

@@ -9,17 +9,21 @@
 //! Only builds/runs where a CUDA toolchain + GPU are present (build.rs requires nvcc
 //! unless COLDSTART_SKIP_CUDA=1 is set, in which case this binary has nothing to do).
 
-use coldstart_infer::aot;
-use cudarc::driver::{CudaDevice, LaunchAsync, LaunchConfig};
+use coldstart_infer::{aot, diagnostics};
+use cudarc::driver::{LaunchAsync, LaunchConfig};
 use std::time::Instant;
-
-const SMOKE_KERNEL_PATH: &str = env!("COLDSTART_KERNEL_SMOKE");
 
 fn main() {
     let t0 = Instant::now();
 
-    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
-    let kernel = aot::load_kernel(&device, SMOKE_KERNEL_PATH, "smoke", "axpy_f32")
+    // Uses the same underlying `CudaDevice::new` call as before on the success path
+    // (no added cost to the timed metric below) -- only the error message improves.
+    // The GPU diagnostic line itself is deliberately printed *after* `elapsed` is
+    // captured, since `diagnostics::probe`'s own driver queries would otherwise
+    // skew this binary's whole reason for existing: the smallest possible
+    // process-start-to-first-kernel-result measurement.
+    let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
+    let kernel = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_SMOKE")), "smoke", "axpy_f32")
         .expect("failed to load AOT smoke kernel");
 
     let n = 1024usize;
@@ -42,4 +46,7 @@ fn main() {
     assert!((result[0] - 5.0).abs() < 1e-5, "wrong result: {}", result[0]);
 
     println!("COLDSTART_SMOKE_OK process_start_to_first_result_ms={:.3}", elapsed.as_secs_f64() * 1000.0);
+    if let Ok(diag) = diagnostics::probe(&device) {
+        eprintln!("{diag}");
+    }
 }
