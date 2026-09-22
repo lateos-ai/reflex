@@ -452,3 +452,88 @@ comparison has to use a fair, external, reproducible measurement or the result i
 trustworthy. Small honest caveats are worth stating explicitly rather than silently
 assuming they don't matter — see README's benchmark section for the specific caveats
 disclosed in the first run.
+
+## Phase 4 (Embeddability) round 1 scope: `--lora`, dense/MoE + hybrid Gated-Attention tensors only, load-time-only
+
+**Decision**: `--lora <adapter.gguf>` applies a llama.cpp-format LoRA adapter
+(`src/lora.rs`) to any 2-D `nn.Linear`-shaped weight the loaded model actually has —
+dense/MoE Qwen3's attention tensors, dense's FFN, and the Qwen3.5 hybrid's
+Gated-Attention-layer attention/FFN tensors and the Gated DeltaNet mixer's FFN tensors
+— once, at load time, in `Model::apply_lora` (`model.rs`). Explicitly rejected, not
+silently mishandled: DeepSeek-V2/V3 MLA outright (checked first, before parsing the
+adapter at all), MoE's per-expert-stacked `ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps`
+tensors (3-D, no per-expert LoRA targeting), the Gated DeltaNet mixer's non-Linear
+state-space tensors (`ssm_*`, `attn_qkv`, `attn_gate`), and `token_embd`/`output`/norm
+tensors — all four cases fall through `Model::find_lora_target_mut`'s match arms to a
+single clear "no matching 2-D weight" error rather than four separate checks, since
+none of them are 2-D `Weight`s regardless of architecture.
+
+**Why**: confirmed with the user before starting (three explicit questions: scope,
+fixture, GPU instance — this project's usual practice). Scope came back "dense/MoE +
+hybrid" rather than dense-only, matching the project's narrow-first precedent one step
+wider than MVP-step ordering alone would suggest, but MLA was excluded by the user's
+original framing (`README.md`'s Non-goals: load-time-only adapter application, no
+runtime hot-swap) and every other MLA-adjacent feature in this codebase already stops
+at the same line. The tensor-level accept/reject split (2-D found-and-shape-matches vs.
+everything else) came from what the real format actually looks like once inspected
+(llama.cpp's `convert_lora_to_gguf.py`/`src/llama-adapter.cpp`, read in full, not
+assumed): a LoRA adapter has no idea what architecture its base model is, it just
+targets tensor *names*, so a from-scratch reimplementation only needs to know which of
+*this project's* tensor names are 2-D and GPU-resident — the MoE/hybrid-mixer-specific
+rejections are a consequence of that lookup, not separate special cases to write.
+
+**Format decision**: parsed with llama.cpp's own convention (its own GGUF adapter
+container, `adapter.type="lora"` + `adapter.lora.alpha` metadata, `<name>.lora_a`/
+`<name>.lora_b` tensor pairs where `<name>` already includes the base tensor's
+`.weight` suffix — confirmed against a real converted adapter file, *not* the
+`.weight`-stripped-then-reappended assumption an initial reading of
+`convert_lora_to_gguf.py`'s Python source suggested; that assumption produced a real
+bug — `blk.0.ffn_down.weight.weight`, caught immediately by the first real end-to-end
+run, see `src/lora.rs`'s git history), not a hand-rolled format — this project's own
+GGUF parser (`src/gguf.rs`) already reads a LoRA adapter file with zero changes, since
+it's still just a GGUF container with a different tensor/metadata set. `scale = alpha /
+rank` (rank read from `lora_a`'s/`lora_b`'s own shapes, never a separate metadata key),
+matching llama.cpp's own formula exactly — confirmed independently by
+`llama-export-lora`'s `calculated_scale` log line on the real verification run below,
+not just by reading the source.
+
+**Application mechanism**: `crate::lora::load` does the full `B @ A` matmul host-side
+(low-rank factors are tiny — rank 16 in the real adapter tested — so this is a
+one-time, load-time cost, not worth a device kernel) and hands back a full-size,
+already-`scale`-multiplied delta per targeted tensor; `Model::apply_lora` uploads each
+delta once and adds it into the already-GPU-resident base `Weight` with the existing
+`add_k` in-place-add kernel (unchanged since Phase 2 round 2) — no new kernel, and the
+forward pass itself needed zero changes. Matches this round's explicit instruction to
+stay load-time-only, and this project's standing rule against reintroducing per-call
+weight upload (see `model.rs`'s `Weight` doc comment).
+
+**Verification**: real hardware (A6000, `bkzn3giz`), real fixture — no synthetic
+stand-in needed for the dense case. Downloaded the real public
+`premjatin/qwen-linear-algebra-coder` PEFT adapter (rank 16, alpha 32, targets all
+7 `q/k/v/o/gate/up/down_proj` modules) for `Qwen/Qwen3-1.7B`, converted both to GGUF
+with llama.cpp's own `convert_hf_to_gguf.py`/`convert_lora_to_gguf.py`. Cross-checked
+three independent ways against a real llama.cpp build: (1) tensor count —
+`llama-export-lora`'s merge log reports `merged 196 tensors with lora adapters`,
+exactly `28 layers × 7 targeted modules`, matching this project's own
+`tensors_applied=196`; (2) scale — `llama-export-lora`'s `calculated_scale=2.000000`
+log line matches `alpha/rank = 32/16 = 2.0` independently; (3) output token —
+`llama-simple` (raw completion, no chat template — see STATUS.md's known-debt entry on
+`llama-cli`'s template-always-on behavior) on the LoRA-merged GGUF completes "The
+capital of France is" with " Paris", matching this project's own `--lora`-applied
+output exactly (`token_id=12095, token_text=" Paris"`). Accept/reject paths (MoE
+attention accepted, MoE FFN-experts rejected, hybrid Gated-Attention accepted, hybrid
+Gated-DeltaNet FFN accepted, hybrid Gated-DeltaNet `attn_qkv` rejected, MLA rejected
+outright, shape-mismatch rejected) all verified against synthetic hand-built adapter
+GGUFs (`gguf.GGUFWriter`, since no real LoRA adapter targeting a real MoE/hybrid
+checkpoint's exact modules was found) targeting the existing local
+`Tiny-Moe.Q4_K_M.gguf`/`Qwen3.5-0.8B-Q4_K_M.gguf`/`deepseek-tiny-mla.gguf` fixtures —
+each produced exactly the expected accept-and-run or the expected clear error text.
+
+**How to apply**: a future round wanting MoE per-expert LoRA or Gated-DeltaNet-mixer
+LoRA needs new math (per-expert delta selection mirroring `gemv_expert`'s slicing, or
+the mixer's own non-Linear parameterization), not just widening
+`find_lora_target_mut`'s match arms — treat that as a new round, not a follow-on patch.
+`--lora-scale` (a CLI-level multiplier on top of `alpha/rank`, which llama.cpp's own
+`--lora-scaled` flag supports) was deliberately left out of round 1 as unrequested
+scope; add it as a plain `f32` multiplier into `LoraTarget::delta`'s scale computation
+if a future need comes up.

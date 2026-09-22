@@ -116,7 +116,10 @@ cold compute into one output token, then getting out of the way.
   swapping), plus a Rust C-FFI surface so an external orchestrator daemon can embed
   coldstart-infer directly instead of `exec`-ing a binary. If a warm-context IPC mode is
   ever built, it's stdin/stdout or a Unix domain socket, one job at a time, never a
-  concurrent server (see Non-goals above).
+  concurrent server (see Non-goals above). **Round 1 done**: `--lora` for dense/MoE
+  Qwen3 and the Qwen3.5 hybrid architecture (MLA rejected, matching every other
+  MLA-adjacent feature's scope line) — see the "Phase 4, round 1" section below. The
+  C-FFI surface is still open.
 
 Phase 2 can run in parallel with the remaining architecture-coverage steps (3-4) above;
 Phases 3-4 are lower priority and should follow once architecture coverage and Phase 2
@@ -797,3 +800,83 @@ This closes Phase 3's architecture-coverage scope entirely — `--export-kv`/
 architectures produce (dense/MoE's K/V pair, hybrid's per-layer tagged state, MLA's
 single compressed latent). Phase 4 (Embeddability) is next per the roadmap above, a
 separate confirm-before-starting conversation.
+
+### Phase 4 (Embeddability), round 1: `--lora` load-time adapter application
+
+Confirmed scope with the user before starting (this project's usual practice): dense/
+MoE Qwen3 plus the Qwen3.5 hybrid architecture, not MLA (matching every other
+MLA-adjacent feature's line in this codebase, and the Non-goals section's "load-time
+adapter application, no runtime hot-swap multiplexer" framing above); a real public
+LoRA adapter for verification where one exists, a hand-built synthetic one where it
+doesn't; reuse the still-running A6000 from the Phase 3 round 3 session.
+
+**Format**: llama.cpp's own GGUF LoRA adapter convention, read in full from source
+before assuming anything (`convert_lora_to_gguf.py`, `src/llama-adapter.cpp`) rather
+than inventing a format — an adapter is its own self-contained GGUF file (converted
+from a HF PEFT checkpoint's `adapter_config.json` + `adapter_model.safetensors`),
+readable with this project's *existing*, unmodified `gguf.rs` parser (a LoRA GGUF is
+just a different metadata/tensor set, not a different container). Required metadata:
+`adapter.type == "lora"`, `adapter.lora.alpha` (`f32`). Every targeted base tensor
+`<name>` (already including `.weight`) gets a `<name>.lora_a`/`<name>.lora_b` pair —
+`lora_a`'s GGUF shape is `[in_features, rank]`, `lora_b`'s is `[rank, out_features]`,
+rank read from these shapes rather than a separate key. Update: `W' = W + scale * (B @
+A)`, `scale = alpha / rank`, matching llama.cpp's own formula exactly.
+
+**New module `src/lora.rs`** does the parsing and the host-side `B @ A` math (the
+low-rank factors are tiny — rank 16 in the real adapter tested below — a one-time
+load-time cost, not worth a device kernel), producing one full-size, already-scaled
+delta per targeted tensor. `Model::apply_lora` (`model.rs`) then, for each delta:
+rejects immediately if the loaded model is MLA; otherwise looks up the matching
+GPU-resident `Weight` via a new `Model::find_lora_target_mut` (matches `blk.{i}.
+{suffix}.weight` against whichever architecture is loaded — dense/MoE's `self.layers`
+or the Qwen3.5 hybrid's `self.hybrid.layers`), checks its shape matches, uploads the
+delta once, and adds it in-place with the existing `add_k` elementwise-add kernel
+(unchanged since Phase 2 round 2). No new kernel, and the forward pass itself needed
+zero changes — exactly the load-time-only scope this round committed to.
+
+**Accept/reject is one lookup, not four special cases**: `find_lora_target_mut` only
+has match arms for the 2-D `nn.Linear`-shaped tensors each layer kind actually has
+(dense/MoE attention, dense FFN, the hybrid's Gated-Attention-layer attention/FFN, and
+the Gated DeltaNet mixer's FFN). MoE's per-expert-stacked `ffn_gate_exps`/`ffn_up_exps`/
+`ffn_down_exps` (3-D), the Gated DeltaNet mixer's non-Linear state-space tensors
+(`ssm_*`, `attn_qkv`, `attn_gate`), and `token_embd`/`output`/norm tensors all simply
+have no match arm, so they fall through to the same clear "no matching 2-D weight"
+error `Model::apply_lora` raises — one rejection path covering four different reasons,
+because none of them are ever a 2-D `Weight` regardless of which architecture is
+loaded.
+
+**Verified real, not just plausible**: real hardware (A6000, `bkzn3giz`), and a real
+public adapter for the dense case — `premjatin/qwen-linear-algebra-coder` (PEFT rank
+16, alpha 32, targets all 7 `q/k/v/o/gate/up/down_proj` modules) for `Qwen/Qwen3-1.7B`,
+both converted to GGUF with llama.cpp's own converters (`convert_hf_to_gguf.py`,
+`convert_lora_to_gguf.py`). Cross-checked three independent ways against a real
+llama.cpp build, not just "produces plausible output": (1) `llama-export-lora`'s merge
+log reports `merged 196 tensors with lora adapters` (`28 layers × 7 targeted modules`),
+matching this project's own `tensors_applied=196` exactly; (2) its
+`calculated_scale=2.000000` log line matches `alpha/rank = 32/16` independently; (3)
+`llama-simple` (raw completion on the LoRA-merged GGUF, no chat template — `llama-cli`'s
+newer conversational mode has no working `--no-cnv` escape hatch in the current build,
+see the known-debt note below) completes "The capital of France is" with " Paris",
+identical to this project's own `--lora`-applied output (`token_id=12095,
+token_text=" Paris"`). The MoE/hybrid accept/reject paths (no real adapter targeting
+those architectures' exact modules was found) were verified against hand-built
+synthetic adapter GGUFs (`gguf.GGUFWriter`, matching this project's established
+"synthetic fixture via a real format/tool" practice from the MLA rounds) targeting the
+existing local `Tiny-Moe.Q4_K_M.gguf`/`Qwen3.5-0.8B-Q4_K_M.gguf`/
+`deepseek-tiny-mla.gguf` fixtures — MoE attention accepted, MoE FFN-experts rejected,
+hybrid Gated-Attention accepted, hybrid Gated-DeltaNet FFN accepted, hybrid
+Gated-DeltaNet `attn_qkv` rejected, MLA rejected outright, and a deliberately
+wrong-shaped adapter tensor rejected with a shape-mismatch error naming both shapes.
+
+**A real bug, caught by the first real run, not shipped**: an initial reading of
+`convert_lora_to_gguf.py`'s Python source suggested the base tensor name has `.weight`
+stripped before `.lora_a`/`.lora_b` is appended. The real converted adapter file
+proved that wrong — the base name already includes `.weight` — which produced a
+`blk.0.ffn_down.weight.weight` lookup and a clear panic on the very first end-to-end
+run against the real fixture, well before any of the verification above. Fixed
+(`src/lora.rs` no longer re-appends `.weight`) and re-verified from that run onward;
+see DECISIONS.md's Phase 4 round 1 entry.
+
+This closes Phase 4's first piece. The second — a Rust C-FFI surface for embedding
+this engine into a host process — is next per the roadmap above, a separate
+confirm-before-starting conversation.

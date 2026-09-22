@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `README.md` — this file is the
 short, current-state summary; README is the log.
 
-_Last updated: 2026-09-21 (Phase 3 round 3 session)_
+_Last updated: 2026-09-22 (Phase 4 round 1 session)_
 
 ## MVP progress
 
@@ -153,23 +153,61 @@ with the user before starting (fixture and GPU-instance choice both explicitly a
   bytes) before relying on the byte-exact-not-determinism-only verification bar round
   2 established for `gpt2`-tokenizer fixtures.
 
+## Phase 4 (Embeddability), round 1
+
+`--lora <adapter.gguf>` added to `qwen3_coldstart` (`src/lora.rs` new module,
+`Model::apply_lora`/`Model::find_lora_target_mut` in `model.rs`): parses a
+llama.cpp-format LoRA adapter GGUF and applies `W' = W + (alpha/rank) * (B @ A)` to
+each targeted weight once, at load time, reusing the existing in-place-add kernel — no
+new kernel, forward pass unchanged. Scope confirmed with the user before starting
+(dense/MoE Qwen3 attention+FFN and the Qwen3.5 hybrid's Gated-Attention-layer
+tensors/Gated-DeltaNet-mixer FFN tensors; MLA and MoE's per-expert-stacked FFN/the
+Gated DeltaNet mixer's non-Linear tensors rejected with a clear error — see
+DECISIONS.md's Phase 4 round 1 entry for the full scope rationale and format details).
+
+- **Real-hardware-verified on the A6000** (`bkzn3giz`, reused from the Phase 3 round 3
+  session — still running, per this project's practice of checking `tnr status --json`
+  before creating a fresh instance): `cargo build --release` clean, `cargo test`
+  unchanged at 59 passing.
+- **Real fixture, not synthetic**: downloaded the real public
+  `premjatin/qwen-linear-algebra-coder` PEFT LoRA adapter (rank 16, alpha 32) for
+  `Qwen/Qwen3-1.7B`, converted both to GGUF with llama.cpp's own converters. Cross-checked
+  three independent ways against a real llama.cpp build (`llama-export-lora`'s merge
+  tensor count and `calculated_scale` log, plus `llama-simple`'s completion on the
+  merged model) — all three matched this project's own `--lora` output exactly
+  (`tensors_applied=196`, `" Paris"` for "The capital of France is"). See
+  DECISIONS.md for the full verification writeup.
+- **Accept/reject paths verified with hand-built synthetic adapters** (`gguf.GGUFWriter`,
+  since no real adapter targeting a real MoE/hybrid checkpoint's exact modules was
+  found) against the existing local `Tiny-Moe.Q4_K_M.gguf`/`Qwen3.5-0.8B-Q4_K_M.gguf`/
+  `deepseek-tiny-mla.gguf` fixtures: MoE attention accepted, MoE FFN-experts rejected,
+  hybrid Gated-Attention accepted, hybrid Gated-DeltaNet FFN accepted, hybrid
+  Gated-DeltaNet `attn_qkv` rejected, MLA rejected outright, and a deliberately
+  wrong-shaped adapter tensor rejected with a shape-mismatch error naming both shapes.
+- **New finding, not a round-1 bug in the shipped code**: an initial reading of
+  `convert_lora_to_gguf.py`'s Python source suggested the base tensor name is stripped
+  of `.weight` before `.lora_a`/`.lora_b` is appended; the real converted file proved
+  that wrong (the base name already includes `.weight`) — caught immediately by the
+  first real end-to-end run (`blk.0.ffn_down.weight.weight`, a clear panic, not silent
+  misbehavior) and fixed before any further verification. See DECISIONS.md.
+
 ## Open decision (not yet resolved)
 
-None currently open. Phase 3 round 3 (above) is done as scoped, closing Phase 3's
-architecture-coverage scope entirely. Remaining low-priority follow-ups (not blocking,
-not actively planned): a real small `qwen3moe`-architecture GGUF fixture with a
-`gpt2`-style tokenizer (see "Known debt" below — would also make MoE's resume path
-byte-exact-testable at the text level, unlike `Tiny-Moe`), on-device dequant coverage
-for the 15+ GGUF block types still on the host path (Q4_0/1, Q5_0/1, Q8_0/1,
-Q2_K/Q3_K/Q5_K/Q8_K, the IQ-family formats — none exercised by a local fixture's bulk
-weight bytes), MoE's per-expert weighted-sum accumulation / the Gated Attention mixer's
-fused-qg gating still round-tripping through the host (flagged, not measured as worth
-closing), and Phase 3 round 3's own resume path verified only against the dense-only
-synthetic MLA fixture, not real DeepSeek-V2-Lite's MoE+shared-expert+YaRN path (the
-resume/cache mechanism is FFN-routing-independent by construction, but this specific
-combination hasn't been run end to end — see DECISIONS.md's round 3 entry). Phase 4
-(Embeddability) is next per README's roadmap, a separate confirm-before-starting
-conversation.
+None currently open. Phase 4 round 1 (above) is done as scoped. Remaining low-priority
+follow-ups (not blocking, not actively planned): a real small `qwen3moe`-architecture
+GGUF fixture with a `gpt2`-style tokenizer (see "Known debt" below — would also make
+MoE's resume path byte-exact-testable at the text level, unlike `Tiny-Moe`), on-device
+dequant coverage for the 15+ GGUF block types still on the host path (Q4_0/1, Q5_0/1,
+Q8_0/1, Q2_K/Q3_K/Q5_K/Q8_K, the IQ-family formats — none exercised by a local
+fixture's bulk weight bytes), MoE's per-expert weighted-sum accumulation / the Gated
+Attention mixer's fused-qg gating still round-tripping through the host (flagged, not
+measured as worth closing), Phase 3 round 3's own resume path verified only against
+the dense-only synthetic MLA fixture (see DECISIONS.md's round 3 entry), and Phase 4
+round 1's own LoRA MoE/hybrid accept/reject paths verified only against synthetic
+hand-built adapters, not a real adapter trained against those architectures (none
+found publicly — see DECISIONS.md's Phase 4 round 1 entry). Phase 4's second piece (a
+Rust C-FFI surface for embedding) is next per README's roadmap, a separate
+confirm-before-starting conversation.
 
 ## Known debt / limitations
 

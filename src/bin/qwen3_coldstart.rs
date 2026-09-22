@@ -15,6 +15,11 @@
 //!
 //! Usage: `qwen3_coldstart <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>]`
 //!        `qwen3_coldstart <path-to-gguf> [continuation-prompt] [--max-tokens N] --import-kv <file>`
+//!
+//! Phase 4 (Embeddability) round 1: `--lora <adapter.gguf>` applies a
+//! llama.cpp-format LoRA adapter to the loaded model's weights once, at load
+//! time, before any forward pass runs (see `model::Model::apply_lora` and
+//! `lora`'s module doc comment for the file format and scope).
 
 use coldstart_infer::gguf::GgufFile;
 use coldstart_infer::kv_io;
@@ -30,12 +35,14 @@ fn main() {
     let mut export_kv: Option<String> = None;
     let mut import_kv: Option<String> = None;
     let mut max_tokens: usize = 1;
+    let mut lora_path: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--export-kv" => export_kv = Some(args.next().expect("--export-kv requires a file path")),
             "--import-kv" => import_kv = Some(args.next().expect("--import-kv requires a file path")),
+            "--lora" => lora_path = Some(args.next().expect("--lora requires a file path")),
             "--max-tokens" => {
                 let raw = args.next().expect("--max-tokens requires a number");
                 max_tokens = raw.parse().unwrap_or_else(|_| panic!("--max-tokens must be a positive integer, got {raw:?}"));
@@ -47,8 +54,8 @@ fn main() {
     }
     let gguf_path = gguf_path.unwrap_or_else(|| {
         panic!(
-            "usage: qwen3_coldstart <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>] | \
-             qwen3_coldstart <path-to-gguf> [continuation-prompt] [--max-tokens N] --import-kv <file>"
+            "usage: qwen3_coldstart <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>] [--lora <adapter.gguf>] | \
+             qwen3_coldstart <path-to-gguf> [continuation-prompt] [--max-tokens N] --import-kv <file> [--lora <adapter.gguf>]"
         )
     });
     let prompt = prompt.unwrap_or_else(|| "Once upon a time".to_string());
@@ -64,7 +71,12 @@ fn main() {
 
     let file = GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
     let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
-    let model = Model::load(device, &file).expect("failed to load model");
+    let mut model = Model::load(device, &file).expect("failed to load model");
+
+    if let Some(lora_path) = &lora_path {
+        let applied = model.apply_lora(std::path::Path::new(lora_path)).expect("failed to apply LoRA adapter");
+        println!("COLDSTART_QWEN3_LORA_OK path={lora_path:?} tensors_applied={applied}");
+    }
 
     if let Some(export_path) = &export_kv {
         let (token_id, text) = match model.architecture_kind() {

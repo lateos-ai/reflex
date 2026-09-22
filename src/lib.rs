@@ -9,6 +9,7 @@ pub mod dequant_iq_tables;
 pub mod gated_deltanet;
 pub mod gguf;
 pub mod kv_io;
+pub mod lora;
 pub mod model;
 pub mod moe;
 pub mod tokenizer;

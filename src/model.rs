@@ -45,6 +45,7 @@
 use crate::aot::{self, AotKernel};
 use crate::dequant;
 use crate::gguf::{GgmlType, GgufFile, GgufValue};
+use crate::lora;
 use crate::moe::{route_top_k, route_top_k_with_norm};
 use crate::tokenizer::Tokenizer;
 use cudarc::driver::{CudaDevice, CudaSlice, CudaView, DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig};
@@ -784,6 +785,133 @@ impl Model {
             ArchitectureKind::Mla
         } else {
             ArchitectureKind::Dense
+        }
+    }
+
+    /// Applies a llama.cpp-format LoRA adapter GGUF (see `crate::lora`'s
+    /// module doc comment for the file format and the `W' = W + scale * (B @
+    /// A)` math) to this already-loaded model's GPU-resident weights, once,
+    /// in place -- `crate::lora::load` does the host-side `B @ A` math and
+    /// hands back a full-size delta per targeted tensor; this method only
+    /// uploads each delta once and adds it in with the existing in-place-add
+    /// kernel (`add_k`, unchanged since Phase 2 round 2). No new kernel, and
+    /// the forward pass itself is completely unmodified afterward -- exactly
+    /// the "load-time adapter application, no runtime hot-swap multiplexer"
+    /// scope README.md's Non-goals section commits this feature to.
+    ///
+    /// Deliberately narrow for this round (see `Self::find_lora_target_mut`'s
+    /// doc comment for the exact accepted tensor set): dense/MoE attention
+    /// tensors and Qwen3.5 hybrid Gated-Attention-layer tensors only.
+    /// DeepSeek-V2/V3 MLA is rejected outright below, matching every other
+    /// MLA-excluded feature in this codebase. Any adapter tensor that
+    /// doesn't resolve to a supported base weight, or whose shape doesn't
+    /// match that weight's, is a hard error -- never a silent skip.
+    pub fn apply_lora(&mut self, path: &std::path::Path) -> Result<usize, String> {
+        if self.mla.is_some() {
+            return Err(
+                "--lora is not supported for DeepSeek-V2/V3 MLA models in this round -- only dense/MoE Qwen3 \
+                 and the Qwen3.5 hybrid architecture are supported LoRA base models"
+                    .to_string(),
+            );
+        }
+
+        let adapter = lora::load(path)?;
+        // Cloned out before the loop's per-target `&mut self` borrow (via
+        // `find_lora_target_mut`) starts, so the in-place-add launch below
+        // doesn't need to re-borrow `self` (which `Self::add_inplace`, a
+        // `&self` method, would) while that borrow is still live.
+        let device = self.device.clone();
+        let add_fn = self.add_k.function.clone();
+
+        let mut applied = 0usize;
+        for target in &adapter.targets {
+            let delta_dev = device
+                .htod_sync_copy(&target.delta)
+                .map_err(|e| format!("upload LoRA delta for '{}': {e}", target.name))?;
+
+            let weight = self.find_lora_target_mut(&target.name).ok_or_else(|| {
+                format!(
+                    "LoRA adapter targets '{}' but this project's Model has no matching 2-D weight for it \
+                     (dense-attention/FFN and Qwen3.5 hybrid Gated-Attention-layer tensors are the only \
+                     supported LoRA targets in this round -- MoE's per-expert-stacked FFN tensors, the \
+                     hybrid Gated DeltaNet mixer's non-Linear tensors, embeddings, and norms are not)",
+                    target.name
+                )
+            })?;
+            if weight.shape.len() != 2 || weight.shape[0] as usize != target.in_features || weight.shape[1] as usize != target.out_features {
+                return Err(format!(
+                    "LoRA adapter tensor '{}' has shape [in={}, out={}] but the base model's tensor has shape {:?} -- wrong base model?",
+                    target.name, target.in_features, target.out_features, weight.shape
+                ));
+            }
+
+            let n = weight.data.len() as u32;
+            let threads = 256u32;
+            let blocks = n.div_ceil(threads).max(1);
+            let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            unsafe {
+                add_fn
+                    .clone()
+                    .launch(launch_cfg, (&mut weight.data, &delta_dev, n))
+                    .map_err(|e| format!("LoRA add launch for '{}': {e}", target.name))?;
+            }
+            applied += 1;
+        }
+
+        if applied == 0 {
+            return Err("LoRA adapter matched no tensors in the base model -- check it targets a compatible architecture/checkpoint".to_string());
+        }
+        Ok(applied)
+    }
+
+    /// Locates the mutable device-resident 2-D [`Weight`] a LoRA adapter
+    /// target name (`blk.{i}.{suffix}.weight`) refers to, across whichever
+    /// architecture is loaded (dense/MoE via `self.layers`, Qwen3.5 hybrid
+    /// via `self.hybrid`). Deliberately narrow: only the 2-D `nn.Linear`-
+    /// shaped tensors every supported layer kind actually has are matched --
+    /// MoE's per-expert-stacked FFN tensors (`ffn_gate_exps`/`ffn_up_exps`/
+    /// `ffn_down_exps`, 3-D), the Gated DeltaNet mixer's non-Linear state-
+    /// space tensors (`ssm_*`, `attn_qkv`, `attn_gate`), and anything outside
+    /// a `blk.N.*` tensor (`token_embd`/`output`/norms) all fall through to
+    /// the `None` arm and are rejected by `Self::apply_lora` with a clear
+    /// error, rather than silently mismatched or misapplied.
+    fn find_lora_target_mut(&mut self, name: &str) -> Option<&mut Weight> {
+        let rest = name.strip_prefix("blk.")?;
+        let (idx_str, rest) = rest.split_once('.')?;
+        let idx: usize = idx_str.parse().ok()?;
+        let suffix = rest.strip_suffix(".weight")?;
+
+        if let Some(hybrid) = &mut self.hybrid {
+            let layer = hybrid.layers.get_mut(idx)?;
+            return match (layer, suffix) {
+                (HybridLayerWeights::GatedAttention(l), "attn_q") => Some(&mut l.attn_q),
+                (HybridLayerWeights::GatedAttention(l), "attn_k") => Some(&mut l.attn_k),
+                (HybridLayerWeights::GatedAttention(l), "attn_v") => Some(&mut l.attn_v),
+                (HybridLayerWeights::GatedAttention(l), "attn_output") => Some(&mut l.attn_output),
+                (HybridLayerWeights::GatedAttention(l), "ffn_gate") => Some(&mut l.ffn_gate),
+                (HybridLayerWeights::GatedAttention(l), "ffn_up") => Some(&mut l.ffn_up),
+                (HybridLayerWeights::GatedAttention(l), "ffn_down") => Some(&mut l.ffn_down),
+                (HybridLayerWeights::GatedDeltaNet(l), "ffn_gate") => Some(&mut l.ffn_gate),
+                (HybridLayerWeights::GatedDeltaNet(l), "ffn_up") => Some(&mut l.ffn_up),
+                (HybridLayerWeights::GatedDeltaNet(l), "ffn_down") => Some(&mut l.ffn_down),
+                _ => None,
+            };
+        }
+
+        let layer = self.layers.get_mut(idx)?;
+        match (layer, suffix) {
+            (LayerWeights::Dense(l), "attn_q") => Some(&mut l.attn_q),
+            (LayerWeights::Dense(l), "attn_k") => Some(&mut l.attn_k),
+            (LayerWeights::Dense(l), "attn_v") => Some(&mut l.attn_v),
+            (LayerWeights::Dense(l), "attn_output") => Some(&mut l.attn_output),
+            (LayerWeights::Dense(l), "ffn_gate") => Some(&mut l.ffn_gate),
+            (LayerWeights::Dense(l), "ffn_up") => Some(&mut l.ffn_up),
+            (LayerWeights::Dense(l), "ffn_down") => Some(&mut l.ffn_down),
+            (LayerWeights::Moe(l), "attn_q") => Some(&mut l.attn_q),
+            (LayerWeights::Moe(l), "attn_k") => Some(&mut l.attn_k),
+            (LayerWeights::Moe(l), "attn_v") => Some(&mut l.attn_v),
+            (LayerWeights::Moe(l), "attn_output") => Some(&mut l.attn_output),
+            _ => None,
         }
     }
 
