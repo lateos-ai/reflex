@@ -20,7 +20,7 @@ documentation_style = "doxy"
 style = "type"
 
 [export]
-include = ["ColdstartModel", "ColdstartGenerateResult"]
+include = ["ColdstartModel", "ColdstartGenerateResult", "ColdstartSystem1Result", "ColdstartSystem1CandidateResult"]
 
 [parse]
 parse_deps = false

@@ -3,6 +3,7 @@
 //! See README.md for the niche rationale and MVP ordering.
 
 pub mod aot;
+pub mod calibration;
 pub mod dequant;
 pub mod dequant_iq;
 pub mod dequant_iq_tables;

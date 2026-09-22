@@ -10,10 +10,13 @@
 //! `coldstart_load` (GGUF path, optional load-time LoRA adapter path --
 //! `--lora` is load-time-only already per Phase 4 round 1, so it folds into
 //! the load call rather than needing its own FFI entry point),
-//! `coldstart_generate` (prompt in, token ids + text out), `coldstart_free`.
-//! Phase 3's `--export-kv`/`--import-kv` state I/O is deliberately **not**
-//! exposed here -- confirmed out of scope for this round, a separable
-//! capability an embedding host may not need yet.
+//! `coldstart_generate` (prompt in, token ids + text out),
+//! `coldstart_system1_evaluate` (prompt + candidate strings in, per-candidate
+//! scores/probabilities out -- see `crate::model::Model::system1_evaluate`'s
+//! doc comment), `coldstart_free`. Phase 3's `--export-kv`/`--import-kv`
+//! state I/O is deliberately **not** exposed here -- confirmed out of scope
+//! for this round, a separable capability an embedding host may not need
+//! yet.
 //!
 //! **Panics never cross the FFI boundary.** Every entry point wraps its body
 //! in `catch_unwind` and converts both an `Err(String)` (this crate's usual
@@ -36,7 +39,7 @@
 //! `cbindgen --config cbindgen.toml --crate coldstart-infer --output include/coldstart_infer.h`
 
 use crate::gguf::GgufFile;
-use crate::model::Model;
+use crate::model::{Model, System1Candidate};
 use cudarc::driver::CudaDevice;
 use std::cell::RefCell;
 use std::ffi::{c_char, CStr, CString};
@@ -242,6 +245,163 @@ pub extern "C" fn coldstart_free_generate_result(result: *mut ColdstartGenerateR
     if !r.text.is_null() {
         unsafe { drop(CString::from_raw(r.text)) };
         r.text = ptr::null_mut();
+    }
+}
+
+/// One candidate's scored result within a `ColdstartSystem1Result`. `text`/
+/// `token_ids` are heap buffers owned by this crate, freed only via the
+/// outer struct's `coldstart_free_system1_result` -- never individually.
+/// `score`/`probability` are relative to the candidate set in this one
+/// call, not vocab-normalized log-probabilities -- see
+/// `crate::model::Model::system1_evaluate`'s doc comment.
+#[repr(C)]
+pub struct ColdstartSystem1CandidateResult {
+    pub text: *mut c_char,
+    pub token_ids: *mut u32,
+    pub num_token_ids: usize,
+    pub score: f32,
+    pub probability: f32,
+}
+
+/// Output of `coldstart_system1_evaluate`. `candidates` is a heap buffer
+/// owned by this crate -- free it (and reset this struct to all-zero/NULL)
+/// with `coldstart_free_system1_result`, never with the C caller's own
+/// `free`/`libc::free`.
+#[repr(C)]
+pub struct ColdstartSystem1Result {
+    pub candidates: *mut ColdstartSystem1CandidateResult,
+    pub num_candidates: usize,
+}
+
+/// Runs System1 (single-pass, non-autoregressive candidate scoring, see
+/// `crate::model::Model::system1_evaluate`'s doc comment) against `prompt`
+/// for each of `num_candidates` candidate strings in `candidate_texts`. No
+/// argmax-then-feedback decode loop runs -- single-token candidates are
+/// scored in one batched gather-GEMV, multi-token candidates via a short
+/// teacher-forced continuation. Dense/MoE Qwen3 models only; hybrid Qwen3.5
+/// and DeepSeek-V2/V3 MLA are rejected with an error (call
+/// `coldstart_last_error` for why).
+///
+/// `handle` must come from `coldstart_load` and not have been freed yet.
+/// `prompt` must be a non-NULL, NUL-terminated UTF-8 C string. `candidate_texts`
+/// must be a non-NULL pointer to `num_candidates` non-NULL, NUL-terminated
+/// UTF-8 C string pointers, with `num_candidates` at least 1. `temperature`
+/// (`1.0` = no-op) is passed through to the calibrated `probability` field
+/// on each result. `out` must be a non-NULL pointer to a
+/// `ColdstartSystem1Result` the caller owns (its initial contents are
+/// ignored, not read).
+///
+/// On success, fills `*out` and returns 0 -- the caller must eventually pass
+/// `out` to `coldstart_free_system1_result`. On failure, leaves `*out`
+/// untouched and returns -1 (call `coldstart_last_error` for why).
+#[no_mangle]
+pub extern "C" fn coldstart_system1_evaluate(
+    handle: *mut ColdstartModel,
+    prompt: *const c_char,
+    candidate_texts: *const *const c_char,
+    num_candidates: usize,
+    temperature: f32,
+    out: *mut ColdstartSystem1Result,
+) -> c_int {
+    let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<ColdstartSystem1Result, String> {
+        if handle.is_null() {
+            return Err("coldstart_system1_evaluate: handle must not be NULL".to_string());
+        }
+        if prompt.is_null() {
+            return Err("coldstart_system1_evaluate: prompt must not be NULL".to_string());
+        }
+        if candidate_texts.is_null() {
+            return Err("coldstart_system1_evaluate: candidate_texts must not be NULL".to_string());
+        }
+        if num_candidates == 0 {
+            return Err("coldstart_system1_evaluate: num_candidates must be at least 1".to_string());
+        }
+        if out.is_null() {
+            return Err("coldstart_system1_evaluate: out must not be NULL".to_string());
+        }
+        let prompt_str = unsafe { CStr::from_ptr(prompt) }
+            .to_str()
+            .map_err(|e| format!("coldstart_system1_evaluate: prompt is not valid UTF-8: {e}"))?;
+
+        let candidate_ptrs = unsafe { std::slice::from_raw_parts(candidate_texts, num_candidates) };
+        let candidates: Vec<System1Candidate> = candidate_ptrs
+            .iter()
+            .enumerate()
+            .map(|(i, &ptr)| {
+                if ptr.is_null() {
+                    return Err(format!("coldstart_system1_evaluate: candidate_texts[{i}] must not be NULL"));
+                }
+                let text = unsafe { CStr::from_ptr(ptr) }
+                    .to_str()
+                    .map_err(|e| format!("coldstart_system1_evaluate: candidate_texts[{i}] is not valid UTF-8: {e}"))?
+                    .to_string();
+                Ok(System1Candidate { text })
+            })
+            .collect::<Result<_, String>>()?;
+
+        let model = unsafe { &(*handle).model };
+        let response = model.system1_evaluate(prompt_str, &candidates, temperature)?;
+
+        let mut boxed_candidates: Vec<ColdstartSystem1CandidateResult> = response
+            .results
+            .into_iter()
+            .zip(response.probabilities)
+            .map(|(r, probability)| {
+                let text_c = CString::new(r.text.replace('\0', "")).unwrap_or_else(|_| CString::new("").unwrap());
+                let mut boxed_ids = r.token_ids.into_boxed_slice();
+                let token_ids = boxed_ids.as_mut_ptr();
+                let num_token_ids = boxed_ids.len();
+                std::mem::forget(boxed_ids);
+                ColdstartSystem1CandidateResult { text: text_c.into_raw(), token_ids, num_token_ids, score: r.score, probability }
+            })
+            .collect();
+        let candidates_ptr = boxed_candidates.as_mut_ptr();
+        let num_candidates = boxed_candidates.len();
+        std::mem::forget(boxed_candidates);
+
+        Ok(ColdstartSystem1Result { candidates: candidates_ptr, num_candidates })
+    }));
+
+    match result {
+        Ok(Ok(r)) => {
+            unsafe { ptr::write(out, r) };
+            0
+        }
+        Ok(Err(e)) => {
+            set_last_error(e);
+            -1
+        }
+        Err(payload) => {
+            set_last_error(panic_message(payload));
+            -1
+        }
+    }
+}
+
+/// Frees the buffers inside a `ColdstartSystem1Result` previously filled by
+/// `coldstart_system1_evaluate` (including every candidate's own `text`/
+/// `token_ids`), and zeroes the struct out. Safe to call on a zeroed/
+/// all-NULL struct (no-op), and safe to call more than once on the same
+/// struct for that reason -- but never on two different copies of the same
+/// non-zeroed struct (double free).
+#[no_mangle]
+pub extern "C" fn coldstart_free_system1_result(result: *mut ColdstartSystem1Result) {
+    if result.is_null() {
+        return;
+    }
+    let r = unsafe { &mut *result };
+    if !r.candidates.is_null() {
+        let candidates = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(r.candidates, r.num_candidates)) };
+        for c in candidates.into_vec() {
+            if !c.text.is_null() {
+                unsafe { drop(CString::from_raw(c.text)) };
+            }
+            if !c.token_ids.is_null() {
+                unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(c.token_ids, c.num_token_ids))) };
+            }
+        }
+        r.candidates = ptr::null_mut();
+        r.num_candidates = 0;
     }
 }
 

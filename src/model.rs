@@ -738,6 +738,11 @@ pub struct Model {
     rope_k: AotKernel,
     silu_k: AotKernel,
     gemv_k: AotKernel,
+    /// Gathers only caller-chosen output rows of a GEMV instead of every row
+    /// -- System1's candidate-subset LM-head scoring (see
+    /// `Self::gemv_gather`/`Self::system1_evaluate`), never used by the
+    /// ordinary dense/MoE/hybrid/MLA forward paths.
+    gemv_gather_k: AotKernel,
     attn_k: AotKernel,
     /// In-place residual add (`a[i] += b[i]`, see `kernels_cuda/elementwise.cu`)
     /// -- keeps residual-stream adds device-resident (Phase 2 round 2)
@@ -777,6 +782,40 @@ pub enum ArchitectureKind {
     Mla,
 }
 
+/// One candidate continuation to score against a shared prompt, for
+/// [`Model::system1_evaluate`]. `text` is tokenized as `prompt + text` and
+/// diffed against `encode(prompt)` -- never tokenized standalone (see
+/// `Model::resolve_candidate_token_ids`).
+#[derive(Debug, Clone)]
+pub struct System1Candidate {
+    pub text: String,
+}
+
+/// One candidate's scored result from [`Model::system1_evaluate`]. `score`
+/// is the sum of each resolved token's raw gathered lm_head logit -- the
+/// first token's from the shared prefill hidden state, any subsequent ones
+/// (multi-token candidates only) from a teacher-forced continuation feeding
+/// the KNOWN candidate token, never sampled. `score` is NOT a
+/// vocab-normalized log-probability -- it is only meaningful relative to
+/// other candidates in the SAME `system1_evaluate` call; see
+/// [`System1Response::probabilities`] for a calibrated distribution over
+/// just this candidate set.
+#[derive(Debug, Clone)]
+pub struct System1CandidateResult {
+    pub text: String,
+    pub token_ids: Vec<u32>,
+    pub score: f32,
+}
+
+/// Result of [`Model::system1_evaluate`].
+#[derive(Debug, Clone)]
+pub struct System1Response {
+    /// Same order as the `candidates` slice passed to `system1_evaluate`.
+    pub results: Vec<System1CandidateResult>,
+    /// `crate::calibration::softmax_scores_with_temperature` over `results[i].score`.
+    pub probabilities: Vec<f32>,
+}
+
 impl Model {
     pub fn architecture_kind(&self) -> ArchitectureKind {
         if self.hybrid.is_some() {
@@ -786,6 +825,14 @@ impl Model {
         } else {
             ArchitectureKind::Dense
         }
+    }
+
+    /// Number of tokens `prompt` encodes to with this model's tokenizer
+    /// (BOS not included) -- a narrow, derived-value accessor for callers
+    /// like `bench_coldstart` that need to report actual prompt length,
+    /// without exposing the private `tokenizer` field itself.
+    pub fn encoded_prompt_len(&self, prompt: &str) -> Result<usize, String> {
+        Ok(self.tokenizer.encode(prompt)?.len())
     }
 
     /// Applies a llama.cpp-format LoRA adapter GGUF (see `crate::lora`'s
@@ -939,6 +986,8 @@ impl Model {
         let silu_k =
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_SILU_AND_MUL"), "silu_and_mul", "silu_and_mul_kernel")?;
         let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
+        let gemv_gather_k =
+            aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV_GATHER"), "gemv_gather", "gemv_gather_kernel")?;
         let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
         let add_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ELEMENTWISE"), "elementwise", "add_kernel")?;
         let mut dequant_fns = aot::load_kernel_module(
@@ -1046,6 +1095,7 @@ impl Model {
             rope_k,
             silu_k,
             gemv_k,
+            gemv_gather_k,
             attn_k,
             add_k,
             cfg,
@@ -1115,6 +1165,8 @@ impl Model {
         let silu_k =
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_SILU_AND_MUL"), "silu_and_mul", "silu_and_mul_kernel")?;
         let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
+        let gemv_gather_k =
+            aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV_GATHER"), "gemv_gather", "gemv_gather_kernel")?;
         let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
         let add_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ELEMENTWISE"), "elementwise", "add_kernel")?;
         let mut gdn_fns = aot::load_kernel_module(
@@ -1224,6 +1276,7 @@ impl Model {
             rope_k,
             silu_k,
             gemv_k,
+            gemv_gather_k,
             attn_k,
             add_k,
             cfg: attn_cfg.clone(),
@@ -1250,6 +1303,8 @@ impl Model {
         let silu_k =
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_SILU_AND_MUL"), "silu_and_mul", "silu_and_mul_kernel")?;
         let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
+        let gemv_gather_k =
+            aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV_GATHER"), "gemv_gather", "gemv_gather_kernel")?;
         let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
         let add_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ELEMENTWISE"), "elementwise", "add_kernel")?;
         let mla_attn_k =
@@ -1352,6 +1407,7 @@ impl Model {
             rope_k,
             silu_k,
             gemv_k,
+            gemv_gather_k,
             attn_k,
             add_k,
             cfg: dummy_cfg,
@@ -1442,6 +1498,43 @@ impl Model {
         let start = expert_idx * expert_len;
         let view = w.data.slice(start..start + expert_len);
         self.gemv_raw(x, &view, in_features, out_features)
+    }
+
+    /// Like `gemv`, but computes only the output rows named by
+    /// `row_indices` instead of every row `0..out_features` -- System1's
+    /// candidate-subset LM-head scoring (`Self::system1_evaluate`), so a
+    /// full-vocab GEMV and a vocab-sized D2H transfer are never paid when
+    /// only a handful of candidate token ids' logits are needed. Returns
+    /// the gathered logits already downloaded to host (unlike `gemv_raw`/
+    /// `gemv_expert`, which return a device-resident `CudaSlice` for further
+    /// on-device chaining) since every call site here is a leaf op wanting
+    /// host floats.
+    fn gemv_gather(&self, x: &CudaSlice<f32>, w: &Weight, row_indices: &[u32]) -> Result<Vec<f32>, String> {
+        let in_features = w.shape[0] as usize;
+        let out_features = w.shape[1] as usize;
+        if x.len() != in_features {
+            return Err(format!("gemv_gather: x.len()={} != in_features={in_features}", x.len()));
+        }
+        if row_indices.is_empty() {
+            return Err("gemv_gather: row_indices must not be empty".to_string());
+        }
+        if let Some(&bad) = row_indices.iter().find(|&&r| r as usize >= out_features) {
+            return Err(format!("gemv_gather: row index {bad} out of range (out_features={out_features})"));
+        }
+        let num_rows = row_indices.len();
+        let dev_indices = self.device.htod_sync_copy(row_indices).map_err(|e| format!("gemv_gather upload row_indices: {e}"))?;
+        let mut dev_y = self.device.alloc_zeros::<f32>(num_rows).map_err(|e| format!("gemv_gather alloc y: {e}"))?;
+        let threads = 256u32;
+        let blocks = (num_rows as u32).div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            self.gemv_gather_k
+                .function
+                .clone()
+                .launch(launch_cfg, (x, &w.data, &dev_indices, &mut dev_y, in_features as u32, num_rows as u32))
+                .map_err(|e| format!("gemv_gather launch: {e}"))?;
+        }
+        self.device.dtoh_sync_copy(&dev_y).map_err(|e| format!("gemv_gather dtoh: {e}"))
     }
 
     /// In-place: `t` is already device-resident. `position` is a plain
@@ -1960,26 +2053,28 @@ impl Model {
         }
     }
 
-    /// Shared dense/MoE implementation behind `forward_prompt`,
-    /// `forward_prompt_capture_kv`, and `generate` (Phase 3 round 2):
-    /// encodes `prompt` (a continuation, not a fresh prompt, when
-    /// `imported.is_some()` -- no BOS is inserted in that case), seeds the
-    /// K/V cache from `imported` first when resuming, runs every position
-    /// exactly like a from-scratch run just offset by `imported`'s
-    /// `seq_len`, then keeps decoding new tokens one at a time until
-    /// `max_new_tokens` have been produced or `eos_token_id` comes up.
-    /// Returns the generated token ids, their concatenated decoded text,
-    /// the final per-layer K/V caches (still device-resident, sized with
-    /// headroom for up to `max_new_tokens` generated positions -- callers
-    /// downloading them for export must slice to `0..seq_len * kv_stride`,
-    /// not the whole buffer), and the total sequence length reached.
-    fn generate_dense_impl(
+    /// Shared prefix-processing step behind `generate_dense_impl` and
+    /// `system1_evaluate`: encodes `prompt` (a continuation, not a fresh
+    /// prompt, when `imported.is_some()` -- no BOS is inserted in that
+    /// case), seeds the K/V cache from `imported` first when resuming, then
+    /// runs every prompt position through `forward_one_token_dense`
+    /// sequentially, exactly like a from-scratch run just offset by
+    /// `imported`'s `seq_len`. `extra_headroom` sizes the K/V cache with
+    /// that many additional position slots beyond the encoded prompt itself
+    /// (`generate_dense_impl` passes `max_new_tokens`, since it will go on
+    /// to decode that many more positions into the same buffers;
+    /// `system1_evaluate` passes its longest candidate's token count minus
+    /// one, since it teacher-forces multi-token candidates into the same
+    /// headroom instead of decoding). Returns the encoded prompt ids
+    /// (including any inserted BOS), the final position's hidden state, the
+    /// filled K/V caches, and the next absolute position a caller may write
+    /// into.
+    fn prefill_dense(
         &self,
         prompt: &str,
         imported: Option<&crate::kv_io::DenseKvCache>,
-        max_new_tokens: usize,
-        mut on_first_token: impl FnMut(),
-    ) -> Result<(Vec<u32>, String, Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>, usize), String> {
+        extra_headroom: usize,
+    ) -> Result<(Vec<u32>, CudaSlice<f32>, Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>, usize), String> {
         let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
 
         let mut ids = self.tokenizer.encode(prompt)?;
@@ -1993,18 +2088,15 @@ impl Model {
         if ids.is_empty() {
             return Err("encode produced no tokens".to_string());
         }
-        if max_new_tokens == 0 {
-            return Err("max_new_tokens must be at least 1".to_string());
-        }
 
         let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
         // Preallocated up front (Phase 2 round 2 sized this to exactly the
         // prompt's token count; round 2 of Phase 3 sizes it for the whole
         // run -- imported positions, the continuation prompt, and headroom
-        // for every token this call might still generate -- since
+        // for every position a caller might still write -- since
         // `forward_attn_block` indexes into it by absolute position and
         // needs the buffer to already be that big).
-        let total_len = start_pos + ids.len() + max_new_tokens;
+        let total_len = start_pos + ids.len() + extra_headroom;
         let mut k_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
             .map(|_| self.device.alloc_zeros::<f32>(total_len * kv_stride))
             .collect::<Result<_, _>>()
@@ -2039,7 +2131,34 @@ impl Model {
             hidden_dev = Some(self.forward_one_token_dense(token_id, position, &mut k_caches, &mut v_caches)?);
             position += 1;
         }
-        let mut hidden = hidden_dev.ok_or("no tokens processed")?;
+        let hidden = hidden_dev.ok_or("no tokens processed")?;
+
+        Ok((ids, hidden, k_caches, v_caches, position))
+    }
+
+    /// Shared dense/MoE implementation behind `forward_prompt`,
+    /// `forward_prompt_capture_kv`, and `generate` (Phase 3 round 2):
+    /// decodes new tokens one at a time (via `Self::prefill_dense` for the
+    /// prompt, then the same `forward_one_token_dense`/`lm_head_argmax` pair
+    /// per generated token) until `max_new_tokens` have been produced or
+    /// `eos_token_id` comes up. Returns the generated token ids, their
+    /// concatenated decoded text, the final per-layer K/V caches (still
+    /// device-resident, sized with headroom for up to `max_new_tokens`
+    /// generated positions -- callers downloading them for export must
+    /// slice to `0..seq_len * kv_stride`, not the whole buffer), and the
+    /// total sequence length reached.
+    fn generate_dense_impl(
+        &self,
+        prompt: &str,
+        imported: Option<&crate::kv_io::DenseKvCache>,
+        max_new_tokens: usize,
+        mut on_first_token: impl FnMut(),
+    ) -> Result<(Vec<u32>, String, Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>, usize), String> {
+        if max_new_tokens == 0 {
+            return Err("max_new_tokens must be at least 1".to_string());
+        }
+
+        let (_ids, mut hidden, mut k_caches, mut v_caches, mut position) = self.prefill_dense(prompt, imported, max_new_tokens)?;
 
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
         let mut next_id = self.lm_head_argmax(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
@@ -2055,6 +2174,91 @@ impl Model {
 
         let text = self.tokenizer.decode(&generated);
         Ok((generated, text, k_caches, v_caches, position))
+    }
+
+    /// Resolves `candidate`'s actual continuation token ids given `prompt`,
+    /// by tokenizing `prompt` and `prompt + candidate` together and diffing
+    /// -- tokenizing `candidate` alone does not reliably give the token(s)
+    /// the model would actually emit as a continuation, since BPE/
+    /// SentencePiece merge boundaries depend on what precedes the candidate
+    /// text. Errs if `encode(prompt)` is not an exact prefix of
+    /// `encode(prompt + candidate)`, or the candidate contributes zero new
+    /// tokens.
+    fn resolve_candidate_token_ids(&self, prompt: &str, candidate: &str) -> Result<Vec<u32>, String> {
+        let prompt_ids = self.tokenizer.encode(prompt)?;
+        let full_ids = self.tokenizer.encode(&format!("{prompt}{candidate}"))?;
+        if full_ids.len() <= prompt_ids.len() || full_ids[..prompt_ids.len()] != prompt_ids[..] {
+            return Err(format!("system1: candidate {candidate:?} does not tokenize as a clean continuation of the prompt"));
+        }
+        Ok(full_ids[prompt_ids.len()..].to_vec())
+    }
+
+    /// System1: single-pass, non-autoregressive candidate scoring. Runs
+    /// `prompt` through the same prefill path as `generate_dense_impl`
+    /// (`Self::prefill_dense`) exactly once, then scores every one of
+    /// `candidates` from that single prefill -- no argmax-then-feedback
+    /// decode loop for single-token candidates (one batched gather-GEMV
+    /// covers all of them, `Self::gemv_gather`), and only a short
+    /// teacher-forced continuation for multi-token ones (feeding each
+    /// candidate's own known next token, never a sampled one).
+    ///
+    /// `score` is relative to this candidate set only, not a vocab-wide
+    /// log-probability -- computing the latter for a single-token candidate
+    /// would require the exact full-vocab GEMV + D2H transfer this method
+    /// exists to avoid. `temperature` (`1.0` = no-op) is passed through to
+    /// `crate::calibration::softmax_scores_with_temperature` to produce
+    /// `System1Response::probabilities`.
+    ///
+    /// Dense/MoE Qwen3 models only as of this version -- errs if
+    /// `self.hybrid`/`self.mla` is set. Every candidate must resolve to at
+    /// least one token (see `Self::resolve_candidate_token_ids`); a
+    /// resolution failure for one candidate fails the whole call.
+    pub fn system1_evaluate(&self, prompt: &str, candidates: &[System1Candidate], temperature: f32) -> Result<System1Response, String> {
+        if self.hybrid.is_some() || self.mla.is_some() {
+            return Err("system1_evaluate: only dense/MoE Qwen3 models are supported in this version".to_string());
+        }
+        if candidates.is_empty() {
+            return Err("system1_evaluate: candidates must not be empty".to_string());
+        }
+
+        let resolved: Vec<Vec<u32>> =
+            candidates.iter().map(|c| self.resolve_candidate_token_ids(prompt, &c.text)).collect::<Result<_, _>>()?;
+        let max_len = resolved.iter().map(Vec::len).max().unwrap_or(1);
+
+        let (_, hidden, mut k_caches, mut v_caches, base_position) = self.prefill_dense(prompt, None, max_len.saturating_sub(1))?;
+
+        // Batched first-token gather: the sub-50ms win for the common
+        // single-token case (Yes/No, A-D, a 1-10 scale).
+        let normed = self.rmsnorm(&hidden, &self.output_norm.data, 1, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
+        let first_tokens: Vec<u32> = resolved.iter().map(|ids| ids[0]).collect();
+        let mut scores = self.gemv_gather(&normed, &self.lm_head, &first_tokens)?;
+
+        // Multi-token candidates: teacher-forced continuation, reusing the
+        // shared post-prompt KV headroom sequentially per candidate (safe
+        // since each candidate is scored to completion before the next one
+        // starts).
+        for (i, ids) in resolved.iter().enumerate() {
+            if ids.len() < 2 {
+                continue;
+            }
+            let mut position = base_position;
+            for w in ids.windows(2) {
+                let (prev, next) = (w[0], w[1]);
+                let h = self.forward_one_token_dense(prev, position, &mut k_caches, &mut v_caches)?;
+                position += 1;
+                let normed_step = self.rmsnorm(&h, &self.output_norm.data, 1, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
+                scores[i] += self.gemv_gather(&normed_step, &self.lm_head, &[next])?[0];
+            }
+        }
+
+        let probabilities = crate::calibration::softmax_scores_with_temperature(&scores, temperature)?;
+        let results = candidates
+            .iter()
+            .zip(resolved)
+            .zip(scores)
+            .map(|((c, token_ids), score)| System1CandidateResult { text: c.text.clone(), token_ids, score })
+            .collect();
+        Ok(System1Response { results, probabilities })
     }
 
     /// Embeds `token_id` and runs it through every dense/MoE layer at
@@ -2898,5 +3102,53 @@ impl Model {
 
         let cache = crate::kv_io::MlaKvCache { seq_len, qk_dim, kv_caches };
         Ok(((generated[0], text), cache))
+    }
+}
+
+#[cfg(test)]
+mod system1_tests {
+    use super::*;
+    use crate::gguf::GgufFile;
+    use cudarc::driver::CudaDevice;
+
+    /// Exact cross-check of `gemv_gather` against the existing full-vocab
+    /// `gemv` path: same weights, same math, different kernel -- gathering a
+    /// handful of rows (including the model's own real argmax id) must
+    /// agree with the corresponding entries of a full-vocab GEMV to float
+    /// rounding. Real GGUF fixtures live outside this repo (`.gguf` is
+    /// gitignored, per CLAUDE.md's "Known test-fixture limitation"), so this
+    /// is `#[ignore]`d by default and reads its model path from
+    /// `COLDSTART_TEST_GGUF` rather than guessing a local path -- run with:
+    /// `COLDSTART_TEST_GGUF=<path> cargo test --release -- --ignored gemv_gather_matches_full_vocab_gemv`
+    #[test]
+    #[ignore]
+    fn gemv_gather_matches_full_vocab_gemv_at_matching_rows() {
+        let gguf_path = std::env::var("COLDSTART_TEST_GGUF").expect("set COLDSTART_TEST_GGUF to a real local GGUF path to run this test");
+        let file = GgufFile::open(&gguf_path).expect("failed to open COLDSTART_TEST_GGUF");
+        let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+        let model = Model::load(device, &file).expect("failed to load model");
+
+        let (_, hidden, _, _, _) = model.prefill_dense("The capital of France is", None, 0).expect("prefill_dense failed");
+        let normed = model.rmsnorm(&hidden, &model.output_norm.data, 1, model.cfg.hidden_size, model.cfg.rmsnorm_eps).expect("rmsnorm failed");
+
+        let full = model.gemv(&normed, &model.lm_head).expect("gemv failed");
+        let full_host = model.device.dtoh_sync_copy(&full).expect("dtoh failed");
+
+        let vocab_size = model.lm_head.shape[1] as usize;
+        let argmax_id = full_host
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i as u32)
+            .expect("full_host must not be empty");
+        let row_indices = [0u32, (vocab_size / 2) as u32, (vocab_size - 1) as u32, argmax_id];
+
+        let gathered = model.gemv_gather(&normed, &model.lm_head, &row_indices).expect("gemv_gather failed");
+
+        for (j, &row) in row_indices.iter().enumerate() {
+            let expected = full_host[row as usize];
+            let got = gathered[j];
+            assert!((expected - got).abs() < 1e-4, "row {row}: full_vocab={expected}, gathered={got}");
+        }
     }
 }
