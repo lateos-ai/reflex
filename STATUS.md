@@ -302,3 +302,17 @@ conversation.
   bartowski) predates the MLA tensor-split conversion format and will be silently
   rejected by `parse_mla_config` (no `key_length_mla`/`value_length_mla` metadata) —
   don't assume a downloaded GGUF is usable without checking for those keys first.
+- **Dockerfile not verified by an actual `docker build`/`docker run` pass**: the
+  MVP-release adoption round's kernel-byte-embedding refactor (`src/aot.rs`) and the
+  `Dockerfile` it enables were checked on a ThunderCompute A6000 instance, but that
+  instance is itself a nested container (`systemd-detect-virt` reports `docker`) and
+  rejects *any* Docker build outright (`unshare: operation not permitted`, confirmed
+  with even a trivial `FROM ubuntu:22.04` Dockerfile) — nested Docker-in-Docker isn't
+  supported there. What *was* verified directly: the compiled `qwen3_coldstart`
+  binary is genuinely self-contained (copied to an empty directory after deleting the
+  entire `target/` build directory, it still ran correctly), which is the actual
+  property the Dockerfile's multi-stage `COPY --from=builder` step depends on. Treat
+  this as strong but indirect evidence, not a substitute for the real thing — **run a
+  real `docker build` + `docker run --gpus all` pass on a standard VM-based Docker
+  host (not a nested-container instance) before publishing this image to Docker Hub/
+  GHCR or otherwise treating it as release-ready.**

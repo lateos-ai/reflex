@@ -41,6 +41,17 @@ real-hardware step: it proves the AOT pipeline works end to end and reports actu
 process-start-to-first-result wall clock on the simplest possible kernel, before any
 model-architecture work begins.
 
+**Linux build prerequisite for `--features download`/`ipc`/`python`** (`--all-features`
+included): these pull in `hf-hub`, whose `ureq` HTTP client needs `libssl-dev` +
+`pkg-config` on the build host, or `cargo build` fails with `openssl-sys` unable to find
+an OpenSSL installation. Not needed for the default feature-less build. On Ubuntu/Debian:
+```
+sudo apt-get install -y libssl-dev pkg-config
+```
+(Discovered on a fresh ThunderCompute instance during the MVP-release adoption round —
+not needed on the Windows dev machine that round otherwise developed on, since
+`native-tls` uses a different TLS backend there.)
+
 ## MVP order
 
 1. **Dense Qwen3** — reuses RustFeference's most mature, most-verified architecture;
