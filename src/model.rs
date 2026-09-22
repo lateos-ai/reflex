@@ -48,6 +48,8 @@ use crate::gguf::{GgmlType, GgufFile, GgufValue};
 use crate::lora;
 use crate::moe::{route_top_k, route_top_k_with_norm};
 use crate::tokenizer::Tokenizer;
+use cudarc::cublas::sys as cublas_sys;
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{CudaDevice, CudaSlice, CudaView, DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
 
@@ -734,8 +736,21 @@ struct HybridModel {
 /// A loaded dense Qwen3 model, ready to [`Model::forward_prompt`] from.
 pub struct Model {
     device: Arc<CudaDevice>,
+    /// Handle for the batched-prefill GEMM projections (`Self::gemm`) --
+    /// created once at load time with math mode pinned to
+    /// `CUBLAS_PEDANTIC_MATH` (see `Self::load`'s construction site) so
+    /// cuBLAS's summation order can be trusted not to silently drift from
+    /// `gemv_kernel`'s naive per-row dot product via a TF32/reduced-precision
+    /// tensor-core path. Only prefill (`rows > 1`) uses this; the per-token
+    /// decode loop still uses `gemv_k` (a GEMM with n=1 buys nothing).
+    cublas: CudaBlas,
     rmsnorm_k: AotKernel,
     rope_k: AotKernel,
+    /// Batched-prefill variant of `rope_k` (`rope_batch_kernel`,
+    /// `kernels_cuda/rope.cu`) -- rotates all of a prefill batch's rows in
+    /// one launch, each at its own absolute position, instead of one
+    /// `rope_k` launch per row.
+    rope_batch_k: AotKernel,
     silu_k: AotKernel,
     gemv_k: AotKernel,
     /// Gathers only caller-chosen output rows of a GEMV instead of every row
@@ -744,6 +759,12 @@ pub struct Model {
     /// ordinary dense/MoE/hybrid/MLA forward paths.
     gemv_gather_k: AotKernel,
     attn_k: AotKernel,
+    /// Batched-prefill variant of `attn_k` (`attention_prefill_kernel`,
+    /// `kernels_cuda/attention_prefill.cu`) -- scores every row of a prefill
+    /// batch in one launch (grid gains a query-row dimension), each row
+    /// causally masked to its own position, instead of one `attn_k` launch
+    /// per row.
+    attn_prefill_k: AotKernel,
     /// In-place residual add (`a[i] += b[i]`, see `kernels_cuda/elementwise.cu`)
     /// -- keeps residual-stream adds device-resident (Phase 2 round 2)
     /// instead of downloading both operands to host just to add two vectors.
@@ -981,14 +1002,31 @@ impl Model {
         let (cfg, block_count, moe) = parse_model_config(file)?;
         let expert_used_count = moe.map(|m| m.expert_used_count);
 
+        // Created once per load, like every AOT kernel handle below -- see
+        // the `cublas` field's doc comment on `Model` for why math mode is
+        // pinned right after creation.
+        let cublas = CudaBlas::new(device.clone()).map_err(|e| format!("cublas handle: {e:?}"))?;
+        unsafe {
+            cublas_sys::lib()
+                .cublasSetMathMode(*cublas.handle(), cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH)
+                .result()
+                .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
+        }
         let rmsnorm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_RMSNORM"), "rmsnorm", "rmsnorm_kernel")?;
         let rope_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope", "rope_kernel")?;
+        let rope_batch_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_batch", "rope_batch_kernel")?;
         let silu_k =
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_SILU_AND_MUL"), "silu_and_mul", "silu_and_mul_kernel")?;
         let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
         let gemv_gather_k =
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV_GATHER"), "gemv_gather", "gemv_gather_kernel")?;
         let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
+        let attn_prefill_k = aot::load_kernel(
+            &device,
+            env!("COLDSTART_KERNEL_ATTENTION_PREFILL"),
+            "attention_prefill",
+            "attention_prefill_kernel",
+        )?;
         let add_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ELEMENTWISE"), "elementwise", "add_kernel")?;
         let mut dequant_fns = aot::load_kernel_module(
             &device,
@@ -1091,12 +1129,15 @@ impl Model {
 
         Ok(Model {
             device,
+            cublas,
             rmsnorm_k,
             rope_k,
+            rope_batch_k,
             silu_k,
             gemv_k,
             gemv_gather_k,
             attn_k,
+            attn_prefill_k,
             add_k,
             cfg,
             layers,
@@ -1160,14 +1201,31 @@ impl Model {
 
         let is_gdn = parse_hybrid_layer_kinds(file, architecture, block_count)?;
 
+        // Created once per load, like every AOT kernel handle below -- see
+        // the `cublas` field's doc comment on `Model` for why math mode is
+        // pinned right after creation.
+        let cublas = CudaBlas::new(device.clone()).map_err(|e| format!("cublas handle: {e:?}"))?;
+        unsafe {
+            cublas_sys::lib()
+                .cublasSetMathMode(*cublas.handle(), cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH)
+                .result()
+                .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
+        }
         let rmsnorm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_RMSNORM"), "rmsnorm", "rmsnorm_kernel")?;
         let rope_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope", "rope_kernel")?;
+        let rope_batch_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_batch", "rope_batch_kernel")?;
         let silu_k =
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_SILU_AND_MUL"), "silu_and_mul", "silu_and_mul_kernel")?;
         let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
         let gemv_gather_k =
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV_GATHER"), "gemv_gather", "gemv_gather_kernel")?;
         let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
+        let attn_prefill_k = aot::load_kernel(
+            &device,
+            env!("COLDSTART_KERNEL_ATTENTION_PREFILL"),
+            "attention_prefill",
+            "attention_prefill_kernel",
+        )?;
         let add_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ELEMENTWISE"), "elementwise", "add_kernel")?;
         let mut gdn_fns = aot::load_kernel_module(
             &device,
@@ -1272,12 +1330,15 @@ impl Model {
 
         Ok(Model {
             device,
+            cublas,
             rmsnorm_k,
             rope_k,
+            rope_batch_k,
             silu_k,
             gemv_k,
             gemv_gather_k,
             attn_k,
+            attn_prefill_k,
             add_k,
             cfg: attn_cfg.clone(),
             layers: Vec::new(),
@@ -1298,14 +1359,31 @@ impl Model {
     fn load_mla(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
         let (mla_cfg, block_count, leading_dense) = parse_mla_config(file)?;
 
+        // Created once per load, like every AOT kernel handle below -- see
+        // the `cublas` field's doc comment on `Model` for why math mode is
+        // pinned right after creation.
+        let cublas = CudaBlas::new(device.clone()).map_err(|e| format!("cublas handle: {e:?}"))?;
+        unsafe {
+            cublas_sys::lib()
+                .cublasSetMathMode(*cublas.handle(), cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH)
+                .result()
+                .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
+        }
         let rmsnorm_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_RMSNORM"), "rmsnorm", "rmsnorm_kernel")?;
         let rope_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope", "rope_kernel")?;
+        let rope_batch_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ROPE"), "rope_batch", "rope_batch_kernel")?;
         let silu_k =
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_SILU_AND_MUL"), "silu_and_mul", "silu_and_mul_kernel")?;
         let gemv_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV"), "gemv", "gemv_kernel")?;
         let gemv_gather_k =
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_GEMV_GATHER"), "gemv_gather", "gemv_gather_kernel")?;
         let attn_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ATTENTION"), "attention", "attention_kernel")?;
+        let attn_prefill_k = aot::load_kernel(
+            &device,
+            env!("COLDSTART_KERNEL_ATTENTION_PREFILL"),
+            "attention_prefill",
+            "attention_prefill_kernel",
+        )?;
         let add_k = aot::load_kernel(&device, env!("COLDSTART_KERNEL_ELEMENTWISE"), "elementwise", "add_kernel")?;
         let mla_attn_k =
             aot::load_kernel(&device, env!("COLDSTART_KERNEL_MLA_ATTENTION"), "mla_attention", "mla_attention_kernel")?;
@@ -1403,12 +1481,15 @@ impl Model {
 
         Ok(Model {
             device,
+            cublas,
             rmsnorm_k,
             rope_k,
+            rope_batch_k,
             silu_k,
             gemv_k,
             gemv_gather_k,
             attn_k,
+            attn_prefill_k,
             add_k,
             cfg: dummy_cfg,
             layers: Vec::new(),
@@ -1479,14 +1560,67 @@ impl Model {
         self.gemv_raw(x, &w.data, in_features, out_features)
     }
 
+    /// Batched linear projection: `y[rows, out_features] = x[rows, in_features]
+    /// @ w^T`, via cuBLAS Sgemm instead of `gemv_k`'s naive per-row dot
+    /// product loop -- the actual win for prefill (`rows` = prompt length):
+    /// cuBLAS reuses each weight byte across all `rows` output columns in one
+    /// pass instead of re-reading the whole weight matrix from global memory
+    /// once per row, turning a bandwidth-bound op into a compute-bound one.
+    /// Not used for the `rows == 1` decode step (`Self::forward_one_token_dense`
+    /// still uses `Self::gemv`) -- a GEMM with n=1 is just a slower GEMV.
+    ///
+    /// `w.data` is row-major `[out_features, in_features]` and `x` is
+    /// row-major `[rows, in_features]`; cuBLAS is column-major. Reinterpreting
+    /// each row-major buffer as column-major gives its transpose for free, so
+    /// `w.data`'s raw buffer read as column-major is already `[in_features,
+    /// out_features]` == w^T -- computing `y^T = w^T applied via CUBLAS_OP_T
+    /// on w, CUBLAS_OP_N on x` (both operands untouched, no transpose copy)
+    /// writes `y`'s raw buffer such that reading it back as row-major gives
+    /// exactly `[rows, out_features]`. This is the single easiest place in
+    /// the batched-prefill path to get a silently-wrong, non-crashing result,
+    /// so verify it against `Self::gemv_raw` row-by-row before trusting it
+    /// (`prefill_batching_tests::prefill_dense_batched_matches_sequential_prefill` does this).
+    fn gemm(&self, x: &CudaSlice<f32>, w: &Weight, rows: usize) -> Result<CudaSlice<f32>, String> {
+        let in_features = w.shape[0] as usize;
+        let out_features = w.shape[1] as usize;
+        if x.len() != rows * in_features {
+            return Err(format!("gemm: x.len()={} != rows*in_features={}", x.len(), rows * in_features));
+        }
+
+        let mut dev_y = self.device.alloc_zeros::<f32>(rows * out_features).map_err(|e| format!("gemm alloc y: {e}"))?;
+
+        let cfg = GemmConfig {
+            transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+            transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+            m: out_features as i32,
+            n: rows as i32,
+            k: in_features as i32,
+            alpha: 1.0f32,
+            lda: in_features as i32,
+            ldb: in_features as i32,
+            beta: 0.0f32,
+            ldc: out_features as i32,
+        };
+        unsafe {
+            self.cublas.gemm(cfg, &w.data, x, &mut dev_y).map_err(|e| format!("gemm launch: {e:?}"))?;
+        }
+        Ok(dev_y)
+    }
+
     /// GEMV against expert `expert_idx`'s slice of a per-expert-stacked 3-D
     /// MoE tensor (shape `[in_features, out_features, expert_count]`).
     /// Expert `e`'s `in_features * out_features` elements are a contiguous
     /// chunk already in the same row-major `(out_features, in_features)`
     /// layout as a standalone 2-D weight (see this module's doc comment), so
     /// `CudaSlice::slice` gives a zero-copy device-side view -- no
-    /// device-to-device copy, let alone a host round-trip.
-    fn gemv_expert(&self, x: &CudaSlice<f32>, w: &Weight, expert_idx: usize) -> Result<CudaSlice<f32>, String> {
+    /// device-to-device copy, let alone a host round-trip. `x` is generic
+    /// (like `Self::gemv_view`, which this delegates to) so callers can pass
+    /// either an owned `&CudaSlice<f32>` (the ordinary per-token MoE path) or
+    /// a `&CudaView<f32>` row-slice of a larger batched buffer (the batched
+    /// prefill MoE path, `Self::forward_layer_moe_batched`, which still
+    /// routes each row to its own experts per-row -- see that function's doc
+    /// comment for why only the attention block is GEMM-batched for MoE).
+    fn gemv_expert<X: DeviceRepr>(&self, x: X, w: &Weight, expert_idx: usize) -> Result<CudaSlice<f32>, String> {
         let (in_features, out_features, expert_count) = match w.shape.as_slice() {
             [i, o, e] => (*i as usize, *o as usize, *e as usize),
             other => return Err(format!("gemv_expert: expected 3-D per-expert tensor shape, got {other:?}")),
@@ -1497,7 +1631,7 @@ impl Model {
         let expert_len = in_features * out_features;
         let start = expert_idx * expert_len;
         let view = w.data.slice(start..start + expert_len);
-        self.gemv_raw(x, &view, in_features, out_features)
+        self.gemv_view(x, &view, in_features, out_features)
     }
 
     /// Like `gemv`, but computes only the output rows named by
@@ -1564,6 +1698,40 @@ impl Model {
                 .clone()
                 .launch(launch_cfg, (t, position as u32, num_heads as u32, head_dim as u32, rotary_dim as u32, base))
                 .map_err(|e| format!("rope launch: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Batched-prefill variant of [`Self::rope`]: rotates `rows` rows of `t`
+    /// in one launch, row `r` at absolute position `start_pos + r` (unlike
+    /// `rope`'s single scalar `position`, which only serves the `rows == 1`
+    /// decode step). `t` is row-major `[rows, num_heads, head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_batch(
+        &self,
+        t: &mut CudaSlice<f32>,
+        start_pos: usize,
+        num_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rows: usize,
+        base: f32,
+    ) -> Result<(), String> {
+        let half_rotary = rotary_dim / 2;
+        let total_pairs = (rows * num_heads * half_rotary) as u32;
+        let threads = 256u32;
+        let blocks = total_pairs.div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+
+        unsafe {
+            self.rope_batch_k
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (t, start_pos as u32, num_heads as u32, head_dim as u32, rotary_dim as u32, rows as u32, base),
+                )
+                .map_err(|e| format!("rope_batch launch: {e}"))?;
         }
         Ok(())
     }
@@ -1701,6 +1869,63 @@ impl Model {
                     ),
                 )
                 .map_err(|e| format!("attn launch: {e}"))?;
+        }
+        Ok(dev_out)
+    }
+
+    /// Batched-prefill variant of [`Self::attention`]: scores `rows` new
+    /// query rows against the shared K/V cache in one launch (grid gains a
+    /// query-row dimension), each row causally masked to its own
+    /// `start_pos + row + 1` positions instead of one shared `seq_len`.
+    /// `k_cache`/`v_cache` must already cover `0..start_pos+rows` positions
+    /// (this batch's own K/V, written by the caller before this call --
+    /// `Self::forward_attn_block_batched`). `q` is row-major `[rows,
+    /// num_q_heads, head_dim]`; returns row-major `[rows, num_q_heads,
+    /// head_dim]`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_prefill(
+        &self,
+        q: &CudaSlice<f32>,
+        k_cache: &CudaView<f32>,
+        v_cache: &CudaView<f32>,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        start_pos: usize,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, String> {
+        let mut dev_out = self
+            .device
+            .alloc_zeros::<f32>(rows * num_q_heads * head_dim)
+            .map_err(|e| format!("attn_prefill alloc out: {e}"))?;
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let max_seq_len = start_pos + rows;
+        let launch_cfg = LaunchConfig {
+            grid_dim: (num_q_heads as u32, rows as u32, 1),
+            block_dim: (head_dim as u32, 1, 1),
+            shared_mem_bytes: (max_seq_len * std::mem::size_of::<f32>()) as u32,
+        };
+        unsafe {
+            self.attn_prefill_k
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (
+                        q,
+                        k_cache,
+                        v_cache,
+                        &mut dev_out,
+                        num_q_heads as u32,
+                        num_kv_heads as u32,
+                        head_dim as u32,
+                        start_pos as u32,
+                        rows as u32,
+                        scale,
+                    ),
+                )
+                .map_err(|e| format!("attn_prefill launch: {e}"))?;
         }
         Ok(dev_out)
     }
@@ -1979,6 +2204,190 @@ impl Model {
         }
     }
 
+    /// Batched-prefill variant of [`Self::forward_attn_block`]: normalizes,
+    /// projects, RoPEs, and attends over `rows` positions at once (`rows *
+    /// hidden_size` flat `hidden`, row-major) instead of one position per
+    /// call -- see `Self::gemm`/`Self::rope_batch`/`Self::attention_prefill`.
+    /// `start_pos` is this batch's first row's absolute position (row `r` is
+    /// `start_pos + r`), matching `Self::prefill_dense_batched`'s resume
+    /// convention (`--import-kv`'s `start_pos > 0` case).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_attn_block_batched(
+        &self,
+        attn_norm: &Weight,
+        attn_q: &Weight,
+        attn_k: &Weight,
+        attn_v: &Weight,
+        attn_output: &Weight,
+        attn_q_norm: &Option<Weight>,
+        attn_k_norm: &Option<Weight>,
+        mut hidden: CudaSlice<f32>,
+        start_pos: usize,
+        rows: usize,
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
+        let cfg = &self.cfg;
+        let normed = self.rmsnorm(&hidden, &attn_norm.data, rows, cfg.hidden_size, cfg.rmsnorm_eps)?;
+
+        let mut q = self.gemm(&normed, attn_q, rows)?;
+        let mut k = self.gemm(&normed, attn_k, rows)?;
+        let v = self.gemm(&normed, attn_v, rows)?;
+
+        if let Some(qn) = attn_q_norm {
+            q = self.rmsnorm(&q, &qn.data, rows * cfg.num_q_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
+        }
+        if let Some(kn) = attn_k_norm {
+            k = self.rmsnorm(&k, &kn.data, rows * cfg.num_kv_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
+        }
+
+        self.rope_batch(&mut q, start_pos, cfg.num_q_heads, cfg.head_dim, cfg.rotary_dim, rows, cfg.rope_base)?;
+        self.rope_batch(&mut k, start_pos, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim, rows, cfg.rope_base)?;
+
+        let kv_stride = cfg.num_kv_heads * cfg.head_dim;
+        let offset = start_pos * kv_stride;
+        let write_len = rows * kv_stride;
+        {
+            let mut dst = k_cache.slice_mut(offset..offset + write_len);
+            self.device.dtod_copy(&k, &mut dst).map_err(|e| format!("attn_batched kv-cache dtod k: {e}"))?;
+        }
+        {
+            let mut dst = v_cache.slice_mut(offset..offset + write_len);
+            self.device.dtod_copy(&v, &mut dst).map_err(|e| format!("attn_batched kv-cache dtod v: {e}"))?;
+        }
+        let seq_len = start_pos + rows;
+
+        let k_view = k_cache.slice(0..seq_len * kv_stride);
+        let v_view = v_cache.slice(0..seq_len * kv_stride);
+        let attn_out =
+            self.attention_prefill(&q, &k_view, &v_view, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, start_pos, rows)?;
+        let o_proj = self.gemm(&attn_out, attn_output, rows)?;
+        self.add_inplace(&mut hidden, &o_proj)?;
+        Ok(hidden)
+    }
+
+    /// Batched-prefill variant of [`Self::forward_layer_dense`]: every
+    /// projection in both the attention block and the FFN becomes one GEMM
+    /// over all `rows` positions instead of `rows` separate GEMV launches --
+    /// `Self::silu_and_mul`/`Self::add_inplace` need no change (already flat
+    /// elementwise ops, see their doc comments).
+    fn forward_layer_dense_batched(
+        &self,
+        layer: &DenseLayerWeights,
+        hidden: CudaSlice<f32>,
+        start_pos: usize,
+        rows: usize,
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
+        let mut post_attn = self.forward_attn_block_batched(
+            &layer.attn_norm,
+            &layer.attn_q,
+            &layer.attn_k,
+            &layer.attn_v,
+            &layer.attn_output,
+            &layer.attn_q_norm,
+            &layer.attn_k_norm,
+            hidden,
+            start_pos,
+            rows,
+            k_cache,
+            v_cache,
+        )?;
+
+        let cfg = &self.cfg;
+        let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, rows, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let gate = self.gemm(&ffn_normed, &layer.ffn_gate, rows)?;
+        let up = self.gemm(&ffn_normed, &layer.ffn_up, rows)?;
+        let activated = self.silu_and_mul(&gate, &up, rows * cfg.ffn_hidden_size)?;
+        let down = self.gemm(&activated, &layer.ffn_down, rows)?;
+
+        self.add_inplace(&mut post_attn, &down)?;
+        Ok(post_attn)
+    }
+
+    /// Batched-prefill variant of [`Self::forward_layer_moe`]: the attention
+    /// block batches identically to the dense case (`Self::
+    /// forward_attn_block_batched`), but the FFN stays a per-row loop reusing
+    /// the same per-expert `Self::gemv_expert` calls `forward_layer_moe`
+    /// makes -- each row can route to a different top-k expert subset, so
+    /// turning that into a single GEMM needs a token->expert grouping/
+    /// permutation step (grouped GEMM, the way vLLM/TensorRT-LLM batch MoE
+    /// FFNs) this round doesn't attempt -- a distinct, materially larger
+    /// follow-on. This still removes the sequential per-token cost from
+    /// QKV/O-proj/attention, the same fraction of the total cost the dense
+    /// case removes; only the FFN GEMV calls remain per-row.
+    fn forward_layer_moe_batched(
+        &self,
+        layer: &MoeLayerWeights,
+        hidden: CudaSlice<f32>,
+        start_pos: usize,
+        rows: usize,
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
+        let mut post_attn = self.forward_attn_block_batched(
+            &layer.attn_norm,
+            &layer.attn_q,
+            &layer.attn_k,
+            &layer.attn_v,
+            &layer.attn_output,
+            &layer.attn_q_norm,
+            &layer.attn_k_norm,
+            hidden,
+            start_pos,
+            rows,
+            k_cache,
+            v_cache,
+        )?;
+
+        let cfg = &self.cfg;
+        let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, rows, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let router_logits_dev = self.gemm(&ffn_normed, &layer.ffn_gate_inp, rows)?;
+        let router_logits = self.device.dtoh_sync_copy(&router_logits_dev).map_err(|e| format!("moe router dtoh: {e}"))?;
+        let k = self.expert_used_count.ok_or("forward_layer_moe_batched called on a model with no expert_used_count")?;
+        let num_experts = router_logits.len() / rows;
+
+        let mut ffn_out = vec![0.0f32; rows * cfg.hidden_size];
+        for row in 0..rows {
+            let row_logits = &router_logits[row * num_experts..(row + 1) * num_experts];
+            let routed = route_top_k(row_logits, k)?;
+            let row_normed = ffn_normed.slice(row * cfg.hidden_size..(row + 1) * cfg.hidden_size);
+
+            for (expert_idx, weight) in routed {
+                let gate = self.gemv_expert(&row_normed, &layer.ffn_gate_exps, expert_idx)?;
+                let up = self.gemv_expert(&row_normed, &layer.ffn_up_exps, expert_idx)?;
+                let activated = self.silu_and_mul(&gate, &up, cfg.ffn_hidden_size)?;
+                let down = self.gemv_expert(&activated, &layer.ffn_down_exps, expert_idx)?;
+                let down_host = self.device.dtoh_sync_copy(&down).map_err(|e| format!("moe expert down dtoh: {e}"))?;
+                let row_out = &mut ffn_out[row * cfg.hidden_size..(row + 1) * cfg.hidden_size];
+                for (o, d) in row_out.iter_mut().zip(down_host.iter()) {
+                    *o += weight * d;
+                }
+            }
+        }
+
+        let ffn_out_dev = self.device.htod_sync_copy(&ffn_out).map_err(|e| format!("moe ffn_out htod: {e}"))?;
+        self.add_inplace(&mut post_attn, &ffn_out_dev)?;
+        Ok(post_attn)
+    }
+
+    /// Batched-prefill variant of [`Self::forward_layer`].
+    fn forward_layer_batched(
+        &self,
+        layer: &LayerWeights,
+        hidden: CudaSlice<f32>,
+        start_pos: usize,
+        rows: usize,
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
+        match layer {
+            LayerWeights::Dense(l) => self.forward_layer_dense_batched(l, hidden, start_pos, rows, k_cache, v_cache),
+            LayerWeights::Moe(l) => self.forward_layer_moe_batched(l, hidden, start_pos, rows, k_cache, v_cache),
+        }
+    }
+
     /// Encodes `prompt`, runs it through every layer one position at a time
     /// (real causal self-attention throughout, matching RustFeference's own
     /// documented scope choice for its minimal forward pass), and returns
@@ -2136,6 +2545,99 @@ impl Model {
         Ok((ids, hidden, k_caches, v_caches, position))
     }
 
+    /// Batched-prefill variant of [`Self::prefill_dense`]: same signature and
+    /// KV-cache allocation/import logic (kept byte-identical to `prefill_dense`
+    /// so the two stay directly comparable -- see
+    /// `prefill_dense_batched_matches_sequential_prefill` below), but runs
+    /// every prompt token through each layer in one batched pass
+    /// (`Self::forward_layer_batched`, `rows = ids.len()`) instead of looping
+    /// `forward_one_token_dense` once per token. Unlike `prefill_dense`,
+    /// whose returned `hidden` is already the single last-position vector,
+    /// this returns the *whole* `[rows, hidden_size]` batched hidden state --
+    /// callers that only want the last prompt position (every current
+    /// caller) must slice it out with [`Self::last_row`].
+    fn prefill_dense_batched(
+        &self,
+        prompt: &str,
+        imported: Option<&crate::kv_io::DenseKvCache>,
+        extra_headroom: usize,
+    ) -> Result<(Vec<u32>, CudaSlice<f32>, Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>, usize), String> {
+        let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
+
+        let mut ids = self.tokenizer.encode(prompt)?;
+        if start_pos == 0 {
+            if let Some(bos) = self.tokenizer.bos_token_id {
+                if ids.first() != Some(&bos) {
+                    ids.insert(0, bos);
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Err("encode produced no tokens".to_string());
+        }
+        let rows = ids.len();
+
+        let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
+        let total_len = start_pos + rows + extra_headroom;
+        let mut k_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
+            .map(|_| self.device.alloc_zeros::<f32>(total_len * kv_stride))
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("alloc k_cache: {e}"))?;
+        let mut v_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
+            .map(|_| self.device.alloc_zeros::<f32>(total_len * kv_stride))
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("alloc v_cache: {e}"))?;
+
+        if let Some(cache) = imported {
+            if cache.num_kv_heads != self.cfg.num_kv_heads || cache.head_dim != self.cfg.head_dim {
+                return Err(format!(
+                    "imported KV cache shape mismatch: file has num_kv_heads={} head_dim={}, model expects num_kv_heads={} head_dim={}",
+                    cache.num_kv_heads, cache.head_dim, self.cfg.num_kv_heads, self.cfg.head_dim
+                ));
+            }
+            if cache.k_caches.len() != self.layers.len() {
+                return Err(format!("imported KV cache has {} layers, model has {}", cache.k_caches.len(), self.layers.len()));
+            }
+            let imported_len = cache.seq_len * kv_stride;
+            for (layer_idx, (k_host, v_host)) in cache.k_caches.iter().zip(&cache.v_caches).enumerate() {
+                let mut k_dst = k_caches[layer_idx].slice_mut(0..imported_len);
+                self.device.htod_sync_copy_into(k_host, &mut k_dst).map_err(|e| format!("import k_cache htod layer {layer_idx}: {e}"))?;
+                let mut v_dst = v_caches[layer_idx].slice_mut(0..imported_len);
+                self.device.htod_sync_copy_into(v_host, &mut v_dst).map_err(|e| format!("import v_cache htod layer {layer_idx}: {e}"))?;
+            }
+        }
+
+        let hidden_size = self.cfg.hidden_size;
+        let mut host_embd = vec![0.0f32; rows * hidden_size];
+        for (row, &token_id) in ids.iter().enumerate() {
+            let embd_base = token_id as usize * hidden_size;
+            host_embd[row * hidden_size..(row + 1) * hidden_size]
+                .copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
+        }
+        let mut hidden = self.device.htod_sync_copy(&host_embd).map_err(|e| format!("embedding htod: {e}"))?;
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            hidden = self.forward_layer_batched(layer, hidden, start_pos, rows, &mut k_caches[layer_idx], &mut v_caches[layer_idx])?;
+        }
+
+        Ok((ids, hidden, k_caches, v_caches, start_pos + rows))
+    }
+
+    /// Copies row `rows - 1` (the last prompt position) out of a batched
+    /// `[rows, hidden_size]` prefill output (`Self::prefill_dense_batched`)
+    /// into its own owned buffer. Every current caller only wants that row
+    /// to continue generation/scoring from, but needs it as an owned
+    /// `CudaSlice` rather than a borrowed view, since callers go on to
+    /// reassign it from `Self::forward_one_token_dense`'s per-token decode
+    /// loop.
+    fn last_row(&self, hidden_batched: &CudaSlice<f32>, rows: usize, hidden_size: usize) -> Result<CudaSlice<f32>, String> {
+        let offset = (rows - 1) * hidden_size;
+        let mut out = self.device.alloc_zeros::<f32>(hidden_size).map_err(|e| format!("last_row alloc: {e}"))?;
+        let src = hidden_batched.slice(offset..offset + hidden_size);
+        self.device.dtod_copy(&src, &mut out).map_err(|e| format!("last_row dtod: {e}"))?;
+        Ok(out)
+    }
+
     /// Shared dense/MoE implementation behind `forward_prompt`,
     /// `forward_prompt_capture_kv`, and `generate` (Phase 3 round 2):
     /// decodes new tokens one at a time (via `Self::prefill_dense` for the
@@ -2158,7 +2660,9 @@ impl Model {
             return Err("max_new_tokens must be at least 1".to_string());
         }
 
-        let (_ids, mut hidden, mut k_caches, mut v_caches, mut position) = self.prefill_dense(prompt, imported, max_new_tokens)?;
+        let (ids, hidden_batched, mut k_caches, mut v_caches, mut position) =
+            self.prefill_dense_batched(prompt, imported, max_new_tokens)?;
+        let mut hidden = self.last_row(&hidden_batched, ids.len(), self.cfg.hidden_size)?;
 
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
         let mut next_id = self.lm_head_argmax(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
@@ -2225,7 +2729,9 @@ impl Model {
             candidates.iter().map(|c| self.resolve_candidate_token_ids(prompt, &c.text)).collect::<Result<_, _>>()?;
         let max_len = resolved.iter().map(Vec::len).max().unwrap_or(1);
 
-        let (_, hidden, mut k_caches, mut v_caches, base_position) = self.prefill_dense(prompt, None, max_len.saturating_sub(1))?;
+        let (ids, hidden_batched, mut k_caches, mut v_caches, base_position) =
+            self.prefill_dense_batched(prompt, None, max_len.saturating_sub(1))?;
+        let hidden = self.last_row(&hidden_batched, ids.len(), self.cfg.hidden_size)?;
 
         // Batched first-token gather: the sub-50ms win for the common
         // single-token case (Yes/No, A-D, a 1-10 scale).
@@ -3102,6 +3608,59 @@ impl Model {
 
         let cache = crate::kv_io::MlaKvCache { seq_len, qk_dim, kv_caches };
         Ok(((generated[0], text), cache))
+    }
+}
+
+#[cfg(test)]
+mod prefill_batching_tests {
+    use super::*;
+    use crate::gguf::GgufFile;
+    use cudarc::driver::CudaDevice;
+
+    /// Byte-exact-ish cross-check of `prefill_dense_batched` (cuBLAS GEMM +
+    /// batched RoPE/attention) against `prefill_dense` (the original
+    /// sequential per-token loop) on the same prompt/weights -- this is the
+    /// blocking check before trusting any batched-prefill latency number
+    /// (cuBLAS's summation order, RoPE's per-row position math, and the
+    /// batched attention kernel's causal masking are exactly the places a
+    /// silently-wrong-but-non-crashing bug would hide). Compares every row
+    /// of the batched hidden state against the
+    /// corresponding sequential-path position, plus the final argmax token
+    /// id. Real GGUF fixtures live outside this repo (gitignored), so this
+    /// is `#[ignore]`d by default -- run with:
+    /// `COLDSTART_TEST_GGUF=<path> cargo test --release -- --ignored prefill_dense_batched_matches_sequential_prefill`
+    #[test]
+    #[ignore]
+    fn prefill_dense_batched_matches_sequential_prefill() {
+        let gguf_path = std::env::var("COLDSTART_TEST_GGUF").expect("set COLDSTART_TEST_GGUF to a real local GGUF path to run this test");
+        let prompt = "The capital of France is";
+
+        let file = GgufFile::open(&gguf_path).expect("failed to open COLDSTART_TEST_GGUF");
+        let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+        let model = Model::load(device, &file).expect("failed to load model");
+
+        let (seq_ids, seq_hidden, _, _, seq_position) =
+            model.prefill_dense(prompt, None, 0).expect("prefill_dense failed");
+        let (batch_ids, batch_hidden, _, _, batch_position) =
+            model.prefill_dense_batched(prompt, None, 0).expect("prefill_dense_batched failed");
+
+        assert_eq!(seq_ids, batch_ids, "tokenization must match between the two prefill paths");
+        assert_eq!(seq_position, batch_position, "final position must match between the two prefill paths");
+
+        let rows = batch_ids.len();
+        let hidden_size = model.cfg.hidden_size;
+        let batch_last_row = model.last_row(&batch_hidden, rows, hidden_size).expect("last_row failed");
+
+        let seq_host = model.device.dtoh_sync_copy(&seq_hidden).expect("seq hidden dtoh failed");
+        let batch_host = model.device.dtoh_sync_copy(&batch_last_row).expect("batch hidden dtoh failed");
+        assert_eq!(seq_host.len(), batch_host.len());
+        for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-3, "hidden[{i}]: sequential={a}, batched={b}");
+        }
+
+        let seq_argmax = model.lm_head_argmax(&seq_hidden, hidden_size, model.cfg.rmsnorm_eps).expect("seq argmax failed");
+        let batch_argmax = model.lm_head_argmax(&batch_last_row, hidden_size, model.cfg.rmsnorm_eps).expect("batch argmax failed");
+        assert_eq!(seq_argmax, batch_argmax, "greedy-argmax next token must match between the two prefill paths");
     }
 }
 

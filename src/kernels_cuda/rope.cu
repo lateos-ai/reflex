@@ -36,6 +36,45 @@ extern "C" __global__ void rope_kernel(
     }
 }
 
+// Batched prefill variant of rope_kernel: rotates `m` rows in place in one
+// launch instead of one `rope_kernel` launch per row, each row at its own
+// absolute position `start_pos + row` (unlike rope_kernel's single scalar
+// `position`, which only ever serves the M=1 decode step -- see model.rs's
+// `Model::prefill_dense_batched`). `t` is row-major (m, num_heads, head_dim).
+// Same GPT-NeoX-style half-split rotation as rope_kernel otherwise.
+extern "C" __global__ void rope_batch_kernel(
+    float* __restrict__ t,
+    unsigned int start_pos,
+    unsigned int num_heads,
+    unsigned int head_dim,
+    unsigned int rotary_dim,
+    unsigned int m,
+    float base
+) {
+    unsigned int half_rotary = rotary_dim / 2;
+    unsigned long long total_pairs = (unsigned long long)m * num_heads * half_rotary;
+    unsigned long long global_tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (unsigned long long idx = global_tid; idx < total_pairs; idx += (unsigned long long)gridDim.x * blockDim.x) {
+        unsigned int i = idx % half_rotary;
+        unsigned int head = (idx / half_rotary) % num_heads;
+        unsigned int row = idx / (half_rotary * (unsigned long long)num_heads);
+        unsigned int position = start_pos + row;
+
+        float exponent = (2.0f * (float)i) / (float)rotary_dim;
+        float theta = (float)position / powf(base, exponent);
+        float cos_t = cosf(theta);
+        float sin_t = sinf(theta);
+
+        unsigned long long base_idx = ((unsigned long long)row * num_heads + head) * head_dim;
+        float x1 = t[base_idx + i];
+        float x2 = t[base_idx + i + half_rotary];
+
+        t[base_idx + i] = x1 * cos_t - x2 * sin_t;
+        t[base_idx + i + half_rotary] = x1 * sin_t + x2 * cos_t;
+    }
+}
+
 // "Normal" RoPE (llama.cpp's LLAMA_ROPE_TYPE_NORM -- rotates pairs of *consecutive*
 // elements (2i, 2i+1), unlike rope_kernel's GPT-NeoX-style half-split pairs (i, i +
 // rotary_dim/2)). Used by DeepSeek-V2/V3 MLA's q_pe/k_pe (confirmed against
