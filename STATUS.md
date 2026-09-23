@@ -59,7 +59,8 @@ caveats are in README.md's "Benchmark expansion" section, summarized here:
 |---|---|
 | llama.cpp (re-verified) | Found and fixed a real ~1.4x regression (CUDA-context-teardown cost, not the forward pass) via `coldstart_infer::fast_exit`. **Now ~1.3-1.4x faster than llama.cpp**, not just parity |
 | vLLM (`scripts/bench_cold_vllm.sh`) | **coldstart-infer ~24-52x faster.** Weight-format deviation disclosed: installed vLLM 0.30.0 has no GGUF support at all, so vLLM ran against the HF safetensors checkpoint instead of the GGUF fixture |
-| TypeSafe Jev latency citation (`scripts/bench_cold_system1_vs_jev.sh`) | Reported honestly as a loss: coldstart-infer's System1 cold start is ~10-60x *slower* than Jev's published figures — dominated by cold-loading the GGUF from disk, which Jev's always-resident managed service never pays. Illustrative citation only, not a benchmark claim |
+| TypeSafe Jev latency citation, cold (`scripts/bench_cold_system1_vs_jev.sh`) | Reported honestly as a loss: coldstart-infer's System1 cold start is ~10-60x *slower* than Jev's published figures — dominated by cold-loading the GGUF from disk, which Jev's always-resident managed service never pays. Illustrative citation only, not a benchmark claim |
+| TypeSafe Jev latency citation, warm (`bench_coldstart --candidate`) | Fairer axis: Jev's 10-15ms figure is itself warm/compute-only. coldstart-infer's warm System1 scoring is 19.4ms at the shortest prompt bucket (29 tokens) — within ~1.3-2x, competitive, not a loss. Published alongside the cold citation, not instead of it |
 | Ollama, TGI, TensorRT-LLM/Triton, other cloud/serverless vendors | Deliberately deferred this round, not attempted — see DECISIONS.md for rationale |
 
 ## MLA (MVP step 4)

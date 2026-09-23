@@ -1342,3 +1342,32 @@ is on the record rather than glossed over.
 
 Raw `/usr/bin/time -v` logs and stdout/stderr for every run above are kept under
 `bench-results/` (gitignored) for inspection.
+
+**A fairer axis, run separately**: Jev's 10-15ms figure is itself a *warm, compute-
+only* number (an always-resident service, no cold load) — comparing it against
+coldstart-infer's cold-process figure above answers "should you self-host a fresh
+process per decision instead of calling an always-on API" (no), but says nothing
+about System1's actual scoring mechanism, which is what Jev's number is actually
+about. `bench_coldstart --candidate " True" --candidate " False"` (already-existing
+warm-latency microbenchmark, model loaded once, `warmup=5 iters=50`, same A6000,
+same GGUF) isolates exactly that — no process launch, no GGUF load, just the
+gather-GEMV scoring step itself, across three prompt-length buckets:
+
+| prompt tokens | System1 warm p50 | p90 | p99 |
+|---:|---:|---:|---:|
+| 29 | 19.4ms | 23.0ms | 24.8ms |
+| 113 | 36.4ms | 37.6ms | 39.8ms |
+| 449 | 144.9ms | 150.1ms | 157.6ms |
+
+At the shortest bucket (29 tokens — closest in shape to a minimal "state + question"
+input) coldstart-infer's warm System1 scoring is **19.4ms, within ~1.3-2x of Jev's
+10-15ms compute figure** — not the 10-60x gap the cold-start citation above shows.
+Even the largest bucket (449 tokens) stays well under Jev's cited 500ms end-to-end
+upper bound. Same caveats as above still apply (Jev's number is self-reported, no
+decision-quality comparison), but this is the comparison that's actually apples-to-
+apples on what Jev's figure measures — a warm decision engine's scoring latency, not
+a cold process's total launch cost. **Both numbers matter and answer different
+questions**: cold-start-to-decision (self-hosting loses badly, above) vs. warm
+per-decision scoring speed (self-hosting is competitive, here) — reporting only one
+of them would be the kind of cherry-picking this project's methodology explicitly
+rejects.

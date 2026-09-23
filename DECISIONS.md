@@ -782,6 +782,19 @@ published materials) deployed on the same A6000 instance — pursue that as a se
 explicitly-scoped decision if/when access and pricing are confirmed, rather than
 retroactively upgrading this citation into a benchmark claim.
 
+**Addendum, same round**: the cold-start citation above reported coldstart-infer
+losing by ~10-60x, which is honest but incomplete — Jev's 10-15ms figure is itself a
+*warm, compute-only* number (an always-resident service pays no cold load), so citing
+it only against coldstart-infer's *cold* number answers a different question than the
+one Jev's figure is actually about. Added a second, separate citation using the
+existing `bench_coldstart --candidate` warm-latency microbenchmark (model loaded
+once, isolates just the gather-GEMV scoring step): at the shortest prompt-length
+bucket (29 tokens), coldstart-infer's warm System1 p50 is 19.4ms, within ~1.3-2x of
+Jev's 10-15ms — competitive, not a loss. Both citations are published side by side in
+README.md, not just the favorable one — cold-start-to-decision and warm-per-decision-
+scoring answer genuinely different questions, and reporting only one would be exactly
+the kind of cherry-picking this project's methodology exists to avoid.
+
 ## Fast-exit after printing the benchmark result (`coldstart_infer::fast_exit`)
 
 **Decision**: `qwen3_coldstart`/`system1_coldstart`/`smoke_coldstart` call
