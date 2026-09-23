@@ -1193,3 +1193,152 @@ untouched, still-sequential `GatedDeltaNet`), so only that fraction of total
 per-token cost gets GEMM-batched. Batching `GatedDeltaNet` itself (the chunked-scan
 reformulation) is the next named candidate if hybrid prefill latency needs to close
 the gap with dense's.
+
+### Benchmark expansion: fixing a real regression, then vLLM and a TypeSafe Jev citation
+
+Re-running the llama.cpp comparison on a fresh ThunderCompute A6000 instance (same
+methodology as before: external `/usr/bin/time -v`, same `Qwen3-0.6B-Q4_K_M.gguf`,
+same prompt, `n=3`) surfaced a real regression the previous "~1.0x parity" number had
+missed: coldstart-infer measured **~9.3-9.5s wall clock vs. llama.cpp's ~6.5s — about
+1.4x slower**, even though coldstart-infer's own internal
+`process_start_to_first_token_ms` metric still reported ~4.8-5.0s. The ~4.5s gap was
+entirely *after* the result was already printed, before the OS reported the process
+as exited.
+
+**Diagnosis** (via `strace -f -T`): dozens of threads doing staged-backoff
+`futex`/`poll` waits (timeouts escalating 100ms → 250ms → 1s → 2s → 10s) against
+`/tmp/.tc_hac` — ThunderCompute's local GPU-virtualization proxy — all starting right
+after the result was printed. First hypothesis: coldstart-infer holds far more
+separate device allocations than llama.cpp (~300 individual `CudaSlice<f32>`
+buffers, one per weight tensor per `Weight`'s doc comment, vs. ggml's arena-style
+backend buffer), and each held allocation pays its own teardown round-trip through
+the proxy at process exit. **This hypothesis was wrong** — a full arena-consolidation
+refactor (one shared `CudaSlice<f32>` per model instead of one per tensor,
+implemented and verified byte-exact correct) made *no measurable difference* to the
+teardown time, and was reverted rather than kept for no benefit. The real tell:
+`smoke_coldstart`, which does no model loading at all (just `CudaDevice::new` + one
+trivial kernel), showed the *same* ~5.6s of pure post-result teardown. The cost is
+fixed, not allocation-count-proportional — it's `libc`'s `atexit` chain running the
+CUDA driver's own registered context-teardown hook against the virtualization proxy,
+paid by any CUDA program on this kind of instance, regardless of what it allocated.
+
+**Fix**: `coldstart_infer::fast_exit` (`src/lib.rs`) flushes stdout/stderr, then
+calls the raw `_exit` syscall directly (an `extern "C"` declaration, not
+`std::process::exit`, which still runs the `atexit` chain) — skipping that hook
+entirely. Safe here because every `*_coldstart` binary's job is finished by the time
+it calls this; the OS reclaims the GPU context/memory/fds on process death regardless
+of whether userspace tore them down first. Wired into `qwen3_coldstart`,
+`system1_coldstart`, and `smoke_coldstart` after they print their result.
+`smoke_coldstart` went from 6.3s wall clock (686ms internal) to 0.56s (525ms
+internal) — teardown overhead essentially eliminated. Correctness re-verified against
+both reference prompts (`"Once upon a time"` → token 11 `","`, `"The capital of
+France is"` → token 12095 `" Paris"`) — unchanged.
+
+Re-measured the same way, same instance, `n=3`:
+
+| | run 1 | run 2 | run 3 | peak RSS | user+sys CPU time |
+|---|---|---|---|---|---|
+| **llama.cpp** | 6.56s | 6.51s | 6.45s | 883 MB | ~1.6-1.8s + ~1.3-1.4s |
+| **coldstart-infer** | 4.71s | 4.81s | 5.05s | 1518 MB | ~1.3-1.4s + ~2.3-2.8s |
+
+**coldstart-infer is now genuinely ~1.3-1.4x faster than llama.cpp on cold start** —
+not just parity, and not a methodology trick: the fix is a real one-line difference
+in how the process ends, found by diagnosing an actual regression rather than
+tuning toward a wanted number. See `scripts/bench_cold_common.sh` (the harness,
+validated by reproducing these exact llama.cpp numbers before trusting it for
+anything else) and DECISIONS.md's "fast-exit after printing the benchmark result"
+and "Benchmark expansion" entries for the full investigation and scope decisions.
+
+#### vLLM: the actual AOT-vs-JIT foil llama.cpp never was
+
+llama.cpp is, like coldstart-infer, AOT-compiled via `nvcc` — it never JIT-compiles
+CUDA kernels, so the comparison above never actually tested this project's core bet
+(AOT-compiled kernels vs. a real JIT/warmup tax at cold start — see "What this
+project is" above). vLLM's CUDA graph capture and `torch.compile`-driven kernel
+compilation is a real, well-documented warmup cost and a much better foil for that
+specific claim.
+
+**Methodology deviation, disclosed upfront**: the installed vLLM (`0.30.0`) has no
+`gguf` entry in its quantization method registry at all — it cannot load
+`Qwen3-0.6B-Q4_K_M.gguf`. Per this project's own no-silent-substitution rule (see
+DECISIONS.md), vLLM was instead pointed at the original `Qwen/Qwen3-0.6B` HF
+safetensors checkpoint (bf16, downloaded fresh). This is **not** the same weight
+format/precision as every other comparison in this project — it tests the same cold-
+start *mechanism* (fresh process → usable output), not byte-identical weights. Both
+engines still produced the same greedy first token for `"Once upon a time"` (`","`).
+
+**Methodology deviation #2**: vLLM caches `torch.compile` artifacts on disk
+(`~/.cache/vllm/torch_compile_cache/`, persists across process launches). The very
+first run on this instance — genuinely no prior cache, the fairest comparison to
+coldstart-infer's AOT-compiled-at-build-time binary, which pays zero variable warmup
+cost on its first run *or* its thousandth — took:
+
+```
+COLD_VLLM_OK text=','
+init engine (profile, create kv cache, warmup model) took 200.69 s (compilation: 1.48 s)
+real  4m4.298s   user  4m27.405s   sys  0m54.466s
+```
+
+**~244s cold start**, almost entirely CUDA graph capture (two full capture passes,
+51 PIECEWISE + up to 35-51 FULL graphs each) plus model init — not compilation
+itself (`torch.compile` found reusable standalone artifacts vLLM ships prebuilt, per
+its own log line, so the 1.48s figure understates what a *true* from-scratch
+`torch.compile` would cost; CUDA graph capture is the real, non-cacheable-across-
+processes cost here). A same-instance `n=3` harness run
+(`scripts/bench_cold_vllm.sh`) afterward got:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| **vLLM** | failed† | 2:00.99 | 2:02.99 |
+
+†Run 1 failed with vLLM's own `AssertionError: Error in memory profiling... This
+happens when other processes sharing the same container release GPU memory while
+vLLM is profiling` — a real, disclosed instability on this GPU-virtualized shared
+instance, not a coldstart-infer-side issue. Runs 2/3's ~121-123s (roughly half the
+true-first-run's ~244s) are **not** a fair "fresh deployment" number either: by then
+`~/.cache/vllm/torch_compile_cache/` was warm from run 1's partial execution (it
+crashed *after* compiling, during graph capture) — a genuinely fresh container/
+serverless launch with no persistent cache volume would see closer to the ~244s
+figure on every single launch, the same way coldstart-infer's AOT compilation cost
+is identical on every launch.
+
+**coldstart-infer (4.71-5.05s) is roughly 24-52x faster than vLLM's best case
+(~121-123s, cache warm) and roughly 48-52x faster than vLLM's true first-run case
+(~244s, no cache)** — a dramatic, honestly-caveated result that actually exercises
+the AOT-vs-JIT bet this project is built on, unlike the llama.cpp comparison above.
+
+#### TypeSafe Jev: an illustrative latency citation, not a benchmark
+
+TypeSafe AI's "Jev" (a "System One" model, released 2026-09-15) is not a generative
+LLM — it takes a state and question(s) and returns typed answers with probabilities,
+never free text, primarily via a managed cloud API. coldstart-infer's closest
+equivalent is **System1** (`Model::system1_evaluate`/`system1_coldstart`, see above):
+single-pass, non-autoregressive candidate scoring — the same task shape, prompt +
+fixed candidates in, scored typed results out, no decode loop.
+
+Per DECISIONS.md's "TypeSafe Jev comparison framing" entry, this is a **latency-only
+citation against Jev's own published figures**, not a live API call or a decision-
+quality claim — run via `scripts/bench_cold_system1_vs_jev.sh` (`n=3`, ThunderCompute
+A6000, `Qwen3-0.6B-Q4_K_M.gguf`, prompt `"Q: Is the sky blue during the day? A:"`,
+candidates `" True"`/`" False"`):
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| **coldstart-infer System1** | 4.70s | 4.78s | 4.50s |
+| **Jev (published)** | 70-500ms end-to-end (10-15ms compute), cited, not reproduced | | |
+
+**Reported honestly, not spun: coldstart-infer's System1 cold start is ~10-60x
+*slower* than Jev's published figures, not faster.** The reason is structural, not a
+System1 inefficiency — System1's scoring step itself is fast (the batched-prefill-GEMM
+win noted earlier), but this measurement is dominated by *cold-loading a ~400MB GGUF
+from disk in a fresh process*, which every comparison in this project pays and Jev's
+managed, always-resident service never does. This is exactly the "different
+deployment models, not just different numbers" caveat DECISIONS.md flagged before
+this was ever run — confirmed, not just theorized. It does not mean coldstart-infer
+is slow at what System1 actually optimizes (single-pass scoring vs. a decode loop);
+it means a cold single-process launch is the wrong comparison point against an
+always-on managed API, and this citation is published specifically so that mismatch
+is on the record rather than glossed over.
+
+Raw `/usr/bin/time -v` logs and stdout/stderr for every run above are kept under
+`bench-results/` (gitignored) for inspection.

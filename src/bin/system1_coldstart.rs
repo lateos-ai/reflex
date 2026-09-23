@@ -10,6 +10,11 @@
 //! Usage: `system1_coldstart <path-to-gguf> <prompt> --candidate <text>
 //! [--candidate <text> ...] [--temperature T] [--lora <adapter.gguf>]`
 //!
+//! Exits via `coldstart_infer::fast_exit` after printing the result instead
+//! of returning from `main` normally -- see that function's doc comment for
+//! why a graceful return costs several extra seconds of CUDA-context-
+//! teardown wall-clock time on GPU-virtualized rented instances.
+//!
 //! Dense/MoE Qwen3 models only (see `Model::system1_evaluate`'s doc
 //! comment) -- hybrid Qwen3.5 and DeepSeek-V2/V3 MLA are rejected with a
 //! clear error, same as every other unsupported-architecture case in this
@@ -96,4 +101,5 @@ fn main() {
         best.text,
         response.entropy,
     );
+    coldstart_infer::fast_exit(0);
 }

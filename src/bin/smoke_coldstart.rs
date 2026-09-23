@@ -8,6 +8,11 @@
 //!
 //! Only builds/runs where a CUDA toolchain + GPU are present (build.rs requires nvcc
 //! unless COLDSTART_SKIP_CUDA=1 is set, in which case this binary has nothing to do).
+//!
+//! Exits via `coldstart_infer::fast_exit` after printing the result instead
+//! of returning from `main` normally -- see that function's doc comment for
+//! why a graceful return costs several extra seconds of CUDA-context-
+//! teardown wall-clock time on GPU-virtualized rented instances.
 
 use coldstart_infer::{aot, diagnostics};
 use cudarc::driver::{LaunchAsync, LaunchConfig};
@@ -49,4 +54,5 @@ fn main() {
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }
+    coldstart_infer::fast_exit(0);
 }

@@ -698,3 +698,126 @@ another ThunderCompute-style rented GPU-cloud instance (those have all reproduci
 been nested containers so far, per the original known-debt entry this session
 partially closed). See STATUS.md's updated Dockerfile entry for the precise remaining
 scope.
+
+## Benchmark expansion: vLLM added, Ollama/TGI/TensorRT-LLM/other-cloud-vendors deferred
+
+**Decision**: extend the cold-start benchmark suite with one new same-A6000 self-hosted
+comparison this round — **vLLM** — reusing the existing external-wall-clock methodology
+verbatim (`scripts/bench_cold_common.sh`, `scripts/bench_cold_vllm.sh`). Ollama, TGI,
+TensorRT-LLM/Triton, and serverless cloud vendors (Modal, Baseten, RunPod Serverless,
+Beam.cloud, fal.ai, Replicate) are explicitly deferred, not silently dropped.
+
+**Why vLLM specifically**: llama.cpp — this project's only existing comparison — is,
+like coldstart-infer, AOT-compiled via `nvcc`; it never JIT-compiles CUDA kernels. That
+means the llama.cpp comparison never actually tested this project's core technical bet
+(AOT-compiled kernels vs. a real JIT/warmup tax at cold start — see CLAUDE.md). vLLM's
+CUDA graph capture and (historically) `torch.compile`/JIT-driven kernel compilation is a
+real, well-documented cold-start cost and a much better foil for that specific claim.
+Confirmed with the user before starting (this project's usual practice for scope
+decisions — see prior "Open decision" entries in STATUS.md).
+
+**Why the rest are deferred**: Ollama wraps llama.cpp's own ggml runtime, so it doesn't
+add a new data point on the AOT-vs-JIT question — it would test daemon/model-pull
+packaging overhead instead, a different claim, worth a future round on its own. TGI and
+TensorRT-LLM/Triton are meaningfully higher setup cost on a single shared, ephemeral
+ThunderCompute instance (heavier Python/Docker stack; TensorRT-LLM doesn't accept GGUF
+at all and needs a separate engine-build step per GPU arch) — not attempted without a
+clear reason to burn shared-instance hours on them. Other cloud/serverless vendors
+answer a different question entirely ("pay-per-request serverless cold boot" vs.
+"rent-your-own-GPU true process cold start") and introduce new vendor accounts and real
+recurring billing — gated on explicit future budget approval, not bundled into this
+round.
+
+**How to apply**: if vLLM's GGUF loader can't load the target Qwen3 fixture, document
+any fallback weight format as an explicit methodology deviation in README.md — same
+standard as the existing chat-template-parity caveat — rather than silently substituting
+it. When Ollama/TGI/TensorRT-LLM/other-cloud-vendor comparisons are eventually pursued,
+each needs its own scoped decision entry here, not a retroactive expansion of this one.
+
+**Update, same round**: the installed vLLM (`0.30.0`) turned out to have no `gguf`
+entry in its quantization method registry at all (confirmed via
+`vllm.model_executor.layers.quantization.QUANTIZATION_METHODS`) — not a config
+issue, GGUF loading isn't present in this version. Per the "how to apply" note
+above, this was disclosed rather than worked around silently: vLLM was pointed at
+the original `Qwen/Qwen3-0.6B` HF safetensors checkpoint instead (confirmed with the
+user first), and README.md's benchmark writeup states plainly that this tests the
+same cold-start mechanism, not byte-identical weights/precision, across engines.
+
+## TypeSafe Jev comparison framing: latency-only citation, not a live benchmark
+
+**Decision**: coldstart-infer's comparison against TypeSafe AI's "Jev" model
+(`scripts/bench_cold_system1_vs_jev.sh`) cites Jev's own **published** latency figures
+(10-15ms compute / 70-500ms end-to-end via TypeSafe's managed cloud API) next to a
+locally **measured** cold-start latency of coldstart-infer's System1 candidate-scoring
+path (`Model::system1_evaluate` / `system1_coldstart`, `process_start_to_result_ms`).
+This is deliberately **not** a live call to Jev's API, and deliberately **not** a
+decision-quality/calibration comparison — latency only, and labeled as an illustrative
+citation, never merged into the same results table as the vLLM/llama.cpp engine-vs-engine
+comparisons.
+
+**Why System1 (not `qwen3_coldstart`) is the right coldstart-infer surface for this
+comparison**: Jev is not a generative LLM — per TypeSafe's own description, it takes a
+state and one or more questions and returns typed answers with probabilities, never a
+sentence. A time-to-first-token comparison against coldstart-infer's normal
+autoregressive generation path would be apples-to-oranges. `Model::system1_evaluate`
+(single-pass, non-autoregressive candidate scoring — see README's "System1" section) is
+the same task shape: prompt + fixed candidates in, scored typed results + probabilities
+out, no decode loop.
+
+**Why latency-only, citation-based, not a live API call or quality claim**: (1) Jev's
+number necessarily includes a network round-trip to TypeSafe's managed cloud, while
+coldstart-infer's is a pure local process launch with zero network dependency at all —
+different deployment models, not just different numbers, so a literal head-to-head table
+would misrepresent both sides; (2) Jev is presumably purpose-trained for calibrated
+decision-making, while System1 is a generic instruction-tuned Qwen3 GGUF with an
+efficient scoring head — this project has no basis to claim decision-quality parity, only
+to measure its own latency on a comparable task shape; (3) calling Jev's live API adds a
+new vendor dependency, rate-limit exposure, and a benchmark-publication ToS question that
+citing already-published numbers avoids entirely. Confirmed with the user before
+starting.
+
+**How to apply**: if a genuine head-to-head is ever wanted, the only fair path is
+TypeSafe's enterprise on-prem tier (Docker/Kubernetes on local NVIDIA GPUs, per their own
+published materials) deployed on the same A6000 instance — pursue that as a separate,
+explicitly-scoped decision if/when access and pricing are confirmed, rather than
+retroactively upgrading this citation into a benchmark claim.
+
+## Fast-exit after printing the benchmark result (`coldstart_infer::fast_exit`)
+
+**Decision**: `qwen3_coldstart`/`system1_coldstart`/`smoke_coldstart` call
+`coldstart_infer::fast_exit(code)` (`src/lib.rs`) instead of returning from `main`
+normally, immediately after printing their result. It flushes stdout/stderr, then
+calls the raw `_exit` syscall via an `extern "C"` declaration — not
+`std::process::exit`, which still runs libc's `atexit` chain.
+
+**Why**: re-running the llama.cpp comparison on a fresh ThunderCompute A6000 this
+round surfaced a real regression — coldstart-infer measured ~1.4x *slower* than
+llama.cpp on full external wall-clock, even though its own internal
+`process_start_to_first_token_ms` metric was unchanged (~4.8-5.0s). `strace -f -T`
+showed ~4.5s of staged-backoff `futex`/`poll` waits against `/tmp/.tc_hac`
+(ThunderCompute's GPU-virtualization proxy) happening entirely *after* the result was
+printed. First hypothesis — too many separate device allocations (~300
+`CudaSlice<f32>` buffers, one per weight tensor) each paying their own teardown
+round-trip — was tested via a full arena-consolidation refactor (one shared buffer
+per model) and **made no measurable difference**, so it was reverted rather than kept
+for no benefit (see git history for that attempt; not present in the current tree).
+The actual tell: `smoke_coldstart`, which allocates almost nothing, showed the *same*
+~5.6s of pure post-result teardown. The cost is fixed per-process, not
+allocation-count-proportional — it's the CUDA driver's own `atexit`-registered
+context-teardown hook handshaking with the virtualization proxy, paid by any CUDA
+program on this kind of shared/virtualized instance. Confirmed the fix actually works
+by testing a raw `_exit()` diagnostically first (`smoke_coldstart`: 6.3s → 0.56s wall
+clock) before wiring it into the real binaries.
+
+**Why this is safe**: every one of these binaries' job (compute a result, print it)
+is finished by the time `fast_exit` runs. The OS reclaims the GPU context, device
+memory, and file descriptors on process death regardless of whether userspace tore
+them down gracefully first — `_exit` skips only the *graceful* teardown handshake,
+not actual resource reclamation. Buffered-writer flushing (the one thing `_exit`
+genuinely skips that matters) is done explicitly first.
+
+**How to apply**: any future `*_coldstart`-style binary whose job ends by printing a
+result should call `fast_exit` the same way. This is deliberately not applied to
+`check_correctness`/library code/the IPC server binaries — panics and multi-request
+servers should keep normal Rust unwind/cleanup semantics; this is specifically for
+single-shot CLI binaries measuring their own process lifetime.

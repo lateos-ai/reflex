@@ -3,6 +3,11 @@
 //! `model::Model::generate`, and reports wall-clock time from process start
 //! to the first generated token -- the project's actual target metric.
 //!
+//! Exits via `coldstart_infer::fast_exit` after printing the result instead
+//! of returning from `main` normally -- see that function's doc comment for
+//! why a graceful return costs several extra seconds of CUDA-context-
+//! teardown wall-clock time on GPU-virtualized rented instances.
+//!
 //! Also the CLI entry point for Phase 3 (State I/O)'s KV-cache export/
 //! import: `--export-kv <file>` downloads the K/V cache produced by this
 //! run's initial prompt pass and writes it to `<file>` (dense/MoE, hybrid
@@ -158,7 +163,7 @@ fn main() {
             "COLDSTART_QWEN3_OK process_start_to_first_token_ms={:.3} token_id={token_id} token_text={text:?}",
             elapsed.as_secs_f64() * 1000.0
         );
-        return;
+        coldstart_infer::fast_exit(0);
     }
 
     let imported = import_kv.as_ref().map(|path| kv_io::import_kv(path).expect("failed to import KV cache"));
@@ -180,4 +185,5 @@ fn main() {
         tokens[0],
         token_ids.join(","),
     );
+    coldstart_infer::fast_exit(0);
 }

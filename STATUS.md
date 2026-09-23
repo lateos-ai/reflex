@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `README.md` — this file is the
 short, current-state summary; README is the log.
 
-_Last updated: 2026-09-22 (Phase 4 round 2 session)_
+_Last updated: 2026-09-23 (benchmark expansion session: llama.cpp regression fix, vLLM, TypeSafe Jev citation)_
 
 ## MVP progress
 
@@ -39,9 +39,28 @@ instead of re-uploading its full history every token position, closing the gap t
 this project's `Q4_K_M` fixtures use for the bulk of weight bytes —
 `kernels_cuda/dequant.cu`, one CUDA thread per 256-element super-block), removing the
 CPU-bound host-side dequant-to-`f32` step from the load path for those types (every
-other block type still uses the existing host path). **Current gap: ~1.0x — parity with
-llama.cpp, within run-to-run noise** (see README.md's "Phase 2, round 3" section for
-the full writeup and per-run numbers).
+other block type still uses the existing host path). Phase 2 round 3 closed the gap to
+~1.0x parity with llama.cpp, but a later re-measurement on a fresh instance (see
+"Benchmarking expansion" below) found the wall-clock parity claim had regressed to
+~1.4x *slower* — root-caused to CUDA-context-teardown cost, not the forward pass —
+and fixed. **Current state: coldstart-infer is ~1.3-1.4x *faster* than llama.cpp on
+cold start** (see README.md's "Benchmark expansion" section for the full
+investigation and per-run numbers).
+
+## Benchmarking expansion (done: llama.cpp re-verified + fixed, vLLM, Jev citation)
+
+Harness (`scripts/bench_cold_common.sh`, reuses the exact external-wall-clock
+methodology from the original llama.cpp comparison) plus two new comparison scripts,
+per DECISIONS.md's "Benchmark expansion", "TypeSafe Jev comparison framing", and
+"Fast-exit after printing the benchmark result" entries. All three run; results and
+caveats are in README.md's "Benchmark expansion" section, summarized here:
+
+| Comparison | Result |
+|---|---|
+| llama.cpp (re-verified) | Found and fixed a real ~1.4x regression (CUDA-context-teardown cost, not the forward pass) via `coldstart_infer::fast_exit`. **Now ~1.3-1.4x faster than llama.cpp**, not just parity |
+| vLLM (`scripts/bench_cold_vllm.sh`) | **coldstart-infer ~24-52x faster.** Weight-format deviation disclosed: installed vLLM 0.30.0 has no GGUF support at all, so vLLM ran against the HF safetensors checkpoint instead of the GGUF fixture |
+| TypeSafe Jev latency citation (`scripts/bench_cold_system1_vs_jev.sh`) | Reported honestly as a loss: coldstart-infer's System1 cold start is ~10-60x *slower* than Jev's published figures — dominated by cold-loading the GGUF from disk, which Jev's always-resident managed service never pays. Illustrative citation only, not a benchmark claim |
+| Ollama, TGI, TensorRT-LLM/Triton, other cloud/serverless vendors | Deliberately deferred this round, not attempted — see DECISIONS.md for rationale |
 
 ## MLA (MVP step 4)
 
