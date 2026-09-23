@@ -834,3 +834,29 @@ result should call `fast_exit` the same way. This is deliberately not applied to
 `check_correctness`/library code/the IPC server binaries — panics and multi-request
 servers should keep normal Rust unwind/cleanup semantics; this is specifically for
 single-shot CLI binaries measuring their own process lifetime.
+
+## Ollama benchmark: three scenarios reported separately, flakiness disclosed not averaged
+
+**Decision**: `scripts/bench_cold_ollama.sh` measures Ollama cold-start across three
+distinct scenarios (cold daemon + cold model, warm daemon + cold model, warm daemon +
+warm model) rather than one number, and reports every individual run rather than
+just a mean/median when the results are inconsistent.
+
+**Why**: Ollama wraps llama.cpp's own ggml runtime (confirmed via its logs, which show
+it spawning a bundled `llama-server` subprocess) — it doesn't test the AOT-vs-JIT
+question `bench_cold_vllm.sh` does, it tests real daemon/packaging overhead, per the
+original "Benchmark expansion" entry's rationale for deferring it. Measuring it
+surfaced a genuine, reproducible finding: Ollama's bundled `llama-server` hits its own
+`"GPU discovery watchdog timed out"` error intermittently on this ThunderCompute
+instance — 2/7 cold-daemon runs and 3/5 warm-daemon-cold-model runs stalled to
+~55-62s instead of the ~6-11s the other runs showed. This is the same class of
+GPU-virtualization-layer slowdown the `fast_exit` fix above addresses, but inside
+Ollama's own process, not coldstart-infer's — nothing here to fix on this project's
+side. Averaging these runs into one number would hide a real, user-relevant
+reliability difference (coldstart-infer/llama.cpp's own cold-start runs this session
+stayed within single-digit-percent variance; Ollama's did not) — reporting every run
+individually keeps that visible.
+
+**How to apply**: if Ollama is benchmarked again on different infrastructure, check
+whether the same intermittent stall reproduces before assuming either the ~6-7s or
+the ~55-60s figure is "the" number — on this environment, neither alone is honest.

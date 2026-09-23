@@ -1249,6 +1249,40 @@ validated by reproducing these exact llama.cpp numbers before trusting it for
 anything else) and DECISIONS.md's "fast-exit after printing the benchmark result"
 and "Benchmark expansion" entries for the full investigation and scope decisions.
 
+**`fast_exit` re-verified across every architecture**, not just dense Qwen3 — it's a
+shared code path (`qwen3_coldstart`'s single exit point, regardless of which of
+`Model::load`'s dense/MoE/`load_hybrid`/`load_mla` dispatch ran), so a regression in
+one would very plausibly regress the others too:
+
+| architecture | fixture | check | result |
+|---|---|---|---|
+| MoE | `Tiny-Moe.Q4_K_M.gguf` | `"Once upon a time"` → token 4036 | matches golden value; clean 1.8s wall-clock exit |
+| Hybrid (Qwen3.5) | `Qwen3.5-0.8B-Q4_K_M.gguf` | `"Once upon a time"` → token 11 `","`, `"The capital of France is"` → token 279 `" the"` | both match; clean 8.2s wall-clock exit |
+| MLA (synthetic) | `deepseek-tiny-mla.gguf` | deterministic across repeated runs, no golden value recorded for this fixture/prompt | deterministic (token 57785 both runs); clean ~2.0s wall-clock exit |
+
+Also re-ran the `#[ignore]`d batched-vs-sequential-prefill oracle tests against real
+fixtures for all three: `prefill_dense_batched_matches_sequential_prefill` (against
+`Tiny-Moe.Q4_K_M.gguf`, exercising the MoE per-expert dispatch path),
+`hybrid_batching_tests::prefill_hybrid_batched_matches_sequential` (against
+`Qwen3.5-0.8B-Q4_K_M.gguf`), and all three MLA `mla_batching_tests` that don't
+require the real DeepSeek-V2-Lite checkpoint — all pass.
+`prefill_mla_batched_matches_sequential_real_moe_checkpoint` correctly rejected the
+synthetic fixture with its own explicit guard message (`"COLDSTART_TEST_GGUF must be
+a real deepseek2 checkpoint with MoE layers"`) rather than silently passing or
+crashing — that test needs the real 80GB-A100-class checkpoint from the MLA section
+below, not provisioned this session.
+
+**Small cleanup, same session**: every build this session warned that
+`prefill_dense`/`prefill_hybrid`/`prefill_mla` were unused — real, not a false
+positive, but not dead code either: they're the sequential-prefill verification
+oracles the batching tests just re-ran above, called only from `#[cfg(test)]`
+modules (`generate_dense_impl`/`system1_evaluate` switched to
+`prefill_dense_batched` when Batched Prefill GEMM landed; `prefill_hybrid`/
+`prefill_mla`'s doc comments already said as much, `prefill_dense`'s didn't). Marked
+all three `#[cfg(test)]` and fixed `prefill_dense`'s stale doc comment to match —
+warning gone, `cargo test` still 69 passed/0 failed/7 ignored, oracle tests above
+confirm the functions still work correctly under the new gating.
+
 #### vLLM: the actual AOT-vs-JIT foil llama.cpp never was
 
 llama.cpp is, like coldstart-infer, AOT-compiled via `nvcc` — it never JIT-compiles
@@ -1306,6 +1340,43 @@ is identical on every launch.
 (~121-123s, cache warm) and roughly 48-52x faster than vLLM's true first-run case
 (~244s, no cache)** — a dramatic, honestly-caveated result that actually exercises
 the AOT-vs-JIT bet this project is built on, unlike the llama.cpp comparison above.
+
+#### Ollama: a realistic packaging/daemon-overhead data point, not an AOT-vs-JIT test
+
+Ollama wraps llama.cpp's own ggml runtime — its logs show it spawning a bundled
+`llama-server` subprocess to actually run inference, so this doesn't add a new data
+point on the AOT-vs-JIT question above. What it tests is real anyway: the
+daemon/packaging overhead most people actually experience running a local model,
+via `ollama create <name> -f Modelfile` (`FROM <path-to-gguf>`, same
+`Qwen3-0.6B-Q4_K_M.gguf`) and `scripts/bench_cold_ollama.sh`, which measures three
+scenarios separately rather than conflating them into one number (`raw: true`,
+`temperature: 0`, `num_predict: 1`, timed via Ollama's own reported
+`total_duration`):
+
+| scenario | measurements (seconds) |
+|---|---|
+| 1. cold daemon + cold model (`ollama serve` freshly restarted, first request) | 5.90, 5.92, 6.72, 6.73, 6.90, 55.19, 61.98 |
+| 2. warm daemon + cold model (daemon running, model not yet loaded/reloaded after `ollama stop`) | 10.67, 10.88, 53.15, 57.57, 60.39 |
+| 3. warm daemon + warm model (steady state, already resident) | 0.0093, 0.0100, 0.0249, 0.0254, 0.0273, 0.0392 |
+
+**A real, reproducible, intermittent flakiness, not a fluke**: 2 of 7 scenario-1 runs
+and 3 of 5 scenario-2 runs hit Ollama's own `"llama-server GPU discovery watchdog
+timed out" error="context deadline exceeded"` — its bundled `llama-server`
+subprocess's GPU-probe stalling against ThunderCompute's virtualization layer (the
+same class of environment-specific slowdown behind the `fast_exit` fix above, but
+this time inside Ollama's own process, not coldstart-infer's, and not something this
+project can fix). When it doesn't hit the stall, scenario 1 (~6-7s) is directly
+competitive with llama.cpp/coldstart-infer's own cold-start range. When it does, it's
+~55-62s — an order of magnitude worse, unpredictably. Scenario 3 (model already
+loaded) is fast and reliable every time, as expected from a ggml/llama.cpp-class
+runtime once warm.
+
+**Reported as-is, not smoothed into a single headline number**: coldstart-infer's own
+cold-start numbers throughout this document are tight, single-digit-percent
+variance runs; Ollama's aren't, on this specific virtualized GPU environment. That
+inconsistency — not just the mean — is itself a real finding about what "run a local
+model" actually costs in practice on infrastructure like this, and burying it in an
+averaged number would misrepresent it.
 
 #### TypeSafe Jev: an illustrative latency citation, not a benchmark
 

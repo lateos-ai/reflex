@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `README.md` — this file is the
 short, current-state summary; README is the log.
 
-_Last updated: 2026-09-23 (benchmark expansion session: llama.cpp regression fix, vLLM, TypeSafe Jev citation)_
+_Last updated: 2026-09-23 (benchmark expansion session: llama.cpp regression fix, vLLM, TypeSafe Jev citation, Ollama, multi-architecture fast_exit re-verification, dead-code cleanup)_
 
 ## MVP progress
 
@@ -61,7 +61,18 @@ caveats are in README.md's "Benchmark expansion" section, summarized here:
 | vLLM (`scripts/bench_cold_vllm.sh`) | **coldstart-infer ~24-52x faster.** Weight-format deviation disclosed: installed vLLM 0.30.0 has no GGUF support at all, so vLLM ran against the HF safetensors checkpoint instead of the GGUF fixture |
 | TypeSafe Jev latency citation, cold (`scripts/bench_cold_system1_vs_jev.sh`) | Reported honestly as a loss: coldstart-infer's System1 cold start is ~10-60x *slower* than Jev's published figures — dominated by cold-loading the GGUF from disk, which Jev's always-resident managed service never pays. Illustrative citation only, not a benchmark claim |
 | TypeSafe Jev latency citation, warm (`bench_coldstart --candidate`) | Fairer axis: Jev's 10-15ms figure is itself warm/compute-only. coldstart-infer's warm System1 scoring is 19.4ms at the shortest prompt bucket (29 tokens) — within ~1.3-2x, competitive, not a loss. Published alongside the cold citation, not instead of it |
-| Ollama, TGI, TensorRT-LLM/Triton, other cloud/serverless vendors | Deliberately deferred this round, not attempted — see DECISIONS.md for rationale |
+| Ollama (`scripts/bench_cold_ollama.sh`) | Wraps llama.cpp's ggml runtime, so no new AOT-vs-JIT data point — but found real, reproducible intermittent flakiness (2/7 and 3/5 runs across two scenarios hit an internal ~55-62s GPU-discovery-watchdog stall vs. ~6-11s otherwise), reported per-run rather than averaged away |
+| TGI, TensorRT-LLM/Triton, other cloud/serverless vendors | Still deliberately deferred, not attempted — see DECISIONS.md for rationale |
+
+`fast_exit` re-verified across MoE (`Tiny-Moe.Q4_K_M.gguf`), hybrid
+(`Qwen3.5-0.8B-Q4_K_M.gguf`), and synthetic MLA (`deepseek-tiny-mla.gguf`) — all
+match documented golden tokens, all exit cleanly (no teardown-delay regression), and
+the batched-vs-sequential-prefill oracle tests pass against real fixtures for all
+three architectures (MLA's real-DeepSeek-V2-Lite-only test correctly declines the
+synthetic fixture rather than passing incorrectly). Also cleaned up the
+`prefill_dense`/`prefill_hybrid`/`prefill_mla` dead-code warnings every build this
+session showed — genuinely test-only now (`#[cfg(test)]` added), not a real bug;
+`prefill_dense`'s doc comment was stale and got fixed to match the other two's.
 
 ## MLA (MVP step 4)
 

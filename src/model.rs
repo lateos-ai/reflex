@@ -3084,22 +3084,23 @@ impl Model {
         }
     }
 
-    /// Shared prefix-processing step behind `generate_dense_impl` and
-    /// `system1_evaluate`: encodes `prompt` (a continuation, not a fresh
+    /// Sequential dense prefill: encodes `prompt` (a continuation, not a fresh
     /// prompt, when `imported.is_some()` -- no BOS is inserted in that
     /// case), seeds the K/V cache from `imported` first when resuming, then
     /// runs every prompt position through `forward_one_token_dense`
     /// sequentially, exactly like a from-scratch run just offset by
-    /// `imported`'s `seq_len`. `extra_headroom` sizes the K/V cache with
-    /// that many additional position slots beyond the encoded prompt itself
-    /// (`generate_dense_impl` passes `max_new_tokens`, since it will go on
-    /// to decode that many more positions into the same buffers;
-    /// `system1_evaluate` passes its longest candidate's token count minus
-    /// one, since it teacher-forces multi-token candidates into the same
-    /// headroom instead of decoding). Returns the encoded prompt ids
-    /// (including any inserted BOS), the final position's hidden state, the
-    /// filled K/V caches, and the next absolute position a caller may write
-    /// into.
+    /// `imported`'s `seq_len` -- the pre-batching behavior, kept unchanged
+    /// as the verification oracle for [`Self::prefill_dense_batched`]
+    /// (`prefill_batching_tests` below), the same role [`Self::prefill_hybrid`]
+    /// plays for `prefill_hybrid_batched`. Not used by `generate_dense_impl`/
+    /// `system1_evaluate` any more (both switched to `prefill_dense_batched`
+    /// -- see README's "Batched Prefill GEMM" section) -- kept only for the
+    /// oracle role and any future direct caller. `extra_headroom` sizes the
+    /// K/V cache with that many additional position slots beyond the
+    /// encoded prompt itself. Returns the encoded prompt ids (including any
+    /// inserted BOS), the final position's hidden state, the filled K/V
+    /// caches, and the next absolute position a caller may write into.
+    #[cfg(test)]
     fn prefill_dense(
         &self,
         prompt: &str,
@@ -4280,6 +4281,7 @@ impl Model {
     /// Not used by [`Self::generate_hybrid_impl`] any more (see that
     /// function's doc comment) -- kept only for the oracle role and any
     /// future direct caller.
+    #[cfg(test)]
     fn prefill_hybrid(
         &self,
         h: &HybridModel,
@@ -4651,6 +4653,7 @@ impl Model {
     /// [`Self::prefill_hybrid`] plays for `prefill_hybrid_batched`. Not used by
     /// [`Self::generate_mla_impl`] any more (see that function's doc comment) --
     /// kept only for the oracle role and any future direct caller.
+    #[cfg(test)]
     fn prefill_mla(
         &self,
         m: &MlaModel,
