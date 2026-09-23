@@ -1277,3 +1277,37 @@ questions**: cold-start-to-decision (self-hosting loses badly, above) vs. warm
 per-decision scoring speed (self-hosting is competitive, here) — reporting only one
 of them would be the kind of cherry-picking this project's methodology explicitly
 rejects.
+
+### CI: build + test on GitHub-hosted runners (no GPU, `REFLEX_SKIP_CUDA`)
+
+`.github/workflows/ci.yml` added — until now `.github/workflows/` only had the CLA
+bot, with no automated `cargo build`/`cargo test` on push/PR. No GitHub-hosted
+runner has an NVIDIA GPU or the CUDA toolkit, so this reuses the existing
+`REFLEX_SKIP_CUDA=1` escape hatch `build.rs` already documents for
+"editing/type-checking on a machine without CUDA" — it doesn't build or exercise any
+CUDA kernel, and can't stand in for real-hardware verification (see CLAUDE.md's "no
+CPU/mock fallback" note); it only catches non-GPU-dependent breakage (Rust
+compile errors, the 74 host-only unit tests across `dequant.rs`/`dequant_iq.rs`/
+`gguf.rs`/`moe.rs`/`tokenizer.rs`/`kv_io.rs`) before it reaches a human running the
+real GPU verification pass. Runs `cargo build --locked --all-targets` then `cargo
+test --locked` on a `[ubuntu-latest, windows-latest]` matrix (`build.rs` branches
+on `cfg!(windows)` for the `nvcc` binary name, so both platforms are worth covering
+even though neither can run kernels). The 7 GPU/real-fixture-dependent tests under
+`model.rs`'s `*_batching_tests`/`system1_tests` modules are already `#[ignore]`d by
+design and correctly skip in this environment — confirmed locally (74 passed, 7
+ignored) before adding the workflow.
+
+**Deliberately left out of this pass**: `cargo fmt --check` and `cargo clippy` are
+not wired into CI. `cargo fmt --check` found the existing tree isn't rustfmt-clean
+(`build.rs` alone had multiple pre-existing diffs) — enabling it would fail CI on
+unrelated code the moment it's turned on, not on anything this change touched.
+`cargo clippy --all-targets` found something more substantive: 12 real
+`clippy::not_unsafe_ptr_arg_deref` **errors** (a deny-by-default correctness lint,
+not a warning) in `src/ffi.rs` — every `extern "C"` entry point that dereferences a
+raw pointer (`reflex_load`, `reflex_generate`, `reflex_free`, etc.) is a plain `fn`,
+not an `unsafe fn`, even though C callers can pass any pointer including null/
+dangling ones. This is a real pre-existing gap in Phase 4 round 2's FFI surface, not
+a false positive — but fixing it means changing public `extern "C"` signatures
+(adding `unsafe`), which changes the `cbindgen`-generated `include/reflex_engine.h`
+contract and is exactly the kind of change this project asks about before starting
+(see STATUS.md's "Known debt" for this being tracked, not silently fixed here).

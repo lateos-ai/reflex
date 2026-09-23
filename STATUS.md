@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
 short, current-state summary; HISTORY.md is the log.
 
-_Last updated: 2026-09-23 (benchmark expansion session: llama.cpp regression fix, vLLM, TypeSafe Jev citation, Ollama, multi-architecture fast_exit re-verification, dead-code cleanup)_
+_Last updated: 2026-09-23 (CI added: build/test on GitHub-hosted runners via REFLEX_SKIP_CUDA; previous update: benchmark expansion session — llama.cpp regression fix, vLLM, TypeSafe Jev citation, Ollama, multi-architecture fast_exit re-verification, dead-code cleanup)_
 
 ## MVP progress
 
@@ -255,26 +255,49 @@ reused the still-running A6000 instance — see DECISIONS.md's Phase 4 round 2 e
 
 This closes Phase 4 (Embeddability) entirely.
 
-## Open decision (not yet resolved)
+## Planned next work (post-public-release-prep, 2026-09-23)
 
-None currently open. Phase 4 (both rounds) is done. Remaining low-priority follow-ups
-(not blocking, not actively planned): a real small `qwen3moe`-architecture GGUF
-fixture with a `gpt2`-style tokenizer (see "Known debt" below — would also make MoE's
-resume path byte-exact-testable at the text level, unlike `Tiny-Moe`), on-device
-dequant coverage for the 15+ GGUF block types still on the host path (Q4_0/1, Q5_0/1,
-Q8_0/1, Q2_K/Q3_K/Q5_K/Q8_K, the IQ-family formats — none exercised by a local
-fixture's bulk weight bytes), MoE's per-expert weighted-sum accumulation / the Gated
-Attention mixer's fused-qg gating still round-tripping through the host (flagged, not
-measured as worth closing), Phase 3 round 3's own resume path verified only against
-the dense-only synthetic MLA fixture (see DECISIONS.md's round 3 entry), and Phase 4
-round 1's own LoRA MoE/hybrid accept/reject paths verified only against synthetic
-hand-built adapters, not a real adapter trained against those architectures (none
-found publicly — see DECISIONS.md's Phase 4 round 1 entry). No further Phase 4/post-MVP
-work is currently planned — next steps, if any, are a separate confirm-before-starting
-conversation.
+Phase 4 (both rounds) is done and no further Phase 4/post-MVP architecture work is
+planned. The user has asked to queue up three release-hardening items, in this order:
+
+1. ~~**Add CI** (build/test workflow)~~ — **done**: `.github/workflows/ci.yml`,
+   `cargo build --locked --all-targets` + `cargo test --locked` under
+   `REFLEX_SKIP_CUDA=1` on an `[ubuntu-latest, windows-latest]` matrix (no
+   GitHub-hosted runner has a GPU). `cargo fmt --check`/`cargo clippy` deliberately
+   left out — see HISTORY.md's CI entry and "Known debt" below for why. This does
+   not replace real-hardware verification, only catches non-GPU-dependent breakage.
+2. **Verify `docker run --rm --gpus all`** end-to-end — the one remaining unverified
+   Docker path (see "Known debt" below), needs a host with genuine VM-level
+   virtualization *and* a real NVIDIA GPU/driver.
+3. **On-device dequant for more GGUF block types** — extend Phase 2 round 3's
+   `dequant.cu` beyond `Q4_K`/`Q6_K` to the other 15+ block types still on the host
+   path (Q4_0/1, Q5_0/1, Q8_0/1, Q2_K/Q3_K/Q5_K/Q8_K, the IQ-family formats) —
+   real kernel work, needs fixtures that exercise those types for the bulk of a
+   model's weight bytes.
+
+Other remaining low-priority follow-ups (not queued, not blocking): a real small
+`qwen3moe`-architecture GGUF fixture with a `gpt2`-style tokenizer (see "Known debt"
+below — would also make MoE's resume path byte-exact-testable at the text level,
+unlike `Tiny-Moe`), MoE's per-expert weighted-sum accumulation / the Gated Attention
+mixer's fused-qg gating still round-tripping through the host, Phase 3 round 3's own
+resume path verified only against the dense-only synthetic MLA fixture (see
+DECISIONS.md's round 3 entry), and Phase 4 round 1's own LoRA MoE/hybrid accept/reject
+paths verified only against synthetic hand-built adapters, not a real adapter trained
+against those architectures (none found publicly — see DECISIONS.md's Phase 4 round 1
+entry).
 
 ## Known debt / limitations
 
+- **`src/ffi.rs`'s `extern "C"` functions dereference raw pointers without being
+  `unsafe fn`**: found by `cargo clippy --all-targets` while adding CI (see
+  HISTORY.md's CI entry) — 12 `clippy::not_unsafe_ptr_arg_deref` errors (a
+  deny-by-default correctness lint) across `reflex_load`/`reflex_generate`/
+  `reflex_free`/etc. Real gap from Phase 4 round 2, not a false positive, but fixing
+  it changes the public `extern "C"` signatures and the `cbindgen`-generated
+  `include/reflex_engine.h` header — not fixed here, flagged for a separate
+  confirm-before-starting conversation. `cargo clippy` is deliberately not wired
+  into CI until this (and the pre-existing `cargo fmt` non-compliance found the same
+  session) is addressed, to avoid a CI check that fails on unrelated code from day one.
 - **Phase 2 round 3 on-device dequant scope**: only `Q4_K`/`Q6_K` dequantize on-GPU
   (`kernels_cuda/dequant.cu`). Every other GGUF block type (`Q4_0/1`, `Q5_0/1`,
   `Q8_0/1`, `Q2_K`/`Q3_K`/`Q5_K`/`Q8_K`, all 8 IQ-family formats, plus F32/F16/Bf16/int

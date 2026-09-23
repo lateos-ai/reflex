@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  # No GitHub-hosted runner has an NVIDIA GPU, so build.rs must skip invoking
+  # nvcc entirely -- this is exactly the "editing/type-checking on a machine
+  # without CUDA" path CLAUDE.md documents. It does not build or run any CUDA
+  # kernel; real GPU-hardware verification stays a manual step (see
+  # CLAUDE.md's "There is no CPU/mock fallback" note).
+  REFLEX_SKIP_CUDA: "1"
+
+jobs:
+  build-and-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (nvcc skipped, no GPU on hosted runners)
+        run: cargo build --locked --all-targets
+
+      - name: Test (GPU-hardware tests are #[ignore]d and skipped here)
+        run: cargo test --locked
