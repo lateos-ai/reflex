@@ -1,42 +1,42 @@
-//! Dense/MoE/hybrid Qwen3 cold-start measurement (MVP steps 1-3, see
-//! README.md's MVP order): loads a real GGUF file, runs the prompt through
-//! `model::Model::generate`, and reports wall-clock time from process start
-//! to the first generated token -- the project's actual target metric.
+//! Dense/MoE/hybrid Qwen3 cold-start measurement: loads a real GGUF file,
+//! runs the prompt through `model::Model::generate`, and reports wall-clock
+//! time from process start to the first generated token -- the project's
+//! actual target metric.
 //!
-//! Exits via `coldstart_infer::fast_exit` after printing the result instead
-//! of returning from `main` normally -- see that function's doc comment for
+//! Exits via `reflex_engine::fast_exit` after printing the result instead
+//! of returning from `run` normally -- see that function's doc comment for
 //! why a graceful return costs several extra seconds of CUDA-context-
 //! teardown wall-clock time on GPU-virtualized rented instances.
 //!
-//! Also the CLI entry point for Phase 3 (State I/O)'s KV-cache export/
-//! import: `--export-kv <file>` downloads the K/V cache produced by this
-//! run's initial prompt pass and writes it to `<file>` (dense/MoE, hybrid
-//! Qwen3.5, and DeepSeek-V2/V3 MLA models). `--import-kv <file>`
-//! loads a previously-exported cache, uploads it as the starting state, and
-//! resumes generation from it -- `prompt` is then the continuation text
-//! appended after the cached positions, not a fresh prompt. `--max-tokens N`
-//! (default 1) generates up to N tokens, feeding each one back in, stopping
-//! early on the tokenizer's EOS.
+//! Also the entry point for KV-cache export/import: `--export-kv <file>`
+//! downloads the K/V cache produced by this run's initial prompt pass and
+//! writes it to `<file>` (dense/MoE, hybrid Qwen3.5, and DeepSeek-V2/V3 MLA
+//! models). `--import-kv <file>` loads a previously-exported cache, uploads
+//! it as the starting state, and resumes generation from it -- `prompt` is
+//! then the continuation text appended after the cached positions, not a
+//! fresh prompt. `--max-tokens N` (default 1) generates up to N tokens,
+//! feeding each one back in, stopping early on the tokenizer's EOS.
 //!
-//! Usage: `qwen3_coldstart <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>]`
-//!        `qwen3_coldstart <path-to-gguf> [continuation-prompt] [--max-tokens N] --import-kv <file>`
+//! Usage: `reflex generate <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>]`
+//!        `reflex generate <path-to-gguf> [continuation-prompt] [--max-tokens N] --import-kv <file>`
 //!
-//! Phase 4 (Embeddability) round 1: `--lora <adapter.gguf>` applies a
-//! llama.cpp-format LoRA adapter to the loaded model's weights once, at load
-//! time, before any forward pass runs (see `model::Model::apply_lora` and
-//! `lora`'s module doc comment for the file format and scope).
+//! `--lora <adapter.gguf>` applies a llama.cpp-format LoRA adapter to the
+//! loaded model's weights once, at load time, before any forward pass runs
+//! (see `model::Model::apply_lora` and `lora`'s module doc comment for the
+//! file format and scope).
 //!
-//! `--model <repo_id[:filename]>` and `--quickstart` (both require `cargo build
-//! --features download`) resolve a Hugging Face repo spec to a local GGUF path via
-//! `coldstart_infer::hf::resolve_gguf_path`/`resolve_quickstart` *before* the usual
-//! `GgufFile::open` -- hf-hub is used strictly as a downloader/cache here, never a
-//! new tensor-format ingestion path; see `src/hf.rs`'s module doc comment. Exactly
-//! one of a positional `<path-to-gguf>`, `--model`, or `--quickstart` must be given.
+//! `--model <repo_id[:filename]>` and `--quickstart` (both require `cargo
+//! build --features download`) resolve a Hugging Face repo spec to a local
+//! GGUF path via `reflex_engine::hf::resolve_gguf_path`/`resolve_quickstart`
+//! *before* the usual `GgufFile::open` -- hf-hub is used strictly as a
+//! downloader/cache here, never a new tensor-format ingestion path; see
+//! `src/hf.rs`'s module doc comment. Exactly one of a positional
+//! `<path-to-gguf>`, `--model`, or `--quickstart` must be given.
 
-use coldstart_infer::diagnostics;
-use coldstart_infer::gguf::GgufFile;
-use coldstart_infer::kv_io;
-use coldstart_infer::model::{ArchitectureKind, Model};
+use reflex_engine::diagnostics;
+use reflex_engine::gguf::GgufFile;
+use reflex_engine::kv_io;
+use reflex_engine::model::{ArchitectureKind, Model};
 use std::time::Instant;
 
 /// Resolves `--model`/`--quickstart` to a local GGUF path, or returns `None` if
@@ -50,7 +50,7 @@ fn resolve_model_flag(model_spec: Option<&str>, quickstart: bool) -> Option<Stri
     }
     #[cfg(feature = "download")]
     {
-        let resolved = if quickstart { coldstart_infer::hf::resolve_quickstart() } else { coldstart_infer::hf::resolve_gguf_path(model_spec.unwrap()) };
+        let resolved = if quickstart { reflex_engine::hf::resolve_quickstart() } else { reflex_engine::hf::resolve_gguf_path(model_spec.unwrap()) };
         Some(resolved.unwrap_or_else(|e| panic!("{e}")).to_string_lossy().into_owned())
     }
     #[cfg(not(feature = "download"))]
@@ -60,7 +60,7 @@ fn resolve_model_flag(model_spec: Option<&str>, quickstart: bool) -> Option<Stri
     }
 }
 
-fn main() {
+pub fn run(args: Vec<String>) {
     let t0 = Instant::now();
 
     let mut positional: Vec<String> = Vec::new();
@@ -71,7 +71,7 @@ fn main() {
     let mut model_spec: Option<String> = None;
     let mut quickstart = false;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--export-kv" => export_kv = Some(args.next().expect("--export-kv requires a file path")),
@@ -95,8 +95,8 @@ fn main() {
         None => {
             let gguf_path = positional.next().unwrap_or_else(|| {
                 panic!(
-                    "usage: qwen3_coldstart <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>] [--lora <adapter.gguf>] | \
-                     qwen3_coldstart --model <org/repo:file.gguf> [prompt] | qwen3_coldstart --quickstart [prompt]"
+                    "usage: reflex generate <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>] [--lora <adapter.gguf>] | \
+                     reflex generate --model <org/repo:file.gguf> [prompt] | reflex generate --quickstart [prompt]"
                 )
             });
             (gguf_path, positional.next())
@@ -122,7 +122,7 @@ fn main() {
 
     if let Some(lora_path) = &lora_path {
         let applied = model.apply_lora(std::path::Path::new(lora_path)).expect("failed to apply LoRA adapter");
-        println!("COLDSTART_QWEN3_LORA_OK path={lora_path:?} tensors_applied={applied}");
+        println!("REFLEX_LORA_OK path={lora_path:?} tensors_applied={applied}");
     }
 
     if let Some(export_path) = &export_kv {
@@ -131,7 +131,7 @@ fn main() {
                 let ((token_id, text), cache) = model.forward_prompt_capture_kv_hybrid(&prompt).expect("forward_prompt_capture_kv_hybrid failed");
                 kv_io::export_hybrid_kv(export_path, &cache).expect("failed to export hybrid KV cache");
                 println!(
-                    "COLDSTART_QWEN3_KV_EXPORT_OK path={export_path:?} kind=hybrid seq_len={} num_layers={}",
+                    "REFLEX_GENERATE_KV_EXPORT_OK path={export_path:?} kind=hybrid seq_len={} num_layers={}",
                     cache.seq_len,
                     cache.layers.len()
                 );
@@ -140,7 +140,7 @@ fn main() {
             ArchitectureKind::Dense => {
                 let ((token_id, text), cache) = model.forward_prompt_capture_kv(&prompt).expect("forward_prompt_capture_kv failed");
                 println!(
-                    "COLDSTART_QWEN3_KV_EXPORT_OK path={export_path:?} kind=dense seq_len={} num_layers={}",
+                    "REFLEX_GENERATE_KV_EXPORT_OK path={export_path:?} kind=dense seq_len={} num_layers={}",
                     cache.seq_len,
                     cache.k_caches.len()
                 );
@@ -150,7 +150,7 @@ fn main() {
             ArchitectureKind::Mla => {
                 let ((token_id, text), cache) = model.forward_prompt_capture_kv_mla(&prompt).expect("forward_prompt_capture_kv_mla failed");
                 println!(
-                    "COLDSTART_QWEN3_KV_EXPORT_OK path={export_path:?} kind=mla seq_len={} num_layers={}",
+                    "REFLEX_GENERATE_KV_EXPORT_OK path={export_path:?} kind=mla seq_len={} num_layers={}",
                     cache.seq_len,
                     cache.kv_caches.len()
                 );
@@ -160,10 +160,10 @@ fn main() {
         };
         let elapsed = t0.elapsed();
         println!(
-            "COLDSTART_QWEN3_OK process_start_to_first_token_ms={:.3} token_id={token_id} token_text={text:?}",
+            "REFLEX_GENERATE_OK process_start_to_first_token_ms={:.3} token_id={token_id} token_text={text:?}",
             elapsed.as_secs_f64() * 1000.0
         );
-        coldstart_infer::fast_exit(0);
+        reflex_engine::fast_exit(0);
     }
 
     let imported = import_kv.as_ref().map(|path| kv_io::import_kv(path).expect("failed to import KV cache"));
@@ -178,12 +178,12 @@ fn main() {
 
     let token_ids: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
     println!(
-        "COLDSTART_QWEN3_OK process_start_to_first_token_ms={:.3} process_start_to_last_token_ms={:.3} num_generated={} token_id={} token_ids=[{}] token_text={text:?}",
+        "REFLEX_GENERATE_OK process_start_to_first_token_ms={:.3} process_start_to_last_token_ms={:.3} num_generated={} token_id={} token_ids=[{}] token_text={text:?}",
         first_token_ms.unwrap_or(total_ms),
         total_ms,
         tokens.len(),
         tokens[0],
         token_ids.join(","),
     );
-    coldstart_infer::fast_exit(0);
+    reflex_engine::fast_exit(0);
 }

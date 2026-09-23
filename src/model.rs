@@ -839,7 +839,7 @@ pub struct Model {
 }
 
 /// Which forward path a loaded [`Model`] dispatches to -- used by callers
-/// (currently `qwen3_coldstart`'s `--export-kv`/`--import-kv` handling) that
+/// (currently `reflex generate`'s `--export-kv`/`--import-kv` handling) that
 /// need to pick an architecture-specific KV-cache capture/resume function
 /// without reaching into `Model`'s private `hybrid`/`mla` fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -901,7 +901,7 @@ impl Model {
 
     /// Number of tokens `prompt` encodes to with this model's tokenizer
     /// (BOS not included) -- a narrow, derived-value accessor for callers
-    /// like `bench_coldstart` that need to report actual prompt length,
+    /// like `reflex bench` that need to report actual prompt length,
     /// without exposing the private `tokenizer` field itself.
     pub fn encoded_prompt_len(&self, prompt: &str) -> Result<usize, String> {
         Ok(self.tokenizer.encode(prompt)?.len())
@@ -1072,24 +1072,24 @@ impl Model {
                 .result()
                 .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
         }
-        let rmsnorm_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_RMSNORM")), "rmsnorm", "rmsnorm_kernel")?;
-        let rope_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope", "rope_kernel")?;
-        let rope_batch_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope_batch", "rope_batch_kernel")?;
+        let rmsnorm_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_RMSNORM")), "rmsnorm", "rmsnorm_kernel")?;
+        let rope_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope", "rope_kernel")?;
+        let rope_batch_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope_batch", "rope_batch_kernel")?;
         let silu_k =
-            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_SILU_AND_MUL")), "silu_and_mul", "silu_and_mul_kernel")?;
-        let gemv_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_GEMV")), "gemv", "gemv_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")), "silu_and_mul", "silu_and_mul_kernel")?;
+        let gemv_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_GEMV")), "gemv", "gemv_kernel")?;
         let gemv_gather_k =
-            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_GEMV_GATHER")), "gemv_gather", "gemv_gather_kernel")?;
-        let attn_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ATTENTION")), "attention", "attention_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_GEMV_GATHER")), "gemv_gather", "gemv_gather_kernel")?;
+        let attn_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ATTENTION")), "attention", "attention_kernel")?;
         let attn_prefill_k = aot::load_kernel(
             &device,
-            include_bytes!(env!("COLDSTART_KERNEL_ATTENTION_PREFILL")),
+            include_bytes!(env!("REFLEX_KERNEL_ATTENTION_PREFILL")),
             "attention_prefill",
             "attention_prefill_kernel",
         )?;
         let mut elementwise_fns = aot::load_kernel_module(
             &device,
-            include_bytes!(env!("COLDSTART_KERNEL_ELEMENTWISE")),
+            include_bytes!(env!("REFLEX_KERNEL_ELEMENTWISE")),
             "elementwise",
             &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel", "moe_gather_kernel", "moe_scatter_add_kernel"],
         )?
@@ -1101,7 +1101,7 @@ impl Model {
         let moe_scatter_add_k = elementwise_fns.next().ok_or("missing moe_scatter_add_kernel")?;
         let mut dequant_fns = aot::load_kernel_module(
             &device,
-            include_bytes!(env!("COLDSTART_KERNEL_DEQUANT")),
+            include_bytes!(env!("REFLEX_KERNEL_DEQUANT")),
             "dequant",
             &["dequantize_q4k_kernel", "dequantize_q6k_kernel"],
         )?
@@ -1288,24 +1288,24 @@ impl Model {
                 .result()
                 .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
         }
-        let rmsnorm_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_RMSNORM")), "rmsnorm", "rmsnorm_kernel")?;
-        let rope_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope", "rope_kernel")?;
-        let rope_batch_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope_batch", "rope_batch_kernel")?;
+        let rmsnorm_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_RMSNORM")), "rmsnorm", "rmsnorm_kernel")?;
+        let rope_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope", "rope_kernel")?;
+        let rope_batch_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope_batch", "rope_batch_kernel")?;
         let silu_k =
-            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_SILU_AND_MUL")), "silu_and_mul", "silu_and_mul_kernel")?;
-        let gemv_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_GEMV")), "gemv", "gemv_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")), "silu_and_mul", "silu_and_mul_kernel")?;
+        let gemv_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_GEMV")), "gemv", "gemv_kernel")?;
         let gemv_gather_k =
-            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_GEMV_GATHER")), "gemv_gather", "gemv_gather_kernel")?;
-        let attn_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ATTENTION")), "attention", "attention_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_GEMV_GATHER")), "gemv_gather", "gemv_gather_kernel")?;
+        let attn_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ATTENTION")), "attention", "attention_kernel")?;
         let attn_prefill_k = aot::load_kernel(
             &device,
-            include_bytes!(env!("COLDSTART_KERNEL_ATTENTION_PREFILL")),
+            include_bytes!(env!("REFLEX_KERNEL_ATTENTION_PREFILL")),
             "attention_prefill",
             "attention_prefill_kernel",
         )?;
         let mut elementwise_fns = aot::load_kernel_module(
             &device,
-            include_bytes!(env!("COLDSTART_KERNEL_ELEMENTWISE")),
+            include_bytes!(env!("REFLEX_KERNEL_ELEMENTWISE")),
             "elementwise",
             &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel", "moe_gather_kernel", "moe_scatter_add_kernel"],
         )?
@@ -1317,7 +1317,7 @@ impl Model {
         let moe_scatter_add_k = elementwise_fns.next().ok_or("missing moe_scatter_add_kernel")?;
         let mut gdn_fns = aot::load_kernel_module(
             &device,
-            include_bytes!(env!("COLDSTART_KERNEL_GATED_DELTANET")),
+            include_bytes!(env!("REFLEX_KERNEL_GATED_DELTANET")),
             "gated_deltanet",
             &["gdn_conv_kernel", "gdn_l2_norm_kernel", "gdn_gates_kernel", "gdn_delta_kernel", "gdn_gated_norm_kernel"],
         )?
@@ -1329,7 +1329,7 @@ impl Model {
         let gdn_gated_norm_k = gdn_fns.next().ok_or("missing gdn_gated_norm_kernel")?;
         let mut dequant_fns = aot::load_kernel_module(
             &device,
-            include_bytes!(env!("COLDSTART_KERNEL_DEQUANT")),
+            include_bytes!(env!("REFLEX_KERNEL_DEQUANT")),
             "dequant",
             &["dequantize_q4k_kernel", "dequantize_q6k_kernel"],
         )?
@@ -1463,24 +1463,24 @@ impl Model {
                 .result()
                 .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
         }
-        let rmsnorm_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_RMSNORM")), "rmsnorm", "rmsnorm_kernel")?;
-        let rope_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope", "rope_kernel")?;
-        let rope_batch_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope_batch", "rope_batch_kernel")?;
+        let rmsnorm_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_RMSNORM")), "rmsnorm", "rmsnorm_kernel")?;
+        let rope_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope", "rope_kernel")?;
+        let rope_batch_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope_batch", "rope_batch_kernel")?;
         let silu_k =
-            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_SILU_AND_MUL")), "silu_and_mul", "silu_and_mul_kernel")?;
-        let gemv_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_GEMV")), "gemv", "gemv_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")), "silu_and_mul", "silu_and_mul_kernel")?;
+        let gemv_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_GEMV")), "gemv", "gemv_kernel")?;
         let gemv_gather_k =
-            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_GEMV_GATHER")), "gemv_gather", "gemv_gather_kernel")?;
-        let attn_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ATTENTION")), "attention", "attention_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_GEMV_GATHER")), "gemv_gather", "gemv_gather_kernel")?;
+        let attn_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ATTENTION")), "attention", "attention_kernel")?;
         let attn_prefill_k = aot::load_kernel(
             &device,
-            include_bytes!(env!("COLDSTART_KERNEL_ATTENTION_PREFILL")),
+            include_bytes!(env!("REFLEX_KERNEL_ATTENTION_PREFILL")),
             "attention_prefill",
             "attention_prefill_kernel",
         )?;
         let mut elementwise_fns = aot::load_kernel_module(
             &device,
-            include_bytes!(env!("COLDSTART_KERNEL_ELEMENTWISE")),
+            include_bytes!(env!("REFLEX_KERNEL_ELEMENTWISE")),
             "elementwise",
             &[
                 "add_kernel",
@@ -1503,33 +1503,33 @@ impl Model {
         let moe_gather_k = elementwise_fns.next().ok_or("missing moe_gather_kernel")?;
         let moe_scatter_add_k = elementwise_fns.next().ok_or("missing moe_scatter_add_kernel")?;
         let mla_attn_k =
-            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_MLA_ATTENTION")), "mla_attention", "mla_attention_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_MLA_ATTENTION")), "mla_attention", "mla_attention_kernel")?;
         let mla_attn_prefill_k = aot::load_kernel(
             &device,
-            include_bytes!(env!("COLDSTART_KERNEL_MLA_ATTENTION_PREFILL")),
+            include_bytes!(env!("REFLEX_KERNEL_MLA_ATTENTION_PREFILL")),
             "mla_attention_prefill",
             "mla_attention_prefill_kernel",
         )?;
-        let rope_norm_k = aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope_norm", "rope_norm_kernel")?;
+        let rope_norm_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope_norm", "rope_norm_kernel")?;
         let rope_norm_yarn_k =
-            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope_norm_yarn", "rope_norm_yarn_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope_norm_yarn", "rope_norm_yarn_kernel")?;
         let rope_norm_batch_k =
-            aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_ROPE")), "rope_norm_batch", "rope_norm_batch_kernel")?;
+            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope_norm_batch", "rope_norm_batch_kernel")?;
         let rope_norm_yarn_batch_k = aot::load_kernel(
             &device,
-            include_bytes!(env!("COLDSTART_KERNEL_ROPE")),
+            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
             "rope_norm_yarn_batch",
             "rope_norm_yarn_batch_kernel",
         )?;
         let gemv_per_head_batch_k = aot::load_kernel(
             &device,
-            include_bytes!(env!("COLDSTART_KERNEL_GEMV_PER_HEAD_BATCH")),
+            include_bytes!(env!("REFLEX_KERNEL_GEMV_PER_HEAD_BATCH")),
             "gemv_per_head_batch",
             "gemv_per_head_batch_kernel",
         )?;
         let mut dequant_fns = aot::load_kernel_module(
             &device,
-            include_bytes!(env!("COLDSTART_KERNEL_DEQUANT")),
+            include_bytes!(env!("REFLEX_KERNEL_DEQUANT")),
             "dequant",
             &["dequantize_q4k_kernel", "dequantize_q6k_kernel"],
         )?
@@ -3032,7 +3032,7 @@ impl Model {
     /// a fresh prompt (no BOS is inserted). `on_first_token` is called
     /// exactly once, right after the first new token is produced, with that
     /// token's full logits vector -- callers can ignore the argument to just
-    /// capture accurate "time to first token" timing (as `src/bin/qwen3_coldstart.rs`
+    /// capture accurate "time to first token" timing (as `src/bin/reflex/generate.rs`
     /// does), or inspect the logits themselves (as `src/bin/check_correctness.rs`
     /// does) -- even when `max_new_tokens > 1` keeps the call running past that
     /// point.
@@ -4850,14 +4850,14 @@ mod prefill_batching_tests {
     /// corresponding sequential-path position, plus the final argmax token
     /// id. Real GGUF fixtures live outside this repo (gitignored), so this
     /// is `#[ignore]`d by default -- run with:
-    /// `COLDSTART_TEST_GGUF=<path> cargo test --release -- --ignored prefill_dense_batched_matches_sequential_prefill`
+    /// `REFLEX_TEST_GGUF=<path> cargo test --release -- --ignored prefill_dense_batched_matches_sequential_prefill`
     #[test]
     #[ignore]
     fn prefill_dense_batched_matches_sequential_prefill() {
-        let gguf_path = std::env::var("COLDSTART_TEST_GGUF").expect("set COLDSTART_TEST_GGUF to a real local GGUF path to run this test");
+        let gguf_path = std::env::var("REFLEX_TEST_GGUF").expect("set REFLEX_TEST_GGUF to a real local GGUF path to run this test");
         let prompt = "The capital of France is";
 
-        let file = GgufFile::open(&gguf_path).expect("failed to open COLDSTART_TEST_GGUF");
+        let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
         let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
         let model = Model::load(device, &file).expect("failed to load model");
 
@@ -4901,15 +4901,15 @@ mod hybrid_batching_tests {
     /// `prefill_dense_batched_matches_sequential_prefill` plays for dense/MoE.
     /// Real GGUF fixtures live outside this repo (gitignored), so this is
     /// `#[ignore]`d by default -- run with:
-    /// `COLDSTART_TEST_GGUF=<path to a Qwen3.5 hybrid GGUF> cargo test --release -- --ignored prefill_hybrid_batched_matches_sequential`
+    /// `REFLEX_TEST_GGUF=<path to a Qwen3.5 hybrid GGUF> cargo test --release -- --ignored prefill_hybrid_batched_matches_sequential`
     #[test]
     #[ignore]
     fn prefill_hybrid_batched_matches_sequential() {
-        let gguf_path = std::env::var("COLDSTART_TEST_GGUF")
-            .expect("set COLDSTART_TEST_GGUF to a real local Qwen3.5 hybrid GGUF path to run this test");
+        let gguf_path = std::env::var("REFLEX_TEST_GGUF")
+            .expect("set REFLEX_TEST_GGUF to a real local Qwen3.5 hybrid GGUF path to run this test");
         let prompt = "The capital of France is";
 
-        let file = GgufFile::open(&gguf_path).expect("failed to open COLDSTART_TEST_GGUF");
+        let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
         let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
         let model = Model::load_hybrid(device, &file).expect("failed to load hybrid model");
         let h = model.hybrid.as_ref().expect("loaded model is not hybrid");
@@ -4955,7 +4955,7 @@ mod mla_batching_tests {
     /// hardware-verified output exactly against the same real `wk_b` weight tensor.
     /// `test-data/deepseek-tiny-mla.gguf` (synthetic, hand-built via llama.cpp's
     /// real converter -- see README.md's MLA fixture section) is already local, so
-    /// this doesn't need `COLDSTART_TEST_GGUF`; still `#[ignore]`d since it needs a
+    /// this doesn't need `REFLEX_TEST_GGUF`; still `#[ignore]`d since it needs a
     /// real GPU -- run with `cargo test --release -- --ignored
     /// gemv_per_head_batch_matches_gemv_per_head_at_rows_one`.
     #[test]
@@ -5043,23 +5043,23 @@ mod mla_batching_tests {
     /// `deepseek2` MoE fixture exists, see CLAUDE.md's "Known test-fixture
     /// limitation"). Same cross-check shape as the fixture-based test (byte-exact-ish
     /// hidden state plus matching greedy-argmax token), but reads its GGUF path from
-    /// `COLDSTART_TEST_GGUF` (the same convention `prefill_dense_batched_matches_sequential_prefill`
+    /// `REFLEX_TEST_GGUF` (the same convention `prefill_dense_batched_matches_sequential_prefill`
     /// uses) instead of the hardcoded fixture constant, so it can point at the real
     /// `deepseek-ai/DeepSeek-V2-Lite` checkpoint (regenerate per STATUS.md's
     /// documented recipe). Run with:
-    /// `COLDSTART_TEST_GGUF=<path to a real deepseek2 GGUF with MoE layers> cargo test --release -- --ignored prefill_mla_batched_matches_sequential_real_moe_checkpoint`.
+    /// `REFLEX_TEST_GGUF=<path to a real deepseek2 GGUF with MoE layers> cargo test --release -- --ignored prefill_mla_batched_matches_sequential_real_moe_checkpoint`.
     #[test]
     #[ignore]
     fn prefill_mla_batched_matches_sequential_real_moe_checkpoint() {
-        let gguf_path = std::env::var("COLDSTART_TEST_GGUF")
-            .expect("set COLDSTART_TEST_GGUF to a real local deepseek2 GGUF path (with MoE layers) to run this test");
+        let gguf_path = std::env::var("REFLEX_TEST_GGUF")
+            .expect("set REFLEX_TEST_GGUF to a real local deepseek2 GGUF path (with MoE layers) to run this test");
         let prompt = "The capital of France is";
 
-        let file = GgufFile::open(&gguf_path).expect("failed to open COLDSTART_TEST_GGUF");
+        let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
         let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
         let model = Model::load(device, &file).expect("failed to load MLA model");
         let m = model.mla.as_ref().expect("loaded model is not MLA");
-        assert!(m.cfg.moe.is_some(), "COLDSTART_TEST_GGUF must be a real deepseek2 checkpoint with MoE layers, not the dense-lead-only synthetic fixture");
+        assert!(m.cfg.moe.is_some(), "REFLEX_TEST_GGUF must be a real deepseek2 checkpoint with MoE layers, not the dense-lead-only synthetic fixture");
 
         let (seq_ids, seq_hidden, _, seq_position) = model.prefill_mla(m, prompt, None, 0).expect("prefill_mla failed");
         let (batch_ids, batch_hidden, _, batch_position) =
@@ -5139,13 +5139,13 @@ mod system1_tests {
     /// rounding. Real GGUF fixtures live outside this repo (`.gguf` is
     /// gitignored, per CLAUDE.md's "Known test-fixture limitation"), so this
     /// is `#[ignore]`d by default and reads its model path from
-    /// `COLDSTART_TEST_GGUF` rather than guessing a local path -- run with:
-    /// `COLDSTART_TEST_GGUF=<path> cargo test --release -- --ignored gemv_gather_matches_full_vocab_gemv`
+    /// `REFLEX_TEST_GGUF` rather than guessing a local path -- run with:
+    /// `REFLEX_TEST_GGUF=<path> cargo test --release -- --ignored gemv_gather_matches_full_vocab_gemv`
     #[test]
     #[ignore]
     fn gemv_gather_matches_full_vocab_gemv_at_matching_rows() {
-        let gguf_path = std::env::var("COLDSTART_TEST_GGUF").expect("set COLDSTART_TEST_GGUF to a real local GGUF path to run this test");
-        let file = GgufFile::open(&gguf_path).expect("failed to open COLDSTART_TEST_GGUF");
+        let gguf_path = std::env::var("REFLEX_TEST_GGUF").expect("set REFLEX_TEST_GGUF to a real local GGUF path to run this test");
+        let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
         let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
         let model = Model::load(device, &file).expect("failed to load model");
 

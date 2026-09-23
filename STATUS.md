@@ -20,7 +20,7 @@ _Last updated: 2026-09-23 (benchmark expansion session: llama.cpp regression fix
 First real cold-start A/B benchmark vs. `llama.cpp` (`972d231`, same A6000, same
 `Qwen3-0.6B-Q4_K_M.gguf`, same prompt, full GPU offload, `n=3`):
 
-| | coldstart-infer (initial) | round 1 | round 2 | round 3 | llama.cpp |
+| | Reflex (initial) | round 1 | round 2 | round 3 | llama.cpp |
 |---|---|---|---|---|---|
 | wall clock | 28–30s | 10.4–11.7s | 6.4–8.5s | 6.38–6.46s | 6.44–6.67s |
 | peak RSS | 3.68 GB | 1.33 GB | 1.35 GB | 1.35 GB | ~887 MB |
@@ -43,7 +43,7 @@ other block type still uses the existing host path). Phase 2 round 3 closed the 
 ~1.0x parity with llama.cpp, but a later re-measurement on a fresh instance (see
 "Benchmarking expansion" below) found the wall-clock parity claim had regressed to
 ~1.4x *slower* — root-caused to CUDA-context-teardown cost, not the forward pass —
-and fixed. **Current state: coldstart-infer is ~1.3-1.4x *faster* than llama.cpp on
+and fixed. **Current state: Reflex is ~1.3-1.4x *faster* than llama.cpp on
 cold start** (see README.md's "Benchmark expansion" section for the full
 investigation and per-run numbers).
 
@@ -57,10 +57,10 @@ caveats are in README.md's "Benchmark expansion" section, summarized here:
 
 | Comparison | Result |
 |---|---|
-| llama.cpp (re-verified) | Found and fixed a real ~1.4x regression (CUDA-context-teardown cost, not the forward pass) via `coldstart_infer::fast_exit`. **Now ~1.3-1.4x faster than llama.cpp**, not just parity |
-| vLLM (`scripts/bench_cold_vllm.sh`) | **coldstart-infer ~24-52x faster.** Weight-format deviation disclosed: installed vLLM 0.30.0 has no GGUF support at all, so vLLM ran against the HF safetensors checkpoint instead of the GGUF fixture |
-| TypeSafe Jev latency citation, cold (`scripts/bench_cold_system1_vs_jev.sh`) | Reported honestly as a loss: coldstart-infer's System1 cold start is ~10-60x *slower* than Jev's published figures — dominated by cold-loading the GGUF from disk, which Jev's always-resident managed service never pays. Illustrative citation only, not a benchmark claim |
-| TypeSafe Jev latency citation, warm (`bench_coldstart --candidate`) | Fairer axis: Jev's 10-15ms figure is itself warm/compute-only. coldstart-infer's warm System1 scoring is 19.4ms at the shortest prompt bucket (29 tokens) — within ~1.3-2x, competitive, not a loss. Published alongside the cold citation, not instead of it |
+| llama.cpp (re-verified) | Found and fixed a real ~1.4x regression (CUDA-context-teardown cost, not the forward pass) via `reflex_engine::fast_exit`. **Now ~1.3-1.4x faster than llama.cpp**, not just parity |
+| vLLM (`scripts/bench_cold_vllm.sh`) | **Reflex ~24-52x faster.** Weight-format deviation disclosed: installed vLLM 0.30.0 has no GGUF support at all, so vLLM ran against the HF safetensors checkpoint instead of the GGUF fixture |
+| TypeSafe Jev latency citation, cold (`scripts/bench_cold_system1_vs_jev.sh`) | Reported honestly as a loss: Reflex's System1 cold start is ~10-60x *slower* than Jev's published figures — dominated by cold-loading the GGUF from disk, which Jev's always-resident managed service never pays. Illustrative citation only, not a benchmark claim |
+| TypeSafe Jev latency citation, warm (`reflex bench --candidate`) | Fairer axis: Jev's 10-15ms figure is itself warm/compute-only. Reflex's warm System1 scoring is 19.4ms at the shortest prompt bucket (29 tokens) — within ~1.3-2x, competitive, not a loss. Published alongside the cold citation, not instead of it |
 | Ollama (`scripts/bench_cold_ollama.sh`) | Wraps llama.cpp's ggml runtime, so no new AOT-vs-JIT data point — but found real, reproducible intermittent flakiness (2/7 and 3/5 runs across two scenarios hit an internal ~55-62s GPU-discovery-watchdog stall vs. ~6-11s otherwise), reported per-run rather than averaged away |
 | TGI, TensorRT-LLM/Triton, other cloud/serverless vendors | Still deliberately deferred, not attempted — see DECISIONS.md for rationale |
 
@@ -82,7 +82,7 @@ Only Q-LoRA query decomposition and MTP/NextN are still rejected with a clear er
 (`parse_mla_config` in `model.rs`); no real file needing either has been seen. First
 verified against a fully synthetic `deepseek2` GGUF
 (`test-data/deepseek-tiny-mla.gguf`, dense-only, no real fixture exists publicly),
-then extended the same session to the real `deepseek-ai/DeepSeek-V2-Lite` checkpoint
+then extended to the real `deepseek-ai/DeepSeek-V2-Lite` checkpoint
 (converted fresh from source with a current `convert_hf_to_gguf.py` — every
 pre-quantized community GGUF found predates llama.cpp's MLA tensor-split format) on a
 rented 80GB A100 (needed for the ~63GB of `f32` device-resident weights; doesn't fit
@@ -95,14 +95,14 @@ llama.cpp builds.
 
 ## Phase 3 (State I/O), round 1
 
-`--export-kv <file>`/`--import-kv <file>` added to `qwen3_coldstart`, dense/MoE Qwen3
+`--export-kv <file>`/`--import-kv <file>` added to `reflex generate`, dense/MoE Qwen3
 only (`src/kv_io.rs`, new `Model::forward_prompt_capture_kv` in `model.rs`). Round 1 is
 scoped to raw buffer export/import only — no resume-generation-from-cache, since there's
 no per-token generation loop or `start_pos` anywhere in `model.rs` yet for a cache to
 resume into (see README.md's "Phase 3, round 1" section and DECISIONS.md for the full
 scope rationale). `--import-kv` proves the file round-trips byte-identical through a
-device upload/download instead. Real-hardware-verified on the A6000 (`kgevfmca`
-instance, still running from the Phase 2 round 3 session): `cargo test` (57 tests, incl.
+device upload/download instead. Real-hardware-verified on the A6000 (the same
+instance, still running from the Phase 2 round 3 round): `cargo test` (57 tests, incl.
 2 new `kv_io` tests) plus real `--export-kv`/`--import-kv` runs against both
 `Qwen3-0.6B-Q4_K_M.gguf` (dense) and `Tiny-Moe.Q4_K_M.gguf` (MoE).
 
@@ -111,8 +111,8 @@ instance, still running from the Phase 2 round 3 session): `cargo test` (57 test
 `--import-kv` now actually resumes generation, and `--max-tokens N` adds a real
 per-token generation loop (feeding each generated id back in, stopping early on EOS) —
 both pieces round 1 deliberately deferred together (see DECISIONS.md's round 1 entry).
-Scope: **dense/MoE and the Qwen3.5 hybrid mixer**, confirmed with the user before
-starting (MLA stays round 3, matching this project's narrow-first precedent).
+Scope: **dense/MoE and the Qwen3.5 hybrid mixer**
+(MLA stays round 3, matching this project's narrow-first precedent).
 
 - `Model::generate` (`model.rs`) is the new top-level entry point; `forward_prompt`
   becomes a thin `max_new_tokens=1, imported=None` wrapper over the same
@@ -133,8 +133,8 @@ starting (MLA stays round 3, matching this project's narrow-first precedent).
 - `--export-kv`/`--import-kv` can no longer be combined in one run (round-2 scope is
   resume, not chained re-export), and `--export-kv` requires `--max-tokens 1` (it only
   captures the cache after the initial prompt pass).
-- **Real-hardware-verified on a fresh A6000 instance** (`lunpulve`; the round-1
-  session's `kgevfmca` instance was gone by this session — confirms instances really
+- **Real-hardware-verified on a fresh A6000 instance** (the round-1
+  instance was gone by this round — confirms instances really
   are per-session ephemeral, not just per-purpose): `cargo test` (58 tests, incl. a new
   hybrid `kv_io` round-trip test) plus **byte-exact** export→import→continue vs. a
   single uninterrupted run, both for dense (`Qwen3-0.6B-Q4_K_M.gguf`, tokens
@@ -173,8 +173,8 @@ with the user before starting (fixture and GPU-instance choice both explicitly a
   version-1/2 formats; `import_kv`/`ImportedKv`, `Model::generate`, and
   `forward_prompt_capture_kv_mla` (the `--export-kv` capture function, matching
   `forward_prompt_capture_kv`/`forward_prompt_capture_kv_hybrid`) all dispatch to it.
-- **Real-hardware-verified on a fresh A6000 instance** (`bkzn3giz`; `tnr status --json`
-  showed none running at session start): `cargo test` (60 tests, incl. a new MLA
+- **Real-hardware-verified on a fresh A6000 instance** (`tnr status --json`
+  showed none running beforehand): `cargo test` (60 tests, incl. a new MLA
   `kv_io` round-trip test) plus **byte-exact** export→import→continue vs. a single
   uninterrupted run against the synthetic `test-data/deepseek-tiny-mla.gguf` fixture
   (chosen over real DeepSeek-V2-Lite — see DECISIONS.md's round 3 entry for why),
@@ -186,18 +186,18 @@ with the user before starting (fixture and GPU-instance choice both explicitly a
 
 ## Phase 4 (Embeddability), round 1
 
-`--lora <adapter.gguf>` added to `qwen3_coldstart` (`src/lora.rs` new module,
+`--lora <adapter.gguf>` added to `reflex generate` (`src/lora.rs` new module,
 `Model::apply_lora`/`Model::find_lora_target_mut` in `model.rs`): parses a
 llama.cpp-format LoRA adapter GGUF and applies `W' = W + (alpha/rank) * (B @ A)` to
 each targeted weight once, at load time, reusing the existing in-place-add kernel — no
-new kernel, forward pass unchanged. Scope confirmed with the user before starting
-(dense/MoE Qwen3 attention+FFN and the Qwen3.5 hybrid's Gated-Attention-layer
+new kernel, forward pass unchanged. Scope covers
+dense/MoE Qwen3 attention+FFN and the Qwen3.5 hybrid's Gated-Attention-layer
 tensors/Gated-DeltaNet-mixer FFN tensors; MLA and MoE's per-expert-stacked FFN/the
-Gated DeltaNet mixer's non-Linear tensors rejected with a clear error — see
-DECISIONS.md's Phase 4 round 1 entry for the full scope rationale and format details).
+Gated DeltaNet mixer's non-Linear tensors are rejected with a clear error — see
+DECISIONS.md's Phase 4 round 1 entry for the full scope rationale and format details.
 
-- **Real-hardware-verified on the A6000** (`bkzn3giz`, reused from the Phase 3 round 3
-  session — still running, per this project's practice of checking `tnr status --json`
+- **Real-hardware-verified on the A6000** (reused from the Phase 3 round 3
+  round — still running, per this project's practice of checking `tnr status --json`
   before creating a fresh instance): `cargo build --release` clean, `cargo test`
   unchanged at 59 passing.
 - **Real fixture, not synthetic**: downloaded the real public
@@ -224,27 +224,27 @@ DECISIONS.md's Phase 4 round 1 entry for the full scope rationale and format det
 
 ## Phase 4 (Embeddability), round 2
 
-`src/ffi.rs` (new module) adds a `extern "C"` surface (`coldstart_load`/
-`coldstart_generate`/`coldstart_free_generate_result`/`coldstart_free`/
-`coldstart_last_error`) wrapping the exact same `Model::load`/`Model::generate`/
-`Model::apply_lora` calls `qwen3_coldstart` itself uses — no new model-loading or
+`src/ffi.rs` (new module) adds a `extern "C"` surface (`reflex_load`/
+`reflex_generate`/`reflex_free_generate_result`/`reflex_free`/
+`reflex_last_error`) wrapping the exact same `Model::load`/`Model::generate`/
+`Model::apply_lora` calls `reflex generate` itself uses — no new model-loading or
 generation logic. `Cargo.toml`'s `[lib]` now emits `cdylib`/`staticlib` alongside
-`rlib`; header generated via `cbindgen` into checked-in `include/coldstart_infer.h`
-(regenerated by hand, not wired into `build.rs`). Scope confirmed with the user before
-starting: load/generate/free only (LoRA folds into `coldstart_load` as an optional
+`rlib`; header generated via `cbindgen` into checked-in `include/reflex_engine.h`
+(regenerated by hand, not wired into `build.rs`). Scope: load/generate/free only (LoRA
+folds into `reflex_load` as an optional
 parameter since it's load-time-only anyway; Phase 3's `--export-kv`/`--import-kv` state
 I/O is *not* exposed through this FFI round), `cbindgen` over a hand-written header,
-reused the still-running `bkzn3giz` A6000 — see DECISIONS.md's Phase 4 round 2 entry.
+reused the still-running A6000 instance — see DECISIONS.md's Phase 4 round 2 entry.
 
-- **Real-hardware-verified on the A6000** (`bkzn3giz`): `cargo build --release`/`cargo
+- **Real-hardware-verified on the A6000**: `cargo build --release`/`cargo
   test --release` both clean (59 tests, unchanged), plus a real C test harness
-  (`ffi-test/smoke_test.c`, plain `gcc` against the built `libcoldstart_infer.so`)
+  (`ffi-test/smoke_test.c`, plain `gcc` against the built `libreflex_engine.so`)
   exercising `load` → `generate` → `free`, cross-checked byte-exact against
-  `qwen3_coldstart` on both the dense `Qwen3-0.6B-Q4_K_M.gguf` fixture
+  `reflex generate` on both the dense `Qwen3-0.6B-Q4_K_M.gguf` fixture
   (`token_ids=[13,576,3974,13876,38835]`) and the hybrid `Qwen3.5-0.8B-Q4_K_M.gguf`
   fixture (`token_ids=[0,353,1044]`), plus a clean (no-crash) error path for a
   nonexistent GGUF path.
-- **`staticlib` follow-up (resolved)**: a same-day debugging pass (see README's Phase 4
+- **`staticlib` follow-up (resolved)**: a follow-up debugging pass (see README's Phase 4
   round 2 section) found the originally-reported link-needs-`--allow-multiple-definition`
   / runtime-hang symptoms don't reproduce — a clean link with no extra flags produces a
   binary that runs correctly, byte-exact against `cdylib`/CLI on both fixtures. The
@@ -279,16 +279,16 @@ conversation.
   (`kernels_cuda/dequant.cu`). Every other GGUF block type (`Q4_0/1`, `Q5_0/1`,
   `Q8_0/1`, `Q2_K`/`Q3_K`/`Q5_K`/`Q8_K`, all 8 IQ-family formats, plus F32/F16/Bf16/int
   passthrough) still dequantizes on the host, unchanged from before this round — correct,
-  just not GPU-accelerated. This round's instance (`kgevfmca`, A6000) has no git history
+  just not GPU-accelerated. This round's instance (an A6000) has no git history
   either (populated by `rsync`, not `git clone`) — local remains the only git-tracked
   copy; a fresh `ggml-org/llama.cpp` (`9655061`) was built there for the A/B benchmark.
 - **Remote instance git state**: the MLA-extension work used a *second*, separate
-  ThunderCompute instance for this session (`fl1uh6dt`, an 80GB A100, created
+  ThunderCompute instance (an 80GB A100, created
   2026-09-21 specifically for the real-DeepSeek-V2-Lite VRAM requirement — the Phase
-  2 round 2 A/B benchmark earlier in the same session used a different A6000 instance,
-  `2xhxwa87`; ThunderCompute instances are ephemeral and per-purpose, not assumed to
-  persist or be reused across even the same session's different tasks). Its
-  `~/coldstart-infer` working tree has no git history at all (populated by `rsync`
+  2 round 2 A/B benchmark earlier used a different A6000 instance;
+  ThunderCompute instances are ephemeral and per-purpose, not assumed to
+  persist or be reused across different tasks). Its
+  `~/Reflex` working tree has no git history at all (populated by `rsync`
   from local, not `git clone`/`scp`); local remains the only git-tracked copy. A real
   `ggml-org/llama.cpp` checkout was built from source there (`~/llama.cpp`, CUDA
   enabled, `examples/simple`'s `llama-simple` built, `-DCMAKE_CUDA_ARCHITECTURES=80`
@@ -322,7 +322,7 @@ conversation.
   reasoned; that reasoning is now backed by a real run, not just architectural inference.
 - **Real DeepSeek-V2-Lite GGUF not preserved locally**: unlike every other fixture,
   the real `DeepSeek-V2-Lite.gguf` (16.7GB, `--outtype q8_0`) used to verify MLA's
-  MoE/shared-expert/YaRN path was left on the A100 instance (`fl1uh6dt`) rather than
+  MoE/shared-expert/YaRN path was left on the A100 instance rather than
   copied to local `test-data/` — too large to be worth preserving the way the tiny
   synthetic fixtures are. Regenerating it needs: download
   `deepseek-ai/DeepSeek-V2-Lite`'s safetensors (~30GB,
@@ -335,15 +335,15 @@ conversation.
   don't assume a downloaded GGUF is usable without checking for those keys first.
 - **Dockerfile `docker build` now real-verified (both modes); `docker run --gpus all`
   still not, for a hardware reason this time, not an environment-access one**: a
-  genuine (non-nested-container) Docker host was finally available this session (a
+  genuine (non-nested-container) Docker host was finally available (a
   Windows machine running Docker Desktop, WSL2 backend) — unlike every ThunderCompute
   A6000 instance used previously, which is itself a nested container
   (`systemd-detect-virt` reports `docker`) and rejects any Docker build outright
   (`unshare: operation not permitted`). `docker build --build-arg
-  COLDSTART_CUDA_ARCH=sm_86 -t coldstart-infer .` and the default portable-PTX
-  `docker build -t coldstart-infer .` **both now pass cleanly** — but the portable-PTX
+  REFLEX_CUDA_ARCH=sm_86 -t Reflex .` and the default portable-PTX
+  `docker build -t Reflex .` **both now pass cleanly** — but the portable-PTX
   mode only after a real bug this run found and fixed: `build.rs`'s
-  `env::var("COLDSTART_CUDA_ARCH").ok()` treated Docker's set-but-empty `ARG` (present
+  `env::var("REFLEX_CUDA_ARCH").ok()` treated Docker's set-but-empty `ARG` (present
   even when no `--build-arg` is passed) as `Some("")` instead of `None`, silently
   taking the cubin branch with an empty `-arch=` and making `nvcc` fatal on every
   default docker build. Fixed with a one-line `.filter(|s| !s.is_empty())`; both modes
@@ -366,19 +366,19 @@ conversation.
   setup for `--gpus all` to work.) **Still needed before this image is treated as
   release-ready**: one real `docker run --rm --gpus all` pass on a Docker host that has
   both genuine VM-level virtualization *and* an actual NVIDIA GPU/driver, producing
-  real `COLDSTART_QWEN3_OK process_start_to_first_token_ms=... token_text=...` output —
-  neither the nested-container ThunderCompute instances nor this session's GPU-less
-  Windows host can provide that combination.
+  real `REFLEX_GENERATE_OK process_start_to_first_token_ms=... token_text=...` output —
+  neither the nested-container ThunderCompute instances nor the GPU-less
+  Windows host used for the Docker build check above can provide that combination.
 - **Kernel-byte-embedding refactor re-verified against the Qwen3.5 hybrid fixture,
   closing the one gap the MVP-release round's own hardware pass left open**: the
-  initial verification (previous session) re-ran the dense/MoE and MLA paths against
+  initial verification re-ran the dense/MoE and MLA paths against
   `src/aot.rs`'s new `include_bytes!`-based kernel loading in both PTX and
-  `COLDSTART_CUDA_ARCH=sm_86` cubin modes, but not hybrid's `gated_deltanet.cu`
+  `REFLEX_CUDA_ARCH=sm_86` cubin modes, but not hybrid's `gated_deltanet.cu`
   module, since that fixture (`Qwen3.5-0.8B-Q4_K_M.gguf`) wasn't present on that
-  session's instance. Downloaded fresh via this project's own `--model` hf-hub
+  instance. Downloaded fresh via this project's own `--model` hf-hub
   integration (`unsloth/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q4_K_M.gguf` — a real,
   publicly hosted GGUF, confirmed via the HF Hub search API, not a guess) on a new
-  A6000 instance (`344497bl`): `qwen3_coldstart --model ... "Once upon a time"`
+  A6000 instance: `reflex generate --model ... "Once upon a time"`
   reproduced this project's own documented historical result exactly (token id `11`,
   `","`), and `model::hybrid_batching_tests::prefill_hybrid_batched_matches_sequential`
   passed in both PTX and cubin modes. All three architecture families are now
@@ -389,11 +389,11 @@ conversation.
   ran only against the synthetic, dense-lead-only, no-YaRN
   `test-data/deepseek-tiny-mla.gguf` fixture — explicitly noted in those tests' doc
   comments as not exercising `MlaFfn::Moe`'s per-row loop or
-  `rope_norm_yarn_batch_kernel`. Re-verified on a fresh 80GB A100 instance
-  (`igr3ptbb`): `deepseek-ai/DeepSeek-V2-Lite` downloaded (~30GB safetensors,
+  `rope_norm_yarn_batch_kernel`. Re-verified on a fresh 80GB A100 instance:
+  `deepseek-ai/DeepSeek-V2-Lite` downloaded (~30GB safetensors,
   `huggingface_hub.snapshot_download`) and converted fresh (`convert_hf_to_gguf.py
   --outtype q8_0`, current `ggml-org/llama.cpp`, 16.7GB output) — same recipe as the
-  original MLA verification. `qwen3_coldstart` against the real checkpoint produced
+  original MLA verification. `reflex generate` against the real checkpoint produced
   `"The capital of France is" -> " Paris"`, independently reproduced byte-exact by a
   fresh CUDA-enabled `llama-simple` build (`-DCMAKE_CUDA_ARCHITECTURES=80`) from the
   same checkpoint. All three `mla_batching_tests` (including the batched-vs-sequential

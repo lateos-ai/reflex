@@ -5,7 +5,7 @@ Loads a model, greedily generates exactly one token for a fixed prompt,
 prints it, and exits. Does no internal timing of its own — this script is
 meant to be wrapped externally by `/usr/bin/time -v` (via
 scripts/bench_cold_vllm.sh), matching the external-wall-clock methodology
-already used for the coldstart-infer-vs-llama.cpp comparison (see
+already used for the Reflex-vs-llama.cpp comparison (see
 DECISIONS.md's benchmark-methodology entry) so process launch, Python
 startup, and vLLM's own engine init (including CUDA graph capture) are all
 included on vLLM's side of the comparison, the same way OS exec/dynamic-
@@ -16,7 +16,7 @@ Usage: vllm_single_shot.py <model-path-or-hf-id> <prompt> [--tokenizer <hf-repo-
 A local .gguf path needs `--tokenizer <hf-repo-id>` alongside it -- vLLM's
 GGUF loader reads only the weights from the file and still wants an
 HF-format tokenizer/config from a separate source (this is vLLM's own
-convention, not a coldstart-infer requirement; coldstart-infer reads the
+convention, not a Reflex requirement; Reflex reads the
 GGUF's own embedded tokenizer directly, see src/tokenizer.rs).
 """
 import argparse

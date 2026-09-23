@@ -1,14 +1,12 @@
 // Ahead-of-time CUDA kernel compilation. This is the project's core technical bet:
 // every kernel is compiled by `nvcc` at BUILD time (like llama.cpp), never by NVRTC
-// at process start (like rft-gpu was). See LESSONS_LEARNED_RUSTFEFERENCE.md in the
-// RustFeference repo for why that distinction is the whole point of this project.
+// at process start -- avoiding a real multi-second JIT tax paid on every cold start.
 //
 // Default output is PTX (portable across compute capabilities, small driver-side JIT
-// cost at load time). Set COLDSTART_CUDA_ARCH=sm_XX to compile straight to a cubin for
+// cost at load time). Set REFLEX_CUDA_ARCH=sm_XX to compile straight to a cubin for
 // that exact architecture instead, which the driver loads with no JIT at all -- the
 // true zero-runtime-compilation path, at the cost of needing a matching cubin per
-// deployment target. Which of these actually wins on real hardware is an open
-// question this project needs to measure, not assume (see plan risk #1).
+// deployment target.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -34,12 +32,12 @@ fn find_nvcc() -> Option<PathBuf> {
 fn main() {
     let src_dir = Path::new("src/kernels_cuda");
     println!("cargo:rerun-if-changed={}", src_dir.display());
-    println!("cargo:rerun-if-env-changed=COLDSTART_CUDA_ARCH");
-    println!("cargo:rerun-if-env-changed=COLDSTART_SKIP_CUDA");
+    println!("cargo:rerun-if-env-changed=REFLEX_CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=REFLEX_SKIP_CUDA");
 
-    let skip_cuda = env::var("COLDSTART_SKIP_CUDA").is_ok();
+    let skip_cuda = env::var("REFLEX_SKIP_CUDA").is_ok();
     if skip_cuda {
-        println!("cargo:warning=COLDSTART_SKIP_CUDA set, skipping AOT kernel compilation (dev-machine-without-CUDA path)");
+        println!("cargo:warning=REFLEX_SKIP_CUDA set, skipping AOT kernel compilation (dev-machine-without-CUDA path)");
     }
 
     let nvcc = if skip_cuda {
@@ -50,26 +48,26 @@ fn main() {
             None => {
                 panic!(
                     "nvcc not found (checked CUDA_PATH/CUDA_HOME and PATH). Install the CUDA toolkit, \
-                     or set COLDSTART_SKIP_CUDA=1 to build without GPU kernels (dev-only, no inference)."
+                     or set REFLEX_SKIP_CUDA=1 to build without GPU kernels (dev-only, no inference)."
                 );
             }
         }
     };
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    // `.filter(|s| !s.is_empty())`: Docker's `ARG COLDSTART_CUDA_ARCH=""` exposes this
+    // `.filter(|s| !s.is_empty())`: Docker's `ARG REFLEX_CUDA_ARCH=""` exposes this
     // as a set-but-empty env var to `RUN` even when no `--build-arg` override is passed
     // (unlike a bare host shell, where it's truly unset) -- without the filter this
     // reads as `Some("")`, taking the cubin branch below with an empty `-arch=` and
     // making nvcc fatal on every default (portable-PTX) `docker build`.
-    let arch = env::var("COLDSTART_CUDA_ARCH").ok().filter(|s| !s.is_empty());
+    let arch = env::var("REFLEX_CUDA_ARCH").ok().filter(|s| !s.is_empty());
 
     // `src/aot.rs` embeds every kernel's bytes at compile time
-    // (`include_bytes!(env!("COLDSTART_KERNEL_<NAME>"))` at each call site) and
+    // (`include_bytes!(env!("REFLEX_KERNEL_<NAME>"))` at each call site) and
     // needs to know, once, crate-wide, which of build.rs's two output modes
     // produced those bytes -- both modes always agree for a single build (the
     // `-cubin`/`-ptx` flag below is chosen once, not per file).
-    println!("cargo:rustc-env=COLDSTART_KERNEL_FORMAT={}", if arch.is_some() { "cubin" } else { "ptx" });
+    println!("cargo:rustc-env=REFLEX_KERNEL_FORMAT={}", if arch.is_some() { "cubin" } else { "ptx" });
 
     let entries = match std::fs::read_dir(src_dir) {
         Ok(e) => e,
@@ -92,14 +90,14 @@ fn main() {
         };
         let out_file = out_dir.join(format!("{stem}.{out_ext}"));
 
-        // In COLDSTART_SKIP_CUDA mode, still expose the COLDSTART_KERNEL_<NAME>
+        // In REFLEX_SKIP_CUDA mode, still expose the REFLEX_KERNEL_<NAME>
         // env var every `include_bytes!(env!(...))` call needs to compile, but
         // skip the nvcc invocation itself and write an empty placeholder file in
         // its place instead -- `include_bytes!` (unlike the old design's runtime
         // `Ptx::from_file`) needs *some* file to exist at compile time, but its
         // contents are never a real kernel in this mode, so no inference binary
         // can actually load/launch kernels here (type-check only, per CLAUDE.md's
-        // "COLDSTART_SKIP_CUDA=1 cargo build" doc).
+        // "REFLEX_SKIP_CUDA=1 cargo build" doc).
         if let Some(nvcc) = &nvcc {
             let mut cmd = Command::new(nvcc);
             cmd.arg(mode_flag).arg(&path).arg("-o").arg(&out_file);
@@ -114,6 +112,6 @@ fn main() {
         } else {
             std::fs::write(&out_file, []).unwrap_or_else(|e| panic!("failed to write placeholder kernel file {}: {e}", out_file.display()));
         }
-        println!("cargo:rustc-env=COLDSTART_KERNEL_{}={}", stem.to_uppercase(), out_file.display());
+        println!("cargo:rustc-env=REFLEX_KERNEL_{}={}", stem.to_uppercase(), out_file.display());
     }
 }

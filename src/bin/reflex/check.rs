@@ -1,30 +1,31 @@
 //! Formalizes this project's own byte-exact-vs-llama.cpp verification methodology
-//! (see README.md/DECISIONS.md) as a user-facing CLI check instead of an ad hoc
-//! development-only comparison. Runs a forward pass on `<gguf>` for `<prompt>` and
-//! either prints a comparable summary (no `--reference`), or compares against a
-//! hand-written reference file: expected token ids (exact match -- the primary,
-//! always-available check, mirroring this project's own established convention)
-//! and, if the reference supplies one, a logit checksum compared within
-//! `--tolerance`. Cross-engine exact bit-match is **not** expected even when both
-//! implementations are correct (cuBLAS/naive-GEMV/llama.cpp's own kernels sum in a
-//! different order) -- see README.md's System1 section for this project's own
-//! documented ~1e-4 gather-vs-full-vocab delta precedent -- so `--tolerance`
-//! defaults to a real, nonzero relative tolerance, not `0.0`.
+//! (see README.md/DECISIONS.md) as a user-facing correctness check instead of an
+//! ad hoc development-only comparison. Runs a forward pass on `<gguf>` for
+//! `<prompt>` and either prints a comparable summary (no `--reference`), or
+//! compares against a hand-written reference file: expected token ids (exact
+//! match -- the primary, always-available check, mirroring this project's own
+//! established convention) and, if the reference supplies one, a logit checksum
+//! compared within `--tolerance`. Cross-engine exact bit-match is **not**
+//! expected even when both implementations are correct (cuBLAS/naive-GEMV/
+//! llama.cpp's own kernels sum in a different order) -- see README.md's
+//! System1 section for this project's own documented ~1e-4 gather-vs-full-vocab
+//! delta precedent -- so `--tolerance` defaults to a real, nonzero relative
+//! tolerance, not `0.0`.
 //!
-//! Reference file format (deliberately plain text, not JSON -- unlike
-//! `src/ipc.rs`'s protocol, this binary has zero optional-feature dependencies, so
-//! it's always buildable with a plain `cargo build`): line 1 is the expected,
-//! comma-separated token ids; an optional line 2 is the expected `logit_checksum`
-//! as a single `f64`.
+//! Reference file format (deliberately plain text, not JSON): line 1 is the
+//! expected, comma-separated token ids; an optional line 2 is the expected
+//! `logit_checksum` as a single `f64`.
 //!
-//! Usage: `check_correctness <path-to-gguf> <prompt> [--max-tokens N] [--reference <file>] [--tolerance F]`
+//! Usage: `reflex check <path-to-gguf> <prompt> [--max-tokens N] [--reference <file>] [--tolerance F]`
 //!
 //! Exit codes: `0` = pass, `1` = mismatch, `2` = internal error (bad args, load/
-//! generate failure, malformed reference file) -- scriptable for CI.
+//! generate failure, malformed reference file) -- scriptable for CI. Uses
+//! `std::process::exit` directly rather than `reflex_engine::fast_exit`,
+//! deliberately: this exit-code contract is the whole point of the subcommand.
 
-use coldstart_infer::diagnostics;
-use coldstart_infer::gguf::GgufFile;
-use coldstart_infer::model::Model;
+use reflex_engine::diagnostics;
+use reflex_engine::gguf::GgufFile;
+use reflex_engine::model::Model;
 
 struct Reference {
     token_ids: Vec<u32>,
@@ -60,14 +61,14 @@ fn exit_usage_error(msg: &str) -> ! {
     std::process::exit(2);
 }
 
-fn main() {
+pub fn run(args: Vec<String>) {
     let mut gguf_path: Option<String> = None;
     let mut prompt: Option<String> = None;
     let mut max_tokens: usize = 1;
     let mut reference_path: Option<String> = None;
     let mut tolerance: f64 = 1e-2;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--max-tokens" => {
@@ -85,7 +86,7 @@ fn main() {
         }
     }
     let gguf_path = gguf_path.unwrap_or_else(|| {
-        exit_usage_error("usage: check_correctness <path-to-gguf> <prompt> [--max-tokens N] [--reference <file>] [--tolerance F]")
+        exit_usage_error("usage: reflex check <path-to-gguf> <prompt> [--max-tokens N] [--reference <file>] [--tolerance F]")
     });
     let prompt = prompt.unwrap_or_else(|| exit_usage_error("a prompt is required"));
     if max_tokens == 0 {
@@ -110,7 +111,7 @@ fn main() {
 
     let token_ids_str: Vec<String> = token_ids.iter().map(|t| t.to_string()).collect();
     println!(
-        "COLDSTART_CHECK token_ids=[{}] token_texts={:?} logit_checksum={logit_checksum:.6} top1_logit={top1_logit:.6} vocab_size={vocab_size}",
+        "REFLEX_CHECK token_ids=[{}] token_texts={:?} logit_checksum={logit_checksum:.6} top1_logit={top1_logit:.6} vocab_size={vocab_size}",
         token_ids_str.join(","),
         token_texts,
     );
@@ -122,7 +123,7 @@ fn main() {
 
     let mut ok = true;
     if reference.token_ids != token_ids {
-        eprintln!("COLDSTART_CHECK_FAIL reason=token_id_mismatch expected={:?} got={token_ids:?}", reference.token_ids);
+        eprintln!("REFLEX_CHECK_FAIL reason=token_id_mismatch expected={:?} got={token_ids:?}", reference.token_ids);
         ok = false;
     }
     if let Some(expected_checksum) = reference.logit_checksum {
@@ -130,7 +131,7 @@ fn main() {
         let relative_delta = (logit_checksum - expected_checksum).abs() / denom;
         if relative_delta > tolerance {
             eprintln!(
-                "COLDSTART_CHECK_FAIL reason=logit_checksum_mismatch expected={expected_checksum:.6} got={logit_checksum:.6} \
+                "REFLEX_CHECK_FAIL reason=logit_checksum_mismatch expected={expected_checksum:.6} got={logit_checksum:.6} \
                  relative_delta={relative_delta:.6} tolerance={tolerance:.6}"
             );
             ok = false;
@@ -138,7 +139,7 @@ fn main() {
     }
 
     if ok {
-        println!("COLDSTART_CHECK_PASS");
+        println!("REFLEX_CHECK_PASS");
         std::process::exit(0);
     }
     std::process::exit(1);

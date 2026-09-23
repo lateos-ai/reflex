@@ -4,18 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-A GGUF-native GPU inference engine optimized for **cold-start energy and latency**
-(process launch to first token) — not sustained server throughput. It's a deliberate,
-narrower pivot from a prior project, [RustFeference](../RustFeference) (`rft-gpu`),
-whose postmortem (`../RustFeference/LESSONS_LEARNED_RUSTFEFERENCE.md`) found that
-chasing llama.cpp/vLLM on steady-state throughput is an unwinnable kernel-optimization
-race. Read that postmortem before proposing throughput-oriented or serving-platform
-features here — see "Non-goals" below.
+Reflex is a GGUF-native GPU inference engine optimized for **cold-start energy and
+latency** (process launch to first token) — not sustained server throughput. Chasing
+llama.cpp/vLLM on steady-state throughput is an unwinnable kernel-optimization race;
+cold start is the underserved axis. Read "Non-goals" below before proposing
+throughput-oriented or serving-platform features here.
 
 **Core technical bet**: every CUDA kernel is compiled ahead-of-time by `nvcc` at *build*
-time (via `build.rs`), never at runtime via NVRTC (which is what rft-gpu did, at a
-measured ~4.5s JIT tax per process). `src/aot.rs` loads the precompiled PTX/cubin via
-the CUDA driver API at process start.
+time (via `build.rs`), never at runtime via NVRTC — avoiding a real multi-second JIT tax
+per process that a naive runtime-compilation design would pay on every cold start.
+`src/aot.rs` loads the precompiled PTX/cubin via the CUDA driver API at process start.
 
 Full narrative context, MVP milestone write-ups, and benchmark numbers live in
 `README.md` — read it before starting new architecture or perf work; it's kept current
@@ -28,47 +26,46 @@ an NVIDIA GPU to build and run for real — `build.rs` invokes `nvcc` against ev
 file in `src/kernels_cuda/` at build time and panics if `nvcc` isn't found.
 
 - `cargo build --release` — normal build, emits portable PTX kernels (JIT'd to SASS by
-  the driver at load time).
-- `COLDSTART_CUDA_ARCH=sm_86 cargo build --release` — compile kernels straight to a
+  the driver at load time). Produces a single `reflex` binary with subcommands.
+- `REFLEX_CUDA_ARCH=sm_86 cargo build --release` — compile kernels straight to a
   `cubin` for one target architecture (zero driver-side JIT, but the binary only runs on
-  that compute capability). `sm_86` is the ThunderCompute A6000 dev instance's arch.
-- `COLDSTART_SKIP_CUDA=1 cargo build` — skip kernel compilation entirely, for editing/
-  type-checking on a machine without CUDA. No inference binary will actually run kernels
+  that compute capability). `sm_86` is a common Ampere-class arch (e.g. an RTX A6000);
+  match this to your actual GPU.
+- `REFLEX_SKIP_CUDA=1 cargo build` — skip kernel compilation entirely, for editing/
+  type-checking on a machine without CUDA. No subcommand will actually run kernels
   in this mode.
-- `cargo run --release --bin smoke_coldstart` — the first thing to run on any fresh GPU
+- `cargo run --release --bin reflex -- smoke` — the first thing to run on any fresh GPU
   instance; proves the AOT pipeline works end to end and prints
   `process_start_to_first_result_ms`.
-- `cargo run --release --bin qwen3_coldstart <path-to-gguf> [prompt]` — runs a real
-  forward pass (dense or MoE Qwen3, auto-detected from GGUF metadata) and prints
+- `cargo run --release --bin reflex -- generate <path-to-gguf> [prompt]` — runs a real
+  forward pass (dense, MoE, hybrid, or MLA, auto-detected from GGUF metadata) and prints
   `process_start_to_first_token_ms token_id=... token_text=...`.
 - `cargo test` — runs unit tests in `dequant.rs`/`dequant_iq.rs`/`gguf.rs`/`moe.rs`/
   `tokenizer.rs`.
 
 **Gotcha**: `cargo test` only rebuilds test-harness binaries under
-`target/release/deps/` — it does **not** rebuild `target/release/<bin-name>`. After any
-source change, explicitly run `cargo build --release --bin <name>` (or `cargo run
---release --bin <name>`) before trusting the standalone binary's behavior; a passing
-`cargo test` is not evidence the binary itself is current.
+`target/release/deps/` — it does **not** rebuild `target/release/reflex`. After any
+source change, explicitly run `cargo build --release --bin reflex` (or `cargo run
+--release --bin reflex -- <subcommand>`) before trusting the binary's behavior; a
+passing `cargo test` is not evidence the binary itself is current.
 
-There is no CPU/mock fallback for the model binaries — real GPU-hardware verification
-(currently done on a ThunderCompute A6000 instance) is the only way to confirm forward-
-pass correctness, since the whole point of the project is measuring real cold-start
-behavior.
+There is no CPU/mock fallback for the `generate`/`system1`/`smoke`/`bench` subcommands —
+real GPU-hardware verification is the only way to confirm forward-pass correctness,
+since the whole point of the project is measuring real cold-start behavior.
 
 ## Architecture
 
 ### Kernel compilation pipeline
 `build.rs` finds `nvcc`, compiles every `src/kernels_cuda/*.cu` to PTX (or cubin if
-`COLDSTART_CUDA_ARCH` is set) into `OUT_DIR`, and exposes each kernel's output path to
-the binary via a `COLDSTART_KERNEL_<NAME>` env var (read with `env!(...)` at compile
-time — see `smoke_coldstart.rs`). `src/aot.rs::load_kernel` loads that PTX/cubin file at
+`REFLEX_CUDA_ARCH` is set) into `OUT_DIR`, and exposes each kernel's output path to
+the binary via a `REFLEX_KERNEL_<NAME>` env var (read with `env!(...)` at compile
+time — see `src/bin/reflex/smoke.rs`). `src/aot.rs::load_kernel` loads that PTX/cubin file at
 process start via `Ptx::from_file` (maps to the driver's `cuModuleLoad`, which accepts
 PTX/cubin/fatbin transparently — this is why the same loader code works for both output
 modes).
 
 ### Model loading and forward pass (`src/model.rs`)
-`Model::load` reads a GGUF file (`src/gguf.rs`, mmap-based parsing — ported unmodified
-from RustFeference) and, per layer, builds either `DenseLayerWeights` or
+`Model::load` reads a GGUF file (`src/gguf.rs`, mmap-based parsing) and, per layer, builds either `DenseLayerWeights` or
 `MoeLayerWeights` (the `LayerWeights` enum), decided by `parse_model_config` checking
 whether `<arch>.expert_count` is present and nonzero in the GGUF metadata (not a
 hardcoded architecture-string check). Every weight tensor is dequantized once
@@ -117,22 +114,15 @@ rotation, `rope_norm_kernel`/`rope_norm_yarn_kernel`), not the `LLAMA_ROPE_TYPE_
 is architecture-independent when adding another model family later.
 
 ### MoE routing (`src/moe.rs`)
-`route_top_k`: softmax over all experts, select top-k, renormalize. Ported from
-RustFeference's verified `route_top_k` (git history around commit `6a70287`). No new
+`route_top_k`: softmax over all experts, select top-k, renormalize. No new
 CUDA kernels were needed for MoE — it reuses `gemv`/`silu_and_mul` unchanged via
 `gemv_expert`'s slicing.
 
-### Code salvaged from RustFeference, unmodified except path
-`src/gguf.rs`, `src/dequant.rs`/`dequant_iq.rs`/`dequant_iq_tables.rs`,
-`src/tokenizer.rs` — these don't care how kernels get compiled, so they ported as-is.
-RustFeference's `jit.rs` (NVRTC compile-and-load) was deliberately **not** ported — it's
-the thing this project replaces.
-
 ### `reference/`
-`reference/gated_deltanet_rustfeference.rs` carries over RustFeference's host/CPU
-reference recurrence math for the Qwen3.5 hybrid Gated DeltaNet mixer (MVP step 3,
-done) as the correctness oracle used while debugging that kernel. It is not compiled
-as part of this crate.
+`reference/gated_deltanet_reference.rs` is a host/CPU reference implementation of the
+recurrence math for the Qwen3.5 hybrid Gated DeltaNet mixer (MVP step 3, done) — the
+correctness oracle used while debugging the GPU kernel. It is not compiled as part of
+this crate.
 
 ## MVP order (see README.md for full detail and current status)
 
@@ -164,10 +154,10 @@ no-thread-pool above, not a separate exception any adoption/UX ask gets to reope
 HTTP access to this engine is ever needed, the pattern is a separate, optional sidecar
 binary (e.g. an OpenAI-compatible adapter) that talks to this engine over local IPC —
 the core engine itself never grows a network socket. The local-ergonomics surface this
-engine may grow directly is limited to sequential, non-network-stack IPC (`--stdio`
-JSON-line mode, `--uds` Unix Domain Socket mode — see README's "Non-goals" section for
-detail) plus in-process bindings (the existing C FFI, and PyO3 Python bindings) — never
-a thread pool, never a queue.
+engine may grow directly is limited to sequential, non-network-stack IPC (`reflex stdio`
+JSON-line mode, `reflex uds` Unix Domain Socket mode — see README's "Non-goals" section
+for detail) plus in-process bindings (the existing C FFI, and PyO3 Python bindings) —
+never a thread pool, never a queue.
 
 ## Known test-fixture limitation
 

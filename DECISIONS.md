@@ -13,13 +13,11 @@ cache back into a forward pass — `--import-kv` proves the file round-trips
 byte-identical through a device upload/download and stops there, rather than resuming
 generation from it.
 
-**Why**: confirmed with the user before implementing (two explicit open questions,
-matching this project's practice of confirming scope before starting rather than after).
-Dense-only matches the established "narrow first" precedent from every prior MVP step
-(dense before MoE before hybrid before MLA). The export/import-only cut came from what
+**Why**: dense-only matches the established "narrow first" precedent from every prior MVP
+step (dense before MoE before hybrid before MLA). The export/import-only cut came from what
 investigating `model.rs` actually found, not just caution: `forward_prompt` (all three
 architecture paths) always starts at position 0, and there is no per-token generation
-loop anywhere in `model.rs` or `qwen3_coldstart.rs` — each run does one full prompt pass
+loop anywhere in `model.rs` or the `generate` subcommand — each run does one full prompt pass
 and returns exactly one token, then the process exits. "Resume generation past position
 0" therefore isn't a small `start_pos: usize` plumb-through; it needs (a) a generation
 loop that doesn't exist yet, and (b) each path's K/V cache allocation changed from
@@ -43,8 +41,8 @@ real per-token generation loop (`--max-tokens N`), together, per round 1's own "
 apply" note. Scope is **dense/MoE and the Qwen3.5 hybrid mixer**; MLA's single
 compressed cache is deliberately deferred to round 3.
 
-**Why**: confirmed with the user before starting (three options offered: dense/MoE
-only, +hybrid, or +hybrid+MLA all in one round). Dense/MoE+hybrid matches this
+**Why**: of the three possible scopes (dense/MoE only, +hybrid, or +hybrid+MLA all in
+one round), dense/MoE+hybrid matches this
 project's narrow-first precedent while still being the meaningfully smaller lift of
 the two extensions round 1 flagged as open: the hybrid `GatedAttention` sublayers need
 exactly the same `start_pos`-offset `k_cache`/`v_cache` treatment dense/MoE's single
@@ -108,9 +106,8 @@ export/import/resume). Verification uses the synthetic `test-data/deepseek-tiny-
 fixture (dense-lead layers only), not the real `deepseek-ai/DeepSeek-V2-Lite` checkpoint's
 MoE+shared-expert+YaRN path.
 
-**Why**: confirmed with the user before starting (two explicit open questions: which
-fixture(s), and whether to reuse or create a ThunderCompute instance — `tnr status --json`
-showed none running, so a fresh A6000 was created). The synthetic fixture was chosen over
+**Why**: the fixture choice was the open question here (a fresh A6000 instance was
+rented, since none was running at the time). The synthetic fixture was chosen over
 real DeepSeek-V2-Lite because round 3's actual code delta is cache/`start_pos` plumbing at
 the attention-block level (`forward_mla_attn_block` already took an absolute `position`
 argument and indexed its single `kv_cache` by it, unchanged by this round), not new
@@ -211,15 +208,15 @@ for a true prompt-in/token-out comparison with no chat wrapping.
 via the CUDA driver API at process start (`src/aot.rs`). No runtime JIT compilation
 (NVRTC) path exists or is planned.
 
-**Why**: this project is a direct pivot from RustFeference (`rft-gpu`), which compiled
-kernels via NVRTC at process start and measured a real ~4.5s JIT tax per invocation —
-fatal for a cold-start-latency target. llama.cpp avoids this because `nvcc` compiles its
-kernels at build time; coldstart-infer adopts the same approach as its core bet.
+**Why**: runtime NVRTC compilation carries a real, measured multi-second JIT tax on
+first kernel use — fatal for a cold-start-latency target. llama.cpp avoids this
+because `nvcc` compiles its kernels at build time; Reflex adopts the same approach as
+its core bet.
 
 **Open question, not yet resolved**: whether to default to portable PTX (small
-driver-side JIT-to-SASS cost) or `COLDSTART_CUDA_ARCH=sm_XX`-targeted cubins (zero JIT,
+driver-side JIT-to-SASS cost) or `REFLEX_CUDA_ARCH=sm_XX`-targeted cubins (zero JIT,
 but needs a matching cubin per deployment target) is unverified on real model kernels —
-`smoke_coldstart` found the two statistically indistinguishable (473–637ms vs.
+`reflex smoke` found the two statistically indistinguishable (473–637ms vs.
 480–617ms), but only for a trivial kernel where CUDA context init dominates. Worth
 re-measuring against real model-sized kernels.
 
@@ -231,10 +228,9 @@ no concurrent HTTP/gRPC server, no autoscaling logic. If a warm-context mode is 
 built, it accepts one job at a time, strictly sequentially — never a thread pool.
 Multi-tenancy and persistent state are the *host orchestrator's* job, not this engine's.
 
-**Why**: RustFeference's own postmortem
-(`../RustFeference/LESSONS_LEARNED_RUSTFEFERENCE.md`) is explicit that a broad serving
-feature set re-enters the exact warm-throughput race against vLLM/SGLang that project
-already lost, with no reason to expect a different outcome this time. coldstart-infer
+**Why**: a broad serving feature set re-enters the exact warm-throughput race against
+vLLM/SGLang that's an unwinnable kernel-optimization race against projects with a
+multi-year head start. Reflex
 exists to win a narrower, different bet (cold-start energy/latency) — the two goals are
 in tension, and every feature that inches toward serving-platform territory dilutes the
 one thing this project is trying to prove. This was explicitly considered (a
@@ -252,9 +248,9 @@ flag, Rust C-FFI so an external orchestrator can embed the engine) — see READM
 **Decision**: Qwen3 dense first, then Qwen3-MoE, then the Qwen3.5 hybrid Gated DeltaNet
 mixer, with DeepSeek-V2/V3 MLA deliberately last.
 
-**Why**: dense Qwen3 reuses RustFeference's most mature, most-verified architecture,
-proving the AOT-compilation + cold-start-benchmark harness works at all before spending
-effort on anything novel. MLA is ordered last on purpose — it's a genuinely different
+**Why**: dense Qwen3 is the best-understood, most well-documented architecture to build
+against first, proving the AOT-compilation + cold-start-benchmark harness works at all
+before spending effort on anything novel. MLA is ordered last on purpose — it's a genuinely different
 caching strategy (compressed latent KV), not an incremental extension of GQA, so it
 carries the most implementation risk and should be tackled once the rest of the harness
 is trustworthy. (Read llama.cpp PR #11446 before attempting it.)
@@ -265,8 +261,8 @@ is trustworthy. (Read llama.cpp PR #11446 before attempting it.)
 (sliced out of a `[in_features, out_features, expert_count]` per-expert-stacked
 tensor), rather than grouping tokens by expert or batching expert computation.
 
-**Why**: this matches RustFeference's own documented finding that naive per-expert
-dispatch is the correct starting point before optimizing. Since `batch_size` is always 1
+**Why**: naive per-expert dispatch is the correct starting point before optimizing.
+Since `batch_size` is always 1
 here (see the serving non-goal above), there's only one token being routed per forward
 call anyway — the grouped-dispatch optimization that matters for batched serving doesn't
 apply the same way to this project's actual workload shape.
@@ -279,7 +275,7 @@ at load time (immediately after dequantizing, with the host scratch buffer dropp
 dispatch slices it with a zero-copy `CudaSlice::slice` view.
 
 **Why**: the first real cold-start-vs-llama.cpp benchmark (2026-09-17) found
-coldstart-infer ~4.3x slower, 4x the peak RSS, and ~11x the system CPU time of
+Reflex ~4.3x slower, 4x the peak RSS, and ~11x the system CPU time of
 llama.cpp. Reading `model.rs`'s kernel-calling functions directly (not just trusting the
 first plausible root cause) found the *dominant* cost wasn't just load-time dequant to
 `f32` — it was that every weight buffer was being re-uploaded to the GPU via a fresh
@@ -308,7 +304,7 @@ from host on every token position.
 re-uploaded per call, but every op still separately `htod`/`dtoh`'d its small
 *activation* vectors, and `attention()`'s full-K/V-cache-history re-upload scaled with
 position count. Closed the cold-start gap vs. llama.cpp from ~1.7x to ~1.1x (see
-[[coldstart-infer-benchmark-result]] memory / README's "Phase 2, round 2" section).
+[[Reflex-benchmark-result]] memory / README's "Phase 2, round 2" section).
 Left out of scope on purpose: MoE's per-expert weighted-sum accumulation and the Gated
 Attention mixer's fused-qg head split/sigmoid gating still round-trip through the host
 — small, and not on the primary dense/MoE path this benchmark measures. **This is
@@ -356,21 +352,20 @@ Gated DeltaNet mixer's residual-add bug):
    `rope_kernel` — **don't assume RoPE convention is architecture-independent** when
    adding another model family later; check `llama_model_rope_type` first.
 
-## MLA extended to real DeepSeek-V2-Lite: MoE + shared experts + YaRN, same session
+## MLA extended to real DeepSeek-V2-Lite: MoE + shared experts + YaRN
 
 **Decision**: after the synthetic-fixture-only MLA work above landed, it was
-extended the same session to the real `deepseek-ai/DeepSeek-V2-Lite` checkpoint on a
+extended to the real `deepseek-ai/DeepSeek-V2-Lite` checkpoint on a
 rented 80GB A100 (the VRAM estimate from the entry above held: fits 80GB with
 headroom, doesn't fit the A6000's 48GB). This added routed-MoE + always-on
 shared-expert FFN (`MlaFfn::Moe`) and YaRN RoPE scaling (`MlaYarnConfig`,
 `rope_norm_yarn_kernel`) to the previously dense-only, no-YaRN implementation.
 
-**Why extend in the same session rather than treat it as separate future work**: the
-user explicitly chose full scope (MoE+shared-experts+YaRN together) after being told
-YaRN was a real, separate chunk of work beyond the originally-scoped MoE addition —
-see the "genuinely blocked, decision only they can make" judgment call this
-represented; once approved, there was no reason to artificially split the work across
-sessions.
+**Why extend immediately rather than treat it as separate future work**: full scope
+(MoE+shared-experts+YaRN together) was the right call once it was clear YaRN was a
+real, separate chunk of work beyond the originally-scoped MoE addition — splitting the
+work artificially across rounds would have meant re-verifying the same checkpoint
+twice for no benefit.
 
 **Three more real, silently-wrong-not-crashing bugs/gotchas found via byte-exact
 comparison against a real llama.cpp build on the real model** (extending the pattern
@@ -428,9 +423,7 @@ work with no local fixture able to prove them byte-exact (the synthetic MLA fixt
 the real DeepSeek-V2-Lite checkpoint both use F16/F32 and Q8_0 respectively, neither of
 which needed a new kernel to begin with — Q8_0's dequant is already a trivial `x = d*q`
 per-element multiply, not a meaningful CPU-time contributor next to K-quant's bit-
-unpacking). Confirmed with the user before starting (this project's usual practice for
-open-ended follow-up work — see STATUS.md's prior "Open decision" entries) with this
-exact scope question asked explicitly, rather than assumed.
+unpacking).
 
 **How to apply**: if a future fixture or real deployment target exercises another
 block type for the bulk of its weight bytes, extend `dequantize_tensor_to_device`
@@ -468,11 +461,10 @@ tensors — all four cases fall through `Model::find_lora_target_mut`'s match ar
 single clear "no matching 2-D weight" error rather than four separate checks, since
 none of them are 2-D `Weight`s regardless of architecture.
 
-**Why**: confirmed with the user before starting (three explicit questions: scope,
-fixture, GPU instance — this project's usual practice). Scope came back "dense/MoE +
+**Why**: scope landed on "dense/MoE +
 hybrid" rather than dense-only, matching the project's narrow-first precedent one step
-wider than MVP-step ordering alone would suggest, but MLA was excluded by the user's
-original framing (`README.md`'s Non-goals: load-time-only adapter application, no
+wider than MVP-step ordering alone would suggest, but MLA was excluded per the
+project's own framing (`README.md`'s Non-goals: load-time-only adapter application, no
 runtime hot-swap) and every other MLA-adjacent feature in this codebase already stops
 at the same line. The tensor-level accept/reject split (2-D found-and-shape-matches vs.
 everything else) came from what the real format actually looks like once inspected
@@ -541,20 +533,18 @@ if a future need comes up.
 ## Phase 4 (Embeddability) round 2 scope: C-FFI is load/generate/free only, cbindgen, reused instance
 
 **Decision**: the Rust C-FFI surface (`src/ffi.rs`) exposes exactly three operations —
-`coldstart_load` (GGUF path + optional LoRA adapter path), `coldstart_generate` (prompt
-in, token ids + text out), `coldstart_free` — plus `coldstart_last_error` for the
-error-string convention and `coldstart_free_generate_result` for the generate call's
+`reflex_load` (GGUF path + optional LoRA adapter path), `reflex_generate` (prompt
+in, token ids + text out), `reflex_free` — plus `reflex_last_error` for the
+error-string convention and `reflex_free_generate_result` for the generate call's
 output buffers. Phase 3's `--export-kv`/`--import-kv` state I/O is **not** exposed
 through this FFI round. The header is generated with `cbindgen` from `src/ffi.rs`
-(config in `cbindgen.toml`) into a checked-in `include/coldstart_infer.h`, regenerated
-by hand rather than wired into `build.rs`. The already-running `bkzn3giz` A6000
+(config in `cbindgen.toml`) into a checked-in `include/reflex_engine.h`, regenerated
+by hand rather than wired into `build.rs`. The already-running A6000
 instance (confirmed `RUNNING` via `tnr status --json`, not assumed) was reused for
 real-hardware verification.
 
-**Why**: confirmed with the user before starting (three explicit questions, matching
-this project's practice: API surface, header-generation approach, GPU instance).
-Load/generate/free-only matches this project's narrow-first precedent one more time —
-`--lora`'s adapter path was folded into `coldstart_load` as an optional parameter
+**Why**: load/generate/free-only matches this project's narrow-first precedent one more time —
+`--lora`'s adapter path was folded into `reflex_load` as an optional parameter
 rather than given its own FFI call, since round 1 already made it load-time-only (no
 separate "apply LoRA" step exists to expose); state I/O was left out because no
 embedding host had asked for it yet and adding it means designing a buffer-ownership
@@ -569,7 +559,7 @@ see above) between the two.
 **Error-boundary mechanism**: every `extern "C"` function wraps its body in
 `std::panic::catch_unwind`, converting both a caught panic and this crate's existing
 `Result<_, String>` convention (`model.rs`/`lora.rs`, unchanged) into the same
-thread-local last-error string read via `coldstart_last_error`. This was necessary,
+thread-local last-error string read via `reflex_last_error`. This was necessary,
 not optional caution: unwinding a Rust panic across an `extern "C"` boundary is
 undefined behavior in the C caller, and this crate's existing code already reaches for
 `.expect()`/panics in a few places (e.g. the `env!()` kernel-path macros, GGUF parsing
@@ -580,24 +570,24 @@ directly into the host process's control flow.
 "staticlib"]` — `rlib` had to stay in the list (not just be replaced) because Cargo
 only auto-links a package's own lib target into its `src/bin/*.rs` targets when a
 Rust-linkable crate-type (`lib`/`rlib`/`dylib`) is present; dropping it to `["cdylib",
-"staticlib"]` alone would have broken `qwen3_coldstart`/`smoke_coldstart`. No
+"staticlib"]` alone would have broken `reflex generate`/`reflex smoke`. No
 `build.rs` changes were needed — the AOT kernel-compilation pipeline governs `.cu` →
 PTX/cubin, entirely orthogonal to which Rust crate-types `rustc` emits from the
 already-built kernels.
 
 **Verification**: real hardware (A6000, `bkzn3giz`), a real C program
 (`ffi-test/smoke_test.c`, plain `gcc`, not a Rust test) linked against the built
-`libcoldstart_infer.so`, exercising the full `load` → `generate` → `free` surface and
-cross-checked byte-exact against `qwen3_coldstart` on the same GGUF+prompt+
+`libreflex_engine.so`, exercising the full `load` → `generate` → `free` surface and
+cross-checked byte-exact against `reflex generate` on the same GGUF+prompt+
 `max_new_tokens` for two architectures: dense `Qwen3-0.6B-Q4_K_M.gguf`
 (`token_ids=[13,576,3974,13876,38835]`, identical decoded text) and Qwen3.5 hybrid
 `Qwen3.5-0.8B-Q4_K_M.gguf` (`token_ids=[0,353,1044]`, identical decoded text) — not
 just "it compiles and links". The error path (a nonexistent GGUF path) was also
-verified: `coldstart_load` returns `NULL`, no crash, and `coldstart_last_error()`
+verified: `reflex_load` returns `NULL`, no crash, and `reflex_last_error()`
 names the missing file. `staticlib` linking was attempted too (not part of the
-confirmed scope, but cheap to try since the crate-type was already added) and *appeared*
-to have a real, unresolved problem in this same session — flagged as known debt at the
-time — but a follow-up debugging pass the same day found it doesn't reproduce (see the
+originally-scoped work, but cheap to try since the crate-type was already added) and
+*appeared* to have a real, unresolved problem — flagged as known debt at the
+time — but a follow-up debugging pass found it doesn't reproduce (see the
 round-2-follow-up entry below): both `cdylib` and `staticlib` are verified working.
 
 **How to apply**: a future round wanting Phase 3 state I/O (`--export-kv`/
@@ -605,17 +595,17 @@ round-2-follow-up entry below): both `cdylib` and `staticlib` are verified worki
 for KV-cache blobs crossing the C boundary (who allocates, who frees, whether it's a
 raw byte buffer or a path to a file this crate itself writes) — treat that as new
 scope requiring its own confirm-before-starting conversation, not a small addition to
-`coldstart_load`/`coldstart_generate`.
+`reflex_load`/`reflex_generate`.
 
 ## Phase 4 round 2 follow-up: the `staticlib` "hang" was GPU-capacity contention, not a linking bug
 
 **Decision**: no code change. The `staticlib` linking issue flagged as known debt right
 after Phase 4 round 2 (`-Wl,--allow-multiple-definition` needed to link,
-then a runtime hang) is retracted — a dedicated debugging session (same day, same
-`bkzn3giz` instance) could not reproduce either symptom.
+then a runtime hang) is retracted — a dedicated debugging pass on the same
+instance could not reproduce either symptom.
 
 **What was actually found**: `gcc -I include -o smoke_test_static ffi-test/smoke_test.c
--L target/release -l:libcoldstart_infer.a -ldl -lpthread -lm` — the exact same command
+-L target/release -l:libreflex_engine.a -ldl -lpthread -lm` — the exact same command
 as before, *minus* `-Wl,--allow-multiple-definition` — linked with zero duplicate-symbol
 warnings. The resulting binary ran successfully against both the dense
 (`Qwen3-0.6B-Q4_K_M.gguf`, `token_ids=[13,576,3974,13876,38835]`) and hybrid
@@ -642,19 +632,19 @@ first GPU-driver contact in a fresh process.
 
 ## Dockerfile real `docker build`/`docker run` verification: found and fixed a real portable-PTX build bug
 
-**Decision**: fixed `build.rs`'s `COLDSTART_CUDA_ARCH` handling (one line) rather than
+**Decision**: fixed `build.rs`'s `REFLEX_CUDA_ARCH` handling (one line) rather than
 working around it in the Dockerfile.
 
 **What was found**: the first real `docker build` pass on a genuine (non-nested-container)
 Docker host — a Windows machine running Docker Desktop, the first environment available
 across this project's sessions that could actually run `docker build` at all — reproduced
-a real, previously-undetected bug: the default (no `--build-arg COLDSTART_CUDA_ARCH=...`)
+a real, previously-undetected bug: the default (no `--build-arg REFLEX_CUDA_ARCH=...`)
 portable-PTX build mode failed every time with `nvcc fatal: Value '' is not defined for
-option 'gpu-architecture'`. Root cause: the Dockerfile's `ARG COLDSTART_CUDA_ARCH=""`
+option 'gpu-architecture'`. Root cause: the Dockerfile's `ARG REFLEX_CUDA_ARCH=""`
 exposes that variable to the `RUN` instruction's shell as a *set-but-empty* env var even
 when no `--build-arg` override is passed (that's exactly why the Dockerfile's own
-`if [ -n "$COLDSTART_CUDA_ARCH" ]` shell check works as intended, correctly taking the
-plain-`cargo build` else-branch) — but `build.rs`'s `env::var("COLDSTART_CUDA_ARCH").ok()`
+`if [ -n "$REFLEX_CUDA_ARCH" ]` shell check works as intended, correctly taking the
+plain-`cargo build` else-branch) — but `build.rs`'s `env::var("REFLEX_CUDA_ARCH").ok()`
 returns `Some("")` for a set-but-empty var, not `None`, so it silently took the cubin
 branch anyway with an empty `-arch=` flag. This never reproduces on a bare host shell
 (where an unset var is truly absent, not present-and-empty), which is exactly why every
@@ -668,7 +658,7 @@ un-verified; leaving a known-broken default build mode in the shipped Dockerfile
 have defeated the point of finally getting a real Docker host to test on.
 
 **Full verification, both build modes, real host**: `docker build --build-arg
-COLDSTART_CUDA_ARCH=sm_86 -t coldstart-infer .` and `docker build -t coldstart-infer .`
+REFLEX_CUDA_ARCH=sm_86 -t Reflex .` and `docker build -t Reflex .`
 (portable PTX) both pass cleanly post-fix; re-ran the `sm_86` build afterward too to
 confirm the fix doesn't regress the cubin path (it doesn't — `arch` is `Some("sm_86")`
 either way, unaffected by the new filter). `docker run` (no `--gpus`) against the
@@ -678,25 +668,25 @@ progressed all the way to `cudarc`'s dynamic `libcuda`/`nvcuda` load before fail
 exactly the expected failure point with no GPU/driver present, not a container defect.
 
 **What could *not* be verified**: `docker run --rm --gpus all` itself, i.e. real GPU
-passthrough + actual inference output (`COLDSTART_QWEN3_OK ...`) from inside the
+passthrough + actual inference output (`REFLEX_GENERATE_OK ...`) from inside the
 container. This Docker host has no NVIDIA GPU at all (confirmed via `Get-CimInstance
 Win32_VideoController` → AMD Radeon only) — `docker run --gpus all` fails immediately
 with `nvidia-container-cli: initialization error: WSL environment detected but no
-adapters were found`, a hardware-absence error, not a configuration problem this session
-could fix. Interesting incidental finding: Docker Desktop's WSL2 backend does already
+adapters were found`, a hardware-absence error, not a configuration problem that could
+be fixed here. Interesting incidental finding: Docker Desktop's WSL2 backend does already
 carry a working `nvidia-container-cli`/toolkit wiring (the error is a clean, specific
 "no adapter" message, not "toolkit not installed") — so a Windows machine with Docker
 Desktop *and* a real NVIDIA GPU would likely need no extra host setup for `--gpus all`
 to work, unlike a from-scratch Linux Docker host.
 
 **How to apply**: the real GPU-passthrough + inference-output check
-(`COLDSTART_QWEN3_OK process_start_to_first_token_ms=... token_text=...` from inside a
+(`REFLEX_GENERATE_OK process_start_to_first_token_ms=... token_text=...` from inside a
 container) still needs a Docker host with (a) genuine VM-level virtualization, not a
 nested container, and (b) an actual NVIDIA GPU + driver — e.g. a Windows or Linux
 machine with Docker Desktop/`nvidia-container-toolkit` and a real NVIDIA card, not
 another ThunderCompute-style rented GPU-cloud instance (those have all reproducibly
-been nested containers so far, per the original known-debt entry this session
-partially closed). See STATUS.md's updated Dockerfile entry for the precise remaining
+been nested containers so far, per the original known-debt entry this partially
+closed). See STATUS.md's updated Dockerfile entry for the precise remaining
 scope.
 
 ## Benchmark expansion: vLLM added, Ollama/TGI/TensorRT-LLM/other-cloud-vendors deferred
@@ -708,13 +698,11 @@ TensorRT-LLM/Triton, and serverless cloud vendors (Modal, Baseten, RunPod Server
 Beam.cloud, fal.ai, Replicate) are explicitly deferred, not silently dropped.
 
 **Why vLLM specifically**: llama.cpp — this project's only existing comparison — is,
-like coldstart-infer, AOT-compiled via `nvcc`; it never JIT-compiles CUDA kernels. That
+like Reflex, AOT-compiled via `nvcc`; it never JIT-compiles CUDA kernels. That
 means the llama.cpp comparison never actually tested this project's core technical bet
 (AOT-compiled kernels vs. a real JIT/warmup tax at cold start — see CLAUDE.md). vLLM's
 CUDA graph capture and (historically) `torch.compile`/JIT-driven kernel compilation is a
 real, well-documented cold-start cost and a much better foil for that specific claim.
-Confirmed with the user before starting (this project's usual practice for scope
-decisions — see prior "Open decision" entries in STATUS.md).
 
 **Why the rest are deferred**: Ollama wraps llama.cpp's own ggml runtime, so it doesn't
 add a new data point on the AOT-vs-JIT question — it would test daemon/model-pull
@@ -745,20 +733,20 @@ same cold-start mechanism, not byte-identical weights/precision, across engines.
 
 ## TypeSafe Jev comparison framing: latency-only citation, not a live benchmark
 
-**Decision**: coldstart-infer's comparison against TypeSafe AI's "Jev" model
+**Decision**: Reflex's comparison against TypeSafe AI's "Jev" model
 (`scripts/bench_cold_system1_vs_jev.sh`) cites Jev's own **published** latency figures
 (10-15ms compute / 70-500ms end-to-end via TypeSafe's managed cloud API) next to a
-locally **measured** cold-start latency of coldstart-infer's System1 candidate-scoring
-path (`Model::system1_evaluate` / `system1_coldstart`, `process_start_to_result_ms`).
+locally **measured** cold-start latency of Reflex's System1 candidate-scoring
+path (`Model::system1_evaluate` / `reflex system1`, `process_start_to_result_ms`).
 This is deliberately **not** a live call to Jev's API, and deliberately **not** a
 decision-quality/calibration comparison — latency only, and labeled as an illustrative
 citation, never merged into the same results table as the vLLM/llama.cpp engine-vs-engine
 comparisons.
 
-**Why System1 (not `qwen3_coldstart`) is the right coldstart-infer surface for this
+**Why System1 (not `reflex generate`) is the right Reflex surface for this
 comparison**: Jev is not a generative LLM — per TypeSafe's own description, it takes a
 state and one or more questions and returns typed answers with probabilities, never a
-sentence. A time-to-first-token comparison against coldstart-infer's normal
+sentence. A time-to-first-token comparison against Reflex's normal
 autoregressive generation path would be apples-to-oranges. `Model::system1_evaluate`
 (single-pass, non-autoregressive candidate scoring — see README's "System1" section) is
 the same task shape: prompt + fixed candidates in, scored typed results + probabilities
@@ -766,15 +754,14 @@ out, no decode loop.
 
 **Why latency-only, citation-based, not a live API call or quality claim**: (1) Jev's
 number necessarily includes a network round-trip to TypeSafe's managed cloud, while
-coldstart-infer's is a pure local process launch with zero network dependency at all —
+Reflex's is a pure local process launch with zero network dependency at all —
 different deployment models, not just different numbers, so a literal head-to-head table
 would misrepresent both sides; (2) Jev is presumably purpose-trained for calibrated
 decision-making, while System1 is a generic instruction-tuned Qwen3 GGUF with an
 efficient scoring head — this project has no basis to claim decision-quality parity, only
 to measure its own latency on a comparable task shape; (3) calling Jev's live API adds a
 new vendor dependency, rate-limit exposure, and a benchmark-publication ToS question that
-citing already-published numbers avoids entirely. Confirmed with the user before
-starting.
+citing already-published numbers avoids entirely.
 
 **How to apply**: if a genuine head-to-head is ever wanted, the only fair path is
 TypeSafe's enterprise on-prem tier (Docker/Kubernetes on local NVIDIA GPUs, per their own
@@ -782,29 +769,29 @@ published materials) deployed on the same A6000 instance — pursue that as a se
 explicitly-scoped decision if/when access and pricing are confirmed, rather than
 retroactively upgrading this citation into a benchmark claim.
 
-**Addendum, same round**: the cold-start citation above reported coldstart-infer
+**Addendum, same round**: the cold-start citation above reported Reflex
 losing by ~10-60x, which is honest but incomplete — Jev's 10-15ms figure is itself a
 *warm, compute-only* number (an always-resident service pays no cold load), so citing
-it only against coldstart-infer's *cold* number answers a different question than the
+it only against Reflex's *cold* number answers a different question than the
 one Jev's figure is actually about. Added a second, separate citation using the
-existing `bench_coldstart --candidate` warm-latency microbenchmark (model loaded
+existing `reflex bench --candidate` warm-latency microbenchmark (model loaded
 once, isolates just the gather-GEMV scoring step): at the shortest prompt-length
-bucket (29 tokens), coldstart-infer's warm System1 p50 is 19.4ms, within ~1.3-2x of
+bucket (29 tokens), Reflex's warm System1 p50 is 19.4ms, within ~1.3-2x of
 Jev's 10-15ms — competitive, not a loss. Both citations are published side by side in
 README.md, not just the favorable one — cold-start-to-decision and warm-per-decision-
 scoring answer genuinely different questions, and reporting only one would be exactly
 the kind of cherry-picking this project's methodology exists to avoid.
 
-## Fast-exit after printing the benchmark result (`coldstart_infer::fast_exit`)
+## Fast-exit after printing the benchmark result (`reflex_engine::fast_exit`)
 
-**Decision**: `qwen3_coldstart`/`system1_coldstart`/`smoke_coldstart` call
-`coldstart_infer::fast_exit(code)` (`src/lib.rs`) instead of returning from `main`
+**Decision**: `reflex generate`/`reflex system1`/`reflex smoke` call
+`reflex_engine::fast_exit(code)` (`src/lib.rs`) instead of returning from `main`
 normally, immediately after printing their result. It flushes stdout/stderr, then
 calls the raw `_exit` syscall via an `extern "C"` declaration — not
 `std::process::exit`, which still runs libc's `atexit` chain.
 
 **Why**: re-running the llama.cpp comparison on a fresh ThunderCompute A6000 this
-round surfaced a real regression — coldstart-infer measured ~1.4x *slower* than
+round surfaced a real regression — Reflex measured ~1.4x *slower* than
 llama.cpp on full external wall-clock, even though its own internal
 `process_start_to_first_token_ms` metric was unchanged (~4.8-5.0s). `strace -f -T`
 showed ~4.5s of staged-backoff `futex`/`poll` waits against `/tmp/.tc_hac`
@@ -814,12 +801,12 @@ printed. First hypothesis — too many separate device allocations (~300
 round-trip — was tested via a full arena-consolidation refactor (one shared buffer
 per model) and **made no measurable difference**, so it was reverted rather than kept
 for no benefit (see git history for that attempt; not present in the current tree).
-The actual tell: `smoke_coldstart`, which allocates almost nothing, showed the *same*
+The actual tell: `reflex smoke`, which allocates almost nothing, showed the *same*
 ~5.6s of pure post-result teardown. The cost is fixed per-process, not
 allocation-count-proportional — it's the CUDA driver's own `atexit`-registered
 context-teardown hook handshaking with the virtualization proxy, paid by any CUDA
 program on this kind of shared/virtualized instance. Confirmed the fix actually works
-by testing a raw `_exit()` diagnostically first (`smoke_coldstart`: 6.3s → 0.56s wall
+by testing a raw `_exit()` diagnostically first (`reflex smoke`: 6.3s → 0.56s wall
 clock) before wiring it into the real binaries.
 
 **Why this is safe**: every one of these binaries' job (compute a result, print it)
@@ -829,9 +816,9 @@ them down gracefully first — `_exit` skips only the *graceful* teardown handsh
 not actual resource reclamation. Buffered-writer flushing (the one thing `_exit`
 genuinely skips that matters) is done explicitly first.
 
-**How to apply**: any future `*_coldstart`-style binary whose job ends by printing a
-result should call `fast_exit` the same way. This is deliberately not applied to
-`check_correctness`/library code/the IPC server binaries — panics and multi-request
+**How to apply**: any future one-shot `reflex` subcommand whose job ends by printing a
+result should call `fast_exit` the same way. This is deliberately not applied to the
+`check`/`stdio`/`uds` subcommands or library code — panics and multi-request
 servers should keep normal Rust unwind/cleanup semantics; this is specifically for
 single-shot CLI binaries measuring their own process lifetime.
 
@@ -851,9 +838,9 @@ surfaced a genuine, reproducible finding: Ollama's bundled `llama-server` hits i
 instance — 2/7 cold-daemon runs and 3/5 warm-daemon-cold-model runs stalled to
 ~55-62s instead of the ~6-11s the other runs showed. This is the same class of
 GPU-virtualization-layer slowdown the `fast_exit` fix above addresses, but inside
-Ollama's own process, not coldstart-infer's — nothing here to fix on this project's
+Ollama's own process, not Reflex's — nothing here to fix on this project's
 side. Averaging these runs into one number would hide a real, user-relevant
-reliability difference (coldstart-infer/llama.cpp's own cold-start runs this session
+reliability difference (Reflex/llama.cpp's own cold-start runs
 stayed within single-digit-percent variance; Ollama's did not) — reporting every run
 individually keeps that visible.
 

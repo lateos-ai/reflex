@@ -1,10 +1,12 @@
 //! Gated DeltaNet (Qwen3.5/3.6 hybrid linear-attention) — host/CPU reference.
 //!
-//! Phase 21.15.2. This is the correctness-first host reference for one
-//! Gated DeltaNet mixer layer, matching the real Qwen3.5 recurrence exactly.
-//! It has no CUDA dependency (Phase 21.15.3 adds the GPU kernel), the same
-//! "get the math right on host first" sequencing every foundational kernel in
-//! this repo started with.
+//! This is the correctness-first host reference for one Gated DeltaNet mixer
+//! layer, matching the real Qwen3.5 recurrence exactly. It has no CUDA
+//! dependency (the GPU kernel is a separate, later step) -- get the math
+//! right on host first, the same sequencing every foundational kernel in
+//! this repo started with. Kept here as the oracle the GPU kernel is
+//! diffed against while debugging (see CLAUDE.md's `reference/` note);
+//! not compiled as part of this crate.
 //!
 //! Port provenance (fetched 2026-09-15, upstream `ggml-org/llama.cpp`):
 //! - `src/models/qwen35.cpp` `build_layer_attn_linear` (input projections,
@@ -16,8 +18,8 @@
 //! - `src/models/models.h` `build_gdn_l2_norm` (`x / sqrt(sum(x^2) + eps)`).
 //!
 //! The first-draft plan used third-party equations that omitted the causal
-//! conv1d, the q scaling, and the `exp` on the decay gate; `PHASE21_15_PLAN.md`
-//! ("item 4") records the corrected step list this module implements.
+//! conv1d, the q scaling, and the `exp` on the decay gate -- this module
+//! implements the corrected step list.
 //!
 //! Layout convention (matching GGUF/ggml, where `ne[0]` is contiguous): a
 //! weight with `[in, out]` ggml dims is stored `w[in_idx + out_idx * in_dim]`,
@@ -427,15 +429,14 @@ pub fn step(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 21.16.1: host/CPU *chunked* Gated DeltaNet forward (prefill).
+// Host/CPU *chunked* Gated DeltaNet forward (prefill).
 //
 // The sequential `step` above is the reference. This is the chunked closed
 // form of the SAME recurrence, ported from llama.cpp's `build_delta_net_chunking`
 // (`src/models/delta-net-base.cpp`, the non-KDA branch — Qwen3.5 uses a
 // per-head scalar gate). It processes a whole chunk of `T` tokens in one
-// parallel pass instead of `T` sequential ones, which is the prefill-speedup
-// primitive `PHASE21_15_PLAN.md`'s design decision 1 deferred and
-// `PHASE21_16_PLAN.md` scopes.
+// parallel pass instead of `T` sequential ones, the prefill-speedup
+// primitive the sequential step above deliberately deferred.
 //
 // Per head, the sequential step is (see `delta_rule_head`):
 //     W_t = exp(g_t) * S_{t-1}                  (decay first)
@@ -709,7 +710,7 @@ pub fn chunked(
 //   `gdn_delta_kernel`        one thread per value column, the delta-rule update
 //   `gdn_gated_norm_kernel`   `y = RMSNorm(o, ssm_norm) * silu(z)`, in place
 //
-// Design decision 2 (`PHASE21_15_PLAN.md`) puts the two recurrent buffers in
+// The design puts the two recurrent buffers in
 // `GatedDeltaNetDeviceState` (a `conv_state` window and a per-head `S`),
 // allocated once and reused across every decode token — never a per-call
 // upload. Weights are uploaded once into `GatedDeltaNetDeviceWeights`; all

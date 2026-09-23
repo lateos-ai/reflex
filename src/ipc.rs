@@ -1,5 +1,5 @@
-//! Local, non-network IPC protocol shared by `coldstart_stdio`/`coldstart_uds`
-//! (`src/bin/coldstart_stdio.rs`/`coldstart_uds.rs`) -- see CLAUDE.md/README.md's
+//! Local, non-network IPC protocol shared by the `reflex stdio`/`reflex uds`
+//! subcommands (`src/bin/reflex/stdio.rs`/`uds.rs`) -- see CLAUDE.md/README.md's
 //! Non-goals: no HTTP/gRPC server, ever; this is the sequential, non-thread-pool
 //! local-ergonomics surface that stands in for one. One line of JSON in, one line of
 //! JSON out, one request fully processed before the next is read -- both binaries
@@ -152,7 +152,7 @@ pub fn run_request_loop<R: BufRead, W: Write>(model: &Model, mut input: R, mut o
 }
 
 /// [`run_request_loop`] over `std::io::stdin()`/`std::io::stdout()` specifically --
-/// the shape `coldstart_stdio`'s `main` needs.
+/// the shape `reflex stdio`'s `run` needs.
 pub fn run_stdio_loop(model: &Model) -> Result<(), String> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();

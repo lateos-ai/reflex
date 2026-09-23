@@ -215,7 +215,7 @@ fn open_and_check_magic(path: &str) -> Result<std::fs::File, String> {
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic).map_err(|e| format!("read magic: {e}"))?;
     if &magic != MAGIC {
-        return Err(format!("{path}: not a coldstart-infer KV cache file (bad magic)"));
+        return Err(format!("{path}: not a reflex-engine KV cache file (bad magic)"));
     }
     Ok(f)
 }
@@ -323,7 +323,7 @@ mod tests {
             ],
         };
 
-        let path = std::env::temp_dir().join(format!("coldstart_kv_io_test_dense_{}.bin", std::process::id()));
+        let path = std::env::temp_dir().join(format!("reflex_kv_io_test_dense_{}.bin", std::process::id()));
         let path_str = path.to_str().unwrap();
 
         export_dense_kv(path_str, &cache).expect("export failed");
@@ -362,7 +362,7 @@ mod tests {
             ],
         };
 
-        let path = std::env::temp_dir().join(format!("coldstart_kv_io_test_hybrid_{}.bin", std::process::id()));
+        let path = std::env::temp_dir().join(format!("reflex_kv_io_test_hybrid_{}.bin", std::process::id()));
         let path_str = path.to_str().unwrap();
 
         export_hybrid_kv(path_str, &cache).expect("export failed");
@@ -407,7 +407,7 @@ mod tests {
             ],
         };
 
-        let path = std::env::temp_dir().join(format!("coldstart_kv_io_test_mla_{}.bin", std::process::id()));
+        let path = std::env::temp_dir().join(format!("reflex_kv_io_test_mla_{}.bin", std::process::id()));
         let path_str = path.to_str().unwrap();
 
         export_mla_kv(path_str, &cache).expect("export failed");
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn import_rejects_bad_magic() {
-        let path = std::env::temp_dir().join(format!("coldstart_kv_io_badmagic_{}.bin", std::process::id()));
+        let path = std::env::temp_dir().join(format!("reflex_kv_io_badmagic_{}.bin", std::process::id()));
         std::fs::write(&path, b"NOPE\x01\x00\x00\x00").unwrap();
         let err = import_dense_kv(path.to_str().unwrap()).unwrap_err();
         std::fs::remove_file(&path).ok();

@@ -1,4 +1,4 @@
-//! PyO3 Python bindings (`import coldstart_infer` after a `maturin build
+//! PyO3 Python bindings (`import reflex_engine` after a `maturin build
 //! --features python`), feature-gated. Calls `crate::model::Model`/
 //! `system1_evaluate` directly, not through `src/ffi.rs`'s C ABI -- there is no
 //! reason to pay a second serialization/indirection layer when PyO3 can hold a
@@ -76,6 +76,6 @@ impl PyModel {
 }
 
 #[pymodule]
-fn coldstart_infer(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn reflex_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyModel>()
 }

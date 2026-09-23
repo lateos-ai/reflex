@@ -7,17 +7,17 @@
 # since a naive `COPY --from=builder` of just the binary never carries that path
 # along). The runtime image never runs nvcc and never needs the devel toolkit.
 #
-# Build (defaults to sm_86, the ThunderCompute A6000 dev instance's arch -- pass
-# --build-arg COLDSTART_CUDA_ARCH=sm_XX for a different target, or
-# --build-arg COLDSTART_CUDA_ARCH= (empty) for the portable PTX build instead, which
-# JITs to whatever GPU the container actually runs on):
-#   docker build --build-arg COLDSTART_CUDA_ARCH=sm_86 -t coldstart-infer .
+# Build (defaults to sm_86 -- pass --build-arg REFLEX_CUDA_ARCH=sm_XX for a
+# different target compute capability, or --build-arg REFLEX_CUDA_ARCH= (empty)
+# for the portable PTX build instead, which JITs to whatever GPU the container
+# actually runs on):
+#   docker build --build-arg REFLEX_CUDA_ARCH=sm_86 -t reflex .
 #
-# Run (needs nvidia-container-toolkit on the host; ThunderCompute's own Docker setup
-# uses a different flag, `--device nvidia.com/gpu=all`, instead of the standard
+# Run (needs nvidia-container-toolkit on the host; some rented-GPU platforms use
+# a different flag, e.g. `--device nvidia.com/gpu=all`, instead of the standard
 # `--gpus all` below -- check your platform's own GPU-passthrough convention if
 # `--gpus all` doesn't work):
-#   docker run --rm --gpus all coldstart-infer <path-to-gguf-inside-the-container> "prompt"
+#   docker run --rm --gpus all reflex generate <path-to-gguf-inside-the-container> "prompt"
 #
 # The CUDA major/minor version in both stages' base images must stay consistent with
 # Cargo.toml's pinned `cudarc` feature (`"cuda-12000"`, i.e. CUDA 12.x) -- a mismatch
@@ -39,15 +39,15 @@ COPY . .
 # Empty by default: unset builds the portable PTX kernels (driver JITs to whatever
 # GPU the container actually runs on -- the safer default for a distributed image,
 # since it isn't pinned to one compute capability the way a cubin build is). Set
-# --build-arg COLDSTART_CUDA_ARCH=sm_86 (or your target) for the true
+# --build-arg REFLEX_CUDA_ARCH=sm_86 (or your target) for the true
 # zero-runtime-JIT cubin path instead.
-ARG COLDSTART_CUDA_ARCH=""
-RUN if [ -n "$COLDSTART_CUDA_ARCH" ]; then \
-        COLDSTART_CUDA_ARCH=$COLDSTART_CUDA_ARCH cargo build --release --bin qwen3_coldstart; \
+ARG REFLEX_CUDA_ARCH=""
+RUN if [ -n "$REFLEX_CUDA_ARCH" ]; then \
+        REFLEX_CUDA_ARCH=$REFLEX_CUDA_ARCH cargo build --release --bin reflex; \
     else \
-        cargo build --release --bin qwen3_coldstart; \
+        cargo build --release --bin reflex; \
     fi
 
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
-COPY --from=builder /build/target/release/qwen3_coldstart /usr/local/bin/qwen3_coldstart
-ENTRYPOINT ["/usr/local/bin/qwen3_coldstart"]
+COPY --from=builder /build/target/release/reflex /usr/local/bin/reflex
+ENTRYPOINT ["/usr/local/bin/reflex", "generate"]

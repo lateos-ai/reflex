@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/bench_cold_ollama.sh — cold-start benchmark: Ollama vs. coldstart-infer.
+# scripts/bench_cold_ollama.sh — cold-start benchmark: Ollama vs. Reflex.
 #
 # Ollama wraps llama.cpp's own ggml runtime (its logs show a bundled
 # `llama-server` subprocess doing the actual inference) — it does NOT add a
@@ -9,14 +9,14 @@
 #
 # THREE distinct scenarios, deliberately not conflated into one number:
 #   1. cold daemon + cold model  — `ollama serve` freshly (re)started, first
-#      request. The fairest comparison to llama.cpp/coldstart-infer/vLLM's
+#      request. The fairest comparison to llama.cpp/Reflex/vLLM's
 #      "process launch to first token" framing.
 #   2. warm daemon + cold model  — daemon already running, but this model
 #      not yet loaded into it (first request for it, or reloaded after
 #      `ollama stop`/keep_alive eviction). Tests model-load cost in
 #      isolation from daemon startup.
 #   3. warm daemon + warm model  — model already resident, steady-state
-#      generation latency. Comparable to `bench_coldstart`'s warm numbers.
+#      generation latency. Comparable to `reflex bench`'s warm numbers.
 #
 # Usage: scripts/bench_cold_ollama.sh <ollama-model-name> [n_runs]
 #   (the model must already exist: `ollama create <name> -f Modelfile`,

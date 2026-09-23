@@ -12,12 +12,12 @@
 //! (full-vocab GEMV+D2H vs. gather-GEMV+small D2H); the delta between the
 //! two is System1's actual, measured win.
 //!
-//! Usage: `bench_coldstart <path-to-gguf> [--warmup N] [--iters N]
+//! Usage: `reflex bench <path-to-gguf> [--warmup N] [--iters N]
 //! [--candidate <text> ...] [--lora <adapter.gguf>]`
 
-use coldstart_infer::diagnostics;
-use coldstart_infer::gguf::GgufFile;
-use coldstart_infer::model::{Model, System1Candidate};
+use reflex_engine::diagnostics;
+use reflex_engine::gguf::GgufFile;
+use reflex_engine::model::{Model, System1Candidate};
 use std::time::Instant;
 
 /// Approximate token-count buckets this bench reports latency for. Built by
@@ -51,14 +51,14 @@ fn print_stats(prefix: &str, prompt_tokens: usize, warmup: usize, iters: usize, 
     );
 }
 
-fn main() {
+pub fn run(args: Vec<String>) {
     let mut gguf_path: Option<String> = None;
     let mut warmup: usize = 5;
     let mut iters: usize = 50;
     let mut candidate_texts: Vec<String> = Vec::new();
     let mut lora_path: Option<String> = None;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--candidate" => candidate_texts.push(args.next().expect("--candidate requires text")),
@@ -76,7 +76,7 @@ fn main() {
         }
     }
     let gguf_path =
-        gguf_path.unwrap_or_else(|| panic!("usage: bench_coldstart <path-to-gguf> [--warmup N] [--iters N] [--candidate <text> ...] [--lora <adapter.gguf>]"));
+        gguf_path.unwrap_or_else(|| panic!("usage: reflex bench <path-to-gguf> [--warmup N] [--iters N] [--candidate <text> ...] [--lora <adapter.gguf>]"));
     if iters == 0 {
         panic!("--iters must be at least 1");
     }
@@ -86,7 +86,7 @@ fn main() {
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }
-    // Snapshot free VRAM before/after `Model::load` for `COLDSTART_BENCH_VRAM_OK`
+    // Snapshot free VRAM before/after `Model::load` for `REFLEX_BENCH_VRAM_OK`
     // below -- a load-time free/total snapshot (`cuMemGetInfo`), not a true
     // allocator-tracked peak (that would need NVML polling, out of scope here).
     let vram_before = diagnostics::probe(&device).ok();
@@ -96,7 +96,7 @@ fn main() {
         if let Ok(after) = diagnostics::probe(&device_for_vram) {
             let resident_mib = before.vram_free_bytes.saturating_sub(after.vram_free_bytes) / (1024 * 1024);
             println!(
-                "COLDSTART_BENCH_VRAM_OK model_resident_mib={resident_mib} free_before_load_mib={} free_after_load_mib={}",
+                "REFLEX_BENCH_VRAM_OK model_resident_mib={resident_mib} free_before_load_mib={} free_after_load_mib={}",
                 before.vram_free_bytes / (1024 * 1024),
                 after.vram_free_bytes / (1024 * 1024),
             );
@@ -105,7 +105,7 @@ fn main() {
 
     if let Some(lora_path) = &lora_path {
         let applied = model.apply_lora(std::path::Path::new(lora_path)).expect("failed to apply LoRA adapter");
-        println!("COLDSTART_QWEN3_LORA_OK path={lora_path:?} tensors_applied={applied}");
+        println!("REFLEX_LORA_OK path={lora_path:?} tensors_applied={applied}");
     }
 
     let candidates: Vec<System1Candidate> = candidate_texts.iter().map(|text| System1Candidate { text: text.clone() }).collect();
@@ -123,7 +123,7 @@ fn main() {
             model.forward_prompt(&prompt).expect("forward_prompt failed");
             samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
-        print_stats("COLDSTART_BENCH_WARM_OK", prompt_tokens, warmup, iters, samples_ms);
+        print_stats("REFLEX_BENCH_WARM_OK", prompt_tokens, warmup, iters, samples_ms);
 
         // Decode throughput: `generate` past the first token measures pure per-token
         // decode cost, isolated from the one-time prefill via `on_first_token`.
@@ -150,7 +150,7 @@ fn main() {
             ms_per_token_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let ms_per_token = percentile(&ms_per_token_samples, 0.50);
             println!(
-                "COLDSTART_BENCH_THROUGHPUT_OK prompt_tokens={prompt_tokens} decode_tokens={DECODE_STEPS} warmup={warmup} iters={iters} \
+                "REFLEX_BENCH_THROUGHPUT_OK prompt_tokens={prompt_tokens} decode_tokens={DECODE_STEPS} warmup={warmup} iters={iters} \
                  tokens_per_sec={:.3} ms_per_token={:.3}",
                 1000.0 / ms_per_token,
                 ms_per_token,
@@ -167,7 +167,8 @@ fn main() {
                 model.system1_evaluate(&prompt, &candidates, 1.0).expect("system1_evaluate failed");
                 samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
             }
-            print_stats("COLDSTART_BENCH_SYSTEM1_OK", prompt_tokens, warmup, iters, samples_ms);
+            print_stats("REFLEX_BENCH_SYSTEM1_OK", prompt_tokens, warmup, iters, samples_ms);
         }
     }
+    reflex_engine::fast_exit(0);
 }

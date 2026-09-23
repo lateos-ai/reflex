@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/bench_cold_vllm.sh — cold-start benchmark: vLLM vs. coldstart-infer.
+# scripts/bench_cold_vllm.sh — cold-start benchmark: vLLM vs. Reflex.
 #
 # Reuses bench_cold_common.sh's methodology (external wall clock via
 # /usr/bin/time -v, greedy decode, disclosed caveats) so the result is
@@ -7,7 +7,7 @@
 # DECISIONS.md's "Cold-start-vs-llama.cpp benchmark methodology" entry.
 #
 # WHY vLLM (not just another llama.cpp-style engine): llama.cpp is, like
-# coldstart-infer, AOT-compiled via nvcc — it never JIT-compiles CUDA
+# Reflex, AOT-compiled via nvcc — it never JIT-compiles CUDA
 # kernels, so it doesn't actually test this project's core AOT-vs-JIT
 # cold-start bet (see CLAUDE.md). vLLM's CUDA graph capture / historically
 # JIT-driven kernel compilation is a real, well-documented warmup cost and

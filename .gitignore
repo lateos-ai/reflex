@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 *.gguf
 test-data/*.tar.gz
 /bench-results

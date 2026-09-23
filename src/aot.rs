@@ -3,8 +3,8 @@
 //! project vs. RustFeference/rft-gpu (see LESSONS_LEARNED_RUSTFEFERENCE.md there).
 //!
 //! Kernel bytes are embedded directly into this binary at compile time
-//! (`include_bytes!(env!("COLDSTART_KERNEL_<NAME>"))` at each call site in
-//! `model.rs`/`smoke_coldstart.rs`, passed in here as `kernel_bytes: &'static
+//! (`include_bytes!(env!("REFLEX_KERNEL_<NAME>"))` at each call site in
+//! `model.rs`/`reflex smoke`, passed in here as `kernel_bytes: &'static
 //! [u8]`) rather than loaded from a filesystem path at runtime. The previous
 //! design (`Ptx::from_file(kernel_path)`, `kernel_path` an absolute *build-time*
 //! `OUT_DIR` path baked in via `env!(...)`) meant the compiled binary was not
@@ -16,9 +16,9 @@
 //! self-contained, which is also a more literal reading of this project's own "AOT,
 //! no runtime dependency" thesis.
 //!
-//! `build.rs` emits one crate-wide `COLDSTART_KERNEL_FORMAT` env var (`"ptx"` or
+//! `build.rs` emits one crate-wide `REFLEX_KERNEL_FORMAT` env var (`"ptx"` or
 //! `"cubin"`, matching whichever single output mode that build produced for every
-//! kernel) alongside each kernel's own `COLDSTART_KERNEL_<NAME>` path var. PTX is
+//! kernel) alongside each kernel's own `REFLEX_KERNEL_<NAME>` path var. PTX is
 //! ASCII text, so it round-trips through `Ptx::from_src` directly from the embedded
 //! bytes -- fully self-contained, no unsafe, no temp file. Cubin is arbitrary
 //! binary, and the pinned `cudarc` version (0.11.9) has no public bytes-based `Ptx`
@@ -38,7 +38,7 @@ pub struct AotKernel {
     pub function: CudaFunction,
 }
 
-const KERNEL_FORMAT: &str = env!("COLDSTART_KERNEL_FORMAT");
+const KERNEL_FORMAT: &str = env!("REFLEX_KERNEL_FORMAT");
 
 /// FNV-1a (64-bit) -- a small, dependency-free non-cryptographic hash, used only to
 /// give each embedded cubin's materialized temp file a content-derived name so
@@ -55,7 +55,7 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 }
 
 /// Turns embedded kernel bytes into a `cudarc::nvrtc::Ptx` the driver can load,
-/// branching on the crate-wide `COLDSTART_KERNEL_FORMAT` build.rs set. See this
+/// branching on the crate-wide `REFLEX_KERNEL_FORMAT` build.rs set. See this
 /// module's doc comment for why the two formats need different handling.
 fn ptx_from_embedded_bytes(kernel_bytes: &'static [u8], module_name: &str) -> Result<Ptx, String> {
     match KERNEL_FORMAT {
@@ -66,7 +66,7 @@ fn ptx_from_embedded_bytes(kernel_bytes: &'static [u8], module_name: &str) -> Re
         }
         "cubin" => {
             let hash = fnv1a_hash(kernel_bytes);
-            let tmp_path = std::env::temp_dir().join(format!("coldstart-infer-kernel-{module_name}-{hash:016x}.cubin"));
+            let tmp_path = std::env::temp_dir().join(format!("reflex-engine-kernel-{module_name}-{hash:016x}.cubin"));
             // Always (re)write, never skip-if-exists: a stale file left over from a
             // different build with the same module name (but different content --
             // the hash is content-derived, so this is only a concern if two builds
@@ -79,12 +79,12 @@ fn ptx_from_embedded_bytes(kernel_bytes: &'static [u8], module_name: &str) -> Re
                 .ok_or_else(|| format!("materialized cubin temp path for module {module_name} is not valid UTF-8: {tmp_path:?}"))?;
             Ok(Ptx::from_file(path_str))
         }
-        other => Err(format!("unknown COLDSTART_KERNEL_FORMAT {other:?} (build.rs should only ever emit \"ptx\" or \"cubin\")")),
+        other => Err(format!("unknown REFLEX_KERNEL_FORMAT {other:?} (build.rs should only ever emit \"ptx\" or \"cubin\")")),
     }
 }
 
 /// Loads a single kernel from bytes embedded at compile time (`kernel_bytes`, built
-/// via `include_bytes!(env!("COLDSTART_KERNEL_<NAME>"))` at the call site -- see
+/// via `include_bytes!(env!("REFLEX_KERNEL_<NAME>"))` at the call site -- see
 /// this module's doc comment for why that has to happen at the call site rather
 /// than inside this function). `module_name` and `function_name` must match the
 /// `extern "C" __global__` symbol name in the original `.cu` source (see

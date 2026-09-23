@@ -1,29 +1,34 @@
 [package]
-name = "coldstart-infer"
+name = "reflex-engine"
 version = "0.2.0"
 edition = "2021"
 license = "MIT"
+description = "A high-performance, GGUF-native Rust & CUDA inference engine optimized for cold-start latency and real-time \"System 1\" agent decision loops."
+repository = "https://github.com/lateos-ai/reflex"
+readme = "README.md"
+keywords = ["llm", "inference", "cuda", "gguf"]
+categories = ["command-line-utilities", "science"]
 build = "build.rs"
 
 [lib]
 # Phase 4 (Embeddability) round 2: cdylib/staticlib alongside the default
 # rlib so `src/ffi.rs`'s extern "C" surface is actually linkable from a C
-# host, while keeping rlib so the existing `src/bin/*.rs` targets still link
-# against this crate unmodified.
+# host, while keeping rlib so `src/bin/reflex/`'s subcommand modules still
+# link against this crate unmodified.
 crate-type = ["rlib", "cdylib", "staticlib"]
 # Explicit (rather than relying on the `[package] name`'s auto hyphen->underscore
 # conversion) because `maturin build --features python` (see src/python.rs) reads
 # this literally and rejects a hyphenated module name outright -- it must match the
-# `#[pymodule] fn coldstart_infer` symbol name in src/python.rs.
-name = "coldstart_infer"
+# `#[pymodule] fn reflex_engine` symbol name in src/python.rs.
+name = "reflex_engine"
 
 [dependencies]
 cudarc = { version = "0.11", features = ["driver", "cublas", "cuda-12000", "f16"] }
 half = "2.3"
 memmap2 = "0.9"
-# Local IPC (--stdio/--uds, see src/ipc.rs), feature-gated: this project's default
-# `cargo build` stays at its original 3-dependency footprint for users who never
-# touch the IPC binaries.
+# Local IPC (`reflex stdio`/`reflex uds`, see src/ipc.rs), feature-gated: this
+# project's default `cargo build` stays at its original 3-dependency footprint
+# for users who never touch the IPC subcommands.
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 # Python bindings (see src/python.rs), feature-gated for the same reason as `ipc`
@@ -41,13 +46,10 @@ python = ["dep:pyo3"]
 download = ["dep:hf-hub"]
 
 [[bin]]
-name = "coldstart_stdio"
-path = "src/bin/coldstart_stdio.rs"
-required-features = ["ipc"]
-
-[[bin]]
-name = "coldstart_uds"
-path = "src/bin/coldstart_uds.rs"
-required-features = ["ipc"]
+name = "reflex"
+path = "src/bin/reflex/main.rs"
+# No required-features: the binary must always build. The `stdio`/`uds`
+# subcommands are gated inside main.rs via #[cfg(feature = "ipc")] instead
+# of at the Cargo-target level, since there's only one binary now.
 
 [dev-dependencies]
