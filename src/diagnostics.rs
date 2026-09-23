@@ -57,6 +57,56 @@ pub fn init_device_with_diagnostics(ordinal: usize) -> Result<Arc<CudaDevice>, S
     CudaDevice::new(ordinal).map_err(|e| explain_driver_error(ordinal, &e))
 }
 
+/// The `REFLEX_CUDA_ARCH` build.rs was invoked with (e.g. `"sm_86"`), or empty in the
+/// default portable-PTX build. See `build.rs`'s matching `cargo:rustc-env` line.
+const COMPILED_ARCH: &str = env!("REFLEX_CUDA_ARCH");
+
+/// Parses a `sm_XY`/`compute_XY` (or bare `XY`) arch string into `(major, minor)`,
+/// matching CUDA's own convention (all digits but the last are major, the last digit
+/// is minor -- e.g. `sm_86` -> `(8, 6)`, `sm_90a` -> `(9, 0)`, the trailing `a`
+/// "family-specific" suffix stripped since it doesn't affect binary compatibility here).
+fn parse_arch(arch: &str) -> Result<(i32, i32), String> {
+    let digits: String = arch
+        .strip_prefix("sm_")
+        .or_else(|| arch.strip_prefix("compute_"))
+        .unwrap_or(arch)
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.len() < 2 {
+        return Err(format!("couldn't parse compute capability out of REFLEX_CUDA_ARCH={arch:?}"));
+    }
+    let (major, minor) = digits.split_at(digits.len() - 1);
+    let major = major.parse::<i32>().map_err(|e| format!("parsing major compute capability from {arch:?}: {e}"))?;
+    let minor = minor.parse::<i32>().map_err(|e| format!("parsing minor compute capability from {arch:?}: {e}"))?;
+    Ok((major, minor))
+}
+
+/// Confirms the running GPU's real compute capability matches the one this binary's
+/// CUDA kernels were AOT-compiled for -- only meaningful when `build.rs` was given
+/// `REFLEX_CUDA_ARCH` (a single-arch cubin build); the default portable-PTX build is
+/// JIT'd by the driver to whatever's present, so no mismatch is possible and this
+/// short-circuits immediately. Called once from `Model::load`, before any kernel is
+/// loaded, so a mismatch surfaces as this plain-English error instead of an opaque
+/// CUDA driver load/launch failure.
+pub fn check_kernel_compute_capability(device: &Arc<CudaDevice>) -> Result<(), String> {
+    if COMPILED_ARCH.is_empty() {
+        return Ok(());
+    }
+    let (compiled_major, compiled_minor) = parse_arch(COMPILED_ARCH)?;
+    let diag = probe(device)?;
+    let (major, minor) = diag.compute_capability;
+    if (major, minor) != (compiled_major, compiled_minor) {
+        return Err(format!(
+            "this binary's CUDA kernels were compiled for compute capability {compiled_major}.{compiled_minor} \
+             (sm_{compiled_major}{compiled_minor}), but the detected GPU ({}) has compute capability {major}.{minor} \
+             -- rebuild with REFLEX_CUDA_ARCH=sm_{major}{minor}, or omit REFLEX_CUDA_ARCH for a portable PTX build.",
+            diag.name
+        ));
+    }
+    Ok(())
+}
+
 fn explain_driver_error(ordinal: usize, e: &DriverError) -> String {
     match e.0 {
         CUresult::CUDA_ERROR_NO_DEVICE => {
@@ -81,5 +131,36 @@ fn explain_driver_error(ordinal: usize, e: &DriverError) -> String {
             "CUDA device init failed ({other:?}): {}",
             e.error_string().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|_| "<no driver error string available>".to_string())
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_arch;
+
+    #[test]
+    fn parse_arch_sm_prefix() {
+        assert_eq!(parse_arch("sm_86"), Ok((8, 6)));
+    }
+
+    #[test]
+    fn parse_arch_compute_prefix() {
+        assert_eq!(parse_arch("compute_75"), Ok((7, 5)));
+    }
+
+    #[test]
+    fn parse_arch_strips_family_specific_suffix() {
+        assert_eq!(parse_arch("sm_90a"), Ok((9, 0)));
+    }
+
+    #[test]
+    fn parse_arch_bare_digits() {
+        assert_eq!(parse_arch("120"), Ok((12, 0)));
+    }
+
+    #[test]
+    fn parse_arch_rejects_garbage() {
+        assert!(parse_arch("sm_").is_err());
+        assert!(parse_arch("nonsense").is_err());
     }
 }

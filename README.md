@@ -74,6 +74,21 @@ requiring `cargo build --features download`:
 cargo run --release --features download --bin reflex -- generate --quickstart "Once upon a time"
 ```
 
+### Bringing your own model (non-GGUF checkpoints)
+
+Reflex only ever loads GGUF — this is deliberate, not a missing feature (its
+Hugging Face integration is a GGUF downloader/cache only, never a new
+tensor-format ingestion path). If you have a safetensors/HF-format checkpoint,
+convert it to GGUF first with llama.cpp's own unmodified `convert_hf_to_gguf.py`
+— the same converter this project uses internally for its own test fixtures and
+for real checkpoints like DeepSeek-V2-Lite:
+
+```
+python convert_hf_to_gguf.py /path/to/hf-checkpoint --outtype q8_0 --outfile model.gguf
+```
+
+LoRA adapters convert the same way, via llama.cpp's `convert_lora_to_gguf.py`.
+
 ## Why this exists
 
 Closing the steady-state-throughput gap with llama.cpp/vLLM is a kernel-optimization

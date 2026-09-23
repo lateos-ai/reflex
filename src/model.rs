@@ -44,6 +44,7 @@
 
 use crate::aot::{self, AotKernel};
 use crate::dequant;
+use crate::diagnostics;
 use crate::gguf::{GgmlType, GgufFile, GgufValue};
 use crate::lora;
 use crate::moe::{route_top_k, route_top_k_with_norm};
@@ -1044,6 +1045,7 @@ impl Model {
     }
 
     pub fn load(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
+        diagnostics::check_kernel_compute_capability(&device)?;
         let architecture = file.metadata.get("general.architecture").and_then(GgufValue::as_str).unwrap_or("");
         if architecture == "qwen35" {
             return Self::load_hybrid(device, file);

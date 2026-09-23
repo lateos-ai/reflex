@@ -68,6 +68,12 @@ fn main() {
     // produced those bytes -- both modes always agree for a single build (the
     // `-cubin`/`-ptx` flag below is chosen once, not per file).
     println!("cargo:rustc-env=REFLEX_KERNEL_FORMAT={}", if arch.is_some() { "cubin" } else { "ptx" });
+    // Threaded forward the same way, so `src/diagnostics.rs` can compare the arch a
+    // cubin was actually compiled for against the running GPU's real compute
+    // capability at startup, instead of letting a mismatch surface as an opaque
+    // driver load/launch error. Empty string in the default (portable PTX) build,
+    // where no such mismatch is possible.
+    println!("cargo:rustc-env=REFLEX_CUDA_ARCH={}", arch.as_deref().unwrap_or(""));
 
     let entries = match std::fs::read_dir(src_dir) {
         Ok(e) => e,
