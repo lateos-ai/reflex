@@ -42,10 +42,19 @@ COPY . .
 # --build-arg REFLEX_CUDA_ARCH=sm_86 (or your target) for the true
 # zero-runtime-JIT cubin path instead.
 ARG REFLEX_CUDA_ARCH=""
-RUN if [ -n "$REFLEX_CUDA_ARCH" ]; then \
-        REFLEX_CUDA_ARCH=$REFLEX_CUDA_ARCH cargo build --release --bin reflex; \
+
+# Empty by default: no optional Cargo features enabled, matching this image's original
+# footprint exactly. Set --build-arg REFLEX_FEATURES=ipc to additionally enable `reflex
+# stdio`/`reflex uds` (see Cargo.toml's [features] table) -- needed for the AWS
+# sidecar-over-UDS pattern in docs/aws-deployment.md. Comma-separate multiple features
+# the same way Cargo does, e.g. REFLEX_FEATURES=ipc,download.
+ARG REFLEX_FEATURES=""
+RUN set -- --release --bin reflex; \
+    if [ -n "$REFLEX_FEATURES" ]; then set -- "$@" --features "$REFLEX_FEATURES"; fi; \
+    if [ -n "$REFLEX_CUDA_ARCH" ]; then \
+        REFLEX_CUDA_ARCH=$REFLEX_CUDA_ARCH cargo build "$@"; \
     else \
-        cargo build --release --bin reflex; \
+        cargo build "$@"; \
     fi
 
 FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime

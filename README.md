@@ -268,6 +268,11 @@ The CUDA major/minor version in both Docker stages must stay consistent with
 `Cargo.toml`'s pinned `cudarc` feature (`"cuda-12000"`, i.e. CUDA 12.x) — a mismatch is
 a build-time/runtime library version mismatch this Dockerfile can't catch for you.
 
+For a cost-optimized AWS pattern built on this same image (Spot GPU instances, an Auto
+Scaling Group with minimum capacity 0, and a `reflex uds` sidecar reachable over a local
+Unix Domain Socket instead of a network load balancer), see
+[`docs/aws-deployment.md`](docs/aws-deployment.md).
+
 ## Kubernetes
 
 Reflex is a single-shot CLI, not a server (see Non-goals above) — the natural
