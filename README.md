@@ -36,6 +36,44 @@ microbenchmark), `check` (byte-exact-vs-reference correctness check, CI-scriptab
 and `stdio`/`uds` (local JSON-line IPC, both need `--features ipc`). Run `reflex
 <subcommand>` with no further arguments to see that subcommand's own usage.
 
+### Example: download a model from Hugging Face, then run a System1 test
+
+`system1` takes a local GGUF path, so download the file first with the
+[`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli) (`pip install -U
+huggingface_hub`), then point `system1` at it — this scores each `--candidate`
+against the prompt in a single pass, with no autoregressive decode loop:
+
+```
+hf download Qwen/Qwen3-0.6B-GGUF Qwen3-0.6B-Q8_0.gguf --local-dir .
+
+cargo run --release --bin reflex -- system1 Qwen3-0.6B-Q8_0.gguf \
+  "The capital of France is" \
+  --candidate " Paris" --candidate " London" --candidate " Berlin"
+```
+
+Real output from this exact command (RTX A6000):
+
+```
+REFLEX_SYSTEM1_CANDIDATE_OK idx=0 text=" Paris" token_ids=[12095] score=17.407064 probability=0.997350
+REFLEX_SYSTEM1_CANDIDATE_OK idx=1 text=" London" token_ids=[7148] score=11.308186 probability=0.002239
+REFLEX_SYSTEM1_CANDIDATE_OK idx=2 text=" Berlin" token_ids=[19846] score=9.612655 probability=0.000411
+REFLEX_SYSTEM1_OK process_start_to_result_ms=8524.253 num_candidates=3 best_idx=0 best_text=" Paris" entropy=0.028154
+```
+
+`probability` is relative to this candidate set only, not a vocab-wide probability —
+see `Model::system1_evaluate`'s doc comment in `src/model.rs`. `system1` currently
+supports dense/MoE Qwen3 only; the Qwen3.5 hybrid mixer and DeepSeek-V2/V3 (MLA) are
+rejected with a clear error (`generate` supports all four architectures — swap in a
+DeepSeek GGUF the same way for a `generate` run instead).
+
+`generate` can also pull a GGUF straight from the Hub itself, via this project's own
+Rust `hf-hub` integration — `--model <org/repo:file.gguf>` or `--quickstart`, both
+requiring `cargo build --features download`:
+
+```
+cargo run --release --features download --bin reflex -- generate --quickstart "Once upon a time"
+```
+
 ## Why this exists
 
 Closing the steady-state-throughput gap with llama.cpp/vLLM is a kernel-optimization
