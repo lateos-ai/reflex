@@ -639,3 +639,62 @@ signature matches GPU-capacity contention as easily as a real hang. Wait longer 
 check `nvidia-smi`/process state for whether it's still making progress) before
 concluding it's broken, particularly for anything touching `CudaDevice::new` or other
 first GPU-driver contact in a fresh process.
+
+## Dockerfile real `docker build`/`docker run` verification: found and fixed a real portable-PTX build bug
+
+**Decision**: fixed `build.rs`'s `COLDSTART_CUDA_ARCH` handling (one line) rather than
+working around it in the Dockerfile.
+
+**What was found**: the first real `docker build` pass on a genuine (non-nested-container)
+Docker host — a Windows machine running Docker Desktop, the first environment available
+across this project's sessions that could actually run `docker build` at all — reproduced
+a real, previously-undetected bug: the default (no `--build-arg COLDSTART_CUDA_ARCH=...`)
+portable-PTX build mode failed every time with `nvcc fatal: Value '' is not defined for
+option 'gpu-architecture'`. Root cause: the Dockerfile's `ARG COLDSTART_CUDA_ARCH=""`
+exposes that variable to the `RUN` instruction's shell as a *set-but-empty* env var even
+when no `--build-arg` override is passed (that's exactly why the Dockerfile's own
+`if [ -n "$COLDSTART_CUDA_ARCH" ]` shell check works as intended, correctly taking the
+plain-`cargo build` else-branch) — but `build.rs`'s `env::var("COLDSTART_CUDA_ARCH").ok()`
+returns `Some("")` for a set-but-empty var, not `None`, so it silently took the cubin
+branch anyway with an empty `-arch=` flag. This never reproduces on a bare host shell
+(where an unset var is truly absent, not present-and-empty), which is exactly why every
+prior real-hardware session's plain `cargo build --release` runs never hit it — only
+Docker's `ARG` mechanism exposes the gap. Fix: `.filter(|s| !s.is_empty())` after the
+`.ok()`.
+
+**Why fixed immediately rather than just documented**: one-line, unambiguous root cause,
+directly blocking the one release-path check STATUS.md had explicitly flagged as
+un-verified; leaving a known-broken default build mode in the shipped Dockerfile would
+have defeated the point of finally getting a real Docker host to test on.
+
+**Full verification, both build modes, real host**: `docker build --build-arg
+COLDSTART_CUDA_ARCH=sm_86 -t coldstart-infer .` and `docker build -t coldstart-infer .`
+(portable PTX) both pass cleanly post-fix; re-ran the `sm_86` build afterward too to
+confirm the fix doesn't regress the cubin path (it doesn't — `arch` is `Some("sm_86")`
+either way, unaffected by the new filter). `docker run` (no `--gpus`) against the
+`ptx`-tagged image with `test-data/deepseek-tiny-mla.gguf` bind-mounted confirmed the
+binary itself is fully correct inside the container: it opened the GGUF, parsed it, and
+progressed all the way to `cudarc`'s dynamic `libcuda`/`nvcuda` load before failing —
+exactly the expected failure point with no GPU/driver present, not a container defect.
+
+**What could *not* be verified**: `docker run --rm --gpus all` itself, i.e. real GPU
+passthrough + actual inference output (`COLDSTART_QWEN3_OK ...`) from inside the
+container. This Docker host has no NVIDIA GPU at all (confirmed via `Get-CimInstance
+Win32_VideoController` → AMD Radeon only) — `docker run --gpus all` fails immediately
+with `nvidia-container-cli: initialization error: WSL environment detected but no
+adapters were found`, a hardware-absence error, not a configuration problem this session
+could fix. Interesting incidental finding: Docker Desktop's WSL2 backend does already
+carry a working `nvidia-container-cli`/toolkit wiring (the error is a clean, specific
+"no adapter" message, not "toolkit not installed") — so a Windows machine with Docker
+Desktop *and* a real NVIDIA GPU would likely need no extra host setup for `--gpus all`
+to work, unlike a from-scratch Linux Docker host.
+
+**How to apply**: the real GPU-passthrough + inference-output check
+(`COLDSTART_QWEN3_OK process_start_to_first_token_ms=... token_text=...` from inside a
+container) still needs a Docker host with (a) genuine VM-level virtualization, not a
+nested container, and (b) an actual NVIDIA GPU + driver — e.g. a Windows or Linux
+machine with Docker Desktop/`nvidia-container-toolkit` and a real NVIDIA card, not
+another ThunderCompute-style rented GPU-cloud instance (those have all reproducibly
+been nested containers so far, per the original known-debt entry this session
+partially closed). See STATUS.md's updated Dockerfile entry for the precise remaining
+scope.

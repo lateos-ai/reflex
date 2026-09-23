@@ -302,20 +302,42 @@ conversation.
   bartowski) predates the MLA tensor-split conversion format and will be silently
   rejected by `parse_mla_config` (no `key_length_mla`/`value_length_mla` metadata) —
   don't assume a downloaded GGUF is usable without checking for those keys first.
-- **Dockerfile not verified by an actual `docker build`/`docker run` pass**: the
-  MVP-release adoption round's kernel-byte-embedding refactor (`src/aot.rs`) and the
-  `Dockerfile` it enables were checked on a ThunderCompute A6000 instance, but that
-  instance is itself a nested container (`systemd-detect-virt` reports `docker`) and
-  rejects *any* Docker build outright (`unshare: operation not permitted`, confirmed
-  with even a trivial `FROM ubuntu:22.04` Dockerfile) — nested Docker-in-Docker isn't
-  supported there. What *was* verified directly: the compiled `qwen3_coldstart`
-  binary is genuinely self-contained (copied to an empty directory after deleting the
-  entire `target/` build directory, it still ran correctly), which is the actual
-  property the Dockerfile's multi-stage `COPY --from=builder` step depends on. Treat
-  this as strong but indirect evidence, not a substitute for the real thing — **run a
-  real `docker build` + `docker run --gpus all` pass on a standard VM-based Docker
-  host (not a nested-container instance) before publishing this image to Docker Hub/
-  GHCR or otherwise treating it as release-ready.**
+- **Dockerfile `docker build` now real-verified (both modes); `docker run --gpus all`
+  still not, for a hardware reason this time, not an environment-access one**: a
+  genuine (non-nested-container) Docker host was finally available this session (a
+  Windows machine running Docker Desktop, WSL2 backend) — unlike every ThunderCompute
+  A6000 instance used previously, which is itself a nested container
+  (`systemd-detect-virt` reports `docker`) and rejects any Docker build outright
+  (`unshare: operation not permitted`). `docker build --build-arg
+  COLDSTART_CUDA_ARCH=sm_86 -t coldstart-infer .` and the default portable-PTX
+  `docker build -t coldstart-infer .` **both now pass cleanly** — but the portable-PTX
+  mode only after a real bug this run found and fixed: `build.rs`'s
+  `env::var("COLDSTART_CUDA_ARCH").ok()` treated Docker's set-but-empty `ARG` (present
+  even when no `--build-arg` is passed) as `Some("")` instead of `None`, silently
+  taking the cubin branch with an empty `-arch=` and making `nvcc` fatal on every
+  default docker build. Fixed with a one-line `.filter(|s| !s.is_empty())`; both modes
+  re-verified clean post-fix. See DECISIONS.md's "Dockerfile real `docker build`/
+  `docker run` verification" entry for the full root-cause writeup.
+  `docker run` (no `--gpus`) against the built image with
+  `test-data/deepseek-tiny-mla.gguf` bind-mounted confirmed the binary itself is
+  correct inside the container — it opens and parses the GGUF, then progresses all the
+  way to `cudarc`'s dynamic `libcuda`/`nvcuda` load before failing, exactly the
+  expected boundary with no GPU present.
+  **`docker run --rm --gpus all` remains unverified** — but now purely because this
+  particular Docker host has no NVIDIA GPU at all (confirmed: `Get-CimInstance
+  Win32_VideoController` → AMD Radeon only), not because of the nested-container
+  access problem the previous entry described. `--gpus all` fails immediately with
+  `nvidia-container-cli: initialization error: WSL environment detected but no
+  adapters were found` — a hardware-absence error. (Incidental finding: Docker
+  Desktop's WSL2 backend already has a working `nvidia-container-cli` wired in — the
+  error is a specific "no adapter," not "toolkit missing" — so a Windows/Docker
+  Desktop host with a real NVIDIA GPU would likely need no extra host-side toolkit
+  setup for `--gpus all` to work.) **Still needed before this image is treated as
+  release-ready**: one real `docker run --rm --gpus all` pass on a Docker host that has
+  both genuine VM-level virtualization *and* an actual NVIDIA GPU/driver, producing
+  real `COLDSTART_QWEN3_OK process_start_to_first_token_ms=... token_text=...` output —
+  neither the nested-container ThunderCompute instances nor this session's GPU-less
+  Windows host can provide that combination.
 - **Kernel-byte-embedding refactor re-verified against the Qwen3.5 hybrid fixture,
   closing the one gap the MVP-release round's own hardware pass left open**: the
   initial verification (previous session) re-ran the dense/MoE and MLA paths against

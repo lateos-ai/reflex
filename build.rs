@@ -57,7 +57,12 @@ fn main() {
     };
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let arch = env::var("COLDSTART_CUDA_ARCH").ok();
+    // `.filter(|s| !s.is_empty())`: Docker's `ARG COLDSTART_CUDA_ARCH=""` exposes this
+    // as a set-but-empty env var to `RUN` even when no `--build-arg` override is passed
+    // (unlike a bare host shell, where it's truly unset) -- without the filter this
+    // reads as `Some("")`, taking the cubin branch below with an empty `-arch=` and
+    // making nvcc fatal on every default (portable-PTX) `docker build`.
+    let arch = env::var("COLDSTART_CUDA_ARCH").ok().filter(|s| !s.is_empty());
 
     // `src/aot.rs` embeds every kernel's bytes at compile time
     // (`include_bytes!(env!("COLDSTART_KERNEL_<NAME>"))` at each call site) and
