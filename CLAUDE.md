@@ -16,7 +16,8 @@ per process that a naive runtime-compilation design would pay on every cold star
 `src/aot.rs` loads the precompiled PTX/cubin via the CUDA driver API at process start.
 
 Full narrative context, MVP milestone write-ups, and benchmark numbers live in
-`README.md` — read it before starting new architecture or perf work; it's kept current
+`HISTORY.md` (the full development log; `README.md` stays a short public-facing
+overview) — read it before starting new architecture or perf work; it's kept current
 as the project's log, not just a pitch doc.
 
 ## Build / run / test commands
@@ -91,7 +92,7 @@ Non-goals).
 `general.architecture == "deepseek2"` dispatches to `Model::load_mla`/
 `forward_prompt_mla` (MVP step 4, Multi-head Latent Attention) instead, a separate path
 from the `LayerWeights`/`forward_layer` machinery above (own `MlaLayerWeights`/
-`MlaModel`, same dispatch pattern as `"qwen35"` → `load_hybrid`). See README.md's MLA
+`MlaModel`, same dispatch pattern as `"qwen35"` → `load_hybrid`). See HISTORY.md's MLA
 sections for the math and this MVP step's scope (dense-lead layers, routed-MoE +
 always-on shared-expert FFN via `MlaFfn::Dense`/`Moe`, and YaRN RoPE scaling are all
 supported — real DeepSeek-V2-Lite's actual shape; only Q-LoRA query decomposition and
@@ -124,7 +125,7 @@ recurrence math for the Qwen3.5 hybrid Gated DeltaNet mixer (MVP step 3, done) �
 correctness oracle used while debugging the GPU kernel. It is not compiled as part of
 this crate.
 
-## MVP order (see README.md for full detail and current status)
+## MVP order (see HISTORY.md for full detail and current status)
 
 1. Dense Qwen3 — done.
 2. Qwen3-MoE — done.
@@ -138,7 +139,7 @@ this crate.
    (no small real `deepseek2` GGUF exists publicly) and the real
    `deepseek-ai/DeepSeek-V2-Lite` checkpoint on a rented 80GB A100 (~63GB of `f32`
    device-resident weights under this project's GPU-residency model — doesn't fit
-   the A6000's 48GB, needed the bigger instance). See README.md's MLA sections.
+   the A6000's 48GB, needed the bigger instance). See HISTORY.md's MLA sections.
 
 ## Non-goals (permanent constraints, not just current-MVP scope)
 
@@ -169,7 +170,7 @@ this repo (`.gguf` is gitignored) — check with the user for their location bef
 assuming a fixture path is valid.
 
 No small real `deepseek2`-architecture GGUF exists publicly at all (not just locally
-— see README.md's MLA section). `test-data/deepseek-tiny-mla.gguf` is a fully
+— see HISTORY.md's MLA section). `test-data/deepseek-tiny-mla.gguf` is a fully
 synthetic fixture: hand-built HF-format `config.json`/`safetensors` (random weights,
 authentic tensor names/shapes) run through llama.cpp's own real, unmodified
 `convert_hf_to_gguf.py`, verified against a real llama.cpp build. Its source

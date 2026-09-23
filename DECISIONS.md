@@ -2,7 +2,7 @@
 
 A log of the project's non-obvious technical and scope decisions, and why they were
 made. For current state see `STATUS.md`; for full narrative/benchmark detail see
-`README.md`.
+`HISTORY.md`.
 
 ## Phase 3 (State I/O) round 1 scope: dense/MoE only, export/import-the-buffers only
 
@@ -717,7 +717,7 @@ recurring billing — gated on explicit future budget approval, not bundled into
 round.
 
 **How to apply**: if vLLM's GGUF loader can't load the target Qwen3 fixture, document
-any fallback weight format as an explicit methodology deviation in README.md — same
+any fallback weight format as an explicit methodology deviation in HISTORY.md — same
 standard as the existing chat-template-parity caveat — rather than silently substituting
 it. When Ollama/TGI/TensorRT-LLM/other-cloud-vendor comparisons are eventually pursued,
 each needs its own scoped decision entry here, not a retroactive expansion of this one.
@@ -728,7 +728,7 @@ entry in its quantization method registry at all (confirmed via
 issue, GGUF loading isn't present in this version. Per the "how to apply" note
 above, this was disclosed rather than worked around silently: vLLM was pointed at
 the original `Qwen/Qwen3-0.6B` HF safetensors checkpoint instead (confirmed with the
-user first), and README.md's benchmark writeup states plainly that this tests the
+user first), and HISTORY.md's benchmark writeup states plainly that this tests the
 same cold-start mechanism, not byte-identical weights/precision, across engines.
 
 ## TypeSafe Jev comparison framing: latency-only citation, not a live benchmark
@@ -778,7 +778,7 @@ existing `reflex bench --candidate` warm-latency microbenchmark (model loaded
 once, isolates just the gather-GEMV scoring step): at the shortest prompt-length
 bucket (29 tokens), Reflex's warm System1 p50 is 19.4ms, within ~1.3-2x of
 Jev's 10-15ms — competitive, not a loss. Both citations are published side by side in
-README.md, not just the favorable one — cold-start-to-decision and warm-per-decision-
+HISTORY.md, not just the favorable one — cold-start-to-decision and warm-per-decision-
 scoring answer genuinely different questions, and reporting only one would be exactly
 the kind of cherry-picking this project's methodology exists to avoid.
 

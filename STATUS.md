@@ -1,8 +1,8 @@
 # STATUS.md
 
 Current state of the project. For narrative write-ups (how each milestone was verified,
-full benchmark tables, bugs found along the way), see `README.md` — this file is the
-short, current-state summary; README is the log.
+full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
+short, current-state summary; HISTORY.md is the log.
 
 _Last updated: 2026-09-23 (benchmark expansion session: llama.cpp regression fix, vLLM, TypeSafe Jev citation, Ollama, multi-architecture fast_exit re-verification, dead-code cleanup)_
 
@@ -44,7 +44,7 @@ other block type still uses the existing host path). Phase 2 round 3 closed the 
 "Benchmarking expansion" below) found the wall-clock parity claim had regressed to
 ~1.4x *slower* — root-caused to CUDA-context-teardown cost, not the forward pass —
 and fixed. **Current state: Reflex is ~1.3-1.4x *faster* than llama.cpp on
-cold start** (see README.md's "Benchmark expansion" section for the full
+cold start** (see HISTORY.md's "Benchmark expansion" section for the full
 investigation and per-run numbers).
 
 ## Benchmarking expansion (done: llama.cpp re-verified + fixed, vLLM, Jev citation)
@@ -53,7 +53,7 @@ Harness (`scripts/bench_cold_common.sh`, reuses the exact external-wall-clock
 methodology from the original llama.cpp comparison) plus two new comparison scripts,
 per DECISIONS.md's "Benchmark expansion", "TypeSafe Jev comparison framing", and
 "Fast-exit after printing the benchmark result" entries. All three run; results and
-caveats are in README.md's "Benchmark expansion" section, summarized here:
+caveats are in HISTORY.md's "Benchmark expansion" section, summarized here:
 
 | Comparison | Result |
 |---|---|
@@ -86,7 +86,7 @@ then extended to the real `deepseek-ai/DeepSeek-V2-Lite` checkpoint
 (converted fresh from source with a current `convert_hf_to_gguf.py` — every
 pre-quantized community GGUF found predates llama.cpp's MLA tensor-split format) on a
 rented 80GB A100 (needed for the ~63GB of `f32` device-resident weights; doesn't fit
-the A6000's 48GB). See README.md's MLA sections for the full writeup, including
+the A6000's 48GB). See HISTORY.md's MLA sections for the full writeup, including
 several easy-to-miss correctness details (attention scale dimension, MLA's different
 RoPE rotation convention, DeepSeek-V2-Lite's un-renormalized router weights, YaRN's
 separate rotation-vs-attention-scale formulas) that each produced silently-wrong
@@ -99,7 +99,7 @@ llama.cpp builds.
 only (`src/kv_io.rs`, new `Model::forward_prompt_capture_kv` in `model.rs`). Round 1 is
 scoped to raw buffer export/import only — no resume-generation-from-cache, since there's
 no per-token generation loop or `start_pos` anywhere in `model.rs` yet for a cache to
-resume into (see README.md's "Phase 3, round 1" section and DECISIONS.md for the full
+resume into (see HISTORY.md's "Phase 3, round 1" section and DECISIONS.md for the full
 scope rationale). `--import-kv` proves the file round-trips byte-identical through a
 device upload/download instead. Real-hardware-verified on the A6000 (the same
 instance, still running from the Phase 2 round 3 round): `cargo test` (57 tests, incl.
