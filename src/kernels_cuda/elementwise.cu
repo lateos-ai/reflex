@@ -151,3 +151,61 @@ extern "C" __global__ void mla_write_kv_cache_batch_kernel(
         kv_cache[dst_idx] = (col < kv_lora) ? kv_cmpr[row * kv_lora + col] : k_pe[row * qk_rope + (col - kv_lora)];
     }
 }
+
+// Batched-prefill grouped-GEMM MoE helper: gathers the rows of `src` selected for one
+// expert's group into a fresh contiguous buffer, so the group can be run through that
+// expert's weights as one real GEMM (model.rs's Model::gemm_view) instead of
+// `group_size` separate per-row GEMV launches (model.rs's Model::gemv_expert). See
+// model.rs's Model::forward_layer_moe_batched/Model::forward_mla_moe_ffn_batched.
+//
+// src:       [rows, hidden_size] contiguous
+// perm_row:  [num_assignments], each entry < rows -- this group's selected row indices
+// dst:       [num_assignments, hidden_size] contiguous, dst[a,:] = src[perm_row[a],:]
+extern "C" __global__ void moe_gather_kernel(
+    const float* __restrict__ src,
+    const unsigned int* __restrict__ perm_row,
+    float* __restrict__ dst,
+    unsigned int num_assignments,
+    unsigned int hidden_size
+) {
+    unsigned long long total = (unsigned long long)num_assignments * hidden_size;
+    unsigned long long global_tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (unsigned long long idx = global_tid; idx < total; idx += (unsigned long long)gridDim.x * blockDim.x) {
+        unsigned int col = idx % hidden_size;
+        unsigned long long a = idx / hidden_size;
+        unsigned long long src_idx = (unsigned long long)perm_row[a] * hidden_size + col;
+        dst[idx] = src[src_idx];
+    }
+}
+
+// Inverse of `moe_gather_kernel`'s data movement: weighted scatter-add of one expert
+// group's down-projected FFN output back into each selected row's slot of the
+// layer-wide output accumulator. No atomics -- callers must guarantee `dest_row` has no
+// duplicate entries within a single launch (true for one expert's group: top-k routing
+// never selects the same expert twice for one row, so a row appears at most once per
+// expert's group). `dst` must already be allocated/seeded (zeroed, or pre-seeded with
+// e.g. MLA's always-on shared-expert output) before the first expert group's launch.
+//
+// src:       [num_assignments, hidden_size] contiguous (one expert group's down-proj output)
+// dest_row:  [num_assignments], each entry < rows, no duplicates within this launch
+// weight:    [num_assignments] -- per-assignment router combination weight
+// dst:       [rows, hidden_size] contiguous, dst[dest_row[a],:] += weight[a] * src[a,:]
+extern "C" __global__ void moe_scatter_add_kernel(
+    const float* __restrict__ src,
+    const unsigned int* __restrict__ dest_row,
+    const float* __restrict__ weight,
+    float* __restrict__ dst,
+    unsigned int num_assignments,
+    unsigned int hidden_size
+) {
+    unsigned long long total = (unsigned long long)num_assignments * hidden_size;
+    unsigned long long global_tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (unsigned long long idx = global_tid; idx < total; idx += (unsigned long long)gridDim.x * blockDim.x) {
+        unsigned int col = idx % hidden_size;
+        unsigned long long a = idx / hidden_size;
+        unsigned long long dst_idx = (unsigned long long)dest_row[a] * hidden_size + col;
+        dst[dst_idx] += weight[a] * src[idx];
+    }
+}

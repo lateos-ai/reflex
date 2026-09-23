@@ -50,7 +50,7 @@ use crate::moe::{route_top_k, route_top_k_with_norm};
 use crate::tokenizer::Tokenizer;
 use cudarc::cublas::sys as cublas_sys;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-use cudarc::driver::{CudaDevice, CudaSlice, CudaView, DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice, CudaView, DevicePtr, DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig};
 use std::sync::Arc;
 
 fn u64_meta(file: &GgufFile, key: &str) -> Option<u64> {
@@ -784,6 +784,16 @@ pub struct Model {
     /// `Self::gemv_gather`/`Self::system1_evaluate`), never used by the
     /// ordinary dense/MoE/hybrid/MLA forward paths.
     gemv_gather_k: AotKernel,
+    /// Grouped-GEMM MoE batching (`Self::forward_layer_moe_batched`,
+    /// `Self::forward_mla_moe_ffn_batched`): gathers one expert's assigned rows out of
+    /// a batched-prefill hidden buffer into a contiguous group before running that
+    /// group through the expert's weights as one real GEMM (`moe_gather_kernel`,
+    /// `kernels_cuda/elementwise.cu`).
+    moe_gather_k: AotKernel,
+    /// Inverse of `moe_gather_k`: weighted scatter-add of one expert group's
+    /// down-projected output back into each selected row's output slot
+    /// (`moe_scatter_add_kernel`, `kernels_cuda/elementwise.cu`).
+    moe_scatter_add_k: AotKernel,
     attn_k: AotKernel,
     /// Batched-prefill variant of `attn_k` (`attention_prefill_kernel`,
     /// `kernels_cuda/attention_prefill.cu`) -- scores every row of a prefill
@@ -1081,12 +1091,14 @@ impl Model {
             &device,
             include_bytes!(env!("COLDSTART_KERNEL_ELEMENTWISE")),
             "elementwise",
-            &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel"],
+            &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel", "moe_gather_kernel", "moe_scatter_add_kernel"],
         )?
         .into_iter();
         let add_k = elementwise_fns.next().ok_or("missing add_kernel")?;
         let split_qg_k = elementwise_fns.next().ok_or("missing split_qg_kernel")?;
         let sigmoid_gate_k = elementwise_fns.next().ok_or("missing sigmoid_gate_kernel")?;
+        let moe_gather_k = elementwise_fns.next().ok_or("missing moe_gather_kernel")?;
+        let moe_scatter_add_k = elementwise_fns.next().ok_or("missing moe_scatter_add_kernel")?;
         let mut dequant_fns = aot::load_kernel_module(
             &device,
             include_bytes!(env!("COLDSTART_KERNEL_DEQUANT")),
@@ -1197,6 +1209,8 @@ impl Model {
             silu_k,
             gemv_k,
             gemv_gather_k,
+            moe_gather_k,
+            moe_scatter_add_k,
             attn_k,
             attn_prefill_k,
             add_k,
@@ -1293,12 +1307,14 @@ impl Model {
             &device,
             include_bytes!(env!("COLDSTART_KERNEL_ELEMENTWISE")),
             "elementwise",
-            &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel"],
+            &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel", "moe_gather_kernel", "moe_scatter_add_kernel"],
         )?
         .into_iter();
         let add_k = elementwise_fns.next().ok_or("missing add_kernel")?;
         let split_qg_k = elementwise_fns.next().ok_or("missing split_qg_kernel")?;
         let sigmoid_gate_k = elementwise_fns.next().ok_or("missing sigmoid_gate_kernel")?;
+        let moe_gather_k = elementwise_fns.next().ok_or("missing moe_gather_kernel")?;
+        let moe_scatter_add_k = elementwise_fns.next().ok_or("missing moe_scatter_add_kernel")?;
         let mut gdn_fns = aot::load_kernel_module(
             &device,
             include_bytes!(env!("COLDSTART_KERNEL_GATED_DELTANET")),
@@ -1411,6 +1427,8 @@ impl Model {
             silu_k,
             gemv_k,
             gemv_gather_k,
+            moe_gather_k,
+            moe_scatter_add_k,
             attn_k,
             attn_prefill_k,
             add_k,
@@ -1471,6 +1489,8 @@ impl Model {
                 "mla_extract_batch_kernel",
                 "mla_concat_qcur_batch_kernel",
                 "mla_write_kv_cache_batch_kernel",
+                "moe_gather_kernel",
+                "moe_scatter_add_kernel",
             ],
         )?
         .into_iter();
@@ -1480,6 +1500,8 @@ impl Model {
         let mla_extract_batch_k = elementwise_fns.next().ok_or("missing mla_extract_batch_kernel")?;
         let mla_concat_qcur_batch_k = elementwise_fns.next().ok_or("missing mla_concat_qcur_batch_kernel")?;
         let mla_write_kv_cache_batch_k = elementwise_fns.next().ok_or("missing mla_write_kv_cache_batch_kernel")?;
+        let moe_gather_k = elementwise_fns.next().ok_or("missing moe_gather_kernel")?;
+        let moe_scatter_add_k = elementwise_fns.next().ok_or("missing moe_scatter_add_kernel")?;
         let mla_attn_k =
             aot::load_kernel(&device, include_bytes!(env!("COLDSTART_KERNEL_MLA_ATTENTION")), "mla_attention", "mla_attention_kernel")?;
         let mla_attn_prefill_k = aot::load_kernel(
@@ -1605,6 +1627,8 @@ impl Model {
             silu_k,
             gemv_k,
             gemv_gather_k,
+            moe_gather_k,
+            moe_scatter_add_k,
             attn_k,
             attn_prefill_k,
             add_k,
@@ -1739,31 +1763,139 @@ impl Model {
         Ok(dev_y)
     }
 
-    /// GEMV against expert `expert_idx`'s slice of a per-expert-stacked 3-D
-    /// MoE tensor (shape `[in_features, out_features, expert_count]`).
-    /// Expert `e`'s `in_features * out_features` elements are a contiguous
-    /// chunk already in the same row-major `(out_features, in_features)`
+    /// Like [`Self::gemm`], but generic over both operands being any device-resident
+    /// reference (`&CudaSlice<f32>` or `&CudaView<f32>`) and taking explicit
+    /// `in_features`/`out_features` instead of reading them off a `Weight` -- the
+    /// same relationship [`Self::gemv_view`] has to [`Self::gemv_raw`]/[`Self::gemv`],
+    /// kept as a separate sibling method rather than folded into `gemm` for the same
+    /// reason that trio stays separate. Needed for grouped-GEMM MoE batching
+    /// (`Self::forward_layer_moe_batched`, `Self::forward_mla_moe_ffn_batched`), where
+    /// `w` is one expert's `CudaView` slice (see [`Self::expert_weight_view`]) and `x`
+    /// is a freshly gathered, variable-`rows`-sized group buffer, neither of which fit
+    /// `gemm`'s `&Weight` signature. No length assertion on `x` (unlike `gemm`) -- a
+    /// generic view type isn't cheaply length-checked here, so correctness relies on
+    /// the caller passing consistent `rows`/`in_features`.
+    fn gemm_view<X: DevicePtr<f32>, W: DevicePtr<f32>>(
+        &self,
+        x: &X,
+        w: &W,
+        in_features: usize,
+        out_features: usize,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, String> {
+        let mut dev_y = self.device.alloc_zeros::<f32>(rows * out_features).map_err(|e| format!("gemm_view alloc y: {e}"))?;
+        let cfg = GemmConfig {
+            transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+            transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+            m: out_features as i32,
+            n: rows as i32,
+            k: in_features as i32,
+            alpha: 1.0f32,
+            lda: in_features as i32,
+            ldb: in_features as i32,
+            beta: 0.0f32,
+            ldc: out_features as i32,
+        };
+        unsafe {
+            self.cublas.gemm(cfg, w, x, &mut dev_y).map_err(|e| format!("gemm_view launch: {e:?}"))?;
+        }
+        Ok(dev_y)
+    }
+
+    /// Shared shape-validation/slicing logic behind [`Self::gemv_expert`] and grouped-
+    /// GEMM MoE batching's per-expert-group GEMMs (`Self::forward_layer_moe_batched`,
+    /// `Self::forward_mla_moe_ffn_batched`): resolves expert `expert_idx`'s slice of a
+    /// per-expert-stacked 3-D MoE tensor (shape `[in_features, out_features,
+    /// expert_count]`). Expert `e`'s `in_features * out_features` elements are a
+    /// contiguous chunk already in the same row-major `(out_features, in_features)`
     /// layout as a standalone 2-D weight (see this module's doc comment), so
-    /// `CudaSlice::slice` gives a zero-copy device-side view -- no
-    /// device-to-device copy, let alone a host round-trip. `x` is generic
-    /// (like `Self::gemv_view`, which this delegates to) so callers can pass
-    /// either an owned `&CudaSlice<f32>` (the ordinary per-token MoE path) or
-    /// a `&CudaView<f32>` row-slice of a larger batched buffer (the batched
-    /// prefill MoE path, `Self::forward_layer_moe_batched`, which still
-    /// routes each row to its own experts per-row -- see that function's doc
-    /// comment for why only the attention block is GEMM-batched for MoE).
-    fn gemv_expert<X: DeviceRepr>(&self, x: X, w: &Weight, expert_idx: usize) -> Result<CudaSlice<f32>, String> {
+    /// `CudaSlice::slice` gives a zero-copy device-side view -- no device-to-device
+    /// copy, let alone a host round-trip.
+    fn expert_weight_view<'a>(w: &'a Weight, expert_idx: usize) -> Result<(CudaView<'a, f32>, usize, usize), String> {
         let (in_features, out_features, expert_count) = match w.shape.as_slice() {
             [i, o, e] => (*i as usize, *o as usize, *e as usize),
-            other => return Err(format!("gemv_expert: expected 3-D per-expert tensor shape, got {other:?}")),
+            other => return Err(format!("expert_weight_view: expected 3-D per-expert tensor shape, got {other:?}")),
         };
         if expert_idx >= expert_count {
-            return Err(format!("gemv_expert: expert_idx {expert_idx} out of range (expert_count={expert_count})"));
+            return Err(format!("expert_weight_view: expert_idx {expert_idx} out of range (expert_count={expert_count})"));
         }
         let expert_len = in_features * out_features;
         let start = expert_idx * expert_len;
-        let view = w.data.slice(start..start + expert_len);
+        Ok((w.data.slice(start..start + expert_len), in_features, out_features))
+    }
+
+    /// GEMV against expert `expert_idx`'s slice of a per-expert-stacked 3-D MoE tensor
+    /// (see [`Self::expert_weight_view`]). `x` is generic (like [`Self::gemv_view`],
+    /// which this delegates to) so callers can pass either an owned `&CudaSlice<f32>`
+    /// (the ordinary per-token MoE path) or a `&CudaView<f32>` row-slice of a larger
+    /// buffer. Used by the single-token decode path (`Self::forward_layer_moe`,
+    /// `Self::forward_mla_moe_ffn`) -- the batched-prefill MoE FFN
+    /// (`Self::forward_layer_moe_batched`, `Self::forward_mla_moe_ffn_batched`) instead
+    /// groups every row routed to the same expert and runs one [`Self::gemm_view`]
+    /// call per expert, so it calls [`Self::expert_weight_view`] directly rather than
+    /// through this single-row wrapper.
+    fn gemv_expert<X: DeviceRepr>(&self, x: X, w: &Weight, expert_idx: usize) -> Result<CudaSlice<f32>, String> {
+        let (view, in_features, out_features) = Self::expert_weight_view(w, expert_idx)?;
         self.gemv_view(x, &view, in_features, out_features)
+    }
+
+    /// Grouped-GEMM MoE batching's gather step (`moe_gather_kernel`,
+    /// `kernels_cuda/elementwise.cu`): copies one expert group's selected rows out of
+    /// `src` (a batched-prefill `[rows, hidden_size]` buffer, e.g. `ffn_normed`) into a
+    /// fresh contiguous `[perm_row.len(), hidden_size]` buffer, so the group can be run
+    /// through that expert's weights as one [`Self::gemm_view`] call. `perm_row` is
+    /// already device-resident (uploaded once per expert group by the caller).
+    fn moe_gather(&self, src: &CudaSlice<f32>, perm_row: &CudaSlice<u32>, hidden_size: usize) -> Result<CudaSlice<f32>, String> {
+        let num_assignments = perm_row.len();
+        let mut dst = self
+            .device
+            .alloc_zeros::<f32>(num_assignments * hidden_size)
+            .map_err(|e| format!("moe_gather alloc: {e}"))?;
+        let n = (num_assignments * hidden_size) as u32;
+        let threads = 256u32;
+        let blocks = n.div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            self.moe_gather_k
+                .function
+                .clone()
+                .launch(launch_cfg, (src, perm_row, &mut dst, num_assignments as u32, hidden_size as u32))
+                .map_err(|e| format!("moe_gather launch: {e}"))?;
+        }
+        Ok(dst)
+    }
+
+    /// Inverse of [`Self::moe_gather`]: weighted scatter-add of one expert group's
+    /// down-projected FFN output (`src`, `[dest_row.len(), hidden_size]`) back into
+    /// `dst` (`[rows, hidden_size]`, already allocated/seeded by the caller --
+    /// zeroed for dense/MoE, or pre-seeded with MLA's shared-expert output).
+    /// `moe_scatter_add_kernel` uses a plain `+=`, not an atomic add -- safe only
+    /// because `dest_row` (this expert's group of selected rows) has no duplicate
+    /// entries, which top-k routing guarantees (a row never selects the same expert
+    /// twice) and because CUDA kernel launches on the default stream (the only stream
+    /// this project uses) run sequentially, so distinct expert groups' launches never
+    /// overlap either.
+    fn moe_scatter_add(
+        &self,
+        src: &CudaSlice<f32>,
+        dest_row: &CudaSlice<u32>,
+        weight: &CudaSlice<f32>,
+        dst: &mut CudaSlice<f32>,
+        hidden_size: usize,
+    ) -> Result<(), String> {
+        let num_assignments = dest_row.len();
+        let n = (num_assignments * hidden_size) as u32;
+        let threads = 256u32;
+        let blocks = n.div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            self.moe_scatter_add_k
+                .function
+                .clone()
+                .launch(launch_cfg, (src, dest_row, weight, dst, num_assignments as u32, hidden_size as u32))
+                .map_err(|e| format!("moe_scatter_add launch: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Like `gemv`, but computes only the output rows named by
@@ -2733,17 +2865,81 @@ impl Model {
         Ok(post_attn)
     }
 
-    /// Batched-prefill variant of [`Self::forward_layer_moe`]: the attention
-    /// block batches identically to the dense case (`Self::
-    /// forward_attn_block_batched`), but the FFN stays a per-row loop reusing
-    /// the same per-expert `Self::gemv_expert` calls `forward_layer_moe`
-    /// makes -- each row can route to a different top-k expert subset, so
-    /// turning that into a single GEMM needs a token->expert grouping/
-    /// permutation step (grouped GEMM, the way vLLM/TensorRT-LLM batch MoE
-    /// FFNs) this round doesn't attempt -- a distinct, materially larger
-    /// follow-on. This still removes the sequential per-token cost from
-    /// QKV/O-proj/attention, the same fraction of the total cost the dense
-    /// case removes; only the FFN GEMV calls remain per-row.
+    /// Grouped-GEMM MoE FFN batching core, shared by [`Self::forward_layer_moe_batched`]
+    /// (dense/MoE Qwen3) and [`Self::forward_mla_moe_ffn_batched`] (DeepSeek-V2/V3
+    /// MLA): each of `rows` tokens routes to a different, data-dependent top-k subset
+    /// of experts (host-side `crate::moe::route_top_k`/`route_top_k_with_norm`), so
+    /// there's no single shared weight matrix to run one GEMM against like the
+    /// attention block's projections. Instead this groups rows by *which expert they
+    /// selected* (bounded by `expert_count`, not by `rows * k`), and for every expert
+    /// with at least one assigned row: gathers that group's rows out of `ffn_normed`
+    /// (`Self::moe_gather`), runs the group through the expert's gate/up/down weights
+    /// as one real GEMM apiece (`Self::gemm_view` against `Self::expert_weight_view`'s
+    /// zero-copy per-expert slice) instead of `group_size` separate `Self::gemv_expert`
+    /// launches, and weighted-scatter-adds the down-projected result straight into
+    /// `ffn_out` (`Self::moe_scatter_add`) -- no host round trip anywhere in this loop,
+    /// unlike the single-token/per-row path this replaces. `ffn_out` must already be
+    /// allocated to `[rows, hidden_size]` and seeded with whatever this should
+    /// accumulate on top of (zero for dense/MoE, MLA's always-on shared-expert output
+    /// for `MlaFfn::Moe`); this function only ever adds into it. `weight_scale` folds
+    /// in a caller-side scalar (MLA's `routed_scaling_factor`; `1.0` -- a no-op -- for
+    /// dense/MoE, which has no such knob) so the scatter kernel itself stays
+    /// architecture-agnostic.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_ffn_grouped(
+        &self,
+        ffn_normed: &CudaSlice<f32>,
+        rows: usize,
+        hidden_size: usize,
+        router_logits: &[f32],
+        expert_count: usize,
+        k: usize,
+        normalize_top_k: bool,
+        weight_scale: f32,
+        ffn_gate_exps: &Weight,
+        ffn_up_exps: &Weight,
+        ffn_down_exps: &Weight,
+        ffn_out: &mut CudaSlice<f32>,
+    ) -> Result<(), String> {
+        let mut groups: Vec<Vec<(u32, f32)>> = vec![Vec::new(); expert_count];
+        for row in 0..rows {
+            let row_logits = &router_logits[row * expert_count..(row + 1) * expert_count];
+            let routed = route_top_k_with_norm(row_logits, k, normalize_top_k)?;
+            for (expert_idx, weight) in routed {
+                groups[expert_idx].push((row as u32, weight * weight_scale));
+            }
+        }
+
+        for (expert_idx, group) in groups.into_iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let rows_e: Vec<u32> = group.iter().map(|&(r, _)| r).collect();
+            let weights_e: Vec<f32> = group.iter().map(|&(_, w)| w).collect();
+
+            let perm_row = self.device.htod_sync_copy(&rows_e).map_err(|e| format!("moe_ffn_grouped upload rows_e: {e}"))?;
+            let weight_dev = self.device.htod_sync_copy(&weights_e).map_err(|e| format!("moe_ffn_grouped upload weights_e: {e}"))?;
+            let group_size = rows_e.len();
+
+            let x_e = self.moe_gather(ffn_normed, &perm_row, hidden_size)?;
+            let (gate_w, in_features, gate_out_features) = Self::expert_weight_view(ffn_gate_exps, expert_idx)?;
+            let gate = self.gemm_view(&x_e, &gate_w, in_features, gate_out_features, group_size)?;
+            let (up_w, _, up_out_features) = Self::expert_weight_view(ffn_up_exps, expert_idx)?;
+            let up = self.gemm_view(&x_e, &up_w, in_features, up_out_features, group_size)?;
+            let activated = self.silu_and_mul(&gate, &up, group_size * gate_out_features)?;
+            let (down_w, down_in_features, down_out_features) = Self::expert_weight_view(ffn_down_exps, expert_idx)?;
+            let down = self.gemm_view(&activated, &down_w, down_in_features, down_out_features, group_size)?;
+
+            self.moe_scatter_add(&down, &perm_row, &weight_dev, ffn_out, hidden_size)?;
+        }
+        Ok(())
+    }
+
+    /// Batched-prefill variant of [`Self::forward_layer_moe`]: the attention block
+    /// batches identically to the dense case (`Self::forward_attn_block_batched`), and
+    /// the FFN tail now batches too, via grouped-GEMM MoE batching
+    /// (`Self::moe_ffn_grouped`) instead of `Self::forward_layer_moe`'s per-row
+    /// `Self::gemv_expert` loop.
     fn forward_layer_moe_batched(
         &self,
         layer: &MoeLayerWeights,
@@ -2775,27 +2971,23 @@ impl Model {
         let k = self.expert_used_count.ok_or("forward_layer_moe_batched called on a model with no expert_used_count")?;
         let num_experts = router_logits.len() / rows;
 
-        let mut ffn_out = vec![0.0f32; rows * cfg.hidden_size];
-        for row in 0..rows {
-            let row_logits = &router_logits[row * num_experts..(row + 1) * num_experts];
-            let routed = route_top_k(row_logits, k)?;
-            let row_normed = ffn_normed.slice(row * cfg.hidden_size..(row + 1) * cfg.hidden_size);
+        let mut ffn_out = self.device.alloc_zeros::<f32>(rows * cfg.hidden_size).map_err(|e| format!("moe ffn_out alloc: {e}"))?;
+        self.moe_ffn_grouped(
+            &ffn_normed,
+            rows,
+            cfg.hidden_size,
+            &router_logits,
+            num_experts,
+            k,
+            true, // Qwen3-MoE's convention: renormalize the selected top-k weights (crate::moe::route_top_k).
+            1.0,  // no routed_scaling_factor-equivalent knob for dense/MoE.
+            &layer.ffn_gate_exps,
+            &layer.ffn_up_exps,
+            &layer.ffn_down_exps,
+            &mut ffn_out,
+        )?;
 
-            for (expert_idx, weight) in routed {
-                let gate = self.gemv_expert(&row_normed, &layer.ffn_gate_exps, expert_idx)?;
-                let up = self.gemv_expert(&row_normed, &layer.ffn_up_exps, expert_idx)?;
-                let activated = self.silu_and_mul(&gate, &up, cfg.ffn_hidden_size)?;
-                let down = self.gemv_expert(&activated, &layer.ffn_down_exps, expert_idx)?;
-                let down_host = self.device.dtoh_sync_copy(&down).map_err(|e| format!("moe expert down dtoh: {e}"))?;
-                let row_out = &mut ffn_out[row * cfg.hidden_size..(row + 1) * cfg.hidden_size];
-                for (o, d) in row_out.iter_mut().zip(down_host.iter()) {
-                    *o += weight * d;
-                }
-            }
-        }
-
-        let ffn_out_dev = self.device.htod_sync_copy(&ffn_out).map_err(|e| format!("moe ffn_out htod: {e}"))?;
-        self.add_inplace(&mut post_attn, &ffn_out_dev)?;
+        self.add_inplace(&mut post_attn, &ffn_out)?;
         Ok(post_attn)
     }
 
@@ -3972,12 +4164,11 @@ impl Model {
     /// the attention block batched (`Self::forward_mla_attn_block_batched`), then the
     /// FFN tail. The dense-lead layers' FFN batches too (`Self::forward_hybrid_ffn_batched`,
     /// already generic over which norm/gate/up/down weights it's given -- see
-    /// `MlaLayerWeights`'s doc comment). The routed-MoE + shared-expert tail stays a
-    /// per-row loop over the unmodified per-token `Self::forward_mla_moe_ffn`
-    /// (`Self::extract_row`/`Self::write_row`) -- same precedent
-    /// `Self::forward_layer_moe_batched` already set for dense/MoE's own MoE FFN;
-    /// grouped-GEMM MoE batching is a separate, already-flagged follow-on, not
-    /// attempted here.
+    /// `MlaLayerWeights`'s doc comment). The routed-MoE + shared-expert tail batches
+    /// too, via [`Self::forward_mla_moe_ffn_batched`] (grouped-GEMM MoE batching, the
+    /// same `Self::moe_ffn_grouped` core `Self::forward_layer_moe_batched` uses for
+    /// dense/MoE's own MoE FFN) instead of a per-row loop over the unmodified
+    /// per-token `Self::forward_mla_moe_ffn`.
     fn forward_mla_layer_batched(
         &self,
         m: &MlaModel,
@@ -4000,13 +4191,7 @@ impl Model {
             }
             MlaFfn::Moe { .. } => {
                 let moe_cfg = cfg.moe.as_ref().ok_or("internal error: MlaFfn::Moe layer but MlaConfig::moe is None")?;
-                let mut out = post_attn;
-                for row in 0..rows {
-                    let row_hidden = self.extract_row(&out, row, hidden_size)?;
-                    let row_out = self.forward_mla_moe_ffn(layer, row_hidden, hidden_size, moe_cfg, eps)?;
-                    self.write_row(&mut out, row, hidden_size, &row_out)?;
-                }
-                Ok(out)
+                self.forward_mla_moe_ffn_batched(layer, post_attn, hidden_size, rows, moe_cfg, eps)
             }
         }
     }
@@ -4349,6 +4534,64 @@ impl Model {
 
         let ffn_out_dev = self.device.htod_sync_copy(&ffn_out).map_err(|e| format!("mla moe ffn_out htod: {e}"))?;
         self.add_inplace(&mut post_attn, &ffn_out_dev)?;
+        Ok(post_attn)
+    }
+
+    /// Batched-prefill variant of [`Self::forward_mla_moe_ffn`]: the always-on shared
+    /// expert has no routing (every row uses it unconditionally with the same
+    /// weights), so it batches trivially with the existing [`Self::gemm`] -- no
+    /// permutation needed, just `rows` instead of `1`. That shared-expert output
+    /// seeds `ffn_out`; the routed experts (a different, data-dependent top-k subset
+    /// per row) then batch via [`Self::moe_ffn_grouped`] (the same grouped-GEMM core
+    /// [`Self::forward_layer_moe_batched`] uses for dense/MoE), scatter-adding on top
+    /// of that seed instead of a zeroed buffer. `moe_cfg.routed_scaling_factor` is
+    /// passed through as `moe_ffn_grouped`'s `weight_scale` so it's folded into each
+    /// assignment's weight before the scatter-add, matching
+    /// `Self::forward_mla_moe_ffn`'s unbatched `weight * moe_cfg.routed_scaling_factor`.
+    fn forward_mla_moe_ffn_batched(
+        &self,
+        layer: &MlaLayerWeights,
+        mut post_attn: CudaSlice<f32>,
+        hidden_size: usize,
+        rows: usize,
+        moe_cfg: &MlaMoeConfig,
+        eps: f32,
+    ) -> Result<CudaSlice<f32>, String> {
+        let MlaFfn::Moe { ffn_gate_inp, ffn_gate_exps, ffn_up_exps, ffn_down_exps, ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp } = &layer.ffn
+        else {
+            return Err("internal error: forward_mla_moe_ffn_batched called on a Dense layer".to_string());
+        };
+
+        let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, rows, hidden_size, eps)?;
+
+        // Always-on shared expert(s), batched across every row with no routing --
+        // seeds ffn_out; the routed experts below accumulate `+=` on top of it.
+        let shared_hidden_size = ffn_gate_shexp.shape[1] as usize;
+        let shared_gate = self.gemm(&ffn_normed, ffn_gate_shexp, rows)?;
+        let shared_up = self.gemm(&ffn_normed, ffn_up_shexp, rows)?;
+        let shared_activated = self.silu_and_mul(&shared_gate, &shared_up, rows * shared_hidden_size)?;
+        let mut ffn_out = self.gemm(&shared_activated, ffn_down_shexp, rows)?;
+
+        let router_logits_dev = self.gemm(&ffn_normed, ffn_gate_inp, rows)?;
+        let router_logits = self.device.dtoh_sync_copy(&router_logits_dev).map_err(|e| format!("mla moe router dtoh: {e}"))?;
+        let num_experts = router_logits.len() / rows;
+
+        self.moe_ffn_grouped(
+            &ffn_normed,
+            rows,
+            hidden_size,
+            &router_logits,
+            num_experts,
+            moe_cfg.expert_used_count,
+            moe_cfg.normalize_top_k,
+            moe_cfg.routed_scaling_factor,
+            ffn_gate_exps,
+            ffn_up_exps,
+            ffn_down_exps,
+            &mut ffn_out,
+        )?;
+
+        self.add_inplace(&mut post_attn, &ffn_out)?;
         Ok(post_attn)
     }
 
@@ -4741,18 +4984,19 @@ mod mla_batching_tests {
     }
 
     /// Byte-exact-ish cross-check of `prefill_mla_batched` (layer-major batched
-    /// attention block, MoE FFN tail -- if present -- left as a per-row loop; see
-    /// `Model::forward_mla_layer_batched`'s doc comment) against `prefill_mla` (the
-    /// original token-major sequential loop) on the same prompt/weights -- the
-    /// blocking check before trusting the batched MLA prefill path, same role
+    /// attention block; grouped-GEMM-batched MoE FFN tail where present, see
+    /// `Model::forward_mla_moe_ffn_batched`) against `prefill_mla` (the original
+    /// token-major sequential loop, still calling the unmodified per-token
+    /// `Model::forward_mla_moe_ffn`) on the same prompt/weights -- the blocking check
+    /// before trusting the batched MLA prefill path, same role
     /// `prefill_hybrid_batched_matches_sequential` plays for the hybrid path. NOTE:
-    /// `test-data/deepseek-tiny-mla.gguf` is dense-lead-only with no YaRN scaling
-    /// (see README.md's MLA fixture section), so this test does not exercise
-    /// `MlaFfn::Moe`'s per-row loop or `rope_norm_yarn_batch_kernel` -- only the real
-    /// `deepseek-ai/DeepSeek-V2-Lite` checkpoint does (see CLAUDE.md's "Known
-    /// test-fixture limitation"), which is a stretch-goal deeper verification, not
-    /// required to trust this round's change. Run with `cargo test --release --
-    /// --ignored prefill_mla_batched_matches_sequential`.
+    /// `test-data/deepseek-tiny-mla.gguf` is dense-lead-only with no YaRN scaling (see
+    /// README.md's MLA fixture section), so this test does not exercise
+    /// `MlaFfn::Moe`'s grouped-GEMM path or `rope_norm_yarn_batch_kernel` -- see
+    /// `prefill_mla_batched_matches_sequential_real_moe_checkpoint` below for that,
+    /// which only the real `deepseek-ai/DeepSeek-V2-Lite` checkpoint can exercise (see
+    /// CLAUDE.md's "Known test-fixture limitation"). Run with `cargo test --release
+    /// -- --ignored prefill_mla_batched_matches_sequential`.
     #[test]
     #[ignore]
     fn prefill_mla_batched_matches_sequential() {
@@ -4762,6 +5006,57 @@ mod mla_batching_tests {
         let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
         let model = Model::load(device, &file).expect("failed to load MLA model");
         let m = model.mla.as_ref().expect("loaded model is not MLA");
+
+        let (seq_ids, seq_hidden, _, seq_position) = model.prefill_mla(m, prompt, None, 0).expect("prefill_mla failed");
+        let (batch_ids, batch_hidden, _, batch_position) =
+            model.prefill_mla_batched(m, prompt, None, 0).expect("prefill_mla_batched failed");
+
+        assert_eq!(seq_ids, batch_ids, "tokenization must match between the two prefill paths");
+        assert_eq!(seq_position, batch_position, "final position must match between the two prefill paths");
+
+        let rows = batch_ids.len();
+        let hidden_size = m.cfg.hidden_size;
+        let batch_last_row = model.last_row(&batch_hidden, rows, hidden_size).expect("last_row failed");
+
+        let seq_host = model.device.dtoh_sync_copy(&seq_hidden).expect("seq hidden dtoh failed");
+        let batch_host = model.device.dtoh_sync_copy(&batch_last_row).expect("batch hidden dtoh failed");
+        assert_eq!(seq_host.len(), batch_host.len());
+        for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-3, "hidden[{i}]: sequential={a}, batched={b}");
+        }
+
+        let eps = m.cfg.rmsnorm_eps;
+        let seq_argmax = model.lm_head_argmax(&seq_hidden, hidden_size, eps).expect("seq argmax failed");
+        let batch_argmax = model.lm_head_argmax(&batch_last_row, hidden_size, eps).expect("batch argmax failed");
+        assert_eq!(seq_argmax, batch_argmax, "greedy-argmax next token must match between the two prefill paths");
+    }
+
+    /// Real-`MlaFfn::Moe` counterpart to `prefill_mla_batched_matches_sequential`
+    /// above: that test's `test-data/deepseek-tiny-mla.gguf` fixture is dense-lead-only
+    /// (see its own doc comment), so it never exercises
+    /// `Model::forward_mla_moe_ffn_batched`'s grouped-GEMM routed-expert path or its
+    /// batched shared-expert seeding -- both new this round, and both only reachable
+    /// through a real `deepseek2` file's routed-MoE layers (no small synthetic
+    /// `deepseek2` MoE fixture exists, see CLAUDE.md's "Known test-fixture
+    /// limitation"). Same cross-check shape as the fixture-based test (byte-exact-ish
+    /// hidden state plus matching greedy-argmax token), but reads its GGUF path from
+    /// `COLDSTART_TEST_GGUF` (the same convention `prefill_dense_batched_matches_sequential_prefill`
+    /// uses) instead of the hardcoded fixture constant, so it can point at the real
+    /// `deepseek-ai/DeepSeek-V2-Lite` checkpoint (regenerate per STATUS.md's
+    /// documented recipe). Run with:
+    /// `COLDSTART_TEST_GGUF=<path to a real deepseek2 GGUF with MoE layers> cargo test --release -- --ignored prefill_mla_batched_matches_sequential_real_moe_checkpoint`.
+    #[test]
+    #[ignore]
+    fn prefill_mla_batched_matches_sequential_real_moe_checkpoint() {
+        let gguf_path = std::env::var("COLDSTART_TEST_GGUF")
+            .expect("set COLDSTART_TEST_GGUF to a real local deepseek2 GGUF path (with MoE layers) to run this test");
+        let prompt = "The capital of France is";
+
+        let file = GgufFile::open(&gguf_path).expect("failed to open COLDSTART_TEST_GGUF");
+        let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+        let model = Model::load(device, &file).expect("failed to load MLA model");
+        let m = model.mla.as_ref().expect("loaded model is not MLA");
+        assert!(m.cfg.moe.is_some(), "COLDSTART_TEST_GGUF must be a real deepseek2 checkpoint with MoE layers, not the dense-lead-only synthetic fixture");
 
         let (seq_ids, seq_hidden, _, seq_position) = model.prefill_mla(m, prompt, None, 0).expect("prefill_mla failed");
         let (batch_ids, batch_hidden, _, batch_position) =
