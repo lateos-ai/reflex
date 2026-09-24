@@ -158,9 +158,17 @@ pub fn run(args: Vec<String>) {
         // Decode throughput: `generate` past the first token measures pure per-token
         // decode cost, isolated from the one-time prefill via `on_first_token`.
         const DECODE_STEPS: usize = 16;
+        let sampling = reflex_engine::sampling::SamplingParams::default();
         for _ in 0..warmup {
             model
-                .generate(&prompt, DECODE_STEPS + 1, None, |_logits| {})
+                .generate(
+                    &prompt,
+                    DECODE_STEPS + 1,
+                    None,
+                    &sampling,
+                    |_logits| {},
+                    |_id, _text| {},
+                )
                 .expect("generate failed (throughput warmup)");
         }
         let mut ms_per_token_samples = Vec::with_capacity(iters);
@@ -168,9 +176,16 @@ pub fn run(args: Vec<String>) {
             let mut first_token_ms = 0.0;
             let t0 = Instant::now();
             let (tokens, _text) = model
-                .generate(&prompt, DECODE_STEPS + 1, None, |_logits| {
-                    first_token_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                })
+                .generate(
+                    &prompt,
+                    DECODE_STEPS + 1,
+                    None,
+                    &sampling,
+                    |_logits| {
+                        first_token_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    },
+                    |_id, _text| {},
+                )
                 .expect("generate failed (throughput)");
             let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
             let decode_count = tokens.len().saturating_sub(1);

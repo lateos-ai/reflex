@@ -1,0 +1,22 @@
+[package]
+name = "reflex-openai-adapter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "OpenAI-compatible /v1/chat/completions HTTP sidecar in front of the Reflex core engine -- see the root README's Non-goals section: the core engine never grows a network socket, so this translation layer lives in its own crate/process instead."
+
+# Deliberately NOT a member of the root Cargo.toml workspace and does not depend on
+# the `reflex-engine` library crate -- this binary must build with a plain stable
+# Rust toolchain, no CUDA toolkit/`nvcc` required, since its only job is HTTP <->
+# JSON-line-IPC translation in front of an already-running `reflex stdio` child
+# process. Keeping it a fully separate Cargo project (own Cargo.lock) is what keeps
+# axum/tokio/etc. out of the core engine's dependency graph entirely, per this
+# project's CLAUDE.md/README.md Non-goals section.
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "net", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+async-stream = "0.3"
+anyhow = "1"
