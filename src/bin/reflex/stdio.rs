@@ -1,10 +1,12 @@
 //! Local, non-network IPC over stdio: reads one JSON request per stdin line,
-//! processes it fully (via `reflex_engine::ipc::handle_request`), and writes one
-//! JSON response line to stdout before reading the next -- see `src/ipc.rs`'s
-//! module doc comment for the protocol and CLAUDE.md/README.md's Non-goals for why
-//! this exists instead of an HTTP server. Ideal for local subprocess orchestration
-//! (MCP tool integrations, shell agents, other-language callers that don't want a
-//! network socket).
+//! processes it fully (via `reflex_engine::ipc::handle_request_streaming`), and
+//! writes one or more JSON response lines to stdout (one per generated token plus
+//! a final aggregate line for a `"stream": true` request; one line for any other
+//! request) before reading the next -- see `src/ipc.rs`'s module doc comment for
+//! the full protocol (including sampling and streaming) and CLAUDE.md/README.md's
+//! Non-goals for why this exists instead of an HTTP server. Ideal for local
+//! subprocess orchestration (MCP tool integrations, shell agents, other-language
+//! callers that don't want a network socket).
 //!
 //! Usage: `reflex stdio <path-to-gguf> [--lora <adapter.gguf>]`
 //! (requires `cargo build --features ipc`)

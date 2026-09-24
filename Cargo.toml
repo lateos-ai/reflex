@@ -26,6 +26,11 @@ name = "reflex_engine"
 cudarc = { version = "0.11", features = ["driver", "cublas", "cuda-12000", "f16"] }
 half = "2.3"
 memmap2 = "0.9"
+# Temperature/top-k/top-p sampling (`src/sampling.rs`), used by `Model::generate`
+# unconditionally (greedy argmax stays the default and needs no RNG draw at all --
+# see `SamplingParams::is_greedy`), so this is a core dependency, not feature-gated
+# like `ipc`/`python`/`download` above.
+rand = "0.8"
 # Local IPC (`reflex stdio`/`reflex uds`, see src/ipc.rs), feature-gated: this
 # project's default `cargo build` stays at its original 3-dependency footprint
 # for users who never touch the IPC subcommands.

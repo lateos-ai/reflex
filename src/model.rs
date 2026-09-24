@@ -1,10 +1,16 @@
 //! Dense and MoE Qwen3 forward pass (MVP steps 1-2, see README.md's MVP
 //! order): loads a GGUF file's weights, runs embedding -> every transformer
-//! layer -> final RMSNorm -> LM head -> argmax for the *first* generated
-//! token only. No KV cache reuse across separate calls, no batching, no
-//! sampling beyond greedy argmax -- the target metric is
-//! process-start-to-first-token latency, not sustained decode throughput
-//! (see README.md's "Why this exists").
+//! layer -> final RMSNorm -> LM head -> next-token choice for the *first*
+//! generated token only. No KV cache reuse across separate calls, no
+//! batching -- those stay permanent constraints (see README.md's
+//! Non-goals) -- but next-token choice is no longer greedy-only: greedy
+//! argmax is still the default and is what this project's own byte-exact-
+//! vs-llama.cpp verification methodology depends on, but `crate::sampling`
+//! adds temperature/top-k/top-p sampling as an explicit opt-in (sampling
+//! strategy was never in README.md's permanent-constraints list, only
+//! unimplemented scope). The target metric is still process-start-to-
+//! first-token latency, not sustained decode throughput (see README.md's
+//! "Why this exists").
 //!
 //! Architecture and math ported from RustFeference's own most mature, most-
 //! verified model code (`rft-gpu/src/generate.rs` + `dispatch.rs` +
@@ -48,6 +54,7 @@ use crate::diagnostics;
 use crate::gguf::{GgmlType, GgufFile, GgufValue};
 use crate::lora;
 use crate::moe::{route_top_k, route_top_k_with_norm};
+use crate::sampling::SamplingParams;
 use crate::tokenizer::Tokenizer;
 use cudarc::cublas::sys as cublas_sys;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
@@ -4231,8 +4238,14 @@ impl Model {
         if let Some(m) = &self.mla {
             return self.forward_prompt_mla(m, prompt);
         }
-        let (generated, text, _k_caches, _v_caches, _seq_len) =
-            self.generate_dense_impl(prompt, None, 1, |_logits| {})?;
+        let (generated, text, _k_caches, _v_caches, _seq_len) = self.generate_dense_impl(
+            prompt,
+            None,
+            1,
+            &SamplingParams::default(),
+            |_logits| {},
+            |_id, _text| {},
+        )?;
         Ok((generated[0], text))
     }
 
@@ -4243,32 +4256,50 @@ impl Model {
     /// `imported` is `Some`, resumes from a previously exported cache
     /// instead of starting at position 0 -- `prompt` is then the
     /// continuation text appended after the imported cache's positions, not
-    /// a fresh prompt (no BOS is inserted). `on_first_token` is called
-    /// exactly once, right after the first new token is produced, with that
-    /// token's full logits vector -- callers can ignore the argument to just
-    /// capture accurate "time to first token" timing (as `src/bin/reflex/generate.rs`
+    /// a fresh prompt (no BOS is inserted). `sampling` selects the next-token
+    /// choice strategy every generated position uses -- `&SamplingParams::default()`
+    /// (greedy argmax) is byte-identical to this function's behavior before
+    /// `crate::sampling` existed; see that module's doc comment for
+    /// temperature/top-k/top-p. `on_first_token` is called exactly once,
+    /// right after the first new token is produced, with that token's full
+    /// logits vector -- callers can ignore the argument to just capture
+    /// accurate "time to first token" timing (as `src/bin/reflex/generate.rs`
     /// does), or inspect the logits themselves (as `src/bin/check_correctness.rs`
-    /// does) -- even when `max_new_tokens > 1` keeps the call running past that
-    /// point.
+    /// does) -- even when `max_new_tokens > 1` keeps the call running past
+    /// that point. `on_token` is called once per generated token (including
+    /// the first, alongside `on_first_token`), with that token's id and its
+    /// incrementally-decoded text (`Tokenizer::decode_stream`) -- this is
+    /// the hook `crate::ipc::handle_request_streaming` uses to emit each
+    /// token over the wire as soon as it's ready, instead of buffering the
+    /// whole response.
     ///
     /// Dense/MoE and the Qwen3.5 hybrid mixer support resume as of round 2
     /// (the hybrid `GatedDeltaNet` sublayers' `conv_state`/`recurrent` need
     /// no `start_pos` handling at all -- see `kv_io.rs`'s doc comment); MLA
     /// as of round 3, via `generate_mla_impl`.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
         prompt: &str,
         max_new_tokens: usize,
         imported: Option<&crate::kv_io::ImportedKv>,
+        sampling: &SamplingParams,
         on_first_token: impl FnMut(&[f32]),
+        on_token: impl FnMut(u32, &str),
     ) -> Result<(Vec<u32>, String), String> {
         match imported {
             Some(crate::kv_io::ImportedKv::Dense(cache)) => {
                 if self.hybrid.is_some() || self.mla.is_some() {
                     return Err("imported KV cache file is dense/MoE format, but this model is not a dense/MoE Qwen3 model".to_string());
                 }
-                let (generated, text, _, _, _) =
-                    self.generate_dense_impl(prompt, Some(cache), max_new_tokens, on_first_token)?;
+                let (generated, text, _, _, _) = self.generate_dense_impl(
+                    prompt,
+                    Some(cache),
+                    max_new_tokens,
+                    sampling,
+                    on_first_token,
+                    on_token,
+                )?;
                 Ok((generated, text))
             }
             Some(crate::kv_io::ImportedKv::Hybrid(cache)) => {
@@ -4281,7 +4312,9 @@ impl Model {
                     prompt,
                     Some(cache),
                     max_new_tokens,
+                    sampling,
                     on_first_token,
+                    on_token,
                 )?;
                 Ok((generated, text))
             }
@@ -4289,23 +4322,50 @@ impl Model {
                 let m = self.mla.as_ref().ok_or(
                     "imported KV cache file is MLA format, but this model is not an MLA model",
                 )?;
-                let (generated, text, _, _) =
-                    self.generate_mla_impl(m, prompt, Some(cache), max_new_tokens, on_first_token)?;
+                let (generated, text, _, _) = self.generate_mla_impl(
+                    m,
+                    prompt,
+                    Some(cache),
+                    max_new_tokens,
+                    sampling,
+                    on_first_token,
+                    on_token,
+                )?;
                 Ok((generated, text))
             }
             None => {
                 if let Some(h) = &self.hybrid {
-                    let (generated, text, _, _) =
-                        self.generate_hybrid_impl(h, prompt, None, max_new_tokens, on_first_token)?;
+                    let (generated, text, _, _) = self.generate_hybrid_impl(
+                        h,
+                        prompt,
+                        None,
+                        max_new_tokens,
+                        sampling,
+                        on_first_token,
+                        on_token,
+                    )?;
                     return Ok((generated, text));
                 }
                 if let Some(m) = &self.mla {
-                    let (generated, text, _, _) =
-                        self.generate_mla_impl(m, prompt, None, max_new_tokens, on_first_token)?;
+                    let (generated, text, _, _) = self.generate_mla_impl(
+                        m,
+                        prompt,
+                        None,
+                        max_new_tokens,
+                        sampling,
+                        on_first_token,
+                        on_token,
+                    )?;
                     return Ok((generated, text));
                 }
-                let (generated, text, _, _, _) =
-                    self.generate_dense_impl(prompt, None, max_new_tokens, on_first_token)?;
+                let (generated, text, _, _, _) = self.generate_dense_impl(
+                    prompt,
+                    None,
+                    max_new_tokens,
+                    sampling,
+                    on_first_token,
+                    on_token,
+                )?;
                 Ok((generated, text))
             }
         }
@@ -4578,20 +4638,26 @@ impl Model {
     /// Shared dense/MoE implementation behind `forward_prompt`,
     /// `forward_prompt_capture_kv`, and `generate` (Phase 3 round 2):
     /// decodes new tokens one at a time (via `Self::prefill_dense` for the
-    /// prompt, then the same `forward_one_token_dense`/`lm_head_argmax` pair
-    /// per generated token) until `max_new_tokens` have been produced or
-    /// `eos_token_id` comes up. Returns the generated token ids, their
-    /// concatenated decoded text, the final per-layer K/V caches (still
-    /// device-resident, sized with headroom for up to `max_new_tokens`
-    /// generated positions -- callers downloading them for export must
-    /// slice to `0..seq_len * kv_stride`, not the whole buffer), and the
-    /// total sequence length reached.
+    /// prompt, then the same `forward_one_token_dense`/`lm_head_logits`/
+    /// `crate::sampling::sample` trio per generated token) until
+    /// `max_new_tokens` have been produced or `eos_token_id` comes up.
+    /// `sampling.is_greedy()` (the default) makes `sample` delegate straight
+    /// to the same `Self::argmax` this loop always used, so this stays
+    /// byte-identical to the pre-sampling implementation in that case.
+    /// Returns the generated token ids, their concatenated decoded text, the
+    /// final per-layer K/V caches (still device-resident, sized with
+    /// headroom for up to `max_new_tokens` generated positions -- callers
+    /// downloading them for export must slice to `0..seq_len * kv_stride`,
+    /// not the whole buffer), and the total sequence length reached.
+    #[allow(clippy::too_many_arguments)]
     fn generate_dense_impl(
         &self,
         prompt: &str,
         imported: Option<&crate::kv_io::DenseKvCache>,
         max_new_tokens: usize,
+        sampling: &SamplingParams,
         mut on_first_token: impl FnMut(&[f32]),
+        mut on_token: impl FnMut(u32, &str),
     ) -> Result<DenseGenerateResult, String> {
         if max_new_tokens == 0 {
             return Err("max_new_tokens must be at least 1".to_string());
@@ -4601,19 +4667,31 @@ impl Model {
             self.prefill_dense_batched(prompt, imported, max_new_tokens)?;
         let mut hidden = self.last_row(&hidden_batched, ids.len(), self.cfg.hidden_size)?;
 
+        let mut rng = crate::sampling::make_rng(sampling.seed);
+        let mut pending_bytes: Vec<u8> = Vec::new();
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
         let first_logits =
             self.lm_head_logits(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
-        let mut next_id = Self::argmax(&first_logits)?;
+        let mut next_id = crate::sampling::sample(&first_logits, sampling, &mut rng)?;
         on_first_token(&first_logits);
         generated.push(next_id);
+        on_token(
+            next_id,
+            &self.tokenizer.decode_stream(&mut pending_bytes, next_id),
+        );
 
         while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
             hidden =
                 self.forward_one_token_dense(next_id, position, &mut k_caches, &mut v_caches)?;
             position += 1;
-            next_id = self.lm_head_argmax(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
+            let logits =
+                self.lm_head_logits(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
+            next_id = crate::sampling::sample(&logits, sampling, &mut rng)?;
             generated.push(next_id);
+            on_token(
+                next_id,
+                &self.tokenizer.decode_stream(&mut pending_bytes, next_id),
+            );
         }
 
         let text = self.tokenizer.decode(&generated);
@@ -4770,9 +4848,14 @@ impl Model {
         Ok(hidden)
     }
 
-    /// Final RMSNorm -> LM head -> argmax, shared by every architecture's
-    /// generation loop (`hidden_size`/`eps` differ by architecture; the
-    /// `output_norm`/`lm_head` weights are shared across all of them).
+    /// Final RMSNorm -> LM head -> argmax. `crate::sampling::sample`'s greedy
+    /// path now covers this same computation for every architecture's
+    /// generation loop (`lm_head_logits` + `Self::argmax`, same as here) --
+    /// this wrapper is kept only as `prefill_batching_tests`' batched-vs-
+    /// sequential-prefill oracle (`hidden_size`/`eps` differ by architecture;
+    /// the `output_norm`/`lm_head` weights are shared across all of them),
+    /// hence `#[cfg(test)]`.
+    #[cfg(test)]
     fn lm_head_argmax(
         &self,
         hidden: &CudaSlice<f32>,
@@ -4803,7 +4886,9 @@ impl Model {
             .map_err(|e| format!("logits dtoh: {e}"))
     }
 
-    fn argmax(logits: &[f32]) -> Result<u32, String> {
+    /// `pub(crate)` (not private) so [`crate::sampling::sample`]'s greedy
+    /// path can delegate straight here instead of duplicating this scan.
+    pub(crate) fn argmax(logits: &[f32]) -> Result<u32, String> {
         logits
             .iter()
             .enumerate()
@@ -4829,8 +4914,14 @@ impl Model {
         if self.mla.is_some() {
             return Err("--export-kv on an MLA model needs forward_prompt_capture_kv_mla, not this function".to_string());
         }
-        let (generated, text, k_caches, v_caches, seq_len) =
-            self.generate_dense_impl(prompt, None, 1, |_logits| {})?;
+        let (generated, text, k_caches, v_caches, seq_len) = self.generate_dense_impl(
+            prompt,
+            None,
+            1,
+            &SamplingParams::default(),
+            |_logits| {},
+            |_id, _text| {},
+        )?;
 
         let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
         let per_layer_len = seq_len * kv_stride;
@@ -6062,8 +6153,15 @@ impl Model {
         h: &HybridModel,
         prompt: &str,
     ) -> Result<(u32, String), String> {
-        let (generated, text, _states, _seq_len) =
-            self.generate_hybrid_impl(h, prompt, None, 1, |_logits| {})?;
+        let (generated, text, _states, _seq_len) = self.generate_hybrid_impl(
+            h,
+            prompt,
+            None,
+            1,
+            &SamplingParams::default(),
+            |_logits| {},
+            |_id, _text| {},
+        )?;
         Ok((generated[0], text))
     }
 
@@ -6249,13 +6347,16 @@ impl Model {
     /// (`Self::prefill_hybrid_batched`), then new tokens are decoded one at a
     /// time (`rows == 1`, a GEMM buys nothing there) via the unchanged
     /// per-token per-layer loop, [`Self::forward_one_token_hybrid`].
+    #[allow(clippy::too_many_arguments)]
     fn generate_hybrid_impl(
         &self,
         h: &HybridModel,
         prompt: &str,
         imported: Option<&crate::kv_io::HybridKvCache>,
         max_new_tokens: usize,
+        sampling: &SamplingParams,
         mut on_first_token: impl FnMut(&[f32]),
+        mut on_token: impl FnMut(u32, &str),
     ) -> Result<HybridGenerateResult, String> {
         if max_new_tokens == 0 {
             return Err("max_new_tokens must be at least 1".to_string());
@@ -6267,17 +6368,28 @@ impl Model {
         let eps = h.attn_cfg.rmsnorm_eps;
         let mut hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
 
+        let mut rng = crate::sampling::make_rng(sampling.seed);
+        let mut pending_bytes: Vec<u8> = Vec::new();
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
         let first_logits = self.lm_head_logits(&hidden, hidden_size, eps)?;
-        let mut next_id = Self::argmax(&first_logits)?;
+        let mut next_id = crate::sampling::sample(&first_logits, sampling, &mut rng)?;
         on_first_token(&first_logits);
         generated.push(next_id);
+        on_token(
+            next_id,
+            &self.tokenizer.decode_stream(&mut pending_bytes, next_id),
+        );
 
         while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
             hidden = self.forward_one_token_hybrid(h, next_id, position, &mut states)?;
             position += 1;
-            next_id = self.lm_head_argmax(&hidden, hidden_size, eps)?;
+            let logits = self.lm_head_logits(&hidden, hidden_size, eps)?;
+            next_id = crate::sampling::sample(&logits, sampling, &mut rng)?;
             generated.push(next_id);
+            on_token(
+                next_id,
+                &self.tokenizer.decode_stream(&mut pending_bytes, next_id),
+            );
         }
 
         let text = self.tokenizer.decode(&generated);
@@ -6359,8 +6471,15 @@ impl Model {
             .hybrid
             .as_ref()
             .ok_or("forward_prompt_capture_kv_hybrid called on a non-hybrid model")?;
-        let (generated, text, states, seq_len) =
-            self.generate_hybrid_impl(h, prompt, None, 1, |_logits| {})?;
+        let (generated, text, states, seq_len) = self.generate_hybrid_impl(
+            h,
+            prompt,
+            None,
+            1,
+            &SamplingParams::default(),
+            |_logits| {},
+            |_id, _text| {},
+        )?;
 
         let attn_len = seq_len * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
         let mut layers = Vec::with_capacity(states.len());
@@ -6580,8 +6699,15 @@ impl Model {
     /// over [`Self::generate_mla_impl`] with no import and exactly one
     /// generated token.
     fn forward_prompt_mla(&self, m: &MlaModel, prompt: &str) -> Result<(u32, String), String> {
-        let (generated, text, _kv_caches, _seq_len) =
-            self.generate_mla_impl(m, prompt, None, 1, |_logits| {})?;
+        let (generated, text, _kv_caches, _seq_len) = self.generate_mla_impl(
+            m,
+            prompt,
+            None,
+            1,
+            &SamplingParams::default(),
+            |_logits| {},
+            |_id, _text| {},
+        )?;
         Ok((generated[0], text))
     }
 
@@ -6746,13 +6872,16 @@ impl Model {
     /// [`Self::forward_mla_attn_block`]) gets the same `start_pos`-offset treatment
     /// dense/MoE's `k_cache`/`v_cache` and hybrid's `GatedAttention` sublayers
     /// already do.
+    #[allow(clippy::too_many_arguments)]
     fn generate_mla_impl(
         &self,
         m: &MlaModel,
         prompt: &str,
         imported: Option<&crate::kv_io::MlaKvCache>,
         max_new_tokens: usize,
+        sampling: &SamplingParams,
         mut on_first_token: impl FnMut(&[f32]),
+        mut on_token: impl FnMut(u32, &str),
     ) -> Result<MlaGenerateResult, String> {
         if max_new_tokens == 0 {
             return Err("max_new_tokens must be at least 1".to_string());
@@ -6764,17 +6893,28 @@ impl Model {
         let eps = m.cfg.rmsnorm_eps;
         let mut hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
 
+        let mut rng = crate::sampling::make_rng(sampling.seed);
+        let mut pending_bytes: Vec<u8> = Vec::new();
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
         let first_logits = self.lm_head_logits(&hidden, hidden_size, eps)?;
-        let mut next_id = Self::argmax(&first_logits)?;
+        let mut next_id = crate::sampling::sample(&first_logits, sampling, &mut rng)?;
         on_first_token(&first_logits);
         generated.push(next_id);
+        on_token(
+            next_id,
+            &self.tokenizer.decode_stream(&mut pending_bytes, next_id),
+        );
 
         while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
             hidden = self.forward_one_token_mla(m, next_id, position, &mut kv_caches)?;
             position += 1;
-            next_id = self.lm_head_argmax(&hidden, hidden_size, eps)?;
+            let logits = self.lm_head_logits(&hidden, hidden_size, eps)?;
+            next_id = crate::sampling::sample(&logits, sampling, &mut rng)?;
             generated.push(next_id);
+            on_token(
+                next_id,
+                &self.tokenizer.decode_stream(&mut pending_bytes, next_id),
+            );
         }
 
         let text = self.tokenizer.decode(&generated);
@@ -6845,8 +6985,15 @@ impl Model {
             .mla
             .as_ref()
             .ok_or("forward_prompt_capture_kv_mla called on a non-MLA model")?;
-        let (generated, text, kv_caches, seq_len) =
-            self.generate_mla_impl(m, prompt, None, 1, |_logits| {})?;
+        let (generated, text, kv_caches, seq_len) = self.generate_mla_impl(
+            m,
+            prompt,
+            None,
+            1,
+            &SamplingParams::default(),
+            |_logits| {},
+            |_id, _text| {},
+        )?;
 
         let qk_dim = m.cfg.kv_lora_rank + m.cfg.qk_rope_head_dim;
         let per_layer_len = seq_len * qk_dim;
@@ -6945,7 +7092,14 @@ mod moe_fixture_tests {
         let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
         let model = Model::load(device, &file).expect("failed to load qwen3moe fixture");
         let (tokens, _text) = model
-            .generate("Once upon a time", 5, None, |_logits| {})
+            .generate(
+                "Once upon a time",
+                5,
+                None,
+                &SamplingParams::default(),
+                |_logits| {},
+                |_id, _text| {},
+            )
             .expect("generate failed");
         assert!(!tokens.is_empty(), "expected at least one generated token");
     }

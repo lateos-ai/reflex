@@ -21,6 +21,7 @@ pub mod model;
 pub mod moe;
 #[cfg(feature = "python")]
 pub mod python;
+pub mod sampling;
 pub mod tokenizer;
 
 /// Terminates the process immediately via the raw `_exit` syscall, skipping

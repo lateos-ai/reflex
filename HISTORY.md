@@ -1505,3 +1505,162 @@ verification layers, not just one:
 new test's tuple-of-function-pointer match arms, fixed with a named `type` alias
 rather than an `#[allow]`, since the fix was trivial and didn't compromise anything
 worth keeping inline).
+
+### IPC sampling + temperature streaming: closing the chat-completion-integration gap (2026-09-24)
+
+Scoped in a prior session, not built until now: `reflex stdio`/`reflex uds` had two
+gaps blocking any real chat-completion-style integration (OpenRouter, a serverless
+platform, a first-party API sitting in front of this engine) — greedy-only next-token
+choice, and a request/response protocol that fully buffers a whole generation before
+writing anything back. Before touching either, checked whether sampling was actually a
+permanent constraint or just unimplemented scope: CLAUDE.md's architecture section
+said "no sampling beyond greedy argmax" in passing, but README.md's Non-goals section —
+the canonical list of *permanent* constraints — only lists `batch_size`/concurrency/
+networking restrictions, never sampling strategy. Unimplemented scope, not a rejected
+feature; CLAUDE.md's line was describing the MVP's forward-pass code as it stood, not
+declaring a constraint.
+
+**Sampling** (`src/sampling.rs`, new module, host-side only — the GPU still only ever
+produces raw logits, same as before): `SamplingParams { temperature, top_k, top_p,
+seed }`, `Default` is `temperature: 0.0`, which `SamplingParams::is_greedy()` treats as
+greedy. `sample()`'s greedy branch calls the exact same `Model::argmax` (now
+`pub(crate)`, was private) every generation loop always called — no new floating-point
+path, so a caller that never touches sampling gets byte-identical output to before this
+module existed, which matters a lot here: `reflex check`'s whole reason to exist is
+byte-exact-vs-llama.cpp comparison, and that has to keep working. The sampling branch
+(temperature > 0) does the ordinary thing: temperature-scale, softmax over the full
+vocabulary, optionally keep only the `top_k` highest-probability entries, optionally
+nucleus-filter to the smallest highest-probability prefix whose cumulative probability
+reaches `top_p`, renormalize over whatever survived, draw categorically from a `rand`
+`StdRng` (seeded via `seed_from_u64` when `seed` is given, `from_entropy()` otherwise —
+`rand` is a new, non-optional dependency, since `Model::generate` needs it
+unconditionally, not gated behind the `ipc` feature like `serde`/`serde_json` are).
+
+Threading it through meant touching all three `generate_*_impl` loops
+(`generate_dense_impl`/`generate_hybrid_impl`/`generate_mla_impl`, `src/model.rs`) — each
+one previously called `self.lm_head_argmax(...)` (RMSNorm -> LM head -> argmax, all in
+one call) per decode step; now each calls `self.lm_head_logits(...)` (unchanged) then
+`crate::sampling::sample(&logits, sampling, &mut rng)`, since sampling needs the actual
+probability distribution, not just an index. `lm_head_argmax` itself is no longer called
+from any of the three production loops — it's kept, but moved behind `#[cfg(test)]`,
+since `prefill_batching_tests`' batched-vs-sequential-prefill oracle tests still use it
+directly and deleting it would have meant inlining `Self::argmax(&self.lm_head_logits(..)?)?`
+at 8 separate test call sites across 4 test modules for no real benefit. `Model::generate`'s
+public signature grew two parameters: `sampling: &SamplingParams` and a new `on_token:
+impl FnMut(u32, &str)` callback (see "Streaming" below) — every existing call site
+(`src/ipc.rs`, `src/ffi.rs`, `src/python.rs`, `src/bin/reflex/{check,bench,generate}.rs`,
+plus one `#[cfg(test)]` call in `model.rs`) needed updating to pass
+`&SamplingParams::default()`/`|_,_| {}` to keep its exact previous behavior — `reflex
+check` and the Python/C-FFI bindings deliberately still hardcode greedy, since none of
+those three call sites had a reason to expose sampling yet. `reflex generate` did get
+new CLI flags (`--temperature`/`--top-k`/`--top-p`/`--seed`) for direct manual
+verification without needing to hand-write IPC JSON.
+
+**Streaming**: checked `Model::generate`'s existing per-token hook structure first,
+since `src/bin/reflex/check.rs` already had a callback parameter
+(`on_first_token: impl FnMut(&[f32])`, used there to capture logits for a checksum). Its
+doc comment was explicit that it fires *exactly once*, right after the first generated
+token — not a per-token hook at all, so streaming needed a real new callback point, not
+just plumbing an existing one further. Added `on_token: impl FnMut(u32, &str)`, called
+once per generated token (including the first, alongside `on_first_token`) from inside
+each `generate_*_impl` loop, with that token's id and its incrementally-decoded text.
+
+That "incrementally-decoded text" needed its own new piece: `Tokenizer::decode_stream`
+(`src/tokenizer.rs`). The existing `decode` collects every token's raw bytes into one
+buffer and UTF-8-decodes it once at the end via `from_utf8_lossy`, which is fine for a
+complete id sequence but wrong for streaming — a multi-byte UTF-8 character split across
+two generated tokens would decode its first token's dangling lead byte(s) as a `U+FFFD`
+replacement character immediately, before the second token arrives to complete it.
+Refactored both `decode_sentencepiece`/`decode_gpt2` to share a new `token_bytes(id)`
+helper (one token's raw decoded bytes, extracted verbatim from what each function's loop
+body used to do inline), then built `decode_stream(pending: &mut Vec<u8>, id: u32)` on
+top of it: appends the new token's bytes to a caller-owned `pending` buffer threaded
+across the whole generation run, finds the longest valid-UTF-8 prefix via
+`str::from_utf8`'s `Utf8Error::valid_up_to()`, emits that as text, and leaves any
+incomplete trailing sequence in `pending` for the next call. Two new tests cover this
+directly: one confirms `decode_stream` called once per token reassembles the same string
+`decode` produces for plain ASCII text, the other manufactures a 'é' (0xC3 0xA9) split
+across two byte-fallback tokens and confirms the first call returns empty text (the
+dangling lead byte held back) while the second returns the complete character.
+
+`crate::ipc` (`src/ipc.rs`) is where both land for real IPC callers. `IpcRequest` grew
+two new optional fields: `sampling: Option<IpcSamplingParams>` (omitted -> greedy, via a
+new `IpcRequest::sampling_params()` method — kept deliberately separate from the
+existing `temperature: f32` field, which is `system1_evaluate`'s Platt-style softmax
+temperature over a handful of candidate scores, an unrelated operation that happens to
+share a name) and `stream: bool` (default `false`). `IpcResponse` grew an `event:
+&'static str` field (always `"final"`) and a new sibling type, `IpcStreamToken` (`event:
+"token"`, `token_id`, `text`), so a client handling both streaming and non-streaming
+responses over the same connection can dispatch on one field rather than guessing from
+which keys are present. The dispatch logic moved from `handle_request` (kept, now used
+internally by the streaming path's fallback branches: `system1_evaluate` requests, and
+any `stream: false` `generate` request) into a new `handle_request_streaming`, which for
+a streaming `generate` request passes an `on_token` closure into `Model::generate` that
+serializes and flushes one `IpcStreamToken` line per token as `Model::generate`'s decode
+loop produces it, then writes the final aggregate `IpcResponse` line once the whole
+generation finishes — same shape a non-streaming caller always got, now also emitted at
+the end of a streaming request. Nothing here spawns a thread or defers writes to a
+background task: token lines are written synchronously from inside the same call stack
+`Model::generate`'s decode loop already runs on, preserving this module's existing
+"strictly sequential, one request fully processed before the next is read" contract —
+`src/bin/reflex/stdio.rs`/`uds.rs` needed no code changes at all, since both already just
+delegate to `ipc::run_request_loop`, which now calls `handle_request_streaming`
+internally; only their doc comments were updated to describe the (potentially
+multi-line) response shape.
+
+**Verification** (real hardware required end to end — no CPU/mock fallback exists for
+`generate`/`stdio`/`uds`, and `cargo test` alone doesn't rebuild `target/release/reflex`,
+per this project's standing rule): this machine has no NVIDIA GPU, so the work was built
+and verified on a fresh ThunderCompute A100-SXM4-80GB (`q82fifka`, `sm_80`), synced via
+`rsync` (the project's established remote-workflow pattern — see DECISIONS.md's rsync
+mtime-staleness entry) after installing a bare Rust toolchain and `libssl-dev`/
+`pkg-config` (the same `--features download` OpenSSL gotcha README already documents)
+fresh on the instance. `cargo build --release --features ipc` and
+`--features ipc,download` both compiled clean; `reflex smoke` passed
+(`process_start_to_first_result_ms=673.495`); `cargo test --release --features ipc`
+passed 92/0/10 (host-only + the fixture-backed tests, same counts as the pre-existing
+suite), and the two `REFLEX_TEST_GGUF`-gated tests this round's changed code path
+touches (`prefill_dense_batched_matches_sequential_prefill`,
+`gemv_gather_matches_full_vocab_gemv_at_matching_rows`) also passed against a real
+downloaded `Qwen/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q8_0.gguf` (`reflex generate --quickstart`).
+Against that same real GGUF:
+
+1. **Greedy regression check**: `reflex generate "The capital of France is" --max-tokens
+   8` (no sampling flags, and again with `--temperature 0.0` explicitly) produced the
+   exact same token ids across three separate runs —
+   `[12095,11,323,279,6722,315,15344,374]`, `" Paris, and the capital of Italy is"` —
+   matching this project's own previously-documented golden `token_id=12095, " Paris"`
+   continuation for this exact prompt (see the IQ-format entry above and README's System1
+   example). Sampling's addition changed nothing about the default path.
+2. **Sampling produces real, sane variation**: `--temperature 1.2 --top-k 50` with no
+   `--seed` produced four different continuations across four runs (" Paris , but not
+   for a long period" / " London, the largest city in Europe" / " Paris, which is known
+   for its architecture" / " Versailles, but that's more of") — all plausible
+   continuations, all different, exactly what temperature sampling should do.
+3. **Seeded reproducibility**: `--temperature 0.9 --top-p 0.9 --seed 12345` produced
+   byte-identical token ids across two separate runs; `--seed 999` with the same other
+   parameters diverged. Confirmed the same way over IPC (`"sampling": {"temperature":
+   0.9, "top_p": 0.9, "seed": 42}` via `reflex stdio`, `stream: false`) — two requests
+   with the same seed produced identical `token_ids`/`text`.
+4. **Streaming is real, not chunked-at-the-end**: a Python harness
+   (`subprocess.Popen`, timestamping each stdout line as it arrived) sent a `"stream":
+   true`, `max_tokens: 24` request over `reflex stdio` — first `IpcStreamToken` line
+   arrived at +381ms, the final `IpcResponse` line at +1968ms, a genuine ~1.6s gap
+   across the 23 remaining decode steps (~69ms/token), not a single write at the end.
+   A non-streaming request (`stream` omitted) still produced exactly one JSON line —
+   the pre-streaming contract, unchanged.
+5. **`system1_evaluate` unaffected**: a `candidates`-non-empty request with `sampling`/
+   `stream` both absent produced the same shape (and near-identical scores/entropy) as
+   before this round; malformed JSON still produces a single `ok: false` line, not a
+   dropped connection.
+
+`cargo fmt --check` clean; `cargo clippy --release --features ipc,download --all-targets
+-- -D warnings` clean (one nit fixed along the way: `SamplingParams::is_greedy`'s
+original `!(self.temperature > 0.0)` tripped `clippy::neg_cmp_op_on_partial_ord`, since
+negating a `>` comparison on a partially-ordered type like `f32` reads differently than
+it evaluates once NaN is in play — rewritten as `self.temperature.is_nan() ||
+self.temperature <= 0.0`, same truth table, no negated comparison). Confirmed via `git
+stash` that a separate pre-existing `clippy::useless_conversion` finding in
+`src/python.rs` (the `python` feature specifically) already existed on `master` before
+this round's changes and is unrelated to this work — left alone rather than folded into
+this round's fix, since touching unrelated code wasn't asked for.

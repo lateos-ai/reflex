@@ -219,7 +219,14 @@ pub unsafe extern "C" fn reflex_generate(
                 .map_err(|e| format!("reflex_generate: prompt is not valid UTF-8: {e}"))?;
             let model = unsafe { &(*handle).model };
 
-            let (tokens, text) = model.generate(prompt_str, max_new_tokens, None, |_logits| {})?;
+            let (tokens, text) = model.generate(
+                prompt_str,
+                max_new_tokens,
+                None,
+                &crate::sampling::SamplingParams::default(),
+                |_logits| {},
+                |_id, _text| {},
+            )?;
 
             let mut boxed_tokens = tokens.into_boxed_slice();
             let token_ids = boxed_tokens.as_mut_ptr();

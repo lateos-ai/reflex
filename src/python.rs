@@ -49,7 +49,14 @@ impl PyModel {
     /// exposed through this binding this round).
     fn generate(&self, prompt: &str, max_new_tokens: usize) -> PyResult<(Vec<u32>, String)> {
         self.inner
-            .generate(prompt, max_new_tokens, None, |_logits| {})
+            .generate(
+                prompt,
+                max_new_tokens,
+                None,
+                &crate::sampling::SamplingParams::default(),
+                |_logits| {},
+                |_id, _text| {},
+            )
             .map_err(to_py_err)
     }
 

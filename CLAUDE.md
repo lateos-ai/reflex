@@ -85,9 +85,14 @@ GQA attention → O-proj residual) → FFN (dense: single SwiGLU; MoE: router GE
 `gemv` on `ffn_gate_inp` → `moe::route_top_k` host-side → per-selected-expert SwiGLU via
 `gemv_expert`, which slices the relevant chunk out of each 3-D `[in_features,
 out_features, expert_count]` per-expert-stacked tensor → weighted-summed by the router's
-combination weights) → final RMSNorm → LM head → greedy argmax. No KV-cache reuse across
-process runs, no batching, no sampling beyond argmax — deliberately out of scope (see
-Non-goals).
+combination weights) → final RMSNorm → LM head → next-token choice, `crate::sampling`'s
+`Model::generate`-shared greedy argmax (still the default, and what `reflex check`'s
+byte-exact-vs-llama.cpp methodology depends on) or explicit-opt-in temperature/top-k/
+top-p sampling (`reflex generate --temperature/--top-k/--top-p/--seed`; IPC's
+`"sampling": {...}`, see `src/ipc.rs`) — see `src/sampling.rs`'s doc comment; this was
+unimplemented scope, not a Non-goals constraint (README.md's Non-goals list only
+`batch_size`/concurrency/networking, never sampling strategy). No KV-cache reuse across
+process runs, no batching — those stay permanent (see Non-goals).
 
 `general.architecture == "deepseek2"` dispatches to `Model::load_mla`/
 `forward_prompt_mla` (MVP step 4, Multi-head Latent Attention) instead, a separate path

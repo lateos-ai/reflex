@@ -1,10 +1,11 @@
 //! Local, non-network IPC over a Unix Domain Socket: binds `socket-path`, then
 //! accepts and fully drains one connection (`reflex_engine::ipc::run_request_loop`,
-//! the same line-delimited JSON protocol `reflex stdio` uses) before accepting
-//! the next -- never a thread pool, matching this engine's permanent `batch_size ==
-//! 1`/no-concurrent-server constraint (see CLAUDE.md/README.md's Non-goals). A
-//! second client connecting while the first is still being processed simply waits
-//! in the OS accept queue.
+//! the same line-delimited JSON protocol `reflex stdio` uses, including
+//! per-token streaming for a `"stream": true` request -- see `src/ipc.rs`'s
+//! module doc comment) before accepting the next -- never a thread pool, matching
+//! this engine's permanent `batch_size == 1`/no-concurrent-server constraint (see
+//! CLAUDE.md/README.md's Non-goals). A second client connecting while the first
+//! is still being processed simply waits in the OS accept queue.
 //!
 //! Usage: `reflex uds <path-to-gguf> <socket-path> [--lora <adapter.gguf>]`
 //! (requires `cargo build --features ipc`)

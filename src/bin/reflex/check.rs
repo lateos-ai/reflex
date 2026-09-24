@@ -129,9 +129,14 @@ pub fn run(args: Vec<String>) {
 
     let mut first_logits: Vec<f32> = Vec::new();
     let (token_ids, _text) = model
-        .generate(&prompt, max_tokens, None, |logits| {
-            first_logits = logits.to_vec()
-        })
+        .generate(
+            &prompt,
+            max_tokens,
+            None,
+            &reflex_engine::sampling::SamplingParams::default(),
+            |logits| first_logits = logits.to_vec(),
+            |_id, _text| {},
+        )
         .unwrap_or_else(|e| exit_usage_error(&format!("generate failed: {e}")));
     let token_texts = model.decode_tokens(&token_ids);
     let vocab_size = first_logits.len();

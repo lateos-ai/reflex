@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
 short, current-state summary; HISTORY.md is the log.
 
-_Last updated: 2026-09-24 (on-device dequant extended to all 8 IQ-family formats, closing the on-device dequant set entirely; previous update: cargo fmt/clippy wired into CI)_
+_Last updated: 2026-09-24 (temperature/top-k/top-p sampling + per-token streaming added to the IPC layer, chat-completion-integration prep; previous update: on-device dequant extended to all 8 IQ-family formats, closing the on-device dequant set entirely)_
 
 ## MVP progress
 
@@ -323,6 +323,54 @@ Adapters`/`-9B-` remain untested: confirmed (via HF page text, not yet its own
 safetensors header) to target MoE's per-expert routed-expert projections, which really
 does need new per-expert-slice delta math beyond a widened accept list, plus a much
 larger model — left for a future round.
+
+## IPC sampling + streaming (chat-completion-integration prep, done 2026-09-24)
+
+Two gaps blocking any real chat-completion-style integration (OpenRouter, a
+serverless platform, a first-party API) against `reflex stdio`/`reflex uds`, closed
+in one round — see HISTORY.md's entry for the full design/verification writeup:
+
+1. **Temperature/top-k/top-p sampling** (`src/sampling.rs`, new module). Confirmed
+   first that this was unimplemented scope, not a permanent constraint — README's
+   Non-goals list `batch_size`/concurrency/networking, never sampling strategy.
+   Greedy argmax stays the default (`SamplingParams::temperature <= 0.0`) and is
+   still what `reflex check`'s byte-exact-vs-llama.cpp methodology relies on;
+   sampling is an explicit opt-in per request (`Model::generate`'s new `sampling:
+   &SamplingParams` parameter; `reflex generate --temperature/--top-k/--top-p
+   --seed` at the CLI; `"sampling": {...}` in the IPC JSON protocol).
+2. **Per-token streaming** over the existing stdio/UDS line-delimited-JSON
+   protocol (`crate::ipc::handle_request_streaming`, `"stream": true`) — one
+   `IpcStreamToken` JSON line per generated token as it's produced, followed by one
+   final `IpcResponse` line, both flushed immediately. `Tokenizer::decode_stream`
+   (new) buffers a token's raw bytes until they form a complete UTF-8 character,
+   avoiding a `U+FFFD` for a multi-byte character split across a token boundary —
+   `decode`'s existing whole-buffer `from_utf8_lossy` never had to handle this
+   since it only ever runs once the full id sequence is in hand.
+
+No concurrency was introduced anywhere — token lines are written synchronously
+from inside the same decode loop `Model::generate` already ran, one line at a
+time, same `strictly sequential, never a thread pool` constraint the rest of this
+module already holds to.
+
+Real-hardware-verified on a fresh ThunderCompute A100 (`q82fifka`), against a real
+`Qwen/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q8_0.gguf` (downloaded via `reflex generate
+--quickstart`): greedy output byte-identical across repeated runs and matching this
+project's own documented golden continuation (`"The capital of France is"` ->
+token ids `[12095,11,323,279,6722,315,15344,374]`, `" Paris, and the capital of
+Italy is"`); `--temperature 1.2 --top-k 50` with no seed produced 4 different
+continuations across 4 runs; the same `--seed` reproduced byte-identical output
+across repeated runs, a different seed diverged; `reflex stdio` streaming emitted
+the first token at +381ms and the final aggregate line at +1968ms for a 24-token
+generation (a real ~1.6s gap across 23 decode steps, not a buffered-at-the-end
+single write); a non-streaming request still produced exactly one JSON line
+(regression check on the pre-streaming contract); `system1_evaluate` (the
+`candidates` path) is unaffected by both `sampling` and `stream` (single-pass
+score, nothing to sample or stream). `cargo test --release --features ipc`: 92
+passed (host-only) + all `REFLEX_TEST_GGUF`-gated tests this round's code path
+touches (`prefill_dense_batched_matches_sequential_prefill`,
+`gemv_gather_matches_full_vocab_gemv_at_matching_rows`); `cargo fmt --check`/
+`cargo clippy --release --features ipc,download --all-targets -- -D warnings`
+both clean.
 
 ## Known debt / limitations
 

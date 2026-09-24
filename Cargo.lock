@@ -813,6 +813,7 @@ dependencies = [
  "hf-hub",
  "memmap2",
  "pyo3",
+ "rand 0.8.8",
  "serde",
  "serde_json",
 ]
