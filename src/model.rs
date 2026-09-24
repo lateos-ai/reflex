@@ -162,6 +162,14 @@ const Q8_1_BLOCK_BYTES: usize = 36;
 const Q2K_BLOCK_BYTES: usize = 84;
 const Q3K_BLOCK_BYTES: usize = 110;
 const Q8K_BLOCK_BYTES: usize = 292;
+const IQ2XXS_BLOCK_BYTES: usize = 66;
+const IQ2XS_BLOCK_BYTES: usize = 74;
+const IQ2S_BLOCK_BYTES: usize = 82;
+const IQ3XXS_BLOCK_BYTES: usize = 98;
+const IQ3S_BLOCK_BYTES: usize = 110;
+const IQ1S_BLOCK_BYTES: usize = 50;
+const IQ1M_BLOCK_BYTES: usize = 56;
+const IQ4XS_BLOCK_BYTES: usize = 136;
 
 /// Every on-device dequant kernel (`src/kernels_cuda/dequant.cu`), loaded
 /// once at model-load time and threaded through `Model::load`/`load_hybrid`/
@@ -181,6 +189,14 @@ struct DequantKernels {
     q2k: AotKernel,
     q3k: AotKernel,
     q8k: AotKernel,
+    iq2xxs: AotKernel,
+    iq2xs: AotKernel,
+    iq2s: AotKernel,
+    iq3xxs: AotKernel,
+    iq3s: AotKernel,
+    iq1s: AotKernel,
+    iq1m: AotKernel,
+    iq4xs: AotKernel,
 }
 
 /// Loads every on-device dequant kernel from the AOT-compiled `dequant`
@@ -200,6 +216,14 @@ fn load_dequant_kernels(device: &Arc<CudaDevice>) -> Result<DequantKernels, Stri
         "dequantize_q2k_kernel",
         "dequantize_q3k_kernel",
         "dequantize_q8k_kernel",
+        "dequantize_iq2xxs_kernel",
+        "dequantize_iq2xs_kernel",
+        "dequantize_iq2s_kernel",
+        "dequantize_iq3xxs_kernel",
+        "dequantize_iq3s_kernel",
+        "dequantize_iq1s_kernel",
+        "dequantize_iq1m_kernel",
+        "dequantize_iq4xs_kernel",
     ];
     let mut fns = aot::load_kernel_module(
         device,
@@ -221,17 +245,28 @@ fn load_dequant_kernels(device: &Arc<CudaDevice>) -> Result<DequantKernels, Stri
         q2k: fns.next().ok_or("missing dequantize_q2k_kernel")?,
         q3k: fns.next().ok_or("missing dequantize_q3k_kernel")?,
         q8k: fns.next().ok_or("missing dequantize_q8k_kernel")?,
+        iq2xxs: fns.next().ok_or("missing dequantize_iq2xxs_kernel")?,
+        iq2xs: fns.next().ok_or("missing dequantize_iq2xs_kernel")?,
+        iq2s: fns.next().ok_or("missing dequantize_iq2s_kernel")?,
+        iq3xxs: fns.next().ok_or("missing dequantize_iq3xxs_kernel")?,
+        iq3s: fns.next().ok_or("missing dequantize_iq3s_kernel")?,
+        iq1s: fns.next().ok_or("missing dequantize_iq1s_kernel")?,
+        iq1m: fns.next().ok_or("missing dequantize_iq1m_kernel")?,
+        iq4xs: fns.next().ok_or("missing dequantize_iq4xs_kernel")?,
     })
 }
 
 /// Dequantizes one tensor's raw quantized bytes straight to a device-resident
-/// `f32` buffer. Every block-quantized format except the IQ family
-/// dequantizes on-device via `src/kernels_cuda/dequant.cu` -- no host `f32`
-/// copy is ever materialized for these, closing the gap with llama.cpp's
-/// CUDA backend, which never materializes one either (see README.md's Phase
-/// 2 round 3 writeup). The remaining IQ-family formats still fall back to
-/// the existing host `dequant::dequantize` path (`src/dequant.rs`/
-/// `dequant_iq.rs`) -- correct but not (yet) GPU-accelerated.
+/// `f32` buffer. Every block-quantized format, including the IQ
+/// (codebook/non-uniform) family, dequantizes on-device via
+/// `src/kernels_cuda/dequant.cu` -- no host `f32` copy is ever materialized
+/// for any of them, closing the gap with llama.cpp's CUDA backend, which
+/// never materializes one either (see README.md's Phase 2 round 3 writeup,
+/// and STATUS.md's IQ-family on-device dequant entry for this format
+/// family's own closeout). The `other` arm below is unreachable for every
+/// `GgmlType` this project's `gguf.rs` parses, but stays as the fallback to
+/// the host `dequant::dequantize` path (`src/dequant.rs`/`dequant_iq.rs`)
+/// rather than a `match` that would need updating for every future format.
 fn dequantize_tensor_to_device(
     device: &Arc<CudaDevice>,
     kernels: &DequantKernels,
@@ -332,6 +367,70 @@ fn dequantize_tensor_to_device(
             device,
             &kernels.q8k,
             Q8K_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
+        GgmlType::IQ2XXS => dequantize_on_device(
+            device,
+            &kernels.iq2xxs,
+            IQ2XXS_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
+        GgmlType::IQ2XS => dequantize_on_device(
+            device,
+            &kernels.iq2xs,
+            IQ2XS_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
+        GgmlType::IQ2S => dequantize_on_device(
+            device,
+            &kernels.iq2s,
+            IQ2S_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
+        GgmlType::IQ3XXS => dequantize_on_device(
+            device,
+            &kernels.iq3xxs,
+            IQ3XXS_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
+        GgmlType::IQ3S => dequantize_on_device(
+            device,
+            &kernels.iq3s,
+            IQ3S_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
+        GgmlType::IQ1S => dequantize_on_device(
+            device,
+            &kernels.iq1s,
+            IQ1S_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
+        GgmlType::IQ1M => dequantize_on_device(
+            device,
+            &kernels.iq1m,
+            IQ1M_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
+        GgmlType::IQ4XS => dequantize_on_device(
+            device,
+            &kernels.iq4xs,
+            IQ4XS_BLOCK_BYTES,
             QK_K,
             bytes,
             element_count,
@@ -7363,5 +7462,95 @@ mod system1_tests {
                 "row {row}: full_vocab={expected}, gathered={got}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod iq_dequant_host_vs_device_tests {
+    use super::*;
+    use crate::dequant_iq;
+    use crate::gguf::GgufFile;
+    use cudarc::driver::CudaDevice;
+
+    /// Byte-exact host-vs-device cross-check for the IQ-family on-device
+    /// dequant kernels (`kernels_cuda/dequant.cu`'s `dequantize_iq*_kernel`
+    /// functions) against the already-verified host path (`dequant_iq.rs`,
+    /// unit-tested against hand-computed values since Phase 21.13) -- run
+    /// against every real IQ-family tensor's actual bytes (not just a
+    /// synthetic all-zero block), so it also exercises codebook/sign-bit
+    /// lookup paths the hand-computed unit tests don't reach. `#[ignore]`d
+    /// like every other real-GGUF test in this file -- run with:
+    /// `REFLEX_TEST_GGUF=<path to a real GGUF containing IQ-family tensors>
+    /// cargo test --release -- --ignored iq_dequant_kernel_matches_host_on_real_tensors`
+    #[test]
+    #[ignore]
+    fn iq_dequant_kernel_matches_host_on_real_tensors() {
+        let gguf_path = std::env::var("REFLEX_TEST_GGUF").expect(
+            "set REFLEX_TEST_GGUF to a real local GGUF path containing IQ-family tensors to run this test",
+        );
+        let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
+        let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+        let kernels = load_dequant_kernels(&device).expect("failed to load dequant kernels");
+
+        type HostDequantFn = fn(&[u8], &mut [f32]);
+
+        let mut tested_types: Vec<GgmlType> = Vec::new();
+        for info in &file.tensors {
+            let ggml_type = info.ggml_type;
+            let (host_fn, block_bytes): (HostDequantFn, usize) = match ggml_type {
+                GgmlType::IQ2XXS => (dequant_iq::dequantize_block_iq2_xxs, IQ2XXS_BLOCK_BYTES),
+                GgmlType::IQ2XS => (dequant_iq::dequantize_block_iq2_xs, IQ2XS_BLOCK_BYTES),
+                GgmlType::IQ2S => (dequant_iq::dequantize_block_iq2_s, IQ2S_BLOCK_BYTES),
+                GgmlType::IQ3XXS => (dequant_iq::dequantize_block_iq3_xxs, IQ3XXS_BLOCK_BYTES),
+                GgmlType::IQ3S => (dequant_iq::dequantize_block_iq3_s, IQ3S_BLOCK_BYTES),
+                GgmlType::IQ1S => (dequant_iq::dequantize_block_iq1_s, IQ1S_BLOCK_BYTES),
+                GgmlType::IQ1M => (dequant_iq::dequantize_block_iq1_m, IQ1M_BLOCK_BYTES),
+                GgmlType::IQ4XS => (dequant_iq::dequantize_block_iq4_xs, IQ4XS_BLOCK_BYTES),
+                _ => continue,
+            };
+            if tested_types.contains(&ggml_type) {
+                continue; // one real tensor per type is enough
+            }
+            tested_types.push(ggml_type);
+
+            let bytes = file.tensor_bytes(info).expect("tensor_bytes failed");
+            let element_count = info.element_count();
+            let num_blocks = bytes.len() / block_bytes;
+
+            let mut host_out = vec![0f32; num_blocks * QK_K];
+            for b in 0..num_blocks {
+                let block = &bytes[b * block_bytes..(b + 1) * block_bytes];
+                host_fn(block, &mut host_out[b * QK_K..(b + 1) * QK_K]);
+            }
+            host_out.truncate(element_count as usize);
+
+            let device_out =
+                dequantize_tensor_to_device(&device, &kernels, ggml_type, bytes, element_count)
+                    .expect("dequantize_tensor_to_device failed");
+            let device_host = device.dtoh_sync_copy(&device_out).expect("dtoh failed");
+
+            assert_eq!(
+                host_out.len(),
+                device_host.len(),
+                "{} ({ggml_type:?}): length mismatch",
+                info.name
+            );
+            for (i, (h, d)) in host_out.iter().zip(device_host.iter()).enumerate() {
+                assert_eq!(
+                    h, d,
+                    "{} ({ggml_type:?}): element {i} host={h} device={d}",
+                    info.name
+                );
+            }
+            eprintln!(
+                "OK {} ({ggml_type:?}): {} elements byte-exact",
+                info.name,
+                host_out.len()
+            );
+        }
+        assert!(
+            !tested_types.is_empty(),
+            "REFLEX_TEST_GGUF contained no IQ-family tensor to test"
+        );
     }
 }
