@@ -1311,3 +1311,47 @@ a false positive — but fixing it means changing public `extern "C"` signatures
 (adding `unsafe`), which changes the `cbindgen`-generated `include/reflex_engine.h`
 contract and is exactly the kind of change this project asks about before starting
 (see STATUS.md's "Known debt" for this being tracked, not silently fixed here).
+
+### `docker run --rm --gpus all`: the last unverified Docker path, closed on real EC2
+
+Every prior verification attempt for the Docker image had a gap: ThunderCompute
+instances are themselves nested containers and reject `docker build` outright
+(`unshare: operation not permitted`), and a real Docker Desktop/WSL2 host that could
+build and run the image had no NVIDIA GPU at all (`nvidia-container-cli:
+initialization error: WSL environment detected but no adapters were found`). Closing
+this needed a host with both genuine VM-level virtualization *and* a real NVIDIA
+GPU/driver — a real cloud GPU instance, not a nested dev container.
+
+Rather than standing up the full production ASG/EFS/ECR pattern from
+`docs/aws-deployment.md` (written but, as that doc's own "Known limitations" section
+says, never deployed against real infrastructure), this was a minimal one-off
+verification: a throwaway IAM role/instance profile (`AmazonSSMManagedInstanceCore`
+only, no SSH key — shell access via SSM `send-command` instead), the repo shipped to
+the instance via a temp private S3 bucket (`git archive HEAD` rather than pushing
+local-only commits to a remote), and a real EC2 `g4dn.xlarge`. Spot capacity for
+`g4dn.xlarge` was exhausted in every `us-east-1` AZ at launch time
+(`InsufficientInstanceCapacity`/"no Spot capacity available"), so this fell back to
+On-Demand, which launched immediately.
+
+The `base-oss-nvidia-driver-gpu-ubuntu-22.04` DLAMI (resolved via the SSM parameter
+`docs/aws-deployment.md` already documents) turned out to already have Docker CE, the
+NVIDIA Container Toolkit, and the `nvidia` container runtime preinstalled and
+registered — none of that guide's bootstrap steps 1-2 were actually needed on this
+AMI. `docker build --build-arg REFLEX_CUDA_ARCH=sm_75 -t reflex:verify .` (matching
+the instance's Tesla T4) built cleanly. `docker run --rm --gpus all reflex:verify
+smoke` initially failed with a confusing "No such file or directory" — the repo's
+`Dockerfile` sets `ENTRYPOINT ["reflex", "generate"]`, so `smoke` was being passed as
+a GGUF path argument to `generate`, not as the `smoke` subcommand; fixed with
+`--entrypoint /usr/local/bin/reflex reflex:verify smoke`.
+
+**Result: `REFLEX_SMOKE_OK process_start_to_first_result_ms=707.599`**, with the GPU
+correctly detected inside the container as `Tesla T4 (sm_75)` — confirming the
+AOT-compiled `sm_75` cubin kernel path loads and runs correctly via the CUDA driver
+API inside a real, non-nested Docker container under `--gpus all`. All throwaway
+infra (EC2 instance, S3 bucket, IAM role/instance profile) was torn down in the same
+session. This closes the Docker image's last unverified path — see STATUS.md's
+former "Known debt" entry, now closed, for the pointer.
+
+Note this verifies the *image* runs correctly under `--gpus all` on real hardware; it
+does not itself validate `docs/aws-deployment.md`'s full ASG/EFS/ECR/scale-to-zero
+pattern, which remains a separate, larger, still-undeployed scope.

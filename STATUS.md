@@ -266,9 +266,10 @@ planned. The user has asked to queue up three release-hardening items, in this o
    GitHub-hosted runner has a GPU). `cargo fmt --check`/`cargo clippy` deliberately
    left out — see HISTORY.md's CI entry and "Known debt" below for why. This does
    not replace real-hardware verification, only catches non-GPU-dependent breakage.
-2. **Verify `docker run --rm --gpus all`** end-to-end — the one remaining unverified
-   Docker path (see "Known debt" below), needs a host with genuine VM-level
-   virtualization *and* a real NVIDIA GPU/driver.
+2. ~~**Verify `docker run --rm --gpus all`** end-to-end~~ — **done 2026-09-24**: a real
+   EC2 `g4dn.xlarge` (On-Demand; Spot capacity was exhausted in every `us-east-1` AZ at
+   launch time) gave the genuine VM-level virtualization *and* real NVIDIA GPU/driver
+   this needed — see "Known debt" below for the full writeup.
 3. ~~**On-device dequant for more GGUF block types**~~ — **`Q5_K` done**, and as of
    2026-09-24, **Q4_0/1, Q5_0/1, Q8_0/1, Q2_K, Q3_K, Q8_K also done** (see "Known
    debt" below for the real-hardware verification writeup, which surfaced and
@@ -426,21 +427,36 @@ larger model — left for a future round.
   correct inside the container — it opens and parses the GGUF, then progresses all the
   way to `cudarc`'s dynamic `libcuda`/`nvcuda` load before failing, exactly the
   expected boundary with no GPU present.
-  **`docker run --rm --gpus all` remains unverified** — but now purely because this
-  particular Docker host has no NVIDIA GPU at all (confirmed: `Get-CimInstance
+  At the time, `docker run --rm --gpus all` remained unverified purely because this
+  particular Docker host had no NVIDIA GPU at all (confirmed: `Get-CimInstance
   Win32_VideoController` → AMD Radeon only), not because of the nested-container
-  access problem the previous entry described. `--gpus all` fails immediately with
+  access problem the previous entry described. `--gpus all` failed immediately with
   `nvidia-container-cli: initialization error: WSL environment detected but no
   adapters were found` — a hardware-absence error. (Incidental finding: Docker
   Desktop's WSL2 backend already has a working `nvidia-container-cli` wired in — the
   error is a specific "no adapter," not "toolkit missing" — so a Windows/Docker
   Desktop host with a real NVIDIA GPU would likely need no extra host-side toolkit
-  setup for `--gpus all` to work.) **Still needed before this image is treated as
-  release-ready**: one real `docker run --rm --gpus all` pass on a Docker host that has
-  both genuine VM-level virtualization *and* an actual NVIDIA GPU/driver, producing
-  real `REFLEX_GENERATE_OK process_start_to_first_token_ms=... token_text=...` output —
-  neither the nested-container ThunderCompute instances nor the GPU-less
-  Windows host used for the Docker build check above can provide that combination.
+  setup for `--gpus all` to work.)
+- ~~**`docker run --rm --gpus all` unverified**~~ — **closed 2026-09-24**: verified on
+  a real EC2 `g4dn.xlarge` (On-Demand — Spot capacity was exhausted in every
+  `us-east-1` AZ at launch time; the `base-oss-nvidia-driver-gpu-ubuntu-22.04` DLAMI
+  already has Docker CE, the NVIDIA Container Toolkit, and the `nvidia` container
+  runtime preinstalled, so no bootstrap script was actually needed on this AMI). Built
+  the repo's own `Dockerfile` with `REFLEX_CUDA_ARCH=sm_75` (matching the instance's
+  Tesla T4), then `docker run --rm --gpus all --entrypoint /usr/local/bin/reflex
+  reflex:verify smoke` (the image's default `ENTRYPOINT` is `["reflex", "generate"]`,
+  so invoking `smoke` needs an explicit entrypoint override or the binary mis-parses
+  `smoke` as a GGUF path argument). **Result: `REFLEX_SMOKE_OK
+  process_start_to_first_result_ms=707.599`**, GPU detected inside the container as
+  `Tesla T4 (sm_75)` — confirms the AOT-compiled cubin kernel path loads and runs
+  correctly via the CUDA driver API inside a real, non-nested Docker container with
+  `--gpus all`. This was a one-off verification pass (throwaway IAM role/instance
+  profile, temp S3 bucket used to ship the repo, and the EC2 instance itself were all
+  created and torn down in the same session) rather than the persistent
+  `docs/aws-deployment.md` ASG/EFS/ECR pattern, which remains unvalidated against real
+  infrastructure as a separate, larger scope. This closes the Docker image's last
+  unverified path — both `docker build` modes and now `docker run --gpus all` are
+  real-hardware-verified.
 - **Kernel-byte-embedding refactor re-verified against the Qwen3.5 hybrid fixture,
   closing the one gap the MVP-release round's own hardware pass left open**: the
   initial verification re-ran the dense/MoE and MLA paths against
