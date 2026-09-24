@@ -92,6 +92,10 @@ const char *reflex_last_error(void);
  * non-NULL; `lora_path` may be NULL. Both, when non-NULL, must be
  * NUL-terminated UTF-8 C strings; this function does not take ownership of
  * either and they may be freed by the caller as soon as it returns.
+ *
+ * # Safety
+ * `gguf_path` and, when non-NULL, `lora_path` must each point to a valid
+ * NUL-terminated C string readable for the duration of this call.
  */
 ReflexModel *reflex_load(const char *gguf_path, const char *lora_path);
 
@@ -112,6 +116,12 @@ ReflexModel *reflex_load(const char *gguf_path, const char *lora_path);
  * On success, fills `*out` and returns 0 -- the caller must eventually pass
  * `out` to `reflex_free_generate_result`. On failure, leaves `*out`
  * untouched and returns -1 (call `reflex_last_error` for why).
+ *
+ * # Safety
+ * `handle` must be a live pointer from `reflex_load`, not yet freed, and not
+ * used concurrently from another thread. `prompt` must point to a valid
+ * NUL-terminated C string readable for the duration of this call. `out`
+ * must point to writable, properly aligned `ReflexGenerateResult` storage.
  */
 int reflex_generate(ReflexModel *handle,
                     const char *prompt,
@@ -124,6 +134,10 @@ int reflex_generate(ReflexModel *handle,
  * zeroed/all-NULL struct (no-op), and safe to call more than once on the
  * same struct for that reason -- but never on two different copies of the
  * same non-zeroed struct (double free).
+ *
+ * # Safety
+ * `result`, if non-NULL, must point to a `ReflexGenerateResult` either
+ * zeroed or previously filled by `reflex_generate` and not yet freed.
  */
 void reflex_free_generate_result(ReflexGenerateResult *result);
 
@@ -149,6 +163,14 @@ void reflex_free_generate_result(ReflexGenerateResult *result);
  * On success, fills `*out` and returns 0 -- the caller must eventually pass
  * `out` to `reflex_free_system1_result`. On failure, leaves `*out`
  * untouched and returns -1 (call `reflex_last_error` for why).
+ *
+ * # Safety
+ * `handle` must be a live pointer from `reflex_load`, not yet freed, and not
+ * used concurrently from another thread. `prompt` must point to a valid
+ * NUL-terminated C string readable for the duration of this call.
+ * `candidate_texts` must point to `num_candidates` valid, non-NULL,
+ * NUL-terminated C string pointers. `out` must point to writable, properly
+ * aligned `ReflexSystem1Result` storage.
  */
 int reflex_system1_evaluate(ReflexModel *handle,
                             const char *prompt,
@@ -164,12 +186,21 @@ int reflex_system1_evaluate(ReflexModel *handle,
  * all-NULL struct (no-op), and safe to call more than once on the same
  * struct for that reason -- but never on two different copies of the same
  * non-zeroed struct (double free).
+ *
+ * # Safety
+ * `result`, if non-NULL, must point to a `ReflexSystem1Result` either
+ * zeroed or previously filled by `reflex_system1_evaluate` and not yet
+ * freed.
  */
 void reflex_free_system1_result(ReflexSystem1Result *result);
 
 /**
  * Frees a handle obtained from `reflex_load`. Safe to call with NULL
  * (no-op). The handle must not be used again afterward.
+ *
+ * # Safety
+ * `handle`, if non-NULL, must be a live pointer from `reflex_load` not yet
+ * freed, and must not be in use on any other thread.
  */
 void reflex_free(ReflexModel *handle);
 

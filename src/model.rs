@@ -96,26 +96,29 @@ struct Weight {
     shape: Vec<u64>,
 }
 
-/// GGUF super-block sizes for the two block types dequantized on-device
-/// (`src/kernels_cuda/dequant.cu`, Phase 2 round 3) -- must match
-/// `dequant.rs`'s `QK_K` and the block-byte-size table
-/// `gguf.rs::ggml_type_size_bytes` computes independently for the same types.
+/// GGUF super-block sizes for the block types dequantized on-device
+/// (`src/kernels_cuda/dequant.cu`, Phase 2 round 3 for Q4_K/Q6_K, extended to
+/// Q5_K post-MVP) -- must match `dequant.rs`'s `QK_K` and the block-byte-size
+/// table `gguf.rs::ggml_type_size_bytes` computes independently for the same
+/// types.
 const QK_K: usize = 256;
 const Q4K_BLOCK_BYTES: usize = 144;
+const Q5K_BLOCK_BYTES: usize = 176;
 const Q6K_BLOCK_BYTES: usize = 210;
 
 /// Dequantizes one tensor's raw quantized bytes straight to a device-resident
-/// `f32` buffer. Q4_K/Q6_K (Phase 2 round 3: the block types this project's
-/// local Q4_K_M fixtures exercise for the bulk of weight bytes) dequantize
-/// on-device via `src/kernels_cuda/dequant.cu` -- no host `f32` copy is ever
-/// materialized for these, closing the gap with llama.cpp's CUDA backend,
-/// which never materializes one either (see README.md's Phase 2 round 3
-/// writeup). Every other block type still falls back to the existing host
+/// `f32` buffer. Q4_K/Q5_K/Q6_K (the block types real Q4_K_M/Q5_K_M GGUFs
+/// exercise for the bulk of weight bytes) dequantize on-device via
+/// `src/kernels_cuda/dequant.cu` -- no host `f32` copy is ever materialized
+/// for these, closing the gap with llama.cpp's CUDA backend, which never
+/// materializes one either (see README.md's Phase 2 round 3 writeup). Every
+/// other block type still falls back to the existing host
 /// `dequant::dequantize` path (`src/dequant.rs`/`dequant_iq.rs`) -- correct
 /// but not (yet) GPU-accelerated.
 fn dequantize_tensor_to_device(
     device: &Arc<CudaDevice>,
     dequant_q4k_k: &AotKernel,
+    dequant_q5k_k: &AotKernel,
     dequant_q6k_k: &AotKernel,
     ggml_type: GgmlType,
     bytes: &[u8],
@@ -123,6 +126,7 @@ fn dequantize_tensor_to_device(
 ) -> Result<CudaSlice<f32>, String> {
     match ggml_type {
         GgmlType::Q4K => dequantize_on_device(device, dequant_q4k_k, Q4K_BLOCK_BYTES, bytes, element_count),
+        GgmlType::Q5K => dequantize_on_device(device, dequant_q5k_k, Q5K_BLOCK_BYTES, bytes, element_count),
         GgmlType::Q6K => dequantize_on_device(device, dequant_q6k_k, Q6K_BLOCK_BYTES, bytes, element_count),
         other => {
             let host = dequant::dequantize(other, bytes, element_count)?;
@@ -132,8 +136,9 @@ fn dequantize_tensor_to_device(
 }
 
 /// Uploads `bytes` (raw quantized block bytes, unmodified) to device memory
-/// and launches `kernel` (`dequantize_q4k_kernel`/`dequantize_q6k_kernel`) to
-/// unpack them into a fresh `f32` buffer, one CUDA thread per `QK_K`-element
+/// and launches `kernel` (`dequantize_q4k_kernel`/`dequantize_q5k_kernel`/
+/// `dequantize_q6k_kernel`) to unpack them into a fresh `f32` buffer, one
+/// CUDA thread per `QK_K`-element
 /// block. Truncates to `element_count` if the last block is only partially
 /// used (ggml's own invariant is that a quantized tensor's element count is
 /// always a block-size multiple, so this is defensive, matching
@@ -178,14 +183,16 @@ fn dequantize_on_device(
 fn load_weight_device(
     device: &Arc<CudaDevice>,
     dequant_q4k_k: &AotKernel,
+    dequant_q5k_k: &AotKernel,
     dequant_q6k_k: &AotKernel,
     file: &GgufFile,
     name: &str,
 ) -> Result<Weight, String> {
     let info = file.tensor_info(name).ok_or_else(|| format!("missing weight '{name}'"))?;
     let bytes = file.tensor_bytes(info)?;
-    let data = dequantize_tensor_to_device(device, dequant_q4k_k, dequant_q6k_k, info.ggml_type, bytes, info.element_count())
-        .map_err(|e| format!("load weight '{name}': {e}"))?;
+    let data =
+        dequantize_tensor_to_device(device, dequant_q4k_k, dequant_q5k_k, dequant_q6k_k, info.ggml_type, bytes, info.element_count())
+            .map_err(|e| format!("load weight '{name}': {e}"))?;
     Ok(Weight { data, shape: info.shape.clone() })
 }
 
@@ -1105,10 +1112,11 @@ impl Model {
             &device,
             include_bytes!(env!("REFLEX_KERNEL_DEQUANT")),
             "dequant",
-            &["dequantize_q4k_kernel", "dequantize_q6k_kernel"],
+            &["dequantize_q4k_kernel", "dequantize_q5k_kernel", "dequantize_q6k_kernel"],
         )?
         .into_iter();
         let dequant_q4k_k = dequant_fns.next().ok_or("missing dequantize_q4k_kernel")?;
+        let dequant_q5k_k = dequant_fns.next().ok_or("missing dequantize_q5k_kernel")?;
         let dequant_q6k_k = dequant_fns.next().ok_or("missing dequantize_q6k_kernel")?;
 
         // Dequantizes straight from the mmap'd GGUF bytes (on-device for
@@ -1118,7 +1126,7 @@ impl Model {
         // model's lifetime, and no forward-pass call re-uploads it (see
         // `Weight`'s doc comment).
         let load_weight = |name: &str| -> Result<Weight, String> {
-            load_weight_device(&device, &dequant_q4k_k, &dequant_q6k_k, file, name)
+            load_weight_device(&device, &dequant_q4k_k, &dequant_q5k_k, &dequant_q6k_k, file, name)
         };
 
         let mut layers = Vec::with_capacity(block_count);
@@ -1184,6 +1192,7 @@ impl Model {
                 let data = dequantize_tensor_to_device(
                     &device,
                     &dequant_q4k_k,
+                    &dequant_q5k_k,
                     &dequant_q6k_k,
                     info.ggml_type,
                     bytes,
@@ -1333,14 +1342,15 @@ impl Model {
             &device,
             include_bytes!(env!("REFLEX_KERNEL_DEQUANT")),
             "dequant",
-            &["dequantize_q4k_kernel", "dequantize_q6k_kernel"],
+            &["dequantize_q4k_kernel", "dequantize_q5k_kernel", "dequantize_q6k_kernel"],
         )?
         .into_iter();
         let dequant_q4k_k = dequant_fns.next().ok_or("missing dequantize_q4k_kernel")?;
+        let dequant_q5k_k = dequant_fns.next().ok_or("missing dequantize_q5k_kernel")?;
         let dequant_q6k_k = dequant_fns.next().ok_or("missing dequantize_q6k_kernel")?;
 
         let load_weight = |name: &str| -> Result<Weight, String> {
-            load_weight_device(&device, &dequant_q4k_k, &dequant_q6k_k, file, name)
+            load_weight_device(&device, &dequant_q4k_k, &dequant_q5k_k, &dequant_q6k_k, file, name)
         };
 
         let mut layers = Vec::with_capacity(block_count);
@@ -1402,6 +1412,7 @@ impl Model {
                 let data = dequantize_tensor_to_device(
                     &device,
                     &dequant_q4k_k,
+                    &dequant_q5k_k,
                     &dequant_q6k_k,
                     info.ggml_type,
                     bytes,
@@ -1533,14 +1544,15 @@ impl Model {
             &device,
             include_bytes!(env!("REFLEX_KERNEL_DEQUANT")),
             "dequant",
-            &["dequantize_q4k_kernel", "dequantize_q6k_kernel"],
+            &["dequantize_q4k_kernel", "dequantize_q5k_kernel", "dequantize_q6k_kernel"],
         )?
         .into_iter();
         let dequant_q4k_k = dequant_fns.next().ok_or("missing dequantize_q4k_kernel")?;
+        let dequant_q5k_k = dequant_fns.next().ok_or("missing dequantize_q5k_kernel")?;
         let dequant_q6k_k = dequant_fns.next().ok_or("missing dequantize_q6k_kernel")?;
 
         let load_weight = |name: &str| -> Result<Weight, String> {
-            load_weight_device(&device, &dequant_q4k_k, &dequant_q6k_k, file, name)
+            load_weight_device(&device, &dequant_q4k_k, &dequant_q5k_k, &dequant_q6k_k, file, name)
         };
 
         let mut layers = Vec::with_capacity(block_count);
@@ -1591,6 +1603,7 @@ impl Model {
                 let data = dequantize_tensor_to_device(
                     &device,
                     &dequant_q4k_k,
+                    &dequant_q5k_k,
                     &dequant_q6k_k,
                     info.ggml_type,
                     bytes,
@@ -2700,10 +2713,12 @@ impl Model {
     /// expert's SwiGLU FFN (naive per-expert `gemv` calls, no batched/grouped
     /// GEMM -- see this module's MoE scope doc comment), weighted-summed by
     /// the router's renormalized combination weights. The router's top-k is
-    /// an inherently host-side sort, and the per-expert weighted accumulate
-    /// stays host-driven too (small expert count, already flagged as
-    /// naive/unoptimized) -- not addressed by Phase 2 round 2's
-    /// device-residency work, unlike everything else in this function.
+    /// an inherently host-side sort (small expert count, already flagged as
+    /// naive/unoptimized), but the weighted accumulate itself is device-resident
+    /// via [`Self::moe_scatter_add`] (the same kernel the batched/grouped prefill
+    /// path uses, called once per selected expert with a single-row group) --
+    /// no expert's `down`-projected output round-trips through the host the way
+    /// it did before this was wired in.
     fn forward_layer_moe(
         &self,
         layer: &MoeLayerWeights,
@@ -2734,19 +2749,18 @@ impl Model {
         let k = self.expert_used_count.ok_or("forward_layer_moe called on a model with no expert_used_count")?;
         let routed = route_top_k(&router_logits, k)?;
 
-        let mut ffn_out = vec![0.0f32; cfg.hidden_size];
+        let mut ffn_out_dev =
+            self.device.alloc_zeros::<f32>(cfg.hidden_size).map_err(|e| format!("moe ffn_out alloc: {e}"))?;
+        let dest_row0 = self.device.htod_sync_copy(&[0u32]).map_err(|e| format!("moe dest_row htod: {e}"))?;
         for (expert_idx, weight) in routed {
             let gate = self.gemv_expert(&ffn_normed, &layer.ffn_gate_exps, expert_idx)?;
             let up = self.gemv_expert(&ffn_normed, &layer.ffn_up_exps, expert_idx)?;
             let activated = self.silu_and_mul(&gate, &up, cfg.ffn_hidden_size)?;
             let down = self.gemv_expert(&activated, &layer.ffn_down_exps, expert_idx)?;
-            let down_host = self.device.dtoh_sync_copy(&down).map_err(|e| format!("moe expert down dtoh: {e}"))?;
-            for (o, d) in ffn_out.iter_mut().zip(down_host.iter()) {
-                *o += weight * d;
-            }
+            let weight_dev = self.device.htod_sync_copy(&[weight]).map_err(|e| format!("moe weight htod: {e}"))?;
+            self.moe_scatter_add(&down, &dest_row0, &weight_dev, &mut ffn_out_dev, cfg.hidden_size)?;
         }
 
-        let ffn_out_dev = self.device.htod_sync_copy(&ffn_out).map_err(|e| format!("moe ffn_out htod: {e}"))?;
         self.add_inplace(&mut post_attn, &ffn_out_dev)?;
         Ok(post_attn)
     }
@@ -3673,11 +3687,11 @@ impl Model {
     /// query+gate projection (split per head into `[q(head_dim),
     /// gate(head_dim)]`) and the attention output is gated by
     /// `sigmoid(gate)` before the output projection. The head split and
-    /// sigmoid gating stay host-side (small, same precedent as MoE's
-    /// host-side router; Phase 2 round 2 only tackles the primary
-    /// dense/MoE-benchmarked path's device residency, not this smaller,
-    /// Gated-Attention-sublayer-only round trip) -- everything else in this
-    /// function (RMSNorm/QKV/QK-Norm/RoPE/attention/O-proj/residual) is
+    /// sigmoid gating are device-resident via `Self::split_qg_k`/
+    /// `Self::sigmoid_gate_k` -- the same kernels
+    /// `forward_gated_attn_mixer_batched` uses, called here with `rows=1`
+    /// since both are already generic over row count -- everything else in
+    /// this function (RMSNorm/QKV/QK-Norm/RoPE/attention/O-proj/residual) is
     /// device-resident like `forward_attn_block`.
     fn forward_gated_attn_mixer(
         &self,
@@ -3692,16 +3706,21 @@ impl Model {
         let normed = self.rmsnorm(&hidden, &w.attn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
 
         let qg = self.gemv(&normed, &w.attn_q)?;
-        let qg_host = self.device.dtoh_sync_copy(&qg).map_err(|e| format!("gated-attn qg dtoh: {e}"))?;
         let q_dim = cfg.num_q_heads * cfg.head_dim;
-        let mut q_host = vec![0.0f32; q_dim];
-        let mut gate = vec![0.0f32; q_dim];
-        for head in 0..cfg.num_q_heads {
-            let base = head * 2 * cfg.head_dim;
-            q_host[head * cfg.head_dim..(head + 1) * cfg.head_dim].copy_from_slice(&qg_host[base..base + cfg.head_dim]);
-            gate[head * cfg.head_dim..(head + 1) * cfg.head_dim].copy_from_slice(&qg_host[base + cfg.head_dim..base + 2 * cfg.head_dim]);
+        let mut q = self.device.alloc_zeros::<f32>(q_dim).map_err(|e| format!("gated-attn q alloc: {e}"))?;
+        let mut gate = self.device.alloc_zeros::<f32>(q_dim).map_err(|e| format!("gated-attn gate alloc: {e}"))?;
+        {
+            let threads = 256u32;
+            let blocks = (q_dim as u32).div_ceil(threads).max(1);
+            let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            unsafe {
+                self.split_qg_k
+                    .function
+                    .clone()
+                    .launch(launch_cfg, (&qg, &mut q, &mut gate, cfg.num_q_heads as u32, cfg.head_dim as u32, 1u32))
+                    .map_err(|e| format!("split_qg launch: {e}"))?;
+            }
         }
-        let mut q = self.device.htod_sync_copy(&q_host).map_err(|e| format!("gated-attn q htod: {e}"))?;
 
         let mut k = self.gemv(&normed, &w.attn_k)?;
         let v = self.gemv(&normed, &w.attn_v)?;
@@ -3726,13 +3745,21 @@ impl Model {
 
         let k_view = k_cache.slice(0..seq_len * kv_stride);
         let v_view = v_cache.slice(0..seq_len * kv_stride);
-        let attn_out = self.attention(&q, &k_view, &v_view, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, seq_len)?;
+        let mut attn_out = self.attention(&q, &k_view, &v_view, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, seq_len)?;
 
-        let mut attn_out_host = self.device.dtoh_sync_copy(&attn_out).map_err(|e| format!("gated-attn out dtoh: {e}"))?;
-        for (a, &g) in attn_out_host.iter_mut().zip(gate.iter()) {
-            *a *= 1.0 / (1.0 + (-g).exp());
+        {
+            let n = q_dim as u32;
+            let threads = 256u32;
+            let blocks = n.div_ceil(threads).max(1);
+            let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            unsafe {
+                self.sigmoid_gate_k
+                    .function
+                    .clone()
+                    .launch(launch_cfg, (&mut attn_out, &gate, n))
+                    .map_err(|e| format!("sigmoid_gate launch: {e}"))?;
+            }
         }
-        let attn_out = self.device.htod_sync_copy(&attn_out_host).map_err(|e| format!("gated-attn out htod: {e}"))?;
 
         let o_proj = self.gemv(&attn_out, &w.attn_output)?;
         self.add_inplace(&mut hidden, &o_proj)?;
@@ -4486,10 +4513,10 @@ impl Model {
     /// MLA's routed-MoE + shared-expert FFN tail (real DeepSeek-V2/V3 layers past
     /// `leading_dense_block_count` -- see `MlaFfn::Moe`). Structurally
     /// `forward_layer_moe`'s router+per-expert dispatch (`crate::moe::route_top_k_with_norm`,
-    /// `Self::gemv_expert`, host-side weighted accumulate -- same "stays
-    /// host-driven, small expert count, not addressed by Phase 2 round 2"
-    /// convention), plus one addition real DeepSeek-V2/V3 has and Qwen3-MoE
-    /// doesn't: an always-on shared expert, computed as a single dense FFN (its
+    /// `Self::gemv_expert`, device-resident weighted accumulate via
+    /// `Self::moe_scatter_add` -- same convention `forward_layer_moe` uses), plus
+    /// one addition real DeepSeek-V2/V3 has and Qwen3-MoE doesn't: an always-on
+    /// shared expert, computed as a single dense FFN (its
     /// `ffn_{gate,up,down}_shexp` weights already fuse every shared expert into
     /// one bigger matmul -- see `MlaFfn`'s doc comment) and added to the
     /// accumulator unconditionally, not gated by the router.
@@ -4512,31 +4539,31 @@ impl Model {
         let router_logits = self.device.dtoh_sync_copy(&router_logits_dev).map_err(|e| format!("mla moe router dtoh: {e}"))?;
         let routed = route_top_k_with_norm(&router_logits, moe_cfg.expert_used_count, moe_cfg.normalize_top_k)?;
 
-        let mut ffn_out = vec![0.0f32; hidden_size];
+        let mut ffn_out_dev =
+            self.device.alloc_zeros::<f32>(hidden_size).map_err(|e| format!("mla moe ffn_out alloc: {e}"))?;
+        let dest_row0 = self.device.htod_sync_copy(&[0u32]).map_err(|e| format!("mla moe dest_row htod: {e}"))?;
         for (expert_idx, weight) in routed {
             let gate = self.gemv_expert(&ffn_normed, ffn_gate_exps, expert_idx)?;
             let up = self.gemv_expert(&ffn_normed, ffn_up_exps, expert_idx)?;
             let activated = self.silu_and_mul(&gate, &up, moe_cfg.n_ff_exp)?;
             let down = self.gemv_expert(&activated, ffn_down_exps, expert_idx)?;
-            let down_host = self.device.dtoh_sync_copy(&down).map_err(|e| format!("mla moe expert down dtoh: {e}"))?;
-            for (o, d) in ffn_out.iter_mut().zip(down_host.iter()) {
-                *o += weight * moe_cfg.routed_scaling_factor * d;
-            }
+            let weight_dev = self
+                .device
+                .htod_sync_copy(&[weight * moe_cfg.routed_scaling_factor])
+                .map_err(|e| format!("mla moe weight htod: {e}"))?;
+            self.moe_scatter_add(&down, &dest_row0, &weight_dev, &mut ffn_out_dev, hidden_size)?;
         }
 
         // Always-on shared expert(s) -- a single fused dense FFN, not gated by the
-        // router, added unconditionally.
+        // router, added unconditionally (device-resident: a plain vector add, no
+        // per-row weighting needed, so `Self::add_inplace` covers it directly).
         let shared_hidden_size = ffn_gate_shexp.shape[1] as usize;
         let shared_gate = self.gemv(&ffn_normed, ffn_gate_shexp)?;
         let shared_up = self.gemv(&ffn_normed, ffn_up_shexp)?;
         let shared_activated = self.silu_and_mul(&shared_gate, &shared_up, shared_hidden_size)?;
         let shared_down = self.gemv(&shared_activated, ffn_down_shexp)?;
-        let shared_down_host = self.device.dtoh_sync_copy(&shared_down).map_err(|e| format!("mla moe shared down dtoh: {e}"))?;
-        for (o, d) in ffn_out.iter_mut().zip(shared_down_host.iter()) {
-            *o += d;
-        }
+        self.add_inplace(&mut ffn_out_dev, &shared_down)?;
 
-        let ffn_out_dev = self.device.htod_sync_copy(&ffn_out).map_err(|e| format!("mla moe ffn_out htod: {e}"))?;
         self.add_inplace(&mut post_attn, &ffn_out_dev)?;
         Ok(post_attn)
     }
@@ -4832,6 +4859,79 @@ impl Model {
 
         let cache = crate::kv_io::MlaKvCache { seq_len, qk_dim, kv_caches };
         Ok(((generated[0], text), cache))
+    }
+}
+
+#[cfg(test)]
+mod moe_fixture_tests {
+    use super::*;
+    use crate::gguf::GgufFile;
+
+    /// `test-data/tiny-qwen3moe.gguf`: a synthetic `qwen3moe` GGUF, hand-built the
+    /// same way as `test-data/deepseek-tiny-mla.gguf` (random-weight HF checkpoint
+    /// run through llama.cpp's own real, unmodified `convert_hf_to_gguf.py` --
+    /// source archived as `test-data/tiny-qwen3moe-src.tar.gz`). Unlike
+    /// `Tiny-Moe.Q4_K_M.gguf` (the only other local MoE fixture, a Mixtral-style
+    /// file with `expert_used_count == expert_count`, which can't prove top-k
+    /// routing excludes anything -- see STATUS.md's "Known test-fixture
+    /// limitation"), this fixture sets `num_experts_per_tok=2 < num_experts=8` and
+    /// includes real Qwen3 QK-Norm tensors (`attn_q_norm`/`attn_k_norm`), closing
+    /// both gaps that entry names. Also has a `gpt2`-style tokenizer (reused
+    /// verbatim from `deepseek-tiny-mla`'s), enabling text-level byte-exact resume
+    /// verification the way `Tiny-Moe`'s SentencePiece tokenizer could not (see
+    /// STATUS.md's Phase 3 round 2 entry).
+    const QWEN3MOE_FIXTURE: &str = "test-data/tiny-qwen3moe.gguf";
+
+    /// Host-only (no GPU/CUDA device needed -- `GgufFile::open`/`parse_model_config`
+    /// are pure mmap/metadata parsing): confirms the fixture actually has the
+    /// properties it was built for before any GPU-hardware test relies on them.
+    /// Still `#[ignore]`d like every other local-fixture test in this file, since
+    /// `test-data/*.gguf` is gitignored and won't exist on a fresh checkout/CI
+    /// runner -- run with `cargo test -- --ignored qwen3moe_fixture_has_excluding_topk_and_qk_norm`.
+    #[test]
+    #[ignore]
+    fn qwen3moe_fixture_has_excluding_topk_and_qk_norm() {
+        let file = GgufFile::open(QWEN3MOE_FIXTURE).expect("failed to open qwen3moe fixture");
+
+        let architecture = file.metadata.get("general.architecture").and_then(GgufValue::as_str).unwrap_or("");
+        assert_eq!(architecture, "qwen3moe", "fixture should report the real qwen3moe architecture string");
+
+        let (_, block_count, moe) = parse_model_config(&file).expect("parse_model_config failed on qwen3moe fixture");
+        let moe = moe.expect("fixture should be detected as an MoE architecture");
+        assert_eq!(moe.expert_count, 8);
+        assert_eq!(moe.expert_used_count, 2);
+        assert!(
+            moe.expert_used_count < moe.expert_count,
+            "this fixture's whole purpose is expert_used_count < expert_count, unlike Tiny-Moe.Q4_K_M.gguf"
+        );
+        assert_eq!(block_count, 2);
+
+        for i in 0..block_count {
+            assert!(
+                file.tensor_info(&format!("blk.{i}.attn_q_norm.weight")).is_some(),
+                "layer {i} missing attn_q_norm.weight (QK-Norm) -- the other gap this fixture closes"
+            );
+            assert!(
+                file.tensor_info(&format!("blk.{i}.attn_k_norm.weight")).is_some(),
+                "layer {i} missing attn_k_norm.weight (QK-Norm) -- the other gap this fixture closes"
+            );
+        }
+    }
+
+    /// Real-hardware follow-up to the host-only test above: loads the fixture on a
+    /// real CUDA device and runs actual generation, proving the fixture isn't just
+    /// metadata-valid but usable end-to-end (MoE routing/QK-Norm exercised for
+    /// real, not just declared in metadata). `#[ignore]`d for both reasons every
+    /// other local-fixture test is (file availability, real GPU needed) -- run
+    /// with `cargo test --release -- --ignored qwen3moe_fixture_generates_without_error`.
+    #[test]
+    #[ignore]
+    fn qwen3moe_fixture_generates_without_error() {
+        let file = GgufFile::open(QWEN3MOE_FIXTURE).expect("failed to open qwen3moe fixture");
+        let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+        let model = Model::load(device, &file).expect("failed to load qwen3moe fixture");
+        let (tokens, _text) = model.generate("Once upon a time", 5, None, |_logits| {}).expect("generate failed");
+        assert!(!tokens.is_empty(), "expected at least one generated token");
     }
 }
 

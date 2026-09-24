@@ -1,14 +1,17 @@
 // On-GPU dequantization for the K-quant block formats that dominate weight
-// bytes in a typical Q4_K_M GGUF (Q4_K attention/FFN projections, Q6_K for a
-// handful of higher-precision tensors like attn_output/ffn_down). Phase 2
-// (Fast IO) round 3: closes the remaining cold-start gap vs. llama.cpp, which
-// never materializes a full-f32 host copy of quantized weights -- unlike this
-// project's model.rs before this round, which did `dequant::dequantize` (CPU,
-// src/dequant.rs) then `htod_sync_copy` for every tensor.
+// bytes in a typical Q4_K_M/Q5_K_M GGUF (Q4_K/Q5_K attention/FFN projections,
+// Q6_K for a handful of higher-precision tensors like attn_output/ffn_down).
+// Phase 2 (Fast IO) round 3 added Q4_K/Q6_K; Q5_K followed the same pattern
+// as a post-MVP extension. Each closes the remaining cold-start gap vs.
+// llama.cpp, which never materializes a full-f32 host copy of quantized
+// weights -- unlike this project's model.rs before Phase 2 round 3, which did
+// `dequant::dequantize` (CPU, src/dequant.rs) then `htod_sync_copy` for every
+// tensor.
 //
 // Each kernel is a line-for-line port of its host counterpart in
-// src/dequant.rs (`dequantize_block_q4_k`/`dequantize_block_q6_k`, which are
-// themselves line-for-line ports of upstream ggml-quants.c) -- variable names
+// src/dequant.rs (`dequantize_block_q4_k`/`dequantize_block_q5_k`/
+// `dequantize_block_q6_k`, themselves line-for-line ports of upstream
+// ggml-quants.c) -- variable names
 // (`d`, `dmin`, `sc`, `m`, `ql`, `qh`, `is`, `shift`, ...) are kept identical
 // on purpose so the CUDA and Rust/C versions can be diffed by eye. One CUDA
 // thread handles one whole 256-element block (correctness-first, matching
@@ -79,6 +82,58 @@ extern "C" __global__ void dequantize_q4k_kernel(
         }
         q_off += 32;
         is += 2;
+        y_off += 64;
+        j += 64;
+    }
+}
+
+// Port of `dequantize_row_q5_K`. Block layout (176 bytes): `d: f16`,
+// `dmin: f16`, `scales[12]`, `qh[32]`, `qs[128]`.
+extern "C" __global__ void dequantize_q5k_kernel(
+    const unsigned char* __restrict__ blocks,
+    float* __restrict__ y,
+    unsigned int num_blocks
+) {
+    unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bi >= num_blocks) {
+        return;
+    }
+    const unsigned char* block = blocks + (unsigned long long)bi * 176;
+    float* yb = y + (unsigned long long)bi * 256;
+
+    float d = le_f16(block);
+    float dmin = le_f16(block + 2);
+    const unsigned char* scales = block + 4;
+    const unsigned char* qh = block + 16;
+    const unsigned char* ql = block + 48;
+
+    unsigned int is = 0;
+    unsigned char u1 = 1;
+    unsigned char u2 = 2;
+    unsigned int y_off = 0;
+    unsigned int ql_off = 0;
+    unsigned int j = 0;
+    while (j < 256) {
+        unsigned char sc, m;
+        get_scale_min_k4(is, scales, &sc, &m);
+        float d1 = d * (float)sc;
+        float m1 = dmin * (float)m;
+        get_scale_min_k4(is + 1, scales, &sc, &m);
+        float d2 = d * (float)sc;
+        float m2 = dmin * (float)m;
+
+        for (unsigned int l = 0; l < 32; l++) {
+            unsigned int hi = (qh[l] & u1) ? 16 : 0;
+            yb[y_off + l] = d1 * (float)((ql[ql_off + l] & 0xF) + hi) - m1;
+        }
+        for (unsigned int l = 0; l < 32; l++) {
+            unsigned int hi = (qh[l] & u2) ? 16 : 0;
+            yb[y_off + 32 + l] = d2 * (float)((ql[ql_off + l] >> 4) + hi) - m2;
+        }
+        ql_off += 32;
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
         y_off += 64;
         j += 64;
     }

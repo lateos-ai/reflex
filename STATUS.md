@@ -275,29 +275,44 @@ planned. The user has asked to queue up three release-hardening items, in this o
    real kernel work, needs fixtures that exercise those types for the bulk of a
    model's weight bytes.
 
-Other remaining low-priority follow-ups (not queued, not blocking): a real small
-`qwen3moe`-architecture GGUF fixture with a `gpt2`-style tokenizer (see "Known debt"
-below — would also make MoE's resume path byte-exact-testable at the text level,
-unlike `Tiny-Moe`), MoE's per-expert weighted-sum accumulation / the Gated Attention
-mixer's fused-qg gating still round-tripping through the host, Phase 3 round 3's own
-resume path verified only against the dense-only synthetic MLA fixture (see
+Other remaining low-priority follow-ups (not queued, not blocking): Phase 3 round 3's
+own resume path verified only against the dense-only synthetic MLA fixture (see
 DECISIONS.md's round 3 entry), and Phase 4 round 1's own LoRA MoE/hybrid accept/reject
 paths verified only against synthetic hand-built adapters, not a real adapter trained
-against those architectures (none found publicly — see DECISIONS.md's Phase 4 round 1
-entry).
+against those architectures. DECISIONS.md's Phase 4 round 1 entry recorded none found
+publicly at the time; a fresh search (2026-09-23) found real candidates now public:
+`Tilakoid/qwen3.5-0.8b-hoasa-lora` (Hugging Face) targets the exact same
+`Qwen3.5-0.8B` size already used as this project's hybrid fixture, and standard PEFT
+LoRA target modules (`q_proj`/`k_proj`/`v_proj`/`o_proj`/`gate_proj`/`up_proj`/
+`down_proj`) would land squarely on the tensor set `find_lora_target_mut` already
+accepts for the hybrid architecture (full `GatedAttention`, FFN-only
+`GatedDeltaNet`) — a promising real-adapter candidate, not yet downloaded/converted/
+verified. `davidanugraha/Qwen3.5-35B-A3B-SWE-Smith-LoRA-Adapters` and
+`davidanugraha/Qwen3.5-9B-SWE-Smith-LoRA-Adapters` are real adapters for the MoE `A3B`
+variant, though a standard PEFT LoRA there would likely also target the per-expert
+FFN tensors this project's `find_lora_target_mut` still rejects for MoE (per-expert
+LoRA needs new math, not just a widened accept list — see DECISIONS.md's forward-looking
+note in that same entry), so verifying that one may only exercise the attention-tensor
+subset, not a full accept. Neither has been inspected (`adapter_config.json`'s
+`target_modules`) or tested yet — next step for a future round, not done here.
 
 ## Known debt / limitations
 
-- **`src/ffi.rs`'s `extern "C"` functions dereference raw pointers without being
-  `unsafe fn`**: found by `cargo clippy --all-targets` while adding CI (see
-  HISTORY.md's CI entry) — 12 `clippy::not_unsafe_ptr_arg_deref` errors (a
+- ~~**`src/ffi.rs`'s `extern "C"` functions dereference raw pointers without being
+  `unsafe fn`**~~ — **closed**: found by `cargo clippy --all-targets` while adding CI
+  (see HISTORY.md's CI entry) — 12 `clippy::not_unsafe_ptr_arg_deref` errors (a
   deny-by-default correctness lint) across `reflex_load`/`reflex_generate`/
-  `reflex_free`/etc. Real gap from Phase 4 round 2, not a false positive, but fixing
-  it changes the public `extern "C"` signatures and the `cbindgen`-generated
-  `include/reflex_engine.h` header — not fixed here, flagged for a separate
-  confirm-before-starting conversation. `cargo clippy` is deliberately not wired
-  into CI until this (and the pre-existing `cargo fmt` non-compliance found the same
-  session) is addressed, to avoid a CI check that fails on unrelated code from day one.
+  `reflex_free`/etc. Fixed by adding `unsafe` to the 5 affected function signatures
+  (`reflex_last_error` takes no pointer args, so it was never flagged) plus a `#
+  Safety` doc section on each (clippy's `missing_safety_doc`, newly surfaced once the
+  functions became `unsafe fn`). Confirmed the change is source-level only, not the
+  wider public-API break originally feared: `cbindgen`'s regenerated
+  `include/reflex_engine.h` is identical except for the new doc comments (`unsafe` is
+  a Rust-only annotation with no C-side representation), `ffi-test/smoke_test.c`'s
+  plain C calls need no changes, and no in-crate Rust code calls these functions
+  directly. `cargo test` still 74 passed/0 failed under `REFLEX_SKIP_CUDA=1`. `cargo
+  clippy` is still not wired into CI (the pre-existing `cargo fmt` non-compliance
+  found the same CI session remains open), but this specific blocker is resolved.
 - **Phase 2 round 3 on-device dequant scope**: only `Q4_K`/`Q6_K` dequantize on-GPU
   (`kernels_cuda/dequant.cu`). Every other GGUF block type (`Q4_0/1`, `Q5_0/1`,
   `Q8_0/1`, `Q2_K`/`Q3_K`/`Q5_K`/`Q8_K`, all 8 IQ-family formats, plus F32/F16/Bf16/int
@@ -323,14 +338,25 @@ entry).
   even when a raw prompt is passed via `-p` — no `--no-cnv` flag exists in the current
   build. Use `examples/simple`'s `llama-simple` binary instead for true prompt-in/
   token-out comparisons with no chat wrapping.
-- **MoE test fixture**: `test-data/Tiny-Moe.Q4_K_M.gguf` is a Mixtral-style synthetic
-  model (`general.architecture="llama"`, `expert_count=2`, `expert_used_count=2` — top-k
-  always selects every expert, so it can't prove routing actually excludes an expert; no
-  QK-Norm tensors, so it doesn't exercise QK-Norm+MoE together). A real small
-  `qwen3moe`-architecture fixture (or one with `expert_used_count < expert_count`)
-  doesn't exist yet locally. Its `llama`-architecture SentencePiece tokenizer also makes
-  it unsuitable for text-level byte-exact resume verification (Phase 3 round 2's
-  `--import-kv` continuation-prompt test) — see STATUS.md's Phase 3 round 2 section.
+- ~~**MoE test fixture**~~ — **partially closed**: `test-data/Tiny-Moe.Q4_K_M.gguf` is
+  still a Mixtral-style synthetic model (`general.architecture="llama"`,
+  `expert_count=2`, `expert_used_count=2` — top-k always selects every expert, so it
+  can't prove routing actually excludes an expert; no QK-Norm tensors; `llama`-arch
+  SentencePiece tokenizer blocks text-level byte-exact resume verification). Added
+  `test-data/tiny-qwen3moe.gguf`, a real `qwen3moe`-architecture fixture built the same
+  way as `deepseek-tiny-mla.gguf` (hand-built HF `config.json`/`safetensors`, random
+  weights, run through llama.cpp's own real, unmodified `convert_hf_to_gguf.py` --
+  source archived as `test-data/tiny-qwen3moe-src.tar.gz`): `expert_count=8`,
+  `expert_used_count=2` (routing can now be shown to exclude experts), real Qwen3
+  `attn_q_norm`/`attn_k_norm` tensors, and a `gpt2`-style tokenizer (reused verbatim
+  from `deepseek-tiny-mla`'s, enabling the same byte-exact resume verification bar
+  Phase 3 round 2 established). Verified locally against this project's own
+  `GgufFile`/`parse_model_config` (host-only, no GPU:
+  `model::moe_fixture_tests::qwen3moe_fixture_has_excluding_topk_and_qk_norm`).
+  **Still open**: a real-hardware pass (`qwen3moe_fixture_generates_without_error`,
+  written and `#[ignore]`d, ready to run) hasn't been executed on a real GPU yet, so
+  routing-exclusion and resume behavior are metadata-verified but not yet
+  forward-pass-verified against this fixture.
 - **Cargo/binary staleness gotcha**: `cargo test --release` does not rebuild
   `target/release/<bin-name>` — only `target/release/deps/`. After any source change,
   run `cargo build --release --bin <name>` explicitly before trusting a binary run
@@ -426,3 +452,29 @@ entry).
   path has been exercised against real MoE routing, the always-on shared expert, and
   YaRN RoPE scaling together, not just architecturally reasoned to be independent of
   them.
+- **On-device dequant extended to Q5_K, not yet real-hardware-verified**: added
+  `dequantize_q5k_kernel` (`kernels_cuda/dequant.cu`, line-for-line port of
+  `dequant.rs`'s `dequantize_block_q5_k`, reusing the same `get_scale_min_k4` device
+  helper Q4_K's kernel already established) and wired it into
+  `dequantize_tensor_to_device`'s dispatch at all three load sites (dense/MoE, hybrid,
+  MLA). Compiles clean under `REFLEX_SKIP_CUDA=1`; not yet run against a real GGUF
+  using `Q5_K` for the bulk of its weight bytes on real GPU hardware — no such local
+  fixture exists yet (same gap the "On-device dequant for more GGUF block types"
+  planned-next-work entry above already named).
+- **MoE weighted-sum and Gated-Attention fused-qg gating moved on-device in the
+  decode path, not yet real-hardware-verified**: `forward_layer_moe`/
+  `forward_mla_moe_ffn`'s per-expert weighted accumulate now uses
+  `Self::moe_scatter_add` (the same kernel `forward_layer_moe_batched`'s grouped-GEMM
+  path already used, called once per selected expert with a single-row group) instead
+  of a `dtoh_sync_copy`/host-sum/`htod_sync_copy` round trip per expert; the always-on
+  MLA shared expert now uses `Self::add_inplace` directly. `forward_gated_attn_mixer`
+  now calls `Self::split_qg_k`/`Self::sigmoid_gate_k` (the exact kernels
+  `forward_gated_attn_mixer_batched` uses, both already generic over row count) with
+  `rows=1` instead of two host round trips. Compiles clean under `REFLEX_SKIP_CUDA=1`,
+  all 74 existing tests still pass — but this is a hot-path change to every MoE/hybrid
+  decode step, so it needs a real-hardware byte-exact re-verification (dense/MoE and
+  hybrid `--import-kv` resume tests, plus a fresh `reflex generate` run against
+  `Tiny-Moe.Q4_K_M.gguf`/`Qwen3.5-0.8B-Q4_K_M.gguf`/the real DeepSeek-V2-Lite
+  checkpoint, comparing token-for-token against this project's own documented golden
+  outputs) before being trusted, same bar every other device-residency change in this
+  project has cleared.

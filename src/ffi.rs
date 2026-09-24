@@ -103,8 +103,12 @@ pub extern "C" fn reflex_last_error() -> *const c_char {
 /// non-NULL; `lora_path` may be NULL. Both, when non-NULL, must be
 /// NUL-terminated UTF-8 C strings; this function does not take ownership of
 /// either and they may be freed by the caller as soon as it returns.
+///
+/// # Safety
+/// `gguf_path` and, when non-NULL, `lora_path` must each point to a valid
+/// NUL-terminated C string readable for the duration of this call.
 #[no_mangle]
-pub extern "C" fn reflex_load(gguf_path: *const c_char, lora_path: *const c_char) -> *mut ReflexModel {
+pub unsafe extern "C" fn reflex_load(gguf_path: *const c_char, lora_path: *const c_char) -> *mut ReflexModel {
     let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<ReflexModel, String> {
         if gguf_path.is_null() {
             return Err("reflex_load: gguf_path must not be NULL".to_string());
@@ -173,8 +177,14 @@ pub struct ReflexGenerateResult {
 /// On success, fills `*out` and returns 0 -- the caller must eventually pass
 /// `out` to `reflex_free_generate_result`. On failure, leaves `*out`
 /// untouched and returns -1 (call `reflex_last_error` for why).
+///
+/// # Safety
+/// `handle` must be a live pointer from `reflex_load`, not yet freed, and not
+/// used concurrently from another thread. `prompt` must point to a valid
+/// NUL-terminated C string readable for the duration of this call. `out`
+/// must point to writable, properly aligned `ReflexGenerateResult` storage.
 #[no_mangle]
-pub extern "C" fn reflex_generate(
+pub unsafe extern "C" fn reflex_generate(
     handle: *mut ReflexModel,
     prompt: *const c_char,
     max_new_tokens: usize,
@@ -231,8 +241,12 @@ pub extern "C" fn reflex_generate(
 /// zeroed/all-NULL struct (no-op), and safe to call more than once on the
 /// same struct for that reason -- but never on two different copies of the
 /// same non-zeroed struct (double free).
+///
+/// # Safety
+/// `result`, if non-NULL, must point to a `ReflexGenerateResult` either
+/// zeroed or previously filled by `reflex_generate` and not yet freed.
 #[no_mangle]
-pub extern "C" fn reflex_free_generate_result(result: *mut ReflexGenerateResult) {
+pub unsafe extern "C" fn reflex_free_generate_result(result: *mut ReflexGenerateResult) {
     if result.is_null() {
         return;
     }
@@ -298,8 +312,16 @@ pub struct ReflexSystem1Result {
 /// On success, fills `*out` and returns 0 -- the caller must eventually pass
 /// `out` to `reflex_free_system1_result`. On failure, leaves `*out`
 /// untouched and returns -1 (call `reflex_last_error` for why).
+///
+/// # Safety
+/// `handle` must be a live pointer from `reflex_load`, not yet freed, and not
+/// used concurrently from another thread. `prompt` must point to a valid
+/// NUL-terminated C string readable for the duration of this call.
+/// `candidate_texts` must point to `num_candidates` valid, non-NULL,
+/// NUL-terminated C string pointers. `out` must point to writable, properly
+/// aligned `ReflexSystem1Result` storage.
 #[no_mangle]
-pub extern "C" fn reflex_system1_evaluate(
+pub unsafe extern "C" fn reflex_system1_evaluate(
     handle: *mut ReflexModel,
     prompt: *const c_char,
     candidate_texts: *const *const c_char,
@@ -389,8 +411,13 @@ pub extern "C" fn reflex_system1_evaluate(
 /// all-NULL struct (no-op), and safe to call more than once on the same
 /// struct for that reason -- but never on two different copies of the same
 /// non-zeroed struct (double free).
+///
+/// # Safety
+/// `result`, if non-NULL, must point to a `ReflexSystem1Result` either
+/// zeroed or previously filled by `reflex_system1_evaluate` and not yet
+/// freed.
 #[no_mangle]
-pub extern "C" fn reflex_free_system1_result(result: *mut ReflexSystem1Result) {
+pub unsafe extern "C" fn reflex_free_system1_result(result: *mut ReflexSystem1Result) {
     if result.is_null() {
         return;
     }
@@ -412,8 +439,12 @@ pub extern "C" fn reflex_free_system1_result(result: *mut ReflexSystem1Result) {
 
 /// Frees a handle obtained from `reflex_load`. Safe to call with NULL
 /// (no-op). The handle must not be used again afterward.
+///
+/// # Safety
+/// `handle`, if non-NULL, must be a live pointer from `reflex_load` not yet
+/// freed, and must not be in use on any other thread.
 #[no_mangle]
-pub extern "C" fn reflex_free(handle: *mut ReflexModel) {
+pub unsafe extern "C" fn reflex_free(handle: *mut ReflexModel) {
     if handle.is_null() {
         return;
     }

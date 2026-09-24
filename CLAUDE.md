@@ -162,12 +162,21 @@ never a thread pool, never a queue.
 
 ## Known test-fixture limitation
 
-There is no small real `qwen3moe`-architecture GGUF available locally for fast
-iteration (`test-data/Tiny-Moe.Q4_K_M.gguf`, used to verify the MoE path, is a
-Mixtral-style synthetic fixture with `expert_used_count == expert_count`, so it cannot
-prove top-k routing actually excludes any expert). Real GGUF test fixtures live outside
-this repo (`.gguf` is gitignored) — check with the user for their location before
-assuming a fixture path is valid.
+`test-data/Tiny-Moe.Q4_K_M.gguf` (used to verify the MoE path) is a Mixtral-style
+synthetic fixture with `expert_used_count == expert_count`, so it cannot prove top-k
+routing actually excludes any expert, and its `llama`-architecture SentencePiece
+tokenizer blocks text-level byte-exact resume verification (see STATUS.md's Phase 3
+round 2 entry). `test-data/tiny-qwen3moe.gguf` (post-MVP addition, hand-built the same
+way as the MLA fixture below, source archived as `test-data/tiny-qwen3moe-src.tar.gz`)
+closes both gaps: a real `qwen3moe`-architecture file with `expert_used_count=2 <
+expert_count=8`, real Qwen3 QK-Norm tensors, and a `gpt2`-style tokenizer — verified
+against this project's own parser
+(`model::moe_fixture_tests::qwen3moe_fixture_has_excluding_topk_and_qk_norm`, host-only,
+no GPU needed). Its real-hardware end-to-end generation test
+(`qwen3moe_fixture_generates_without_error`) is written but not yet run against real
+GPU hardware. Real GGUF test fixtures otherwise live outside this repo (`.gguf` is
+gitignored) — check with the user for their location before assuming another fixture
+path is valid.
 
 No small real `deepseek2`-architecture GGUF exists publicly at all (not just locally
 — see HISTORY.md's MLA section). `test-data/deepseek-tiny-mla.gguf` is a fully
