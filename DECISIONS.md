@@ -847,3 +847,69 @@ individually keeps that visible.
 **How to apply**: if Ollama is benchmarked again on different infrastructure, check
 whether the same intermittent stall reproduces before assuming either the ~6-7s or
 the ~55-60s figure is "the" number — on this environment, neither alone is honest.
+
+## Phase 4 round 1 follow-up: widen `--lora` to the Gated DeltaNet mixer's Linear tensors, verified against a real hybrid adapter
+
+**Decision**: `find_lora_target_mut` (`src/model.rs`) now also matches
+`HybridLayerWeights::GatedDeltaNet`'s `attn_qkv`/`attn_gate`/`ssm_alpha`/`ssm_beta`/
+`ssm_out` fields, not just its FFN tensors. No change to `src/lora.rs` or the
+application mechanism (`add_k`, unchanged) — this is purely five more match arms.
+
+**Why**: round 1's doc comments called the whole Gated DeltaNet mixer "non-Linear" and
+rejected all of it beyond FFN, based on `model.rs`'s own field-doc language, not a real
+adapter's actual target list (none was found public at the time). A fresh search this
+round found `Tilakoid/qwen3.5-0.8b-hoasa-lora` (targets `Qwen/Qwen3.5-0.8B` exactly),
+and — critically — its `adapter_config.json`'s `target_modules` is an unsloth-style
+*regex* (`(?:...)(?:qkv|proj|...|in_proj_qkv|in_proj_z|in_proj_b|in_proj_a|...)`), not
+a literal list, so paraphrasing it (even via a direct fetch) couldn't establish what it
+actually touched. Read the real safetensors header instead (`curl -r` for the 8-byte
+length prefix + the JSON header itself, no full download needed) and found LoRA pairs
+for `linear_attn.in_proj_qkv`/`.in_proj_z`/`.in_proj_a`/`.in_proj_b`/`.out_proj` — the
+mixer's own projections — alongside the already-accepted `self_attn.*`/`mlp.*`. Cross-
+referencing those HF module names against `model.rs`'s own `GatedDeltaNetLayerWeights`
+struct (not assumed, read directly) showed all five are declared as plain 2-D `Weight`
+fields driven by `gemv` in `forward_gated_attn_mixer` — the same machinery every
+already-accepted Linear projection uses. Only `ssm_dt`/`ssm_a`/`ssm_conv1d`/`ssm_norm`
+(a bias vector, a decay vector, a conv1d kernel, a norm weight — none an `nn.Linear`
+module PEFT could target, confirmed by their absence from the adapter's tensor list)
+remain genuinely non-Linear and stay rejected. So the "non-Linear" framing was true for
+four of the mixer's nine weight tensors, not all nine — a real adapter's ground-truth
+tensor names caught the overbroad rejection a synthetic hand-built fixture (round 1's
+only verification tool, built to whatever shape the author assumed) never could.
+
+**How to apply**: when a llama.cpp/PEFT-format adapter's `target_modules` is a regex
+(common with unsloth-trained adapters) rather than a literal list, don't infer what it
+matched from the pattern text or a summarized fetch of it — read the actual
+`adapter_model.safetensors` header (cheap: a ranged HTTP fetch of its first 8 bytes for
+the JSON-header length, then that many more bytes, no full-file download) and treat
+*that* tensor list as ground truth. The same caution applies to any base-model source
+code paraphrase, not just this one — see round 1's `.weight`-suffix bug above for the
+first time this exact mistake pattern (trusting a paraphrase over the raw artifact)
+caused a real bug in this file's history.
+
+**Verification**: real hardware (L40, `ae85c35a`). `convert_hf_to_gguf.py` on a fresh
+`Qwen/Qwen3.5-0.8B` checkout hit this project's own `nextn_predict_layers` MTP/NextN
+rejection (the real upstream checkpoint now ships an MTP draft block that didn't exist
+when `load_hybrid`'s doc comment was written — an orthogonal, correctly-enforced
+rejection, not a bug) — worked around by using the pre-quantized
+`unsloth/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q4_K_M.gguf` as the LoRA base instead (MTP
+absence confirmed by it loading), since the LoRA adapter's own targeted tensor
+names/shapes don't depend on which GGUF build supplies the base weights.
+`convert_lora_to_gguf.py` on the real adapter produced exactly the predicted GGUF base
+names (`blk.N.ssm_alpha.weight`/`ssm_beta`/`attn_qkv`/`attn_gate`/`ssm_out`, confirmed
+in its own conversion log before any of this project's code ran). `reflex generate
+--lora` applied `tensors_applied=186`, exactly `18 GatedDeltaNet layers × 8 tensors +
+6 GatedAttention layers × 7` — proof every real adapter tensor resolved, zero silent
+rejections. Cross-checked against a real llama.cpp build the same three ways as round
+1: (1) tensor count — `llama-export-lora` logged `merged 186 tensors with lora
+adapters`, matching exactly; (2) scale — `calculated_scale=2.000000` matches
+`alpha/rank = 32/16` independently; (3) output text — `llama-simple` on the merged
+GGUF produced `"The capital of France is the city of Paris.\nThe capital of Germany is
+the"`, token-for-token identical to `reflex generate --lora`'s own decoded continuation
+for the same prompt, and visibly different from the un-adapted base's `"...the capital
+of the country."` (proof the adapter changes behavior, not a no-op accept).
+`davidanugraha/Qwen3.5-35B-A3B-SWE-Smith-LoRA-Adapters`/`-9B-` remain untested this
+round — confirmed via the HF repo's own page text (not yet its safetensors header) to
+target MoE's per-expert routed-expert projections, which per round 1's own
+"How to apply" note needs new per-expert delta-selection math, not just a widened
+accept list, plus a much larger model to rent for — left for a future round.

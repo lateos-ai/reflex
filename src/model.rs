@@ -937,7 +937,9 @@ impl Model {
     ///
     /// Deliberately narrow for this round (see `Self::find_lora_target_mut`'s
     /// doc comment for the exact accepted tensor set): dense/MoE attention
-    /// tensors and Qwen3.5 hybrid Gated-Attention-layer tensors only.
+    /// tensors, Qwen3.5 hybrid Gated-Attention-layer tensors, and the hybrid
+    /// Gated DeltaNet mixer's five 2-D Linear-shaped tensors
+    /// (`attn_qkv`/`attn_gate`/`ssm_alpha`/`ssm_beta`/`ssm_out`) only.
     /// DeepSeek-V2/V3 MLA is rejected outright below, matching every other
     /// MLA-excluded feature in this codebase. Any adapter tensor that
     /// doesn't resolve to a supported base weight, or whose shape doesn't
@@ -968,9 +970,11 @@ impl Model {
             let weight = self.find_lora_target_mut(&target.name).ok_or_else(|| {
                 format!(
                     "LoRA adapter targets '{}' but this project's Model has no matching 2-D weight for it \
-                     (dense-attention/FFN and Qwen3.5 hybrid Gated-Attention-layer tensors are the only \
-                     supported LoRA targets in this round -- MoE's per-expert-stacked FFN tensors, the \
-                     hybrid Gated DeltaNet mixer's non-Linear tensors, embeddings, and norms are not)",
+                     (dense-attention/FFN, Qwen3.5 hybrid Gated-Attention-layer tensors, and the hybrid Gated \
+                     DeltaNet mixer's attn_qkv/attn_gate/ssm_alpha/ssm_beta/ssm_out are the only supported LoRA \
+                     targets in this round -- MoE's per-expert-stacked FFN tensors, the mixer's remaining \
+                     non-Linear state-space tensors (ssm_dt/ssm_a/ssm_conv1d/ssm_norm), embeddings, and norms \
+                     are not)",
                     target.name
                 )
             })?;
@@ -1006,11 +1010,28 @@ impl Model {
     /// via `self.hybrid`). Deliberately narrow: only the 2-D `nn.Linear`-
     /// shaped tensors every supported layer kind actually has are matched --
     /// MoE's per-expert-stacked FFN tensors (`ffn_gate_exps`/`ffn_up_exps`/
-    /// `ffn_down_exps`, 3-D), the Gated DeltaNet mixer's non-Linear state-
-    /// space tensors (`ssm_*`, `attn_qkv`, `attn_gate`), and anything outside
-    /// a `blk.N.*` tensor (`token_embd`/`output`/norms) all fall through to
-    /// the `None` arm and are rejected by `Self::apply_lora` with a clear
-    /// error, rather than silently mismatched or misapplied.
+    /// `ffn_down_exps`, 3-D) and anything outside a `blk.N.*` tensor
+    /// (`token_embd`/`output`/norms) fall through to the `None` arm and are
+    /// rejected by `Self::apply_lora` with a clear error, rather than
+    /// silently mismatched or misapplied.
+    ///
+    /// The Gated DeltaNet mixer's `attn_qkv`/`attn_gate`/`ssm_alpha`/
+    /// `ssm_beta`/`ssm_out` *are* matched here despite an earlier version of
+    /// this comment calling the whole mixer "non-Linear": those five are
+    /// plain 2-D `Weight`s driven by the same `gemv` every other Linear
+    /// projection uses (see `forward_gated_attn_mixer`) -- only
+    /// `ssm_dt`/`ssm_a`/`ssm_conv1d`/`ssm_norm` (a bias vector, a decay
+    /// vector, a conv1d kernel, and a norm weight -- none of them a PEFT
+    /// `nn.Linear` module, confirmed by a real downloaded adapter's tensor
+    /// names never including any of the four) are genuinely non-Linear and
+    /// stay unmatched. Confirmed against a real adapter
+    /// (`Tilakoid/qwen3.5-0.8b-hoasa-lora`, targets `Qwen/Qwen3.5-0.8B`
+    /// exactly): its safetensors header's `linear_attn.in_proj_qkv` /
+    /// `.in_proj_z` / `.in_proj_a` / `.in_proj_b` / `.out_proj` module names
+    /// map onto `attn_qkv` / `attn_gate` / `ssm_alpha` / `ssm_beta` /
+    /// `ssm_out` respectively (llama.cpp's `convert_lora_to_gguf.py` reuses
+    /// the base model's own name-mapping table, so the GGUF base tensor
+    /// names line up with this project's own base-model loader above).
     fn find_lora_target_mut(&mut self, name: &str) -> Option<&mut Weight> {
         let rest = name.strip_prefix("blk.")?;
         let (idx_str, rest) = rest.split_once('.')?;
@@ -1030,6 +1051,11 @@ impl Model {
                 (HybridLayerWeights::GatedDeltaNet(l), "ffn_gate") => Some(&mut l.ffn_gate),
                 (HybridLayerWeights::GatedDeltaNet(l), "ffn_up") => Some(&mut l.ffn_up),
                 (HybridLayerWeights::GatedDeltaNet(l), "ffn_down") => Some(&mut l.ffn_down),
+                (HybridLayerWeights::GatedDeltaNet(l), "attn_qkv") => Some(&mut l.attn_qkv),
+                (HybridLayerWeights::GatedDeltaNet(l), "attn_gate") => Some(&mut l.attn_gate),
+                (HybridLayerWeights::GatedDeltaNet(l), "ssm_alpha") => Some(&mut l.ssm_alpha),
+                (HybridLayerWeights::GatedDeltaNet(l), "ssm_beta") => Some(&mut l.ssm_beta),
+                (HybridLayerWeights::GatedDeltaNet(l), "ssm_out") => Some(&mut l.ssm_out),
                 _ => None,
             };
         }

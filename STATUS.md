@@ -277,24 +277,44 @@ planned. The user has asked to queue up three release-hardening items, in this o
 
 Other remaining low-priority follow-ups (not queued, not blocking): Phase 3 round 3's
 own resume path verified only against the dense-only synthetic MLA fixture (see
-DECISIONS.md's round 3 entry), and Phase 4 round 1's own LoRA MoE/hybrid accept/reject
-paths verified only against synthetic hand-built adapters, not a real adapter trained
-against those architectures. DECISIONS.md's Phase 4 round 1 entry recorded none found
-publicly at the time; a fresh search (2026-09-23) found real candidates now public:
-`Tilakoid/qwen3.5-0.8b-hoasa-lora` (Hugging Face) targets the exact same
-`Qwen3.5-0.8B` size already used as this project's hybrid fixture, and standard PEFT
-LoRA target modules (`q_proj`/`k_proj`/`v_proj`/`o_proj`/`gate_proj`/`up_proj`/
-`down_proj`) would land squarely on the tensor set `find_lora_target_mut` already
-accepts for the hybrid architecture (full `GatedAttention`, FFN-only
-`GatedDeltaNet`) — a promising real-adapter candidate, not yet downloaded/converted/
-verified. `davidanugraha/Qwen3.5-35B-A3B-SWE-Smith-LoRA-Adapters` and
-`davidanugraha/Qwen3.5-9B-SWE-Smith-LoRA-Adapters` are real adapters for the MoE `A3B`
-variant, though a standard PEFT LoRA there would likely also target the per-expert
-FFN tensors this project's `find_lora_target_mut` still rejects for MoE (per-expert
-LoRA needs new math, not just a widened accept list — see DECISIONS.md's forward-looking
-note in that same entry), so verifying that one may only exercise the attention-tensor
-subset, not a full accept. Neither has been inspected (`adapter_config.json`'s
-`target_modules`) or tested yet — next step for a future round, not done here.
+DECISIONS.md's round 3 entry).
+
+**Real-adapter LoRA verification for the hybrid architecture — closed 2026-09-24**:
+`Tilakoid/qwen3.5-0.8b-hoasa-lora` (targets `Qwen/Qwen3.5-0.8B` exactly) was
+downloaded and inspected for real, not just via its `adapter_config.json`'s regex
+`target_modules` (too imprecise to trust — see DECISIONS.md's new entry) but via its
+actual safetensors header. That corrected an assumption this paragraph used to make:
+the adapter targets not just `self_attn`/`mlp` (the previously-accepted subset) but
+also the Gated DeltaNet mixer's `linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,
+in_proj_b,out_proj}` — which `find_lora_target_mut` rejected before this round. Those
+five turned out to be plain 2-D `Weight`s already driven by `gemv` (mapping onto this
+project's own `attn_qkv`/`attn_gate`/`ssm_alpha`/`ssm_beta`/`ssm_out`), not the
+genuinely non-Linear `ssm_dt`/`ssm_a`/`ssm_conv1d`/`ssm_norm` the mixer also has (which
+the adapter never targets, confirmed by its tensor list) — so widening the accept list
+needed no new math or kernel, just five more match arms in `find_lora_target_mut`
+(`src/model.rs`). Verified end-to-end on a real L40: `convert_lora_to_gguf.py`
+produced exactly the predicted GGUF base tensor names
+(`blk.N.{ssm_alpha,ssm_beta,attn_qkv,attn_gate,ssm_out}.weight`); `reflex generate
+--lora` against `unsloth/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q4_K_M.gguf` applied
+`tensors_applied=186` (18 `GatedDeltaNet` layers × 8 tensors + 6 `GatedAttention`
+layers × 7, exactly the expected count, confirming zero silent rejections); cross-
+checked against a real llama.cpp build (`llama-export-lora` logged `merged 186
+tensors with lora adapters` and `calculated_scale=2.000000`, matching both the tensor
+count and `alpha/rank=32/16` exactly) and `llama-simple` on the merged GGUF produced
+token-for-token identical continuation text to `reflex generate --lora`'s own output
+for `"The capital of France is"` (`" the city of Paris.\nThe capital of Germany is
+the"`), which also visibly diverges from the un-adapted base's `" the capital of the
+country."` continuation — proof the adapter is doing something, not a no-op accept.
+**Note**: freshly converting `Qwen/Qwen3.5-0.8B` from HF directly (rather than using
+the pre-quantized `unsloth` GGUF) hit this project's own `nextn_predict_layers`
+MTP/NextN rejection — the real upstream checkpoint now ships an MTP draft block that
+didn't exist when `load_hybrid`'s doc comment was written; worked around by using the
+`unsloth` GGUF as the LoRA base instead (MTP rejection is orthogonal to LoRA and still
+correctly enforced, not disabled). `davidanugraha/Qwen3.5-35B-A3B-SWE-Smith-LoRA-
+Adapters`/`-9B-` remain untested: confirmed (via HF page text, not yet its own
+safetensors header) to target MoE's per-expert routed-expert projections, which really
+does need new per-expert-slice delta math beyond a widened accept list, plus a much
+larger model — left for a future round.
 
 ## Known debt / limitations
 
