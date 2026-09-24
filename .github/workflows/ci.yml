@@ -23,11 +23,19 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Format check
+        run: cargo fmt --check
+
       - name: Build (nvcc skipped, no GPU on hosted runners)
         run: cargo build --locked --all-targets
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test (GPU-hardware tests are #[ignore]d and skipped here)
         run: cargo test --locked

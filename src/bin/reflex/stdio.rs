@@ -25,9 +25,11 @@ pub fn run(args: Vec<String>) {
             other => panic!("unexpected argument: {other}"),
         }
     }
-    let gguf_path = gguf_path.unwrap_or_else(|| panic!("usage: reflex stdio <path-to-gguf> [--lora <adapter.gguf>]"));
+    let gguf_path = gguf_path
+        .unwrap_or_else(|| panic!("usage: reflex stdio <path-to-gguf> [--lora <adapter.gguf>]"));
 
-    let file = GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
+    let file =
+        GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
     let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
@@ -35,7 +37,9 @@ pub fn run(args: Vec<String>) {
     let mut model = Model::load(device, &file).expect("failed to load model");
 
     if let Some(lora_path) = &lora_path {
-        let applied = model.apply_lora(std::path::Path::new(lora_path)).expect("failed to apply LoRA adapter");
+        let applied = model
+            .apply_lora(std::path::Path::new(lora_path))
+            .expect("failed to apply LoRA adapter");
         eprintln!("REFLEX_STDIO_LORA_OK path={lora_path:?} tensors_applied={applied}");
     }
 

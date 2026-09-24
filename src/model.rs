@@ -51,8 +51,55 @@ use crate::moe::{route_top_k, route_top_k_with_norm};
 use crate::tokenizer::Tokenizer;
 use cudarc::cublas::sys as cublas_sys;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-use cudarc::driver::{CudaDevice, CudaSlice, CudaView, DevicePtr, DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{
+    CudaDevice, CudaSlice, CudaView, DevicePtr, DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig,
+};
 use std::sync::Arc;
+
+/// Prefill result: encoded prompt ids, the final position's hidden state,
+/// the filled per-layer K/V caches (separate K and V buffers), and the next
+/// absolute position a caller may write into. Shared by `prefill_dense` and
+/// `prefill_dense_batched`.
+type DensePrefillResult = (
+    Vec<u32>,
+    CudaSlice<f32>,
+    Vec<CudaSlice<f32>>,
+    Vec<CudaSlice<f32>>,
+    usize,
+);
+
+/// Generate result: generated token ids, their concatenated decoded text,
+/// the final per-layer K/V caches, and the total sequence length reached.
+/// Returned by `generate_dense_impl`.
+type DenseGenerateResult = (
+    Vec<u32>,
+    String,
+    Vec<CudaSlice<f32>>,
+    Vec<CudaSlice<f32>>,
+    usize,
+);
+
+/// Hybrid-mixer prefill result: encoded prompt ids, the final position's
+/// hidden state, the filled per-layer mixer states (attention K/V or GDN
+/// recurrent state, see `HybridLayerState`), and the next absolute position.
+/// Shared by `prefill_hybrid` and `prefill_hybrid_batched`.
+type HybridPrefillResult = (Vec<u32>, CudaSlice<f32>, Vec<HybridLayerState>, usize);
+
+/// Hybrid-mixer generate result: generated token ids, their concatenated
+/// decoded text, the final per-layer mixer states, and the total sequence
+/// length reached. Returned by `generate_hybrid_impl`.
+type HybridGenerateResult = (Vec<u32>, String, Vec<HybridLayerState>, usize);
+
+/// MLA prefill result: encoded prompt ids, the final position's hidden
+/// state, the filled per-layer compressed-latent K/V caches, and the next
+/// absolute position. Shared by `prefill_mla_batched` and its non-batched
+/// counterpart.
+type MlaPrefillResult = (Vec<u32>, CudaSlice<f32>, Vec<CudaSlice<f32>>, usize);
+
+/// MLA generate result: generated token ids, their concatenated decoded
+/// text, the final per-layer compressed-latent K/V caches, and the total
+/// sequence length reached. Returned by `generate_mla_impl`.
+type MlaGenerateResult = (Vec<u32>, String, Vec<CudaSlice<f32>>, usize);
 
 fn u64_meta(file: &GgufFile, key: &str) -> Option<u64> {
     file.metadata.get(key).and_then(GgufValue::as_u64)
@@ -154,7 +201,13 @@ fn load_dequant_kernels(device: &Arc<CudaDevice>) -> Result<DequantKernels, Stri
         "dequantize_q3k_kernel",
         "dequantize_q8k_kernel",
     ];
-    let mut fns = aot::load_kernel_module(device, include_bytes!(env!("REFLEX_KERNEL_DEQUANT")), "dequant", &names)?.into_iter();
+    let mut fns = aot::load_kernel_module(
+        device,
+        include_bytes!(env!("REFLEX_KERNEL_DEQUANT")),
+        "dequant",
+        &names,
+    )?
+    .into_iter();
     Ok(DequantKernels {
         q4k: fns.next().ok_or("missing dequantize_q4k_kernel")?,
         q5k: fns.next().ok_or("missing dequantize_q5k_kernel")?,
@@ -187,21 +240,107 @@ fn dequantize_tensor_to_device(
     element_count: u64,
 ) -> Result<CudaSlice<f32>, String> {
     match ggml_type {
-        GgmlType::Q4K => dequantize_on_device(device, &kernels.q4k, Q4K_BLOCK_BYTES, QK_K, bytes, element_count),
-        GgmlType::Q5K => dequantize_on_device(device, &kernels.q5k, Q5K_BLOCK_BYTES, QK_K, bytes, element_count),
-        GgmlType::Q6K => dequantize_on_device(device, &kernels.q6k, Q6K_BLOCK_BYTES, QK_K, bytes, element_count),
-        GgmlType::Q4_0 => dequantize_on_device(device, &kernels.q4_0, Q4_0_BLOCK_BYTES, QK_LEGACY, bytes, element_count),
-        GgmlType::Q4_1 => dequantize_on_device(device, &kernels.q4_1, Q4_1_BLOCK_BYTES, QK_LEGACY, bytes, element_count),
-        GgmlType::Q5_0 => dequantize_on_device(device, &kernels.q5_0, Q5_0_BLOCK_BYTES, QK_LEGACY, bytes, element_count),
-        GgmlType::Q5_1 => dequantize_on_device(device, &kernels.q5_1, Q5_1_BLOCK_BYTES, QK_LEGACY, bytes, element_count),
-        GgmlType::Q8_0 => dequantize_on_device(device, &kernels.q8_0, Q8_0_BLOCK_BYTES, QK_LEGACY, bytes, element_count),
-        GgmlType::Q8_1 => dequantize_on_device(device, &kernels.q8_1, Q8_1_BLOCK_BYTES, QK_LEGACY, bytes, element_count),
-        GgmlType::Q2K => dequantize_on_device(device, &kernels.q2k, Q2K_BLOCK_BYTES, QK_K, bytes, element_count),
-        GgmlType::Q3K => dequantize_on_device(device, &kernels.q3k, Q3K_BLOCK_BYTES, QK_K, bytes, element_count),
-        GgmlType::Q8K => dequantize_on_device(device, &kernels.q8k, Q8K_BLOCK_BYTES, QK_K, bytes, element_count),
+        GgmlType::Q4K => dequantize_on_device(
+            device,
+            &kernels.q4k,
+            Q4K_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
+        GgmlType::Q5K => dequantize_on_device(
+            device,
+            &kernels.q5k,
+            Q5K_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
+        GgmlType::Q6K => dequantize_on_device(
+            device,
+            &kernels.q6k,
+            Q6K_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
+        GgmlType::Q4_0 => dequantize_on_device(
+            device,
+            &kernels.q4_0,
+            Q4_0_BLOCK_BYTES,
+            QK_LEGACY,
+            bytes,
+            element_count,
+        ),
+        GgmlType::Q4_1 => dequantize_on_device(
+            device,
+            &kernels.q4_1,
+            Q4_1_BLOCK_BYTES,
+            QK_LEGACY,
+            bytes,
+            element_count,
+        ),
+        GgmlType::Q5_0 => dequantize_on_device(
+            device,
+            &kernels.q5_0,
+            Q5_0_BLOCK_BYTES,
+            QK_LEGACY,
+            bytes,
+            element_count,
+        ),
+        GgmlType::Q5_1 => dequantize_on_device(
+            device,
+            &kernels.q5_1,
+            Q5_1_BLOCK_BYTES,
+            QK_LEGACY,
+            bytes,
+            element_count,
+        ),
+        GgmlType::Q8_0 => dequantize_on_device(
+            device,
+            &kernels.q8_0,
+            Q8_0_BLOCK_BYTES,
+            QK_LEGACY,
+            bytes,
+            element_count,
+        ),
+        GgmlType::Q8_1 => dequantize_on_device(
+            device,
+            &kernels.q8_1,
+            Q8_1_BLOCK_BYTES,
+            QK_LEGACY,
+            bytes,
+            element_count,
+        ),
+        GgmlType::Q2K => dequantize_on_device(
+            device,
+            &kernels.q2k,
+            Q2K_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
+        GgmlType::Q3K => dequantize_on_device(
+            device,
+            &kernels.q3k,
+            Q3K_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
+        GgmlType::Q8K => dequantize_on_device(
+            device,
+            &kernels.q8k,
+            Q8K_BLOCK_BYTES,
+            QK_K,
+            bytes,
+            element_count,
+        ),
         other => {
             let host = dequant::dequantize(other, bytes, element_count)?;
-            device.htod_sync_copy(&host).map_err(|e| format!("upload weight to device: {e}"))
+            device
+                .htod_sync_copy(&host)
+                .map_err(|e| format!("upload weight to device: {e}"))
         }
     }
 }
@@ -222,13 +361,21 @@ fn dequantize_on_device(
     element_count: u64,
 ) -> Result<CudaSlice<f32>, String> {
     let num_blocks = bytes.len() / block_bytes;
-    let raw = device.htod_sync_copy(bytes).map_err(|e| format!("upload raw quantized bytes: {e}"))?;
+    let raw = device
+        .htod_sync_copy(bytes)
+        .map_err(|e| format!("upload raw quantized bytes: {e}"))?;
     let out_len = num_blocks * block_elems;
-    let mut dev_out = device.alloc_zeros::<f32>(out_len).map_err(|e| format!("alloc dequant output: {e}"))?;
+    let mut dev_out = device
+        .alloc_zeros::<f32>(out_len)
+        .map_err(|e| format!("alloc dequant output: {e}"))?;
 
     let threads = 256u32;
     let blocks = (num_blocks as u32).div_ceil(threads).max(1);
-    let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+    let launch_cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
     unsafe {
         kernel
             .function
@@ -241,9 +388,13 @@ fn dequantize_on_device(
         return Ok(dev_out);
     }
     let n = element_count as usize;
-    let mut truncated = device.alloc_zeros::<f32>(n).map_err(|e| format!("alloc truncated dequant output: {e}"))?;
+    let mut truncated = device
+        .alloc_zeros::<f32>(n)
+        .map_err(|e| format!("alloc truncated dequant output: {e}"))?;
     let src = dev_out.slice(0..n);
-    device.dtod_copy(&src, &mut truncated).map_err(|e| format!("truncate dequant output: {e}"))?;
+    device
+        .dtod_copy(&src, &mut truncated)
+        .map_err(|e| format!("truncate dequant output: {e}"))?;
     Ok(truncated)
 }
 
@@ -251,12 +402,23 @@ fn dequantize_on_device(
 /// buffer -- shared by `Model::load`/`load_hybrid`/`load_mla`'s own
 /// `load_weight` closures (see [`dequantize_tensor_to_device`] for the
 /// on-device-vs-host dispatch).
-fn load_weight_device(device: &Arc<CudaDevice>, kernels: &DequantKernels, file: &GgufFile, name: &str) -> Result<Weight, String> {
-    let info = file.tensor_info(name).ok_or_else(|| format!("missing weight '{name}'"))?;
+fn load_weight_device(
+    device: &Arc<CudaDevice>,
+    kernels: &DequantKernels,
+    file: &GgufFile,
+    name: &str,
+) -> Result<Weight, String> {
+    let info = file
+        .tensor_info(name)
+        .ok_or_else(|| format!("missing weight '{name}'"))?;
     let bytes = file.tensor_bytes(info)?;
-    let data = dequantize_tensor_to_device(device, kernels, info.ggml_type, bytes, info.element_count())
-        .map_err(|e| format!("load weight '{name}': {e}"))?;
-    Ok(Weight { data, shape: info.shape.clone() })
+    let data =
+        dequantize_tensor_to_device(device, kernels, info.ggml_type, bytes, info.element_count())
+            .map_err(|e| format!("load weight '{name}': {e}"))?;
+    Ok(Weight {
+        data,
+        shape: info.shape.clone(),
+    })
 }
 
 struct DenseLayerWeights {
@@ -319,14 +481,23 @@ pub struct MoeMetaConfig {
 /// `<arch>.expert_count` (real `qwen3moe`, or a Mixtral-style test fixture
 /// under `llama.*`) -- other architectures are out of scope (see README.md's
 /// MVP order).
-pub fn parse_model_config(file: &GgufFile) -> Result<(LayerConfig, usize, Option<MoeMetaConfig>), String> {
-    let architecture = file.metadata.get("general.architecture").and_then(GgufValue::as_str).unwrap_or("");
+pub fn parse_model_config(
+    file: &GgufFile,
+) -> Result<(LayerConfig, usize, Option<MoeMetaConfig>), String> {
+    let architecture = file
+        .metadata
+        .get("general.architecture")
+        .and_then(GgufValue::as_str)
+        .unwrap_or("");
 
     let moe = match u64_meta(file, &format!("{architecture}.expert_count")).filter(|&n| n > 0) {
         Some(expert_count) => {
             let expert_used_count = u64_meta(file, &format!("{architecture}.expert_used_count"))
                 .ok_or_else(|| format!("missing {architecture}.expert_used_count metadata key"))?;
-            Some(MoeMetaConfig { expert_count: expert_count as usize, expert_used_count: expert_used_count as usize })
+            Some(MoeMetaConfig {
+                expert_count: expert_count as usize,
+                expert_used_count: expert_used_count as usize,
+            })
         }
         None => None,
     };
@@ -337,14 +508,17 @@ pub fn parse_model_config(file: &GgufFile) -> Result<(LayerConfig, usize, Option
         ));
     }
 
-    let block_count =
-        u64_meta(file, &format!("{architecture}.block_count")).ok_or_else(|| format!("missing {architecture}.block_count metadata key"))? as usize;
+    let block_count = u64_meta(file, &format!("{architecture}.block_count"))
+        .ok_or_else(|| format!("missing {architecture}.block_count metadata key"))?
+        as usize;
     let hidden_size = u64_meta(file, &format!("{architecture}.embedding_length"))
-        .ok_or_else(|| format!("missing {architecture}.embedding_length metadata key"))? as usize;
+        .ok_or_else(|| format!("missing {architecture}.embedding_length metadata key"))?
+        as usize;
     let num_q_heads = u64_meta(file, &format!("{architecture}.attention.head_count"))
-        .ok_or_else(|| format!("missing {architecture}.attention.head_count metadata key"))? as usize;
-    let num_kv_heads =
-        u64_meta(file, &format!("{architecture}.attention.head_count_kv")).unwrap_or(num_q_heads as u64) as usize;
+        .ok_or_else(|| format!("missing {architecture}.attention.head_count metadata key"))?
+        as usize;
+    let num_kv_heads = u64_meta(file, &format!("{architecture}.attention.head_count_kv"))
+        .unwrap_or(num_q_heads as u64) as usize;
     // Qwen3 (dense and MoE) decouples head_dim from hidden_size/num_q_heads via
     // this key. Non-Qwen3 MoE fixtures (e.g. a Mixtral-style test GGUF with no
     // per-head decoupling) don't set it, so fall back to the standard derivation
@@ -354,19 +528,42 @@ pub fn parse_model_config(file: &GgufFile) -> Result<(LayerConfig, usize, Option
         .map(|n| n as usize)
         .unwrap_or(hidden_size / num_q_heads);
 
-    let ffn_gate_weight_name = if moe.is_some() { "blk.0.ffn_gate_exps.weight" } else { "blk.0.ffn_gate.weight" };
-    let ffn_gate_info = file.tensor_info(ffn_gate_weight_name).ok_or_else(|| format!("missing {ffn_gate_weight_name} tensor"))?;
+    let ffn_gate_weight_name = if moe.is_some() {
+        "blk.0.ffn_gate_exps.weight"
+    } else {
+        "blk.0.ffn_gate.weight"
+    };
+    let ffn_gate_info = file
+        .tensor_info(ffn_gate_weight_name)
+        .ok_or_else(|| format!("missing {ffn_gate_weight_name} tensor"))?;
     let ffn_hidden_size = match ffn_gate_info.shape.as_slice() {
         [_in_features, out_features] => *out_features as usize,
         [_in_features, out_features, _expert_count] => *out_features as usize,
-        other => return Err(format!("{ffn_gate_weight_name} has unexpected shape {other:?}")),
+        other => {
+            return Err(format!(
+                "{ffn_gate_weight_name} has unexpected shape {other:?}"
+            ))
+        }
     };
 
     let rope_base = f32_meta(file, &format!("{architecture}.rope.freq_base")).unwrap_or(10000.0);
-    let rmsnorm_eps = f32_meta(file, &format!("{architecture}.attention.layer_norm_rms_epsilon")).unwrap_or(1e-5);
+    let rmsnorm_eps = f32_meta(
+        file,
+        &format!("{architecture}.attention.layer_norm_rms_epsilon"),
+    )
+    .unwrap_or(1e-5);
 
     Ok((
-        LayerConfig { hidden_size, num_q_heads, num_kv_heads, head_dim, rotary_dim: head_dim, ffn_hidden_size, rope_base, rmsnorm_eps },
+        LayerConfig {
+            hidden_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim: head_dim,
+            ffn_hidden_size,
+            rope_base,
+            rmsnorm_eps,
+        },
         block_count,
         moe,
     ))
@@ -381,29 +578,38 @@ pub fn parse_model_config(file: &GgufFile) -> Result<(LayerConfig, usize, Option
 /// each group) is Gated Attention and the rest are Gated DeltaNet. The real
 /// `Qwen3.5-0.8B` fixture uses the interval fallback (`full_attention_interval
 /// = 4`), giving Gated Attention at trunk indices `[3, 7, 11, 15, 19, 23]`.
-fn parse_hybrid_layer_kinds(file: &GgufFile, architecture: &str, block_count: usize) -> Result<Vec<bool>, String> {
+fn parse_hybrid_layer_kinds(
+    file: &GgufFile,
+    architecture: &str,
+    block_count: usize,
+) -> Result<Vec<bool>, String> {
     let key = |suffix: &str| format!("{architecture}.{suffix}");
     let recurrent_key = key("attention.recurrent_layers");
     match file.metadata.get(&recurrent_key) {
         Some(GgufValue::Array(items)) => {
             if items.len() != block_count {
-                return Err(format!("{recurrent_key} has {} entries but block_count is {block_count}", items.len()));
+                return Err(format!(
+                    "{recurrent_key} has {} entries but block_count is {block_count}",
+                    items.len()
+                ));
             }
             items
                 .iter()
                 .map(|v| match v {
                     GgufValue::Bool(b) => Ok(*b),
-                    other => {
-                        other.as_u64().map(|x| x != 0).ok_or_else(|| format!("{recurrent_key} has non-boolean entry {other:?}"))
-                    }
+                    other => other
+                        .as_u64()
+                        .map(|x| x != 0)
+                        .ok_or_else(|| format!("{recurrent_key} has non-boolean entry {other:?}")),
                 })
                 .collect()
         }
         Some(other) => Err(format!("{recurrent_key} must be an array, got {other:?}")),
         None => {
             let interval_key = key("full_attention_interval");
-            let interval = u64_meta(file, &interval_key)
-                .ok_or_else(|| format!("{architecture} model has neither {recurrent_key} nor {interval_key}"))? as usize;
+            let interval = u64_meta(file, &interval_key).ok_or_else(|| {
+                format!("{architecture} model has neither {recurrent_key} nor {interval_key}")
+            })? as usize;
             if interval == 0 {
                 return Err(format!("{interval_key} must be > 0"));
             }
@@ -425,7 +631,8 @@ fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usize), String
     let architecture = "deepseek2";
     let key = |suffix: &str| format!("{architecture}.{suffix}");
 
-    let block_count = u64_meta(file, &key("block_count")).ok_or_else(|| format!("missing {}", key("block_count")))? as usize;
+    let block_count = u64_meta(file, &key("block_count"))
+        .ok_or_else(|| format!("missing {}", key("block_count")))? as usize;
 
     let nextn = u64_meta(file, &key("nextn_predict_layers")).unwrap_or(0);
     if nextn != 0 {
@@ -436,22 +643,36 @@ fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usize), String
     }
 
     let leading_dense = u64_meta(file, &key("leading_dense_block_count"))
-        .ok_or_else(|| format!("missing {}", key("leading_dense_block_count")))? as usize;
+        .ok_or_else(|| format!("missing {}", key("leading_dense_block_count")))?
+        as usize;
 
-    if u64_meta(file, &key("attention.q_lora_rank")).filter(|&n| n > 0).is_some() {
-        return Err(format!("{} (Q-LoRA query decomposition) is not supported by this MVP", key("attention.q_lora_rank")));
+    if u64_meta(file, &key("attention.q_lora_rank"))
+        .filter(|&n| n > 0)
+        .is_some()
+    {
+        return Err(format!(
+            "{} (Q-LoRA query decomposition) is not supported by this MVP",
+            key("attention.q_lora_rank")
+        ));
     }
 
-    let hidden_size = u64_meta(file, &key("embedding_length")).ok_or_else(|| format!("missing {}", key("embedding_length")))? as usize;
-    let num_heads = u64_meta(file, &key("attention.head_count")).ok_or_else(|| format!("missing {}", key("attention.head_count")))? as usize;
-    let kv_lora_rank =
-        u64_meta(file, &key("attention.kv_lora_rank")).ok_or_else(|| format!("missing {}", key("attention.kv_lora_rank")))? as usize;
+    let hidden_size = u64_meta(file, &key("embedding_length"))
+        .ok_or_else(|| format!("missing {}", key("embedding_length")))?
+        as usize;
+    let num_heads = u64_meta(file, &key("attention.head_count"))
+        .ok_or_else(|| format!("missing {}", key("attention.head_count")))?
+        as usize;
+    let kv_lora_rank = u64_meta(file, &key("attention.kv_lora_rank"))
+        .ok_or_else(|| format!("missing {}", key("attention.kv_lora_rank")))?
+        as usize;
     let n_embd_head_k_mla = u64_meta(file, &key("attention.key_length_mla"))
         .ok_or_else(|| format!("missing {} (a legacy pre-MLA-split deepseek2 GGUF -- unsplit attn_kv_b, no key_length_mla/value_length_mla metadata -- is not supported by this MVP; reconvert from the original checkpoint with a current convert_hf_to_gguf.py)", key("attention.key_length_mla")))? as usize;
     let v_head_dim = u64_meta(file, &key("attention.value_length_mla"))
-        .ok_or_else(|| format!("missing {}", key("attention.value_length_mla")))? as usize;
-    let qk_rope_head_dim =
-        u64_meta(file, &key("rope.dimension_count")).ok_or_else(|| format!("missing {}", key("rope.dimension_count")))? as usize;
+        .ok_or_else(|| format!("missing {}", key("attention.value_length_mla")))?
+        as usize;
+    let qk_rope_head_dim = u64_meta(file, &key("rope.dimension_count"))
+        .ok_or_else(|| format!("missing {}", key("rope.dimension_count")))?
+        as usize;
     if n_embd_head_k_mla <= qk_rope_head_dim {
         return Err(format!(
             "{} ({n_embd_head_k_mla}) must be greater than {} ({qk_rope_head_dim})",
@@ -470,48 +691,78 @@ fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usize), String
         .ok_or("missing blk.0.ffn_gate.weight tensor (an all-MoE deepseek2 file, leading_dense_block_count == 0, is not supported by this MVP)")?;
     let ffn_hidden_size = match ffn_gate_info.shape.as_slice() {
         [_in_features, out_features] => *out_features as usize,
-        other => return Err(format!("blk.0.ffn_gate.weight has unexpected shape {other:?}")),
+        other => {
+            return Err(format!(
+                "blk.0.ffn_gate.weight has unexpected shape {other:?}"
+            ))
+        }
     };
 
     // Sanity-check `attention.value_length_mla` against `wv_b`'s own shape (the
     // tensor `Model::gemv_per_head` actually derives its decompressed output width
     // from) -- catches a malformed/mismatched real file early rather than silently
     // producing a wrong-sized attention output deep in the forward pass.
-    let wv_b_info = file.tensor_info("blk.0.attn_v_b.weight").ok_or("missing blk.0.attn_v_b.weight tensor")?;
+    let wv_b_info = file
+        .tensor_info("blk.0.attn_v_b.weight")
+        .ok_or("missing blk.0.attn_v_b.weight tensor")?;
     match wv_b_info.shape.as_slice() {
         [_in_features, out_features, _n_head] if *out_features as usize == v_head_dim => {}
-        other => return Err(format!("blk.0.attn_v_b.weight shape {other:?} doesn't match {} ({v_head_dim})", key("attention.value_length_mla"))),
+        other => {
+            return Err(format!(
+                "blk.0.attn_v_b.weight shape {other:?} doesn't match {} ({v_head_dim})",
+                key("attention.value_length_mla")
+            ))
+        }
     }
 
     let moe = if leading_dense < block_count {
-        let expert_used_count = u64_meta(file, &key("expert_used_count"))
-            .ok_or_else(|| format!("missing {} (expert_count > 0 implied by leading_dense_block_count < block_count)", key("expert_used_count")))?
-            as usize;
+        let expert_used_count = u64_meta(file, &key("expert_used_count")).ok_or_else(|| {
+            format!(
+                "missing {} (expert_count > 0 implied by leading_dense_block_count < block_count)",
+                key("expert_used_count")
+            )
+        })? as usize;
         let ffn_gate_exps_info = file
             .tensor_info(&format!("blk.{leading_dense}.ffn_gate_exps.weight"))
             .ok_or_else(|| format!("missing blk.{leading_dense}.ffn_gate_exps.weight tensor"))?;
         let n_ff_exp = match ffn_gate_exps_info.shape.as_slice() {
             [_in_features, out_features, _expert_count] => *out_features as usize,
-            other => return Err(format!("blk.{leading_dense}.ffn_gate_exps.weight has unexpected shape {other:?}")),
+            other => {
+                return Err(format!(
+                    "blk.{leading_dense}.ffn_gate_exps.weight has unexpected shape {other:?}"
+                ))
+            }
         };
         let routed_scaling_factor = f32_meta(file, &key("expert_weights_scale")).unwrap_or(1.0);
         // The converter only ever writes this key when the source model's
         // `norm_topk_prob` is truthy (see `MlaMoeConfig`'s doc comment) -- absence
         // means "don't renormalize", not "assume the usual true default".
-        let normalize_top_k = matches!(file.metadata.get(&key("expert_weights_norm")), Some(GgufValue::Bool(true)));
-        Some(MlaMoeConfig { expert_used_count, n_ff_exp, routed_scaling_factor, normalize_top_k })
+        let normalize_top_k = matches!(
+            file.metadata.get(&key("expert_weights_norm")),
+            Some(GgufValue::Bool(true))
+        );
+        Some(MlaMoeConfig {
+            expert_used_count,
+            n_ff_exp,
+            routed_scaling_factor,
+            normalize_top_k,
+        })
     } else {
         None
     };
 
-    let rope_scaling_type = file.metadata.get(&key("rope.scaling.type")).and_then(GgufValue::as_str);
+    let rope_scaling_type = file
+        .metadata
+        .get(&key("rope.scaling.type"))
+        .and_then(GgufValue::as_str);
     let yarn = match rope_scaling_type {
         None | Some("none") => None,
         Some("yarn") => {
             let factor = f32_meta(file, &key("rope.scaling.factor"))
                 .ok_or_else(|| format!("missing {}", key("rope.scaling.factor")))?;
             let orig_ctx_len = u64_meta(file, &key("rope.scaling.original_context_length"))
-                .ok_or_else(|| format!("missing {}", key("rope.scaling.original_context_length")))? as f32;
+                .ok_or_else(|| format!("missing {}", key("rope.scaling.original_context_length")))?
+                as f32;
             // llama.cpp's own CLI-settable defaults (32.0/1.0), used when the GGUF
             // doesn't override them -- real DeepSeek-V2-Lite doesn't set these keys
             // either, relying on the same defaults.
@@ -521,7 +772,8 @@ fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usize), String
             // ([TAG_DEEPSEEK2_YARN_LOG_MUL_FIX] in a real llama.cpp build's
             // `deepseek2.cpp` `load_arch_hparams`) before using it -- replicate that
             // exactly, since every downstream formula assumes the undone value.
-            let yarn_log_mul_raw = f32_meta(file, &key("rope.scaling.yarn_log_multiplier")).unwrap_or(0.0) / 0.1;
+            let yarn_log_mul_raw =
+                f32_meta(file, &key("rope.scaling.yarn_log_multiplier")).unwrap_or(0.0) / 0.1;
 
             let freq_scale = 1.0 / factor;
             let ext_factor = 1.0f32;
@@ -540,19 +792,47 @@ fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usize), String
 
             // ggml_rope_yarn_corr_dims: start/end correction dims over the rotated
             // width (qk_rope_head_dim), from beta_fast/beta_slow.
-            let corr_dim = |n_rot: f32| qk_rope_head_dim as f32 * (orig_ctx_len / (n_rot * 2.0 * std::f32::consts::PI)).ln() / (2.0 * rope_base.ln());
+            let corr_dim = |n_rot: f32| {
+                qk_rope_head_dim as f32 * (orig_ctx_len / (n_rot * 2.0 * std::f32::consts::PI)).ln()
+                    / (2.0 * rope_base.ln())
+            };
             let corr_dim_start = corr_dim(beta_fast).floor().max(0.0);
-            let corr_dim_end = corr_dim(beta_slow).ceil().min(qk_rope_head_dim as f32 - 1.0);
+            let corr_dim_end = corr_dim(beta_slow)
+                .ceil()
+                .min(qk_rope_head_dim as f32 - 1.0);
 
-            Some(MlaYarnConfig { freq_scale, ext_factor, attn_factor, corr_dim_start, corr_dim_end, attention_scale })
+            Some(MlaYarnConfig {
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                corr_dim_start,
+                corr_dim_end,
+                attention_scale,
+            })
         }
-        Some(other) => return Err(format!("{} = {other:?} (only \"none\"/\"yarn\" RoPE scaling is supported by this MVP)", key("rope.scaling.type"))),
+        Some(other) => {
+            return Err(format!(
+                "{} = {other:?} (only \"none\"/\"yarn\" RoPE scaling is supported by this MVP)",
+                key("rope.scaling.type")
+            ))
+        }
     };
 
     let rmsnorm_eps = f32_meta(file, &key("attention.layer_norm_rms_epsilon")).unwrap_or(1e-6);
 
     Ok((
-        MlaConfig { hidden_size, num_heads, qk_rope_head_dim, qk_nope_head_dim, kv_lora_rank, ffn_hidden_size, rope_base, rmsnorm_eps, moe, yarn },
+        MlaConfig {
+            hidden_size,
+            num_heads,
+            qk_rope_head_dim,
+            qk_nope_head_dim,
+            kv_lora_rank,
+            ffn_hidden_size,
+            rope_base,
+            rmsnorm_eps,
+            moe,
+            yarn,
+        },
         block_count,
         leading_dense,
     ))
@@ -609,8 +889,8 @@ struct GatedDeltaNetLayerWeights {
 }
 
 enum HybridLayerWeights {
-    GatedAttention(GatedAttnLayerWeights),
-    GatedDeltaNet(GatedDeltaNetLayerWeights),
+    GatedAttention(Box<GatedAttnLayerWeights>),
+    GatedDeltaNet(Box<GatedDeltaNetLayerWeights>),
 }
 
 /// Shape/hyperparameter config for a DeepSeek-V2/V3 Multi-head Latent Attention
@@ -710,15 +990,19 @@ struct MlaYarnConfig {
 /// concatenated into one bigger matmul), not `expert_shared_count` separate
 /// per-expert calls -- confirmed against `deepseek2.cpp`'s own tensor shapes.
 enum MlaFfn {
-    Dense { ffn_gate: Weight, ffn_up: Weight, ffn_down: Weight },
+    Dense {
+        ffn_gate: Weight,
+        ffn_up: Weight,
+        ffn_down: Weight,
+    },
     Moe {
         ffn_gate_inp: Weight,
         ffn_gate_exps: Weight,
         ffn_up_exps: Weight,
         ffn_down_exps: Weight,
         ffn_gate_shexp: Weight,
-        ffn_up_shexp: Weight,
-        ffn_down_shexp: Weight,
+        ffn_up_shexp: Box<Weight>,
+        ffn_down_shexp: Box<Weight>,
     },
 }
 
@@ -806,8 +1090,14 @@ struct MlaModel {
 /// pre-round-2 convention. Same for `conv_state`/`recurrent`, mutated in
 /// place on-device by `Model::gdn_conv`/`Model::gdn_delta`.
 enum HybridLayerState {
-    Attn { k_cache: CudaSlice<f32>, v_cache: CudaSlice<f32> },
-    Gdn { conv_state: CudaSlice<f32>, recurrent: CudaSlice<f32> },
+    Attn {
+        k_cache: CudaSlice<f32>,
+        v_cache: CudaSlice<f32>,
+    },
+    Gdn {
+        conv_state: CudaSlice<f32>,
+        recurrent: CudaSlice<f32>,
+    },
 }
 
 /// A loaded Qwen3.5 hybrid model's extra state, layered on top of the same
@@ -1041,7 +1331,10 @@ impl Model {
                     target.name
                 )
             })?;
-            if weight.shape.len() != 2 || weight.shape[0] as usize != target.in_features || weight.shape[1] as usize != target.out_features {
+            if weight.shape.len() != 2
+                || weight.shape[0] as usize != target.in_features
+                || weight.shape[1] as usize != target.out_features
+            {
                 return Err(format!(
                     "LoRA adapter tensor '{}' has shape [in={}, out={}] but the base model's tensor has shape {:?} -- wrong base model?",
                     target.name, target.in_features, target.out_features, weight.shape
@@ -1051,7 +1344,11 @@ impl Model {
             let n = weight.data.len() as u32;
             let threads = 256u32;
             let blocks = n.div_ceil(threads).max(1);
-            let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            let launch_cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
             unsafe {
                 add_fn
                     .clone()
@@ -1142,7 +1439,11 @@ impl Model {
 
     pub fn load(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
         diagnostics::check_kernel_compute_capability(&device)?;
-        let architecture = file.metadata.get("general.architecture").and_then(GgufValue::as_str).unwrap_or("");
+        let architecture = file
+            .metadata
+            .get("general.architecture")
+            .and_then(GgufValue::as_str)
+            .unwrap_or("");
         if architecture == "qwen35" {
             return Self::load_hybrid(device, file);
         }
@@ -1166,19 +1467,55 @@ impl Model {
         let cublas = CudaBlas::new(device.clone()).map_err(|e| format!("cublas handle: {e:?}"))?;
         unsafe {
             cublas_sys::lib()
-                .cublasSetMathMode(*cublas.handle(), cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH)
+                .cublasSetMathMode(
+                    *cublas.handle(),
+                    cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH,
+                )
                 .result()
                 .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
         }
-        let rmsnorm_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_RMSNORM")), "rmsnorm", "rmsnorm_kernel")?;
-        let rope_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope", "rope_kernel")?;
-        let rope_batch_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope_batch", "rope_batch_kernel")?;
-        let silu_k =
-            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")), "silu_and_mul", "silu_and_mul_kernel")?;
-        let gemv_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_GEMV")), "gemv", "gemv_kernel")?;
-        let gemv_gather_k =
-            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_GEMV_GATHER")), "gemv_gather", "gemv_gather_kernel")?;
-        let attn_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ATTENTION")), "attention", "attention_kernel")?;
+        let rmsnorm_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_RMSNORM")),
+            "rmsnorm",
+            "rmsnorm_kernel",
+        )?;
+        let rope_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
+            "rope",
+            "rope_kernel",
+        )?;
+        let rope_batch_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
+            "rope_batch",
+            "rope_batch_kernel",
+        )?;
+        let silu_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")),
+            "silu_and_mul",
+            "silu_and_mul_kernel",
+        )?;
+        let gemv_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_GEMV")),
+            "gemv",
+            "gemv_kernel",
+        )?;
+        let gemv_gather_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_GEMV_GATHER")),
+            "gemv_gather",
+            "gemv_gather_kernel",
+        )?;
+        let attn_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ATTENTION")),
+            "attention",
+            "attention_kernel",
+        )?;
         let attn_prefill_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ATTENTION_PREFILL")),
@@ -1189,14 +1526,24 @@ impl Model {
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ELEMENTWISE")),
             "elementwise",
-            &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel", "moe_gather_kernel", "moe_scatter_add_kernel"],
+            &[
+                "add_kernel",
+                "split_qg_kernel",
+                "sigmoid_gate_kernel",
+                "moe_gather_kernel",
+                "moe_scatter_add_kernel",
+            ],
         )?
         .into_iter();
         let add_k = elementwise_fns.next().ok_or("missing add_kernel")?;
         let split_qg_k = elementwise_fns.next().ok_or("missing split_qg_kernel")?;
-        let sigmoid_gate_k = elementwise_fns.next().ok_or("missing sigmoid_gate_kernel")?;
+        let sigmoid_gate_k = elementwise_fns
+            .next()
+            .ok_or("missing sigmoid_gate_kernel")?;
         let moe_gather_k = elementwise_fns.next().ok_or("missing moe_gather_kernel")?;
-        let moe_scatter_add_k = elementwise_fns.next().ok_or("missing moe_scatter_add_kernel")?;
+        let moe_scatter_add_k = elementwise_fns
+            .next()
+            .ok_or("missing moe_scatter_add_kernel")?;
         let dequant_kernels = load_dequant_kernels(&device)?;
 
         // Dequantizes straight from the mmap'd GGUF bytes (on-device for
@@ -1205,7 +1552,9 @@ impl Model {
         // into device memory -- unlike before round 1, no dequantized weight
         // stays host-resident for the model's lifetime, and no forward-pass
         // call re-uploads it (see `Weight`'s doc comment).
-        let load_weight = |name: &str| -> Result<Weight, String> { load_weight_device(&device, &dequant_kernels, file, name) };
+        let load_weight = |name: &str| -> Result<Weight, String> {
+            load_weight_device(&device, &dequant_kernels, file, name)
+        };
 
         let mut layers = Vec::with_capacity(block_count);
         for i in 0..block_count {
@@ -1253,11 +1602,15 @@ impl Model {
         }
         eprintln!();
 
-        let token_embd_info =
-            file.tensor_info("token_embd.weight").ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
+        let token_embd_info = file
+            .tensor_info("token_embd.weight")
+            .ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
         let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
-        let token_embd =
-            dequant::dequantize(token_embd_info.ggml_type, token_embd_bytes, token_embd_info.element_count())?;
+        let token_embd = dequant::dequantize(
+            token_embd_info.ggml_type,
+            token_embd_bytes,
+            token_embd_info.element_count(),
+        )?;
 
         let output_norm = load_weight("output_norm.weight")?;
 
@@ -1267,15 +1620,27 @@ impl Model {
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
-                let data = dequantize_tensor_to_device(&device, &dequant_kernels, info.ggml_type, bytes, info.element_count())
-                    .map_err(|e| format!("load weight 'output.weight': {e}"))?;
-                Weight { data, shape: info.shape.clone() }
+                let data = dequantize_tensor_to_device(
+                    &device,
+                    &dequant_kernels,
+                    info.ggml_type,
+                    bytes,
+                    info.element_count(),
+                )
+                .map_err(|e| format!("load weight 'output.weight': {e}"))?;
+                Weight {
+                    data,
+                    shape: info.shape.clone(),
+                }
             }
             None => {
                 let data = device
                     .htod_sync_copy(&token_embd)
                     .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
-                Weight { data, shape: token_embd_info.shape.clone() }
+                Weight {
+                    data,
+                    shape: token_embd_info.shape.clone(),
+                }
             }
         };
 
@@ -1319,7 +1684,9 @@ impl Model {
         let architecture = "qwen35";
         let key = |suffix: &str| format!("{architecture}.{suffix}");
 
-        let block_count = u64_meta(file, &key("block_count")).ok_or_else(|| format!("missing {}", key("block_count")))? as usize;
+        let block_count = u64_meta(file, &key("block_count"))
+            .ok_or_else(|| format!("missing {}", key("block_count")))?
+            as usize;
         let nextn = u64_meta(file, &key("nextn_predict_layers")).unwrap_or(0);
         if nextn != 0 {
             return Err(format!(
@@ -1328,25 +1695,55 @@ impl Model {
             ));
         }
 
-        let hidden_size = u64_meta(file, &key("embedding_length")).ok_or_else(|| format!("missing {}", key("embedding_length")))? as usize;
-        let num_q_heads = u64_meta(file, &key("attention.head_count")).ok_or_else(|| format!("missing {}", key("attention.head_count")))? as usize;
-        let num_kv_heads = u64_meta(file, &key("attention.head_count_kv")).unwrap_or(num_q_heads as u64) as usize;
-        let head_dim = u64_meta(file, &key("attention.key_length")).ok_or_else(|| format!("missing {}", key("attention.key_length")))? as usize;
-        let rotary_dim = u64_meta(file, &key("rope.dimension_count")).map(|n| n as usize).unwrap_or(head_dim);
+        let hidden_size = u64_meta(file, &key("embedding_length"))
+            .ok_or_else(|| format!("missing {}", key("embedding_length")))?
+            as usize;
+        let num_q_heads = u64_meta(file, &key("attention.head_count"))
+            .ok_or_else(|| format!("missing {}", key("attention.head_count")))?
+            as usize;
+        let num_kv_heads =
+            u64_meta(file, &key("attention.head_count_kv")).unwrap_or(num_q_heads as u64) as usize;
+        let head_dim = u64_meta(file, &key("attention.key_length"))
+            .ok_or_else(|| format!("missing {}", key("attention.key_length")))?
+            as usize;
+        let rotary_dim = u64_meta(file, &key("rope.dimension_count"))
+            .map(|n| n as usize)
+            .unwrap_or(head_dim);
         let rope_base = f32_meta(file, &key("rope.freq_base")).unwrap_or(10_000.0);
         let rmsnorm_eps = f32_meta(file, &key("attention.layer_norm_rms_epsilon")).unwrap_or(1e-6);
-        let ffn_hidden_size =
-            u64_meta(file, &key("feed_forward_length")).ok_or_else(|| format!("missing {}", key("feed_forward_length")))? as usize;
-        let attn_cfg = LayerConfig { hidden_size, num_q_heads, num_kv_heads, head_dim, rotary_dim, ffn_hidden_size, rope_base, rmsnorm_eps };
+        let ffn_hidden_size = u64_meta(file, &key("feed_forward_length"))
+            .ok_or_else(|| format!("missing {}", key("feed_forward_length")))?
+            as usize;
+        let attn_cfg = LayerConfig {
+            hidden_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            ffn_hidden_size,
+            rope_base,
+            rmsnorm_eps,
+        };
 
-        let d_state = u64_meta(file, &key("ssm.state_size")).ok_or_else(|| format!("missing {}", key("ssm.state_size")))? as usize;
-        let d_inner = u64_meta(file, &key("ssm.inner_size")).ok_or_else(|| format!("missing {}", key("ssm.inner_size")))? as usize;
-        let group_count = u64_meta(file, &key("ssm.group_count")).ok_or_else(|| format!("missing {}", key("ssm.group_count")))? as usize;
-        let conv_kernel = u64_meta(file, &key("ssm.conv_kernel")).ok_or_else(|| format!("missing {}", key("ssm.conv_kernel")))? as usize;
+        let d_state = u64_meta(file, &key("ssm.state_size"))
+            .ok_or_else(|| format!("missing {}", key("ssm.state_size")))?
+            as usize;
+        let d_inner = u64_meta(file, &key("ssm.inner_size"))
+            .ok_or_else(|| format!("missing {}", key("ssm.inner_size")))?
+            as usize;
+        let group_count = u64_meta(file, &key("ssm.group_count"))
+            .ok_or_else(|| format!("missing {}", key("ssm.group_count")))?
+            as usize;
+        let conv_kernel = u64_meta(file, &key("ssm.conv_kernel"))
+            .ok_or_else(|| format!("missing {}", key("ssm.conv_kernel")))?
+            as usize;
         if d_state == 0 {
             return Err(format!("{} must be nonzero", key("ssm.state_size")));
         }
-        let num_v_heads = u64_meta(file, &key("ssm.time_step_rank")).map(|n| n as usize).filter(|&n| n > 0).unwrap_or(d_inner / d_state);
+        let num_v_heads = u64_meta(file, &key("ssm.time_step_rank"))
+            .map(|n| n as usize)
+            .filter(|&n| n > 0)
+            .unwrap_or(d_inner / d_state);
         let gdn_cfg = crate::gated_deltanet::GatedDeltaNetConfig {
             hidden_size,
             num_k_heads: group_count,
@@ -1365,19 +1762,55 @@ impl Model {
         let cublas = CudaBlas::new(device.clone()).map_err(|e| format!("cublas handle: {e:?}"))?;
         unsafe {
             cublas_sys::lib()
-                .cublasSetMathMode(*cublas.handle(), cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH)
+                .cublasSetMathMode(
+                    *cublas.handle(),
+                    cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH,
+                )
                 .result()
                 .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
         }
-        let rmsnorm_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_RMSNORM")), "rmsnorm", "rmsnorm_kernel")?;
-        let rope_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope", "rope_kernel")?;
-        let rope_batch_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope_batch", "rope_batch_kernel")?;
-        let silu_k =
-            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")), "silu_and_mul", "silu_and_mul_kernel")?;
-        let gemv_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_GEMV")), "gemv", "gemv_kernel")?;
-        let gemv_gather_k =
-            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_GEMV_GATHER")), "gemv_gather", "gemv_gather_kernel")?;
-        let attn_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ATTENTION")), "attention", "attention_kernel")?;
+        let rmsnorm_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_RMSNORM")),
+            "rmsnorm",
+            "rmsnorm_kernel",
+        )?;
+        let rope_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
+            "rope",
+            "rope_kernel",
+        )?;
+        let rope_batch_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
+            "rope_batch",
+            "rope_batch_kernel",
+        )?;
+        let silu_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")),
+            "silu_and_mul",
+            "silu_and_mul_kernel",
+        )?;
+        let gemv_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_GEMV")),
+            "gemv",
+            "gemv_kernel",
+        )?;
+        let gemv_gather_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_GEMV_GATHER")),
+            "gemv_gather",
+            "gemv_gather_kernel",
+        )?;
+        let attn_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ATTENTION")),
+            "attention",
+            "attention_kernel",
+        )?;
         let attn_prefill_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ATTENTION_PREFILL")),
@@ -1388,19 +1821,35 @@ impl Model {
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ELEMENTWISE")),
             "elementwise",
-            &["add_kernel", "split_qg_kernel", "sigmoid_gate_kernel", "moe_gather_kernel", "moe_scatter_add_kernel"],
+            &[
+                "add_kernel",
+                "split_qg_kernel",
+                "sigmoid_gate_kernel",
+                "moe_gather_kernel",
+                "moe_scatter_add_kernel",
+            ],
         )?
         .into_iter();
         let add_k = elementwise_fns.next().ok_or("missing add_kernel")?;
         let split_qg_k = elementwise_fns.next().ok_or("missing split_qg_kernel")?;
-        let sigmoid_gate_k = elementwise_fns.next().ok_or("missing sigmoid_gate_kernel")?;
+        let sigmoid_gate_k = elementwise_fns
+            .next()
+            .ok_or("missing sigmoid_gate_kernel")?;
         let moe_gather_k = elementwise_fns.next().ok_or("missing moe_gather_kernel")?;
-        let moe_scatter_add_k = elementwise_fns.next().ok_or("missing moe_scatter_add_kernel")?;
+        let moe_scatter_add_k = elementwise_fns
+            .next()
+            .ok_or("missing moe_scatter_add_kernel")?;
         let mut gdn_fns = aot::load_kernel_module(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_GATED_DELTANET")),
             "gated_deltanet",
-            &["gdn_conv_kernel", "gdn_l2_norm_kernel", "gdn_gates_kernel", "gdn_delta_kernel", "gdn_gated_norm_kernel"],
+            &[
+                "gdn_conv_kernel",
+                "gdn_l2_norm_kernel",
+                "gdn_gates_kernel",
+                "gdn_delta_kernel",
+                "gdn_gated_norm_kernel",
+            ],
         )?
         .into_iter();
         let gdn_conv_k = gdn_fns.next().ok_or("missing gdn_conv_kernel")?;
@@ -1410,10 +1859,12 @@ impl Model {
         let gdn_gated_norm_k = gdn_fns.next().ok_or("missing gdn_gated_norm_kernel")?;
         let dequant_kernels = load_dequant_kernels(&device)?;
 
-        let load_weight = |name: &str| -> Result<Weight, String> { load_weight_device(&device, &dequant_kernels, file, name) };
+        let load_weight = |name: &str| -> Result<Weight, String> {
+            load_weight_device(&device, &dequant_kernels, file, name)
+        };
 
         let mut layers = Vec::with_capacity(block_count);
-        for i in 0..block_count {
+        for (i, &gdn) in is_gdn.iter().enumerate() {
             eprint!("\rLoading weights: layer {}/{block_count}", i + 1);
             let attn_norm = load_weight(&format!("blk.{i}.attn_norm.weight"))?;
             let post_attn_norm = load_weight(&format!("blk.{i}.post_attention_norm.weight"))?;
@@ -1421,8 +1872,8 @@ impl Model {
             let ffn_up = load_weight(&format!("blk.{i}.ffn_up.weight"))?;
             let ffn_down = load_weight(&format!("blk.{i}.ffn_down.weight"))?;
 
-            let layer = if is_gdn[i] {
-                HybridLayerWeights::GatedDeltaNet(GatedDeltaNetLayerWeights {
+            let layer = if gdn {
+                HybridLayerWeights::GatedDeltaNet(Box::new(GatedDeltaNetLayerWeights {
                     attn_norm,
                     attn_qkv: load_weight(&format!("blk.{i}.attn_qkv.weight"))?,
                     attn_gate: load_weight(&format!("blk.{i}.attn_gate.weight"))?,
@@ -1437,9 +1888,9 @@ impl Model {
                     ffn_gate,
                     ffn_up,
                     ffn_down,
-                })
+                }))
             } else {
-                HybridLayerWeights::GatedAttention(GatedAttnLayerWeights {
+                HybridLayerWeights::GatedAttention(Box::new(GatedAttnLayerWeights {
                     attn_norm,
                     attn_q: load_weight(&format!("blk.{i}.attn_q.weight"))?,
                     attn_k: load_weight(&format!("blk.{i}.attn_k.weight"))?,
@@ -1451,32 +1902,48 @@ impl Model {
                     ffn_gate,
                     ffn_up,
                     ffn_down,
-                })
+                }))
             };
             layers.push(layer);
         }
         eprintln!();
 
-        let token_embd_info =
-            file.tensor_info("token_embd.weight").ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
+        let token_embd_info = file
+            .tensor_info("token_embd.weight")
+            .ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
         let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
-        let token_embd =
-            dequant::dequantize(token_embd_info.ggml_type, token_embd_bytes, token_embd_info.element_count())?;
+        let token_embd = dequant::dequantize(
+            token_embd_info.ggml_type,
+            token_embd_bytes,
+            token_embd_info.element_count(),
+        )?;
 
         let output_norm = load_weight("output_norm.weight")?;
 
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
-                let data = dequantize_tensor_to_device(&device, &dequant_kernels, info.ggml_type, bytes, info.element_count())
-                    .map_err(|e| format!("load weight 'output.weight': {e}"))?;
-                Weight { data, shape: info.shape.clone() }
+                let data = dequantize_tensor_to_device(
+                    &device,
+                    &dequant_kernels,
+                    info.ggml_type,
+                    bytes,
+                    info.element_count(),
+                )
+                .map_err(|e| format!("load weight 'output.weight': {e}"))?;
+                Weight {
+                    data,
+                    shape: info.shape.clone(),
+                }
             }
             None => {
                 let data = device
                     .htod_sync_copy(&token_embd)
                     .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
-                Weight { data, shape: token_embd_info.shape.clone() }
+                Weight {
+                    data,
+                    shape: token_embd_info.shape.clone(),
+                }
             }
         };
 
@@ -1505,7 +1972,16 @@ impl Model {
             output_norm,
             lm_head,
             tokenizer,
-            hybrid: Some(HybridModel { attn_cfg, gdn_cfg, layers, gdn_conv_k, gdn_l2_norm_k, gdn_gates_k, gdn_delta_k, gdn_gated_norm_k }),
+            hybrid: Some(HybridModel {
+                attn_cfg,
+                gdn_cfg,
+                layers,
+                gdn_conv_k,
+                gdn_l2_norm_k,
+                gdn_gates_k,
+                gdn_delta_k,
+                gdn_gated_norm_k,
+            }),
             mla: None,
         })
     }
@@ -1523,19 +1999,55 @@ impl Model {
         let cublas = CudaBlas::new(device.clone()).map_err(|e| format!("cublas handle: {e:?}"))?;
         unsafe {
             cublas_sys::lib()
-                .cublasSetMathMode(*cublas.handle(), cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH)
+                .cublasSetMathMode(
+                    *cublas.handle(),
+                    cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH,
+                )
                 .result()
                 .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
         }
-        let rmsnorm_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_RMSNORM")), "rmsnorm", "rmsnorm_kernel")?;
-        let rope_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope", "rope_kernel")?;
-        let rope_batch_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope_batch", "rope_batch_kernel")?;
-        let silu_k =
-            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")), "silu_and_mul", "silu_and_mul_kernel")?;
-        let gemv_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_GEMV")), "gemv", "gemv_kernel")?;
-        let gemv_gather_k =
-            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_GEMV_GATHER")), "gemv_gather", "gemv_gather_kernel")?;
-        let attn_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ATTENTION")), "attention", "attention_kernel")?;
+        let rmsnorm_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_RMSNORM")),
+            "rmsnorm",
+            "rmsnorm_kernel",
+        )?;
+        let rope_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
+            "rope",
+            "rope_kernel",
+        )?;
+        let rope_batch_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
+            "rope_batch",
+            "rope_batch_kernel",
+        )?;
+        let silu_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")),
+            "silu_and_mul",
+            "silu_and_mul_kernel",
+        )?;
+        let gemv_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_GEMV")),
+            "gemv",
+            "gemv_kernel",
+        )?;
+        let gemv_gather_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_GEMV_GATHER")),
+            "gemv_gather",
+            "gemv_gather_kernel",
+        )?;
+        let attn_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ATTENTION")),
+            "attention",
+            "attention_kernel",
+        )?;
         let attn_prefill_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ATTENTION_PREFILL")),
@@ -1560,25 +2072,52 @@ impl Model {
         .into_iter();
         let add_k = elementwise_fns.next().ok_or("missing add_kernel")?;
         let split_qg_k = elementwise_fns.next().ok_or("missing split_qg_kernel")?;
-        let sigmoid_gate_k = elementwise_fns.next().ok_or("missing sigmoid_gate_kernel")?;
-        let mla_extract_batch_k = elementwise_fns.next().ok_or("missing mla_extract_batch_kernel")?;
-        let mla_concat_qcur_batch_k = elementwise_fns.next().ok_or("missing mla_concat_qcur_batch_kernel")?;
-        let mla_write_kv_cache_batch_k = elementwise_fns.next().ok_or("missing mla_write_kv_cache_batch_kernel")?;
+        let sigmoid_gate_k = elementwise_fns
+            .next()
+            .ok_or("missing sigmoid_gate_kernel")?;
+        let mla_extract_batch_k = elementwise_fns
+            .next()
+            .ok_or("missing mla_extract_batch_kernel")?;
+        let mla_concat_qcur_batch_k = elementwise_fns
+            .next()
+            .ok_or("missing mla_concat_qcur_batch_kernel")?;
+        let mla_write_kv_cache_batch_k = elementwise_fns
+            .next()
+            .ok_or("missing mla_write_kv_cache_batch_kernel")?;
         let moe_gather_k = elementwise_fns.next().ok_or("missing moe_gather_kernel")?;
-        let moe_scatter_add_k = elementwise_fns.next().ok_or("missing moe_scatter_add_kernel")?;
-        let mla_attn_k =
-            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_MLA_ATTENTION")), "mla_attention", "mla_attention_kernel")?;
+        let moe_scatter_add_k = elementwise_fns
+            .next()
+            .ok_or("missing moe_scatter_add_kernel")?;
+        let mla_attn_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_MLA_ATTENTION")),
+            "mla_attention",
+            "mla_attention_kernel",
+        )?;
         let mla_attn_prefill_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_MLA_ATTENTION_PREFILL")),
             "mla_attention_prefill",
             "mla_attention_prefill_kernel",
         )?;
-        let rope_norm_k = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope_norm", "rope_norm_kernel")?;
-        let rope_norm_yarn_k =
-            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope_norm_yarn", "rope_norm_yarn_kernel")?;
-        let rope_norm_batch_k =
-            aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_ROPE")), "rope_norm_batch", "rope_norm_batch_kernel")?;
+        let rope_norm_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
+            "rope_norm",
+            "rope_norm_kernel",
+        )?;
+        let rope_norm_yarn_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
+            "rope_norm_yarn",
+            "rope_norm_yarn_kernel",
+        )?;
+        let rope_norm_batch_k = aot::load_kernel(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
+            "rope_norm_batch",
+            "rope_norm_batch_kernel",
+        )?;
         let rope_norm_yarn_batch_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ROPE")),
@@ -1593,7 +2132,9 @@ impl Model {
         )?;
         let dequant_kernels = load_dequant_kernels(&device)?;
 
-        let load_weight = |name: &str| -> Result<Weight, String> { load_weight_device(&device, &dequant_kernels, file, name) };
+        let load_weight = |name: &str| -> Result<Weight, String> {
+            load_weight_device(&device, &dequant_kernels, file, name)
+        };
 
         let mut layers = Vec::with_capacity(block_count);
         for i in 0..block_count {
@@ -1611,8 +2152,10 @@ impl Model {
                     ffn_up_exps: load_weight(&format!("blk.{i}.ffn_up_exps.weight"))?,
                     ffn_down_exps: load_weight(&format!("blk.{i}.ffn_down_exps.weight"))?,
                     ffn_gate_shexp: load_weight(&format!("blk.{i}.ffn_gate_shexp.weight"))?,
-                    ffn_up_shexp: load_weight(&format!("blk.{i}.ffn_up_shexp.weight"))?,
-                    ffn_down_shexp: load_weight(&format!("blk.{i}.ffn_down_shexp.weight"))?,
+                    ffn_up_shexp: Box::new(load_weight(&format!("blk.{i}.ffn_up_shexp.weight"))?),
+                    ffn_down_shexp: Box::new(load_weight(&format!(
+                        "blk.{i}.ffn_down_shexp.weight"
+                    ))?),
                 }
             };
             layers.push(MlaLayerWeights {
@@ -1629,26 +2172,42 @@ impl Model {
         }
         eprintln!();
 
-        let token_embd_info =
-            file.tensor_info("token_embd.weight").ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
+        let token_embd_info = file
+            .tensor_info("token_embd.weight")
+            .ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
         let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
-        let token_embd =
-            dequant::dequantize(token_embd_info.ggml_type, token_embd_bytes, token_embd_info.element_count())?;
+        let token_embd = dequant::dequantize(
+            token_embd_info.ggml_type,
+            token_embd_bytes,
+            token_embd_info.element_count(),
+        )?;
 
         let output_norm = load_weight("output_norm.weight")?;
 
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
-                let data = dequantize_tensor_to_device(&device, &dequant_kernels, info.ggml_type, bytes, info.element_count())
-                    .map_err(|e| format!("load weight 'output.weight': {e}"))?;
-                Weight { data, shape: info.shape.clone() }
+                let data = dequantize_tensor_to_device(
+                    &device,
+                    &dequant_kernels,
+                    info.ggml_type,
+                    bytes,
+                    info.element_count(),
+                )
+                .map_err(|e| format!("load weight 'output.weight': {e}"))?;
+                Weight {
+                    data,
+                    shape: info.shape.clone(),
+                }
             }
             None => {
                 let data = device
                     .htod_sync_copy(&token_embd)
                     .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
-                Weight { data, shape: token_embd_info.shape.clone() }
+                Weight {
+                    data,
+                    shape: token_embd_info.shape.clone(),
+                }
             }
         };
 
@@ -1718,16 +2277,33 @@ impl Model {
         eps: f32,
     ) -> Result<CudaSlice<f32>, String> {
         let n = x.len() as u32;
-        let mut dev_out = self.device.alloc_zeros::<f32>(x.len()).map_err(|e| format!("rmsnorm alloc out: {e}"))?;
+        let mut dev_out = self
+            .device
+            .alloc_zeros::<f32>(x.len())
+            .map_err(|e| format!("rmsnorm alloc out: {e}"))?;
 
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             self.rmsnorm_k
                 .function
                 .clone()
-                .launch(launch_cfg, (x, weight, &mut dev_out, rows as u32, hidden_size as u32, eps))
+                .launch(
+                    launch_cfg,
+                    (
+                        x,
+                        weight,
+                        &mut dev_out,
+                        rows as u32,
+                        hidden_size as u32,
+                        eps,
+                    ),
+                )
                 .map_err(|e| format!("rmsnorm launch: {e}"))?;
         }
         Ok(dev_out)
@@ -1737,21 +2313,46 @@ impl Model {
     /// `w_dev` is either `&self.data` on a whole [`Weight`] (a
     /// `&CudaSlice<f32>`) or a zero-copy `CudaView` slice of one (see
     /// `Self::gemv_expert`).
-    fn gemv_raw<W: DeviceRepr>(&self, x: &CudaSlice<f32>, w_dev: W, in_features: usize, out_features: usize) -> Result<CudaSlice<f32>, String> {
+    fn gemv_raw<W: DeviceRepr>(
+        &self,
+        x: &CudaSlice<f32>,
+        w_dev: W,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<CudaSlice<f32>, String> {
         if x.len() != in_features {
-            return Err(format!("gemv: x.len()={} != in_features={in_features}", x.len()));
+            return Err(format!(
+                "gemv: x.len()={} != in_features={in_features}",
+                x.len()
+            ));
         }
 
-        let mut dev_y = self.device.alloc_zeros::<f32>(out_features).map_err(|e| format!("gemv alloc y: {e}"))?;
+        let mut dev_y = self
+            .device
+            .alloc_zeros::<f32>(out_features)
+            .map_err(|e| format!("gemv alloc y: {e}"))?;
 
         let threads = 256u32;
         let blocks = (out_features as u32).div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             self.gemv_k
                 .function
                 .clone()
-                .launch(launch_cfg, (x, w_dev, &mut dev_y, in_features as u32, out_features as u32))
+                .launch(
+                    launch_cfg,
+                    (
+                        x,
+                        w_dev,
+                        &mut dev_y,
+                        in_features as u32,
+                        out_features as u32,
+                    ),
+                )
                 .map_err(|e| format!("gemv launch: {e}"))?;
         }
         Ok(dev_y)
@@ -1787,10 +2388,17 @@ impl Model {
         let in_features = w.shape[0] as usize;
         let out_features = w.shape[1] as usize;
         if x.len() != rows * in_features {
-            return Err(format!("gemm: x.len()={} != rows*in_features={}", x.len(), rows * in_features));
+            return Err(format!(
+                "gemm: x.len()={} != rows*in_features={}",
+                x.len(),
+                rows * in_features
+            ));
         }
 
-        let mut dev_y = self.device.alloc_zeros::<f32>(rows * out_features).map_err(|e| format!("gemm alloc y: {e}"))?;
+        let mut dev_y = self
+            .device
+            .alloc_zeros::<f32>(rows * out_features)
+            .map_err(|e| format!("gemm alloc y: {e}"))?;
 
         let cfg = GemmConfig {
             transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
@@ -1805,7 +2413,9 @@ impl Model {
             ldc: out_features as i32,
         };
         unsafe {
-            self.cublas.gemm(cfg, &w.data, x, &mut dev_y).map_err(|e| format!("gemm launch: {e:?}"))?;
+            self.cublas
+                .gemm(cfg, &w.data, x, &mut dev_y)
+                .map_err(|e| format!("gemm launch: {e:?}"))?;
         }
         Ok(dev_y)
     }
@@ -1830,7 +2440,10 @@ impl Model {
         out_features: usize,
         rows: usize,
     ) -> Result<CudaSlice<f32>, String> {
-        let mut dev_y = self.device.alloc_zeros::<f32>(rows * out_features).map_err(|e| format!("gemm_view alloc y: {e}"))?;
+        let mut dev_y = self
+            .device
+            .alloc_zeros::<f32>(rows * out_features)
+            .map_err(|e| format!("gemm_view alloc y: {e}"))?;
         let cfg = GemmConfig {
             transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
             transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
@@ -1844,7 +2457,9 @@ impl Model {
             ldc: out_features as i32,
         };
         unsafe {
-            self.cublas.gemm(cfg, w, x, &mut dev_y).map_err(|e| format!("gemm_view launch: {e:?}"))?;
+            self.cublas
+                .gemm(cfg, w, x, &mut dev_y)
+                .map_err(|e| format!("gemm_view launch: {e:?}"))?;
         }
         Ok(dev_y)
     }
@@ -1858,17 +2473,28 @@ impl Model {
     /// layout as a standalone 2-D weight (see this module's doc comment), so
     /// `CudaSlice::slice` gives a zero-copy device-side view -- no device-to-device
     /// copy, let alone a host round-trip.
-    fn expert_weight_view<'a>(w: &'a Weight, expert_idx: usize) -> Result<(CudaView<'a, f32>, usize, usize), String> {
+    fn expert_weight_view<'a>(
+        w: &'a Weight,
+        expert_idx: usize,
+    ) -> Result<(CudaView<'a, f32>, usize, usize), String> {
         let (in_features, out_features, expert_count) = match w.shape.as_slice() {
             [i, o, e] => (*i as usize, *o as usize, *e as usize),
-            other => return Err(format!("expert_weight_view: expected 3-D per-expert tensor shape, got {other:?}")),
+            other => {
+                return Err(format!(
+                    "expert_weight_view: expected 3-D per-expert tensor shape, got {other:?}"
+                ))
+            }
         };
         if expert_idx >= expert_count {
             return Err(format!("expert_weight_view: expert_idx {expert_idx} out of range (expert_count={expert_count})"));
         }
         let expert_len = in_features * out_features;
         let start = expert_idx * expert_len;
-        Ok((w.data.slice(start..start + expert_len), in_features, out_features))
+        Ok((
+            w.data.slice(start..start + expert_len),
+            in_features,
+            out_features,
+        ))
     }
 
     /// GEMV against expert `expert_idx`'s slice of a per-expert-stacked 3-D MoE tensor
@@ -1881,7 +2507,12 @@ impl Model {
     /// groups every row routed to the same expert and runs one [`Self::gemm_view`]
     /// call per expert, so it calls [`Self::expert_weight_view`] directly rather than
     /// through this single-row wrapper.
-    fn gemv_expert<X: DeviceRepr>(&self, x: X, w: &Weight, expert_idx: usize) -> Result<CudaSlice<f32>, String> {
+    fn gemv_expert<X: DeviceRepr>(
+        &self,
+        x: X,
+        w: &Weight,
+        expert_idx: usize,
+    ) -> Result<CudaSlice<f32>, String> {
         let (view, in_features, out_features) = Self::expert_weight_view(w, expert_idx)?;
         self.gemv_view(x, &view, in_features, out_features)
     }
@@ -1892,7 +2523,12 @@ impl Model {
     /// fresh contiguous `[perm_row.len(), hidden_size]` buffer, so the group can be run
     /// through that expert's weights as one [`Self::gemm_view`] call. `perm_row` is
     /// already device-resident (uploaded once per expert group by the caller).
-    fn moe_gather(&self, src: &CudaSlice<f32>, perm_row: &CudaSlice<u32>, hidden_size: usize) -> Result<CudaSlice<f32>, String> {
+    fn moe_gather(
+        &self,
+        src: &CudaSlice<f32>,
+        perm_row: &CudaSlice<u32>,
+        hidden_size: usize,
+    ) -> Result<CudaSlice<f32>, String> {
         let num_assignments = perm_row.len();
         let mut dst = self
             .device
@@ -1901,12 +2537,25 @@ impl Model {
         let n = (num_assignments * hidden_size) as u32;
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             self.moe_gather_k
                 .function
                 .clone()
-                .launch(launch_cfg, (src, perm_row, &mut dst, num_assignments as u32, hidden_size as u32))
+                .launch(
+                    launch_cfg,
+                    (
+                        src,
+                        perm_row,
+                        &mut dst,
+                        num_assignments as u32,
+                        hidden_size as u32,
+                    ),
+                )
                 .map_err(|e| format!("moe_gather launch: {e}"))?;
         }
         Ok(dst)
@@ -1934,12 +2583,26 @@ impl Model {
         let n = (num_assignments * hidden_size) as u32;
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             self.moe_scatter_add_k
                 .function
                 .clone()
-                .launch(launch_cfg, (src, dest_row, weight, dst, num_assignments as u32, hidden_size as u32))
+                .launch(
+                    launch_cfg,
+                    (
+                        src,
+                        dest_row,
+                        weight,
+                        dst,
+                        num_assignments as u32,
+                        hidden_size as u32,
+                    ),
+                )
                 .map_err(|e| format!("moe_scatter_add launch: {e}"))?;
         }
         Ok(())
@@ -1954,32 +2617,64 @@ impl Model {
     /// `gemv_expert`, which return a device-resident `CudaSlice` for further
     /// on-device chaining) since every call site here is a leaf op wanting
     /// host floats.
-    fn gemv_gather(&self, x: &CudaSlice<f32>, w: &Weight, row_indices: &[u32]) -> Result<Vec<f32>, String> {
+    fn gemv_gather(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+        row_indices: &[u32],
+    ) -> Result<Vec<f32>, String> {
         let in_features = w.shape[0] as usize;
         let out_features = w.shape[1] as usize;
         if x.len() != in_features {
-            return Err(format!("gemv_gather: x.len()={} != in_features={in_features}", x.len()));
+            return Err(format!(
+                "gemv_gather: x.len()={} != in_features={in_features}",
+                x.len()
+            ));
         }
         if row_indices.is_empty() {
             return Err("gemv_gather: row_indices must not be empty".to_string());
         }
         if let Some(&bad) = row_indices.iter().find(|&&r| r as usize >= out_features) {
-            return Err(format!("gemv_gather: row index {bad} out of range (out_features={out_features})"));
+            return Err(format!(
+                "gemv_gather: row index {bad} out of range (out_features={out_features})"
+            ));
         }
         let num_rows = row_indices.len();
-        let dev_indices = self.device.htod_sync_copy(row_indices).map_err(|e| format!("gemv_gather upload row_indices: {e}"))?;
-        let mut dev_y = self.device.alloc_zeros::<f32>(num_rows).map_err(|e| format!("gemv_gather alloc y: {e}"))?;
+        let dev_indices = self
+            .device
+            .htod_sync_copy(row_indices)
+            .map_err(|e| format!("gemv_gather upload row_indices: {e}"))?;
+        let mut dev_y = self
+            .device
+            .alloc_zeros::<f32>(num_rows)
+            .map_err(|e| format!("gemv_gather alloc y: {e}"))?;
         let threads = 256u32;
         let blocks = (num_rows as u32).div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             self.gemv_gather_k
                 .function
                 .clone()
-                .launch(launch_cfg, (x, &w.data, &dev_indices, &mut dev_y, in_features as u32, num_rows as u32))
+                .launch(
+                    launch_cfg,
+                    (
+                        x,
+                        &w.data,
+                        &dev_indices,
+                        &mut dev_y,
+                        in_features as u32,
+                        num_rows as u32,
+                    ),
+                )
                 .map_err(|e| format!("gemv_gather launch: {e}"))?;
         }
-        self.device.dtoh_sync_copy(&dev_y).map_err(|e| format!("gemv_gather dtoh: {e}"))
+        self.device
+            .dtoh_sync_copy(&dev_y)
+            .map_err(|e| format!("gemv_gather dtoh: {e}"))
     }
 
     /// In-place: `t` is already device-resident. `position` is a plain
@@ -2001,13 +2696,27 @@ impl Model {
         let total_pairs = (num_heads * half_rotary) as u32;
         let threads = 256u32;
         let blocks = total_pairs.div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
 
         unsafe {
             self.rope_k
                 .function
                 .clone()
-                .launch(launch_cfg, (t, position as u32, num_heads as u32, head_dim as u32, rotary_dim as u32, base))
+                .launch(
+                    launch_cfg,
+                    (
+                        t,
+                        position as u32,
+                        num_heads as u32,
+                        head_dim as u32,
+                        rotary_dim as u32,
+                        base,
+                    ),
+                )
                 .map_err(|e| format!("rope launch: {e}"))?;
         }
         Ok(())
@@ -2032,7 +2741,11 @@ impl Model {
         let total_pairs = (rows * num_heads * half_rotary) as u32;
         let threads = 256u32;
         let blocks = total_pairs.div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
 
         unsafe {
             self.rope_batch_k
@@ -2040,7 +2753,15 @@ impl Model {
                 .clone()
                 .launch(
                     launch_cfg,
-                    (t, start_pos as u32, num_heads as u32, head_dim as u32, rotary_dim as u32, rows as u32, base),
+                    (
+                        t,
+                        start_pos as u32,
+                        num_heads as u32,
+                        head_dim as u32,
+                        rotary_dim as u32,
+                        rows as u32,
+                        base,
+                    ),
                 )
                 .map_err(|e| format!("rope_batch launch: {e}"))?;
         }
@@ -2052,18 +2773,44 @@ impl Model {
     /// (`rope_kernel` -- half-split rotation). Only DeepSeek-V2/V3 MLA needs this
     /// (see `MlaModel::rope_norm_k`'s doc comment); every other architecture uses
     /// `Self::rope` unchanged.
-    fn rope_norm(&self, m: &MlaModel, t: &mut CudaSlice<f32>, num_heads: usize, head_dim: usize, rotary_dim: usize, position: usize, base: f32) -> Result<(), String> {
+    // Each parameter maps 1:1 to a distinct `rope_norm_k` launch argument;
+    // bundling them into a struct would just relocate the count, not reduce it.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_norm(
+        &self,
+        m: &MlaModel,
+        t: &mut CudaSlice<f32>,
+        num_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        position: usize,
+        base: f32,
+    ) -> Result<(), String> {
         let half_rotary = rotary_dim / 2;
         let total_pairs = (num_heads * half_rotary) as u32;
         let threads = 256u32;
         let blocks = total_pairs.div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
 
         unsafe {
             m.rope_norm_k
                 .function
                 .clone()
-                .launch(launch_cfg, (t, position as u32, num_heads as u32, head_dim as u32, rotary_dim as u32, base))
+                .launch(
+                    launch_cfg,
+                    (
+                        t,
+                        position as u32,
+                        num_heads as u32,
+                        head_dim as u32,
+                        rotary_dim as u32,
+                        base,
+                    ),
+                )
                 .map_err(|e| format!("rope_norm launch: {e}"))?;
         }
         Ok(())
@@ -2089,7 +2836,11 @@ impl Model {
         let total_pairs = (num_heads * half_rotary) as u32;
         let threads = 256u32;
         let blocks = total_pairs.div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
 
         unsafe {
             m.rope_norm_yarn_k
@@ -2136,7 +2887,11 @@ impl Model {
         let total_pairs = (rows * num_heads * half_rotary) as u32;
         let threads = 256u32;
         let blocks = total_pairs.div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
 
         unsafe {
             m.rope_norm_batch_k
@@ -2144,7 +2899,15 @@ impl Model {
                 .clone()
                 .launch(
                     launch_cfg,
-                    (t, start_pos as u32, num_heads as u32, head_dim as u32, rotary_dim as u32, rows as u32, base),
+                    (
+                        t,
+                        start_pos as u32,
+                        num_heads as u32,
+                        head_dim as u32,
+                        rotary_dim as u32,
+                        rows as u32,
+                        base,
+                    ),
                 )
                 .map_err(|e| format!("rope_norm_batch launch: {e}"))?;
         }
@@ -2170,7 +2933,11 @@ impl Model {
         let total_pairs = (rows * num_heads * half_rotary) as u32;
         let threads = 256u32;
         let blocks = total_pairs.div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
 
         unsafe {
             m.rope_norm_yarn_batch_k
@@ -2201,17 +2968,32 @@ impl Model {
     /// `gate`/`up` are already device-resident, separate (not concatenated)
     /// buffers -- `silu_and_mul_kernel` takes them as two pointers, so no
     /// device-side concatenation step is needed either (Phase 2 round 2).
-    fn silu_and_mul(&self, gate: &CudaSlice<f32>, up: &CudaSlice<f32>, hidden_size: usize) -> Result<CudaSlice<f32>, String> {
-        let mut dev_out = self.device.alloc_zeros::<f32>(hidden_size).map_err(|e| format!("silu alloc out: {e}"))?;
+    fn silu_and_mul(
+        &self,
+        gate: &CudaSlice<f32>,
+        up: &CudaSlice<f32>,
+        hidden_size: usize,
+    ) -> Result<CudaSlice<f32>, String> {
+        let mut dev_out = self
+            .device
+            .alloc_zeros::<f32>(hidden_size)
+            .map_err(|e| format!("silu alloc out: {e}"))?;
 
         let threads = 256u32;
         let blocks = (hidden_size as u32).div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             self.silu_k
                 .function
                 .clone()
-                .launch(launch_cfg, (gate, up, &mut dev_out, 1u32, hidden_size as u32))
+                .launch(
+                    launch_cfg,
+                    (gate, up, &mut dev_out, 1u32, hidden_size as u32),
+                )
                 .map_err(|e| format!("silu launch: {e}"))?;
         }
         Ok(dev_out)
@@ -2224,6 +3006,9 @@ impl Model {
     /// already device-resident (Phase 2 round 2) -- `k_cache`/`v_cache` are
     /// `CudaView`s into a preallocated per-layer device buffer, not a fresh
     /// upload of the whole cache history on every call.
+    // Each parameter maps 1:1 to a distinct attention-kernel launch argument;
+    // bundling them into a struct would just relocate the count, not reduce it.
+    #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
         q: &CudaSlice<f32>,
@@ -2234,8 +3019,10 @@ impl Model {
         head_dim: usize,
         seq_len: usize,
     ) -> Result<CudaSlice<f32>, String> {
-        let mut dev_out =
-            self.device.alloc_zeros::<f32>(num_q_heads * head_dim).map_err(|e| format!("attn alloc out: {e}"))?;
+        let mut dev_out = self
+            .device
+            .alloc_zeros::<f32>(num_q_heads * head_dim)
+            .map_err(|e| format!("attn alloc out: {e}"))?;
 
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let launch_cfg = LaunchConfig {
@@ -2331,9 +3118,17 @@ impl Model {
         let n = a.len() as u32;
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
-            self.add_k.function.clone().launch(launch_cfg, (a, b, n)).map_err(|e| format!("add launch: {e}"))?;
+            self.add_k
+                .function
+                .clone()
+                .launch(launch_cfg, (a, b, n))
+                .map_err(|e| format!("add launch: {e}"))?;
         }
         Ok(())
     }
@@ -2346,16 +3141,38 @@ impl Model {
     /// buffer. No length assertion (unlike `gemv_raw`) -- a generic view type isn't
     /// cheaply length-checked here, so correctness relies on the caller passing
     /// consistent `in_features`/`out_features`.
-    fn gemv_view<X: DeviceRepr, W: DeviceRepr>(&self, x: X, w_dev: W, in_features: usize, out_features: usize) -> Result<CudaSlice<f32>, String> {
-        let mut dev_y = self.device.alloc_zeros::<f32>(out_features).map_err(|e| format!("gemv_view alloc y: {e}"))?;
+    fn gemv_view<X: DeviceRepr, W: DeviceRepr>(
+        &self,
+        x: X,
+        w_dev: W,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<CudaSlice<f32>, String> {
+        let mut dev_y = self
+            .device
+            .alloc_zeros::<f32>(out_features)
+            .map_err(|e| format!("gemv_view alloc y: {e}"))?;
         let threads = 256u32;
         let blocks = (out_features as u32).div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             self.gemv_k
                 .function
                 .clone()
-                .launch(launch_cfg, (x, w_dev, &mut dev_y, in_features as u32, out_features as u32))
+                .launch(
+                    launch_cfg,
+                    (
+                        x,
+                        w_dev,
+                        &mut dev_y,
+                        in_features as u32,
+                        out_features as u32,
+                    ),
+                )
                 .map_err(|e| format!("gemv_view launch: {e}"))?;
         }
         Ok(dev_y)
@@ -2371,21 +3188,39 @@ impl Model {
     /// `Self::forward_mla_attn_block`) always uses every head, so this loops over
     /// all of them, reusing the same `gemv_kernel` per head via zero-copy
     /// `CudaSlice::slice` views on both operands (via `Self::gemv_view`).
-    fn gemv_per_head(&self, x: &CudaSlice<f32>, w: &Weight, n_head: usize) -> Result<CudaSlice<f32>, String> {
+    fn gemv_per_head(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+        n_head: usize,
+    ) -> Result<CudaSlice<f32>, String> {
         let (in_features, out_features, head_count) = match w.shape.as_slice() {
             [i, o, h] => (*i as usize, *o as usize, *h as usize),
-            other => return Err(format!("gemv_per_head: expected 3-D per-head tensor shape, got {other:?}")),
+            other => {
+                return Err(format!(
+                    "gemv_per_head: expected 3-D per-head tensor shape, got {other:?}"
+                ))
+            }
         };
         if head_count != n_head {
-            return Err(format!("gemv_per_head: tensor's head dim {head_count} != n_head {n_head}"));
+            return Err(format!(
+                "gemv_per_head: tensor's head dim {head_count} != n_head {n_head}"
+            ));
         }
-        let mut out = self.device.alloc_zeros::<f32>(n_head * out_features).map_err(|e| format!("gemv_per_head alloc: {e}"))?;
+        let mut out = self
+            .device
+            .alloc_zeros::<f32>(n_head * out_features)
+            .map_err(|e| format!("gemv_per_head alloc: {e}"))?;
         for h in 0..n_head {
-            let w_view = w.data.slice(h * in_features * out_features..(h + 1) * in_features * out_features);
+            let w_view = w
+                .data
+                .slice(h * in_features * out_features..(h + 1) * in_features * out_features);
             let x_view = x.slice(h * in_features..(h + 1) * in_features);
             let y = self.gemv_view(&x_view, &w_view, in_features, out_features)?;
             let mut dst = out.slice_mut(h * out_features..(h + 1) * out_features);
-            self.device.dtod_copy(&y, &mut dst).map_err(|e| format!("gemv_per_head dtod head {h}: {e}"))?;
+            self.device
+                .dtod_copy(&y, &mut dst)
+                .map_err(|e| format!("gemv_per_head dtod head {h}: {e}"))?;
         }
         Ok(out)
     }
@@ -2417,18 +3252,29 @@ impl Model {
     ) -> Result<CudaSlice<f32>, String> {
         let (in_features, out_features, head_count) = match w.shape.as_slice() {
             [i, o, h] => (*i as usize, *o as usize, *h as usize),
-            other => return Err(format!("gemv_per_head_batch: expected 3-D per-head tensor shape, got {other:?}")),
+            other => {
+                return Err(format!(
+                    "gemv_per_head_batch: expected 3-D per-head tensor shape, got {other:?}"
+                ))
+            }
         };
         if head_count != n_head {
-            return Err(format!("gemv_per_head_batch: tensor's head dim {head_count} != n_head {n_head}"));
+            return Err(format!(
+                "gemv_per_head_batch: tensor's head dim {head_count} != n_head {n_head}"
+            ));
         }
-        let mut out =
-            self.device.alloc_zeros::<f32>(rows * n_head * out_features).map_err(|e| format!("gemv_per_head_batch alloc: {e}"))?;
+        let mut out = self
+            .device
+            .alloc_zeros::<f32>(rows * n_head * out_features)
+            .map_err(|e| format!("gemv_per_head_batch alloc: {e}"))?;
 
         let threads = 256u32;
         let out_blocks = (out_features as u32).div_ceil(threads).max(1);
-        let launch_cfg =
-            LaunchConfig { grid_dim: (out_blocks, n_head as u32, rows as u32), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (out_blocks, n_head as u32, rows as u32),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             m.gemv_per_head_batch_k
                 .function
@@ -2478,7 +3324,10 @@ impl Model {
         seq_len: usize,
         scale: f32,
     ) -> Result<CudaSlice<f32>, String> {
-        let mut dev_out = self.device.alloc_zeros::<f32>(num_q_heads * v_dim).map_err(|e| format!("mla_attn alloc out: {e}"))?;
+        let mut dev_out = self
+            .device
+            .alloc_zeros::<f32>(num_q_heads * v_dim)
+            .map_err(|e| format!("mla_attn alloc out: {e}"))?;
         let block_dim = (qk_dim as u32).next_power_of_two();
         let launch_cfg = LaunchConfig {
             grid_dim: (num_q_heads as u32, 1, 1),
@@ -2489,7 +3338,19 @@ impl Model {
             m.mla_attn_k
                 .function
                 .clone()
-                .launch(launch_cfg, (q, kv_cache, &mut dev_out, num_q_heads as u32, qk_dim as u32, v_dim as u32, seq_len as u32, scale))
+                .launch(
+                    launch_cfg,
+                    (
+                        q,
+                        kv_cache,
+                        &mut dev_out,
+                        num_q_heads as u32,
+                        qk_dim as u32,
+                        v_dim as u32,
+                        seq_len as u32,
+                        scale,
+                    ),
+                )
                 .map_err(|e| format!("mla_attn launch: {e}"))?;
         }
         Ok(dev_out)
@@ -2517,8 +3378,10 @@ impl Model {
         rows: usize,
         scale: f32,
     ) -> Result<CudaSlice<f32>, String> {
-        let mut dev_out =
-            self.device.alloc_zeros::<f32>(rows * num_q_heads * v_dim).map_err(|e| format!("mla_attn_prefill alloc out: {e}"))?;
+        let mut dev_out = self
+            .device
+            .alloc_zeros::<f32>(rows * num_q_heads * v_dim)
+            .map_err(|e| format!("mla_attn_prefill alloc out: {e}"))?;
         let block_dim = (qk_dim as u32).next_power_of_two();
         let max_seq_len = start_pos + rows;
         let launch_cfg = LaunchConfig {
@@ -2571,14 +3434,26 @@ impl Model {
         let n = (rows * num_heads * dst_width) as u32;
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             m.mla_extract_batch_k
                 .function
                 .clone()
                 .launch(
                     launch_cfg,
-                    (src, &mut dst, rows as u32, num_heads as u32, src_head_width as u32, dst_width as u32, src_head_offset as u32),
+                    (
+                        src,
+                        &mut dst,
+                        rows as u32,
+                        num_heads as u32,
+                        src_head_width as u32,
+                        dst_width as u32,
+                        src_head_offset as u32,
+                    ),
                 )
                 .map_err(|e| format!("mla_extract_batch launch: {e}"))?;
         }
@@ -2588,6 +3463,10 @@ impl Model {
     /// Batched-prefill helper: merges per-head `absorbed` (kv_lora-wide) and
     /// already-RoPE'd `q_pe` (qk_rope-wide) into Qcur's per-head row
     /// (`mla_concat_qcur_batch_kernel`).
+    // Each parameter maps 1:1 to a distinct `mla_concat_qcur_batch_kernel`
+    // launch argument; bundling them into a struct would just relocate the
+    // count, not reduce it.
+    #[allow(clippy::too_many_arguments)]
     fn mla_concat_qcur_batch(
         &self,
         m: &MlaModel,
@@ -2599,17 +3478,34 @@ impl Model {
         qk_rope: usize,
     ) -> Result<CudaSlice<f32>, String> {
         let qk_dim = kv_lora + qk_rope;
-        let mut out =
-            self.device.alloc_zeros::<f32>(rows * n_head * qk_dim).map_err(|e| format!("mla_concat_qcur_batch alloc: {e}"))?;
+        let mut out = self
+            .device
+            .alloc_zeros::<f32>(rows * n_head * qk_dim)
+            .map_err(|e| format!("mla_concat_qcur_batch alloc: {e}"))?;
         let n = (rows * n_head * qk_dim) as u32;
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             m.mla_concat_qcur_batch_k
                 .function
                 .clone()
-                .launch(launch_cfg, (absorbed, q_pe, &mut out, rows as u32, n_head as u32, kv_lora as u32, qk_rope as u32))
+                .launch(
+                    launch_cfg,
+                    (
+                        absorbed,
+                        q_pe,
+                        &mut out,
+                        rows as u32,
+                        n_head as u32,
+                        kv_lora as u32,
+                        qk_rope as u32,
+                    ),
+                )
                 .map_err(|e| format!("mla_concat_qcur_batch launch: {e}"))?;
         }
         Ok(out)
@@ -2634,12 +3530,27 @@ impl Model {
         let n = (rows * qk_dim) as u32;
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             m.mla_write_kv_cache_batch_k
                 .function
                 .clone()
-                .launch(launch_cfg, (kv_cache, kv_cmpr, k_pe, start_pos as u32, rows as u32, kv_lora as u32, qk_rope as u32))
+                .launch(
+                    launch_cfg,
+                    (
+                        kv_cache,
+                        kv_cmpr,
+                        k_pe,
+                        start_pos as u32,
+                        rows as u32,
+                        kv_lora as u32,
+                        qk_rope as u32,
+                    ),
+                )
                 .map_err(|e| format!("mla_write_kv_cache_batch launch: {e}"))?;
         }
         Ok(())
@@ -2670,7 +3581,13 @@ impl Model {
         v_cache: &mut CudaSlice<f32>,
     ) -> Result<CudaSlice<f32>, String> {
         let cfg = &self.cfg;
-        let normed = self.rmsnorm(&hidden, &attn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let normed = self.rmsnorm(
+            &hidden,
+            &attn_norm.data,
+            1,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
 
         let mut q = self.gemv(&normed, attn_q)?;
         let mut k = self.gemv(&normed, attn_k)?;
@@ -2680,27 +3597,59 @@ impl Model {
             q = self.rmsnorm(&q, &qn.data, cfg.num_q_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
         }
         if let Some(kn) = attn_k_norm {
-            k = self.rmsnorm(&k, &kn.data, cfg.num_kv_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
+            k = self.rmsnorm(
+                &k,
+                &kn.data,
+                cfg.num_kv_heads,
+                cfg.head_dim,
+                cfg.rmsnorm_eps,
+            )?;
         }
 
-        self.rope(&mut q, cfg.num_q_heads, cfg.head_dim, cfg.rotary_dim, position, cfg.rope_base)?;
-        self.rope(&mut k, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim, position, cfg.rope_base)?;
+        self.rope(
+            &mut q,
+            cfg.num_q_heads,
+            cfg.head_dim,
+            cfg.rotary_dim,
+            position,
+            cfg.rope_base,
+        )?;
+        self.rope(
+            &mut k,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            cfg.rotary_dim,
+            position,
+            cfg.rope_base,
+        )?;
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
         let offset = position * kv_stride;
         {
             let mut dst = k_cache.slice_mut(offset..offset + kv_stride);
-            self.device.dtod_copy(&k, &mut dst).map_err(|e| format!("attn kv-cache dtod k: {e}"))?;
+            self.device
+                .dtod_copy(&k, &mut dst)
+                .map_err(|e| format!("attn kv-cache dtod k: {e}"))?;
         }
         {
             let mut dst = v_cache.slice_mut(offset..offset + kv_stride);
-            self.device.dtod_copy(&v, &mut dst).map_err(|e| format!("attn kv-cache dtod v: {e}"))?;
+            self.device
+                .dtod_copy(&v, &mut dst)
+                .map_err(|e| format!("attn kv-cache dtod v: {e}"))?;
         }
         let seq_len = position + 1;
 
         let k_view = k_cache.slice(0..seq_len * kv_stride);
         let v_view = v_cache.slice(0..seq_len * kv_stride);
-        let attn_out = self.attention(&q, &k_view, &v_view, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, seq_len)?;
+        let attn_out = self.attention(
+            &q,
+            &k_view,
+            &v_view,
+            cfg.num_q_heads,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            seq_len,
+        )?;
         let o_proj = self.gemv(&attn_out, attn_output)?;
         self.add_inplace(&mut hidden, &o_proj)?;
         Ok(hidden)
@@ -2729,7 +3678,13 @@ impl Model {
         )?;
 
         let cfg = &self.cfg;
-        let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let ffn_normed = self.rmsnorm(
+            &post_attn,
+            &layer.ffn_norm.data,
+            1,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
         let gate = self.gemv(&ffn_normed, &layer.ffn_gate)?;
         let up = self.gemv(&ffn_normed, &layer.ffn_up)?;
         let activated = self.silu_and_mul(&gate, &up, cfg.ffn_hidden_size)?;
@@ -2774,23 +3729,48 @@ impl Model {
         )?;
 
         let cfg = &self.cfg;
-        let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let ffn_normed = self.rmsnorm(
+            &post_attn,
+            &layer.ffn_norm.data,
+            1,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
 
         let router_logits_dev = self.gemv(&ffn_normed, &layer.ffn_gate_inp)?;
-        let router_logits = self.device.dtoh_sync_copy(&router_logits_dev).map_err(|e| format!("moe router dtoh: {e}"))?;
-        let k = self.expert_used_count.ok_or("forward_layer_moe called on a model with no expert_used_count")?;
+        let router_logits = self
+            .device
+            .dtoh_sync_copy(&router_logits_dev)
+            .map_err(|e| format!("moe router dtoh: {e}"))?;
+        let k = self
+            .expert_used_count
+            .ok_or("forward_layer_moe called on a model with no expert_used_count")?;
         let routed = route_top_k(&router_logits, k)?;
 
-        let mut ffn_out_dev =
-            self.device.alloc_zeros::<f32>(cfg.hidden_size).map_err(|e| format!("moe ffn_out alloc: {e}"))?;
-        let dest_row0 = self.device.htod_sync_copy(&[0u32]).map_err(|e| format!("moe dest_row htod: {e}"))?;
+        let mut ffn_out_dev = self
+            .device
+            .alloc_zeros::<f32>(cfg.hidden_size)
+            .map_err(|e| format!("moe ffn_out alloc: {e}"))?;
+        let dest_row0 = self
+            .device
+            .htod_sync_copy(&[0u32])
+            .map_err(|e| format!("moe dest_row htod: {e}"))?;
         for (expert_idx, weight) in routed {
             let gate = self.gemv_expert(&ffn_normed, &layer.ffn_gate_exps, expert_idx)?;
             let up = self.gemv_expert(&ffn_normed, &layer.ffn_up_exps, expert_idx)?;
             let activated = self.silu_and_mul(&gate, &up, cfg.ffn_hidden_size)?;
             let down = self.gemv_expert(&activated, &layer.ffn_down_exps, expert_idx)?;
-            let weight_dev = self.device.htod_sync_copy(&[weight]).map_err(|e| format!("moe weight htod: {e}"))?;
-            self.moe_scatter_add(&down, &dest_row0, &weight_dev, &mut ffn_out_dev, cfg.hidden_size)?;
+            let weight_dev = self
+                .device
+                .htod_sync_copy(&[weight])
+                .map_err(|e| format!("moe weight htod: {e}"))?;
+            self.moe_scatter_add(
+                &down,
+                &dest_row0,
+                &weight_dev,
+                &mut ffn_out_dev,
+                cfg.hidden_size,
+            )?;
         }
 
         self.add_inplace(&mut post_attn, &ffn_out_dev)?;
@@ -2806,7 +3786,9 @@ impl Model {
         v_cache: &mut CudaSlice<f32>,
     ) -> Result<CudaSlice<f32>, String> {
         match layer {
-            LayerWeights::Dense(l) => self.forward_layer_dense(l, hidden, position, k_cache, v_cache),
+            LayerWeights::Dense(l) => {
+                self.forward_layer_dense(l, hidden, position, k_cache, v_cache)
+            }
             LayerWeights::Moe(l) => self.forward_layer_moe(l, hidden, position, k_cache, v_cache),
         }
     }
@@ -2835,39 +3817,85 @@ impl Model {
         v_cache: &mut CudaSlice<f32>,
     ) -> Result<CudaSlice<f32>, String> {
         let cfg = &self.cfg;
-        let normed = self.rmsnorm(&hidden, &attn_norm.data, rows, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let normed = self.rmsnorm(
+            &hidden,
+            &attn_norm.data,
+            rows,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
 
         let mut q = self.gemm(&normed, attn_q, rows)?;
         let mut k = self.gemm(&normed, attn_k, rows)?;
         let v = self.gemm(&normed, attn_v, rows)?;
 
         if let Some(qn) = attn_q_norm {
-            q = self.rmsnorm(&q, &qn.data, rows * cfg.num_q_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
+            q = self.rmsnorm(
+                &q,
+                &qn.data,
+                rows * cfg.num_q_heads,
+                cfg.head_dim,
+                cfg.rmsnorm_eps,
+            )?;
         }
         if let Some(kn) = attn_k_norm {
-            k = self.rmsnorm(&k, &kn.data, rows * cfg.num_kv_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
+            k = self.rmsnorm(
+                &k,
+                &kn.data,
+                rows * cfg.num_kv_heads,
+                cfg.head_dim,
+                cfg.rmsnorm_eps,
+            )?;
         }
 
-        self.rope_batch(&mut q, start_pos, cfg.num_q_heads, cfg.head_dim, cfg.rotary_dim, rows, cfg.rope_base)?;
-        self.rope_batch(&mut k, start_pos, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim, rows, cfg.rope_base)?;
+        self.rope_batch(
+            &mut q,
+            start_pos,
+            cfg.num_q_heads,
+            cfg.head_dim,
+            cfg.rotary_dim,
+            rows,
+            cfg.rope_base,
+        )?;
+        self.rope_batch(
+            &mut k,
+            start_pos,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            cfg.rotary_dim,
+            rows,
+            cfg.rope_base,
+        )?;
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
         let offset = start_pos * kv_stride;
         let write_len = rows * kv_stride;
         {
             let mut dst = k_cache.slice_mut(offset..offset + write_len);
-            self.device.dtod_copy(&k, &mut dst).map_err(|e| format!("attn_batched kv-cache dtod k: {e}"))?;
+            self.device
+                .dtod_copy(&k, &mut dst)
+                .map_err(|e| format!("attn_batched kv-cache dtod k: {e}"))?;
         }
         {
             let mut dst = v_cache.slice_mut(offset..offset + write_len);
-            self.device.dtod_copy(&v, &mut dst).map_err(|e| format!("attn_batched kv-cache dtod v: {e}"))?;
+            self.device
+                .dtod_copy(&v, &mut dst)
+                .map_err(|e| format!("attn_batched kv-cache dtod v: {e}"))?;
         }
         let seq_len = start_pos + rows;
 
         let k_view = k_cache.slice(0..seq_len * kv_stride);
         let v_view = v_cache.slice(0..seq_len * kv_stride);
-        let attn_out =
-            self.attention_prefill(&q, &k_view, &v_view, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, start_pos, rows)?;
+        let attn_out = self.attention_prefill(
+            &q,
+            &k_view,
+            &v_view,
+            cfg.num_q_heads,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            start_pos,
+            rows,
+        )?;
         let o_proj = self.gemm(&attn_out, attn_output, rows)?;
         self.add_inplace(&mut hidden, &o_proj)?;
         Ok(hidden)
@@ -2903,7 +3931,13 @@ impl Model {
         )?;
 
         let cfg = &self.cfg;
-        let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, rows, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let ffn_normed = self.rmsnorm(
+            &post_attn,
+            &layer.ffn_norm.data,
+            rows,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
         let gate = self.gemm(&ffn_normed, &layer.ffn_gate, rows)?;
         let up = self.gemm(&ffn_normed, &layer.ffn_up, rows)?;
         let activated = self.silu_and_mul(&gate, &up, rows * cfg.ffn_hidden_size)?;
@@ -2965,18 +3999,32 @@ impl Model {
             let rows_e: Vec<u32> = group.iter().map(|&(r, _)| r).collect();
             let weights_e: Vec<f32> = group.iter().map(|&(_, w)| w).collect();
 
-            let perm_row = self.device.htod_sync_copy(&rows_e).map_err(|e| format!("moe_ffn_grouped upload rows_e: {e}"))?;
-            let weight_dev = self.device.htod_sync_copy(&weights_e).map_err(|e| format!("moe_ffn_grouped upload weights_e: {e}"))?;
+            let perm_row = self
+                .device
+                .htod_sync_copy(&rows_e)
+                .map_err(|e| format!("moe_ffn_grouped upload rows_e: {e}"))?;
+            let weight_dev = self
+                .device
+                .htod_sync_copy(&weights_e)
+                .map_err(|e| format!("moe_ffn_grouped upload weights_e: {e}"))?;
             let group_size = rows_e.len();
 
             let x_e = self.moe_gather(ffn_normed, &perm_row, hidden_size)?;
-            let (gate_w, in_features, gate_out_features) = Self::expert_weight_view(ffn_gate_exps, expert_idx)?;
+            let (gate_w, in_features, gate_out_features) =
+                Self::expert_weight_view(ffn_gate_exps, expert_idx)?;
             let gate = self.gemm_view(&x_e, &gate_w, in_features, gate_out_features, group_size)?;
             let (up_w, _, up_out_features) = Self::expert_weight_view(ffn_up_exps, expert_idx)?;
             let up = self.gemm_view(&x_e, &up_w, in_features, up_out_features, group_size)?;
             let activated = self.silu_and_mul(&gate, &up, group_size * gate_out_features)?;
-            let (down_w, down_in_features, down_out_features) = Self::expert_weight_view(ffn_down_exps, expert_idx)?;
-            let down = self.gemm_view(&activated, &down_w, down_in_features, down_out_features, group_size)?;
+            let (down_w, down_in_features, down_out_features) =
+                Self::expert_weight_view(ffn_down_exps, expert_idx)?;
+            let down = self.gemm_view(
+                &activated,
+                &down_w,
+                down_in_features,
+                down_out_features,
+                group_size,
+            )?;
 
             self.moe_scatter_add(&down, &perm_row, &weight_dev, ffn_out, hidden_size)?;
         }
@@ -3013,13 +4061,27 @@ impl Model {
         )?;
 
         let cfg = &self.cfg;
-        let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, rows, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let ffn_normed = self.rmsnorm(
+            &post_attn,
+            &layer.ffn_norm.data,
+            rows,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
         let router_logits_dev = self.gemm(&ffn_normed, &layer.ffn_gate_inp, rows)?;
-        let router_logits = self.device.dtoh_sync_copy(&router_logits_dev).map_err(|e| format!("moe router dtoh: {e}"))?;
-        let k = self.expert_used_count.ok_or("forward_layer_moe_batched called on a model with no expert_used_count")?;
+        let router_logits = self
+            .device
+            .dtoh_sync_copy(&router_logits_dev)
+            .map_err(|e| format!("moe router dtoh: {e}"))?;
+        let k = self
+            .expert_used_count
+            .ok_or("forward_layer_moe_batched called on a model with no expert_used_count")?;
         let num_experts = router_logits.len() / rows;
 
-        let mut ffn_out = self.device.alloc_zeros::<f32>(rows * cfg.hidden_size).map_err(|e| format!("moe ffn_out alloc: {e}"))?;
+        let mut ffn_out = self
+            .device
+            .alloc_zeros::<f32>(rows * cfg.hidden_size)
+            .map_err(|e| format!("moe ffn_out alloc: {e}"))?;
         self.moe_ffn_grouped(
             &ffn_normed,
             rows,
@@ -3050,8 +4112,12 @@ impl Model {
         v_cache: &mut CudaSlice<f32>,
     ) -> Result<CudaSlice<f32>, String> {
         match layer {
-            LayerWeights::Dense(l) => self.forward_layer_dense_batched(l, hidden, start_pos, rows, k_cache, v_cache),
-            LayerWeights::Moe(l) => self.forward_layer_moe_batched(l, hidden, start_pos, rows, k_cache, v_cache),
+            LayerWeights::Dense(l) => {
+                self.forward_layer_dense_batched(l, hidden, start_pos, rows, k_cache, v_cache)
+            }
+            LayerWeights::Moe(l) => {
+                self.forward_layer_moe_batched(l, hidden, start_pos, rows, k_cache, v_cache)
+            }
         }
     }
 
@@ -3066,7 +4132,8 @@ impl Model {
         if let Some(m) = &self.mla {
             return self.forward_prompt_mla(m, prompt);
         }
-        let (generated, text, _k_caches, _v_caches, _seq_len) = self.generate_dense_impl(prompt, None, 1, |_logits| {})?;
+        let (generated, text, _k_caches, _v_caches, _seq_len) =
+            self.generate_dense_impl(prompt, None, 1, |_logits| {})?;
         Ok((generated[0], text))
     }
 
@@ -3101,7 +4168,8 @@ impl Model {
                 if self.hybrid.is_some() || self.mla.is_some() {
                     return Err("imported KV cache file is dense/MoE format, but this model is not a dense/MoE Qwen3 model".to_string());
                 }
-                let (generated, text, _, _, _) = self.generate_dense_impl(prompt, Some(cache), max_new_tokens, on_first_token)?;
+                let (generated, text, _, _, _) =
+                    self.generate_dense_impl(prompt, Some(cache), max_new_tokens, on_first_token)?;
                 Ok((generated, text))
             }
             Some(crate::kv_io::ImportedKv::Hybrid(cache)) => {
@@ -3109,24 +4177,36 @@ impl Model {
                     .hybrid
                     .as_ref()
                     .ok_or("imported KV cache file is hybrid format, but this model is not a Qwen3.5 hybrid model")?;
-                let (generated, text, _, _) = self.generate_hybrid_impl(h, prompt, Some(cache), max_new_tokens, on_first_token)?;
+                let (generated, text, _, _) = self.generate_hybrid_impl(
+                    h,
+                    prompt,
+                    Some(cache),
+                    max_new_tokens,
+                    on_first_token,
+                )?;
                 Ok((generated, text))
             }
             Some(crate::kv_io::ImportedKv::Mla(cache)) => {
-                let m = self.mla.as_ref().ok_or("imported KV cache file is MLA format, but this model is not an MLA model")?;
-                let (generated, text, _, _) = self.generate_mla_impl(m, prompt, Some(cache), max_new_tokens, on_first_token)?;
+                let m = self.mla.as_ref().ok_or(
+                    "imported KV cache file is MLA format, but this model is not an MLA model",
+                )?;
+                let (generated, text, _, _) =
+                    self.generate_mla_impl(m, prompt, Some(cache), max_new_tokens, on_first_token)?;
                 Ok((generated, text))
             }
             None => {
                 if let Some(h) = &self.hybrid {
-                    let (generated, text, _, _) = self.generate_hybrid_impl(h, prompt, None, max_new_tokens, on_first_token)?;
+                    let (generated, text, _, _) =
+                        self.generate_hybrid_impl(h, prompt, None, max_new_tokens, on_first_token)?;
                     return Ok((generated, text));
                 }
                 if let Some(m) = &self.mla {
-                    let (generated, text, _, _) = self.generate_mla_impl(m, prompt, None, max_new_tokens, on_first_token)?;
+                    let (generated, text, _, _) =
+                        self.generate_mla_impl(m, prompt, None, max_new_tokens, on_first_token)?;
                     return Ok((generated, text));
                 }
-                let (generated, text, _, _, _) = self.generate_dense_impl(prompt, None, max_new_tokens, on_first_token)?;
+                let (generated, text, _, _, _) =
+                    self.generate_dense_impl(prompt, None, max_new_tokens, on_first_token)?;
                 Ok((generated, text))
             }
         }
@@ -3154,7 +4234,7 @@ impl Model {
         prompt: &str,
         imported: Option<&crate::kv_io::DenseKvCache>,
         extra_headroom: usize,
-    ) -> Result<(Vec<u32>, CudaSlice<f32>, Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>, usize), String> {
+    ) -> Result<DensePrefillResult, String> {
         let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
 
         let mut ids = self.tokenizer.encode(prompt)?;
@@ -3194,21 +4274,36 @@ impl Model {
                 ));
             }
             if cache.k_caches.len() != self.layers.len() {
-                return Err(format!("imported KV cache has {} layers, model has {}", cache.k_caches.len(), self.layers.len()));
+                return Err(format!(
+                    "imported KV cache has {} layers, model has {}",
+                    cache.k_caches.len(),
+                    self.layers.len()
+                ));
             }
             let imported_len = cache.seq_len * kv_stride;
-            for (layer_idx, (k_host, v_host)) in cache.k_caches.iter().zip(&cache.v_caches).enumerate() {
+            for (layer_idx, (k_host, v_host)) in
+                cache.k_caches.iter().zip(&cache.v_caches).enumerate()
+            {
                 let mut k_dst = k_caches[layer_idx].slice_mut(0..imported_len);
-                self.device.htod_sync_copy_into(k_host, &mut k_dst).map_err(|e| format!("import k_cache htod layer {layer_idx}: {e}"))?;
+                self.device
+                    .htod_sync_copy_into(k_host, &mut k_dst)
+                    .map_err(|e| format!("import k_cache htod layer {layer_idx}: {e}"))?;
                 let mut v_dst = v_caches[layer_idx].slice_mut(0..imported_len);
-                self.device.htod_sync_copy_into(v_host, &mut v_dst).map_err(|e| format!("import v_cache htod layer {layer_idx}: {e}"))?;
+                self.device
+                    .htod_sync_copy_into(v_host, &mut v_dst)
+                    .map_err(|e| format!("import v_cache htod layer {layer_idx}: {e}"))?;
             }
         }
 
         let mut position = start_pos;
         let mut hidden_dev: Option<CudaSlice<f32>> = None;
         for &token_id in &ids {
-            hidden_dev = Some(self.forward_one_token_dense(token_id, position, &mut k_caches, &mut v_caches)?);
+            hidden_dev = Some(self.forward_one_token_dense(
+                token_id,
+                position,
+                &mut k_caches,
+                &mut v_caches,
+            )?);
             position += 1;
         }
         let hidden = hidden_dev.ok_or("no tokens processed")?;
@@ -3232,7 +4327,7 @@ impl Model {
         prompt: &str,
         imported: Option<&crate::kv_io::DenseKvCache>,
         extra_headroom: usize,
-    ) -> Result<(Vec<u32>, CudaSlice<f32>, Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>, usize), String> {
+    ) -> Result<DensePrefillResult, String> {
         let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
 
         let mut ids = self.tokenizer.encode(prompt)?;
@@ -3267,14 +4362,24 @@ impl Model {
                 ));
             }
             if cache.k_caches.len() != self.layers.len() {
-                return Err(format!("imported KV cache has {} layers, model has {}", cache.k_caches.len(), self.layers.len()));
+                return Err(format!(
+                    "imported KV cache has {} layers, model has {}",
+                    cache.k_caches.len(),
+                    self.layers.len()
+                ));
             }
             let imported_len = cache.seq_len * kv_stride;
-            for (layer_idx, (k_host, v_host)) in cache.k_caches.iter().zip(&cache.v_caches).enumerate() {
+            for (layer_idx, (k_host, v_host)) in
+                cache.k_caches.iter().zip(&cache.v_caches).enumerate()
+            {
                 let mut k_dst = k_caches[layer_idx].slice_mut(0..imported_len);
-                self.device.htod_sync_copy_into(k_host, &mut k_dst).map_err(|e| format!("import k_cache htod layer {layer_idx}: {e}"))?;
+                self.device
+                    .htod_sync_copy_into(k_host, &mut k_dst)
+                    .map_err(|e| format!("import k_cache htod layer {layer_idx}: {e}"))?;
                 let mut v_dst = v_caches[layer_idx].slice_mut(0..imported_len);
-                self.device.htod_sync_copy_into(v_host, &mut v_dst).map_err(|e| format!("import v_cache htod layer {layer_idx}: {e}"))?;
+                self.device
+                    .htod_sync_copy_into(v_host, &mut v_dst)
+                    .map_err(|e| format!("import v_cache htod layer {layer_idx}: {e}"))?;
             }
         }
 
@@ -3285,10 +4390,20 @@ impl Model {
             host_embd[row * hidden_size..(row + 1) * hidden_size]
                 .copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
         }
-        let mut hidden = self.device.htod_sync_copy(&host_embd).map_err(|e| format!("embedding htod: {e}"))?;
+        let mut hidden = self
+            .device
+            .htod_sync_copy(&host_embd)
+            .map_err(|e| format!("embedding htod: {e}"))?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer_batched(layer, hidden, start_pos, rows, &mut k_caches[layer_idx], &mut v_caches[layer_idx])?;
+            hidden = self.forward_layer_batched(
+                layer,
+                hidden,
+                start_pos,
+                rows,
+                &mut k_caches[layer_idx],
+                &mut v_caches[layer_idx],
+            )?;
         }
 
         Ok((ids, hidden, k_caches, v_caches, start_pos + rows))
@@ -3301,11 +4416,21 @@ impl Model {
     /// `CudaSlice` rather than a borrowed view, since callers go on to
     /// reassign it from `Self::forward_one_token_dense`'s per-token decode
     /// loop.
-    fn last_row(&self, hidden_batched: &CudaSlice<f32>, rows: usize, hidden_size: usize) -> Result<CudaSlice<f32>, String> {
+    fn last_row(
+        &self,
+        hidden_batched: &CudaSlice<f32>,
+        rows: usize,
+        hidden_size: usize,
+    ) -> Result<CudaSlice<f32>, String> {
         let offset = (rows - 1) * hidden_size;
-        let mut out = self.device.alloc_zeros::<f32>(hidden_size).map_err(|e| format!("last_row alloc: {e}"))?;
+        let mut out = self
+            .device
+            .alloc_zeros::<f32>(hidden_size)
+            .map_err(|e| format!("last_row alloc: {e}"))?;
         let src = hidden_batched.slice(offset..offset + hidden_size);
-        self.device.dtod_copy(&src, &mut out).map_err(|e| format!("last_row dtod: {e}"))?;
+        self.device
+            .dtod_copy(&src, &mut out)
+            .map_err(|e| format!("last_row dtod: {e}"))?;
         Ok(out)
     }
 
@@ -3315,11 +4440,21 @@ impl Model {
     /// buffer before feeding it through a `GatedDeltaNet` layer's sequential
     /// per-token recurrence (`Self::forward_gdn_mixer` takes ownership of a
     /// single-row `CudaSlice`, not a view into a larger batch).
-    fn extract_row(&self, batched: &CudaSlice<f32>, row: usize, hidden_size: usize) -> Result<CudaSlice<f32>, String> {
+    fn extract_row(
+        &self,
+        batched: &CudaSlice<f32>,
+        row: usize,
+        hidden_size: usize,
+    ) -> Result<CudaSlice<f32>, String> {
         let offset = row * hidden_size;
-        let mut out = self.device.alloc_zeros::<f32>(hidden_size).map_err(|e| format!("extract_row alloc: {e}"))?;
+        let mut out = self
+            .device
+            .alloc_zeros::<f32>(hidden_size)
+            .map_err(|e| format!("extract_row alloc: {e}"))?;
         let src = batched.slice(offset..offset + hidden_size);
-        self.device.dtod_copy(&src, &mut out).map_err(|e| format!("extract_row dtod: {e}"))?;
+        self.device
+            .dtod_copy(&src, &mut out)
+            .map_err(|e| format!("extract_row dtod: {e}"))?;
         Ok(out)
     }
 
@@ -3327,10 +4462,18 @@ impl Model {
     /// vector) back into row `row` of a `[rows, hidden_size]` buffer -- same
     /// device-to-device copy convention `Self::forward_attn_block` already
     /// uses for kv-cache writes, never a host round trip.
-    fn write_row(&self, batched: &mut CudaSlice<f32>, row: usize, hidden_size: usize, src: &CudaSlice<f32>) -> Result<(), String> {
+    fn write_row(
+        &self,
+        batched: &mut CudaSlice<f32>,
+        row: usize,
+        hidden_size: usize,
+        src: &CudaSlice<f32>,
+    ) -> Result<(), String> {
         let offset = row * hidden_size;
         let mut dst = batched.slice_mut(offset..offset + hidden_size);
-        self.device.dtod_copy(src, &mut dst).map_err(|e| format!("write_row dtod: {e}"))
+        self.device
+            .dtod_copy(src, &mut dst)
+            .map_err(|e| format!("write_row dtod: {e}"))
     }
 
     /// Shared dense/MoE implementation behind `forward_prompt`,
@@ -3350,7 +4493,7 @@ impl Model {
         imported: Option<&crate::kv_io::DenseKvCache>,
         max_new_tokens: usize,
         mut on_first_token: impl FnMut(&[f32]),
-    ) -> Result<(Vec<u32>, String, Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>, usize), String> {
+    ) -> Result<DenseGenerateResult, String> {
         if max_new_tokens == 0 {
             return Err("max_new_tokens must be at least 1".to_string());
         }
@@ -3360,13 +4503,15 @@ impl Model {
         let mut hidden = self.last_row(&hidden_batched, ids.len(), self.cfg.hidden_size)?;
 
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
-        let first_logits = self.lm_head_logits(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
+        let first_logits =
+            self.lm_head_logits(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
         let mut next_id = Self::argmax(&first_logits)?;
         on_first_token(&first_logits);
         generated.push(next_id);
 
         while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
-            hidden = self.forward_one_token_dense(next_id, position, &mut k_caches, &mut v_caches)?;
+            hidden =
+                self.forward_one_token_dense(next_id, position, &mut k_caches, &mut v_caches)?;
             position += 1;
             next_id = self.lm_head_argmax(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
             generated.push(next_id);
@@ -3384,7 +4529,11 @@ impl Model {
     /// text. Errs if `encode(prompt)` is not an exact prefix of
     /// `encode(prompt + candidate)`, or the candidate contributes zero new
     /// tokens.
-    fn resolve_candidate_token_ids(&self, prompt: &str, candidate: &str) -> Result<Vec<u32>, String> {
+    fn resolve_candidate_token_ids(
+        &self,
+        prompt: &str,
+        candidate: &str,
+    ) -> Result<Vec<u32>, String> {
         let prompt_ids = self.tokenizer.encode(prompt)?;
         let full_ids = self.tokenizer.encode(&format!("{prompt}{candidate}"))?;
         if full_ids.len() <= prompt_ids.len() || full_ids[..prompt_ids.len()] != prompt_ids[..] {
@@ -3413,16 +4562,26 @@ impl Model {
     /// `self.hybrid`/`self.mla` is set. Every candidate must resolve to at
     /// least one token (see `Self::resolve_candidate_token_ids`); a
     /// resolution failure for one candidate fails the whole call.
-    pub fn system1_evaluate(&self, prompt: &str, candidates: &[System1Candidate], temperature: f32) -> Result<System1Response, String> {
+    pub fn system1_evaluate(
+        &self,
+        prompt: &str,
+        candidates: &[System1Candidate],
+        temperature: f32,
+    ) -> Result<System1Response, String> {
         if self.hybrid.is_some() || self.mla.is_some() {
-            return Err("system1_evaluate: only dense/MoE Qwen3 models are supported in this version".to_string());
+            return Err(
+                "system1_evaluate: only dense/MoE Qwen3 models are supported in this version"
+                    .to_string(),
+            );
         }
         if candidates.is_empty() {
             return Err("system1_evaluate: candidates must not be empty".to_string());
         }
 
-        let resolved: Vec<Vec<u32>> =
-            candidates.iter().map(|c| self.resolve_candidate_token_ids(prompt, &c.text)).collect::<Result<_, _>>()?;
+        let resolved: Vec<Vec<u32>> = candidates
+            .iter()
+            .map(|c| self.resolve_candidate_token_ids(prompt, &c.text))
+            .collect::<Result<_, _>>()?;
         let max_len = resolved.iter().map(Vec::len).max().unwrap_or(1);
 
         let (ids, hidden_batched, mut k_caches, mut v_caches, base_position) =
@@ -3431,7 +4590,13 @@ impl Model {
 
         // Batched first-token gather: the sub-50ms win for the common
         // single-token case (Yes/No, A-D, a 1-10 scale).
-        let normed = self.rmsnorm(&hidden, &self.output_norm.data, 1, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
+        let normed = self.rmsnorm(
+            &hidden,
+            &self.output_norm.data,
+            1,
+            self.cfg.hidden_size,
+            self.cfg.rmsnorm_eps,
+        )?;
         let first_tokens: Vec<u32> = resolved.iter().map(|ids| ids[0]).collect();
         let mut scores = self.gemv_gather(&normed, &self.lm_head, &first_tokens)?;
 
@@ -3443,25 +4608,39 @@ impl Model {
             if ids.len() < 2 {
                 continue;
             }
-            let mut position = base_position;
-            for w in ids.windows(2) {
+            for (position, w) in (base_position..).zip(ids.windows(2)) {
                 let (prev, next) = (w[0], w[1]);
-                let h = self.forward_one_token_dense(prev, position, &mut k_caches, &mut v_caches)?;
-                position += 1;
-                let normed_step = self.rmsnorm(&h, &self.output_norm.data, 1, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
+                let h =
+                    self.forward_one_token_dense(prev, position, &mut k_caches, &mut v_caches)?;
+                let normed_step = self.rmsnorm(
+                    &h,
+                    &self.output_norm.data,
+                    1,
+                    self.cfg.hidden_size,
+                    self.cfg.rmsnorm_eps,
+                )?;
                 scores[i] += self.gemv_gather(&normed_step, &self.lm_head, &[next])?[0];
             }
         }
 
-        let probabilities = crate::calibration::softmax_scores_with_temperature(&scores, temperature)?;
+        let probabilities =
+            crate::calibration::softmax_scores_with_temperature(&scores, temperature)?;
         let entropy = crate::calibration::shannon_entropy(&probabilities)?;
         let results = candidates
             .iter()
             .zip(resolved)
             .zip(scores)
-            .map(|((c, token_ids), score)| System1CandidateResult { text: c.text.clone(), token_ids, score })
+            .map(|((c, token_ids), score)| System1CandidateResult {
+                text: c.text.clone(),
+                token_ids,
+                score,
+            })
             .collect();
-        Ok(System1Response { results, probabilities, entropy })
+        Ok(System1Response {
+            results,
+            probabilities,
+            entropy,
+        })
     }
 
     /// Embeds `token_id` and runs it through every dense/MoE layer at
@@ -3481,7 +4660,13 @@ impl Model {
             .htod_sync_copy(&self.token_embd[embd_base..embd_base + hidden_size])
             .map_err(|e| format!("embedding htod: {e}"))?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer(layer, hidden, position, &mut k_caches[layer_idx], &mut v_caches[layer_idx])?;
+            hidden = self.forward_layer(
+                layer,
+                hidden,
+                position,
+                &mut k_caches[layer_idx],
+                &mut v_caches[layer_idx],
+            )?;
         }
         Ok(hidden)
     }
@@ -3489,7 +4674,12 @@ impl Model {
     /// Final RMSNorm -> LM head -> argmax, shared by every architecture's
     /// generation loop (`hidden_size`/`eps` differ by architecture; the
     /// `output_norm`/`lm_head` weights are shared across all of them).
-    fn lm_head_argmax(&self, hidden: &CudaSlice<f32>, hidden_size: usize, eps: f32) -> Result<u32, String> {
+    fn lm_head_argmax(
+        &self,
+        hidden: &CudaSlice<f32>,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<u32, String> {
         let logits = self.lm_head_logits(hidden, hidden_size, eps)?;
         Self::argmax(&logits)
     }
@@ -3501,10 +4691,17 @@ impl Model {
     /// so `Model::generate`'s callers (e.g. `check_correctness`, see
     /// `src/bin/check_correctness.rs`) can inspect the real logits a byte-exact
     /// verification needs without adding a second full generation API.
-    fn lm_head_logits(&self, hidden: &CudaSlice<f32>, hidden_size: usize, eps: f32) -> Result<Vec<f32>, String> {
+    fn lm_head_logits(
+        &self,
+        hidden: &CudaSlice<f32>,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<Vec<f32>, String> {
         let normed = self.rmsnorm(hidden, &self.output_norm.data, 1, hidden_size, eps)?;
         let logits_dev = self.gemv(&normed, &self.lm_head)?;
-        self.device.dtoh_sync_copy(&logits_dev).map_err(|e| format!("logits dtoh: {e}"))
+        self.device
+            .dtoh_sync_copy(&logits_dev)
+            .map_err(|e| format!("logits dtoh: {e}"))
     }
 
     fn argmax(logits: &[f32]) -> Result<u32, String> {
@@ -3523,24 +4720,36 @@ impl Model {
     /// `--export-kv` to serialize. Hybrid models use
     /// `forward_prompt_capture_kv_hybrid` instead, MLA models
     /// `forward_prompt_capture_kv_mla`.
-    pub fn forward_prompt_capture_kv(&self, prompt: &str) -> Result<((u32, String), crate::kv_io::DenseKvCache), String> {
+    pub fn forward_prompt_capture_kv(
+        &self,
+        prompt: &str,
+    ) -> Result<((u32, String), crate::kv_io::DenseKvCache), String> {
         if self.hybrid.is_some() {
             return Err("--export-kv on a hybrid Qwen3.5 model needs forward_prompt_capture_kv_hybrid, not this function".to_string());
         }
         if self.mla.is_some() {
             return Err("--export-kv on an MLA model needs forward_prompt_capture_kv_mla, not this function".to_string());
         }
-        let (generated, text, k_caches, v_caches, seq_len) = self.generate_dense_impl(prompt, None, 1, |_logits| {})?;
+        let (generated, text, k_caches, v_caches, seq_len) =
+            self.generate_dense_impl(prompt, None, 1, |_logits| {})?;
 
         let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
         let per_layer_len = seq_len * kv_stride;
         let k_caches = k_caches
             .iter()
-            .map(|c| self.device.dtoh_sync_copy(&c.slice(0..per_layer_len)).map_err(|e| format!("k_cache dtoh: {e}")))
+            .map(|c| {
+                self.device
+                    .dtoh_sync_copy(&c.slice(0..per_layer_len))
+                    .map_err(|e| format!("k_cache dtoh: {e}"))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let v_caches = v_caches
             .iter()
-            .map(|c| self.device.dtoh_sync_copy(&c.slice(0..per_layer_len)).map_err(|e| format!("v_cache dtoh: {e}")))
+            .map(|c| {
+                self.device
+                    .dtoh_sync_copy(&c.slice(0..per_layer_len))
+                    .map_err(|e| format!("v_cache dtoh: {e}"))
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         let cache = crate::kv_io::DenseKvCache {
@@ -3559,17 +4768,41 @@ impl Model {
     /// to in `HybridLayerState`'s doc comment). Returns the post-SiLU
     /// `conv_dim` output. Ports `gdn_conv_kernel` (see
     /// `kernels_cuda/gated_deltanet.cu`).
-    fn gdn_conv(&self, h: &HybridModel, qkv: &CudaSlice<f32>, conv1d: &CudaSlice<f32>, conv_state: &mut CudaSlice<f32>, conv_dim: usize) -> Result<CudaSlice<f32>, String> {
-        let mut dev_out = self.device.alloc_zeros::<f32>(conv_dim).map_err(|e| format!("gdn_conv alloc out: {e}"))?;
+    fn gdn_conv(
+        &self,
+        h: &HybridModel,
+        qkv: &CudaSlice<f32>,
+        conv1d: &CudaSlice<f32>,
+        conv_state: &mut CudaSlice<f32>,
+        conv_dim: usize,
+    ) -> Result<CudaSlice<f32>, String> {
+        let mut dev_out = self
+            .device
+            .alloc_zeros::<f32>(conv_dim)
+            .map_err(|e| format!("gdn_conv alloc out: {e}"))?;
 
         let threads = 256u32;
         let blocks = (conv_dim as u32).div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             h.gdn_conv_k
                 .function
                 .clone()
-                .launch(launch_cfg, (qkv, conv1d, conv_state, &mut dev_out, conv_dim as u32, h.gdn_cfg.conv_kernel_size as u32))
+                .launch(
+                    launch_cfg,
+                    (
+                        qkv,
+                        conv1d,
+                        conv_state,
+                        &mut dev_out,
+                        conv_dim as u32,
+                        h.gdn_cfg.conv_kernel_size as u32,
+                    ),
+                )
                 .map_err(|e| format!("gdn_conv launch: {e}"))?;
         }
         Ok(dev_out)
@@ -3580,14 +4813,33 @@ impl Model {
     /// which calls this twice in a row on the same device buffer, once for
     /// the q heads and once for the k heads, without an intervening
     /// host round-trip). Ports `gdn_l2_norm_kernel`.
-    fn gdn_l2_norm(&self, h: &HybridModel, dev_x: &mut CudaSlice<f32>, offset: usize, heads: usize, head_dim: usize, eps: f32, scale: f32) -> Result<(), String> {
-        let launch_cfg =
-            LaunchConfig { grid_dim: (heads as u32, 1, 1), block_dim: (h.gdn_cfg.norm_block_dim(), 1, 1), shared_mem_bytes: 0 };
+    // Each parameter maps 1:1 to a distinct `gdn_l2_norm_kernel` launch
+    // argument; bundling them into a struct would just relocate the count,
+    // not reduce it.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_l2_norm(
+        &self,
+        h: &HybridModel,
+        dev_x: &mut CudaSlice<f32>,
+        offset: usize,
+        heads: usize,
+        head_dim: usize,
+        eps: f32,
+        scale: f32,
+    ) -> Result<(), String> {
+        let launch_cfg = LaunchConfig {
+            grid_dim: (heads as u32, 1, 1),
+            block_dim: (h.gdn_cfg.norm_block_dim(), 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             h.gdn_l2_norm_k
                 .function
                 .clone()
-                .launch(launch_cfg, (dev_x, offset as u32, head_dim as u32, eps, scale))
+                .launch(
+                    launch_cfg,
+                    (dev_x, offset as u32, head_dim as u32, eps, scale),
+                )
                 .map_err(|e| format!("gdn_l2_norm launch: {e}"))?;
         }
         Ok(())
@@ -3596,18 +4848,47 @@ impl Model {
     /// `beta = sigmoid(beta_raw)`, `decay = exp(softplus(alpha_raw + dt) *
     /// a)`. All inputs/outputs device-resident (Phase 2 round 2). Ports
     /// `gdn_gates_kernel`.
-    fn gdn_gates(&self, h: &HybridModel, alpha_raw: &CudaSlice<f32>, beta_raw: &CudaSlice<f32>, dt: &CudaSlice<f32>, a: &CudaSlice<f32>, num_v_heads: usize) -> Result<(CudaSlice<f32>, CudaSlice<f32>), String> {
-        let mut dev_decay = self.device.alloc_zeros::<f32>(num_v_heads).map_err(|e| format!("gdn_gates alloc decay: {e}"))?;
-        let mut dev_beta = self.device.alloc_zeros::<f32>(num_v_heads).map_err(|e| format!("gdn_gates alloc beta: {e}"))?;
+    fn gdn_gates(
+        &self,
+        h: &HybridModel,
+        alpha_raw: &CudaSlice<f32>,
+        beta_raw: &CudaSlice<f32>,
+        dt: &CudaSlice<f32>,
+        a: &CudaSlice<f32>,
+        num_v_heads: usize,
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), String> {
+        let mut dev_decay = self
+            .device
+            .alloc_zeros::<f32>(num_v_heads)
+            .map_err(|e| format!("gdn_gates alloc decay: {e}"))?;
+        let mut dev_beta = self
+            .device
+            .alloc_zeros::<f32>(num_v_heads)
+            .map_err(|e| format!("gdn_gates alloc beta: {e}"))?;
 
         let threads = 256u32;
         let blocks = (num_v_heads as u32).div_ceil(threads).max(1);
-        let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             h.gdn_gates_k
                 .function
                 .clone()
-                .launch(launch_cfg, (alpha_raw, beta_raw, dt, a, &mut dev_decay, &mut dev_beta, num_v_heads as u32))
+                .launch(
+                    launch_cfg,
+                    (
+                        alpha_raw,
+                        beta_raw,
+                        dt,
+                        a,
+                        &mut dev_decay,
+                        &mut dev_beta,
+                        num_v_heads as u32,
+                    ),
+                )
                 .map_err(|e| format!("gdn_gates launch: {e}"))?;
         }
         Ok((dev_beta, dev_decay))
@@ -3620,11 +4901,26 @@ impl Model {
     /// `qkv_normed` is the post-conv/SiLU/L2-norm fused buffer (q at offset
     /// 0, k at `key_dim`, v at `2*key_dim`). Ports `gdn_delta_kernel`.
     #[allow(clippy::too_many_arguments)]
-    fn gdn_delta(&self, h: &HybridModel, recurrent: &mut CudaSlice<f32>, qkv_normed: &CudaSlice<f32>, key_dim: usize, beta: &CudaSlice<f32>, decay: &CudaSlice<f32>) -> Result<CudaSlice<f32>, String> {
+    fn gdn_delta(
+        &self,
+        h: &HybridModel,
+        recurrent: &mut CudaSlice<f32>,
+        qkv_normed: &CudaSlice<f32>,
+        key_dim: usize,
+        beta: &CudaSlice<f32>,
+        decay: &CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
         let cfg = &h.gdn_cfg;
-        let mut dev_o = self.device.alloc_zeros::<f32>(cfg.value_dim()).map_err(|e| format!("gdn_delta alloc o: {e}"))?;
+        let mut dev_o = self
+            .device
+            .alloc_zeros::<f32>(cfg.value_dim())
+            .map_err(|e| format!("gdn_delta alloc o: {e}"))?;
 
-        let launch_cfg = LaunchConfig { grid_dim: (cfg.num_v_heads as u32, 1, 1), block_dim: (cfg.head_dim as u32, 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (cfg.num_v_heads as u32, 1, 1),
+            block_dim: (cfg.head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             h.gdn_delta_k
                 .function
@@ -3652,17 +4948,33 @@ impl Model {
 
     /// `y = RMSNorm(o, ssm_norm) * silu(z)`, all device-resident (Phase 2
     /// round 2). Ports `gdn_gated_norm_kernel`.
-    fn gdn_gated_norm(&self, h: &HybridModel, o: &CudaSlice<f32>, z: &CudaSlice<f32>, norm_w: &CudaSlice<f32>, eps: f32) -> Result<CudaSlice<f32>, String> {
+    fn gdn_gated_norm(
+        &self,
+        h: &HybridModel,
+        o: &CudaSlice<f32>,
+        z: &CudaSlice<f32>,
+        norm_w: &CudaSlice<f32>,
+        eps: f32,
+    ) -> Result<CudaSlice<f32>, String> {
         let cfg = &h.gdn_cfg;
-        let mut dev_y = self.device.alloc_zeros::<f32>(cfg.value_dim()).map_err(|e| format!("gdn_gated_norm alloc y: {e}"))?;
+        let mut dev_y = self
+            .device
+            .alloc_zeros::<f32>(cfg.value_dim())
+            .map_err(|e| format!("gdn_gated_norm alloc y: {e}"))?;
 
-        let launch_cfg =
-            LaunchConfig { grid_dim: (cfg.num_v_heads as u32, 1, 1), block_dim: (cfg.norm_block_dim(), 1, 1), shared_mem_bytes: 0 };
+        let launch_cfg = LaunchConfig {
+            grid_dim: (cfg.num_v_heads as u32, 1, 1),
+            block_dim: (cfg.norm_block_dim(), 1, 1),
+            shared_mem_bytes: 0,
+        };
         unsafe {
             h.gdn_gated_norm_k
                 .function
                 .clone()
-                .launch(launch_cfg, (o, z, norm_w, &mut dev_y, cfg.head_dim as u32, eps))
+                .launch(
+                    launch_cfg,
+                    (o, z, norm_w, &mut dev_y, cfg.head_dim as u32, eps),
+                )
                 .map_err(|e| format!("gdn_gated_norm launch: {e}"))?;
         }
         Ok(dev_y)
@@ -3697,14 +5009,37 @@ impl Model {
         let beta_raw = self.gemv(&normed, &w.ssm_beta)?;
         let alpha_raw = self.gemv(&normed, &w.ssm_alpha)?;
 
-        let (beta, decay) = self.gdn_gates(h, &alpha_raw, &beta_raw, &w.ssm_dt.data, &w.ssm_a.data, cfg.num_v_heads)?;
+        let (beta, decay) = self.gdn_gates(
+            h,
+            &alpha_raw,
+            &beta_raw,
+            &w.ssm_dt.data,
+            &w.ssm_a.data,
+            cfg.num_v_heads,
+        )?;
         let mut conv_out = self.gdn_conv(h, &qkv, &w.ssm_conv1d.data, conv_state, conv_dim)?;
 
         // Split q/k, L2-normalize both (q additionally scaled), v left raw,
         // in place on the same device buffer `gdn_conv` just produced.
         let q_scale = 1.0 / (cfg.head_dim as f32).sqrt();
-        self.gdn_l2_norm(h, &mut conv_out, 0, cfg.num_k_heads, cfg.head_dim, cfg.eps, q_scale)?;
-        self.gdn_l2_norm(h, &mut conv_out, key_dim, cfg.num_k_heads, cfg.head_dim, cfg.eps, 1.0)?;
+        self.gdn_l2_norm(
+            h,
+            &mut conv_out,
+            0,
+            cfg.num_k_heads,
+            cfg.head_dim,
+            cfg.eps,
+            q_scale,
+        )?;
+        self.gdn_l2_norm(
+            h,
+            &mut conv_out,
+            key_dim,
+            cfg.num_k_heads,
+            cfg.head_dim,
+            cfg.eps,
+            1.0,
+        )?;
 
         let o = self.gdn_delta(h, recurrent, &conv_out, key_dim, &beta, &decay)?;
         let y = self.gdn_gated_norm(h, &o, &z, &w.ssm_norm.data, cfg.eps)?;
@@ -3735,21 +5070,47 @@ impl Model {
         v_cache: &mut CudaSlice<f32>,
     ) -> Result<CudaSlice<f32>, String> {
         let cfg = &h.attn_cfg;
-        let normed = self.rmsnorm(&hidden, &w.attn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let normed = self.rmsnorm(
+            &hidden,
+            &w.attn_norm.data,
+            1,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
 
         let qg = self.gemv(&normed, &w.attn_q)?;
         let q_dim = cfg.num_q_heads * cfg.head_dim;
-        let mut q = self.device.alloc_zeros::<f32>(q_dim).map_err(|e| format!("gated-attn q alloc: {e}"))?;
-        let mut gate = self.device.alloc_zeros::<f32>(q_dim).map_err(|e| format!("gated-attn gate alloc: {e}"))?;
+        let mut q = self
+            .device
+            .alloc_zeros::<f32>(q_dim)
+            .map_err(|e| format!("gated-attn q alloc: {e}"))?;
+        let mut gate = self
+            .device
+            .alloc_zeros::<f32>(q_dim)
+            .map_err(|e| format!("gated-attn gate alloc: {e}"))?;
         {
             let threads = 256u32;
             let blocks = (q_dim as u32).div_ceil(threads).max(1);
-            let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            let launch_cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
             unsafe {
                 self.split_qg_k
                     .function
                     .clone()
-                    .launch(launch_cfg, (&qg, &mut q, &mut gate, cfg.num_q_heads as u32, cfg.head_dim as u32, 1u32))
+                    .launch(
+                        launch_cfg,
+                        (
+                            &qg,
+                            &mut q,
+                            &mut gate,
+                            cfg.num_q_heads as u32,
+                            cfg.head_dim as u32,
+                            1u32,
+                        ),
+                    )
                     .map_err(|e| format!("split_qg launch: {e}"))?;
             }
         }
@@ -3757,33 +5118,75 @@ impl Model {
         let mut k = self.gemv(&normed, &w.attn_k)?;
         let v = self.gemv(&normed, &w.attn_v)?;
 
-        q = self.rmsnorm(&q, &w.attn_q_norm.data, cfg.num_q_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
-        k = self.rmsnorm(&k, &w.attn_k_norm.data, cfg.num_kv_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
+        q = self.rmsnorm(
+            &q,
+            &w.attn_q_norm.data,
+            cfg.num_q_heads,
+            cfg.head_dim,
+            cfg.rmsnorm_eps,
+        )?;
+        k = self.rmsnorm(
+            &k,
+            &w.attn_k_norm.data,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            cfg.rmsnorm_eps,
+        )?;
 
-        self.rope(&mut q, cfg.num_q_heads, cfg.head_dim, cfg.rotary_dim, position, cfg.rope_base)?;
-        self.rope(&mut k, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim, position, cfg.rope_base)?;
+        self.rope(
+            &mut q,
+            cfg.num_q_heads,
+            cfg.head_dim,
+            cfg.rotary_dim,
+            position,
+            cfg.rope_base,
+        )?;
+        self.rope(
+            &mut k,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            cfg.rotary_dim,
+            position,
+            cfg.rope_base,
+        )?;
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
         let offset = position * kv_stride;
         {
             let mut dst = k_cache.slice_mut(offset..offset + kv_stride);
-            self.device.dtod_copy(&k, &mut dst).map_err(|e| format!("gated-attn kv-cache dtod k: {e}"))?;
+            self.device
+                .dtod_copy(&k, &mut dst)
+                .map_err(|e| format!("gated-attn kv-cache dtod k: {e}"))?;
         }
         {
             let mut dst = v_cache.slice_mut(offset..offset + kv_stride);
-            self.device.dtod_copy(&v, &mut dst).map_err(|e| format!("gated-attn kv-cache dtod v: {e}"))?;
+            self.device
+                .dtod_copy(&v, &mut dst)
+                .map_err(|e| format!("gated-attn kv-cache dtod v: {e}"))?;
         }
         let seq_len = position + 1;
 
         let k_view = k_cache.slice(0..seq_len * kv_stride);
         let v_view = v_cache.slice(0..seq_len * kv_stride);
-        let mut attn_out = self.attention(&q, &k_view, &v_view, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, seq_len)?;
+        let mut attn_out = self.attention(
+            &q,
+            &k_view,
+            &v_view,
+            cfg.num_q_heads,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            seq_len,
+        )?;
 
         {
             let n = q_dim as u32;
             let threads = 256u32;
             let blocks = n.div_ceil(threads).max(1);
-            let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            let launch_cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
             unsafe {
                 self.sigmoid_gate_k
                     .function
@@ -3820,23 +5223,47 @@ impl Model {
         v_cache: &mut CudaSlice<f32>,
     ) -> Result<CudaSlice<f32>, String> {
         let cfg = &h.attn_cfg;
-        let normed = self.rmsnorm(&hidden, &w.attn_norm.data, rows, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let normed = self.rmsnorm(
+            &hidden,
+            &w.attn_norm.data,
+            rows,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
 
         let qg = self.gemm(&normed, &w.attn_q, rows)?;
         let q_elems = rows * cfg.num_q_heads * cfg.head_dim;
-        let mut q =
-            self.device.alloc_zeros::<f32>(q_elems).map_err(|e| format!("gated-attn-batched q alloc: {e}"))?;
-        let mut gate =
-            self.device.alloc_zeros::<f32>(q_elems).map_err(|e| format!("gated-attn-batched gate alloc: {e}"))?;
+        let mut q = self
+            .device
+            .alloc_zeros::<f32>(q_elems)
+            .map_err(|e| format!("gated-attn-batched q alloc: {e}"))?;
+        let mut gate = self
+            .device
+            .alloc_zeros::<f32>(q_elems)
+            .map_err(|e| format!("gated-attn-batched gate alloc: {e}"))?;
         {
             let threads = 256u32;
             let blocks = (q_elems as u32).div_ceil(threads).max(1);
-            let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            let launch_cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
             unsafe {
                 self.split_qg_k
                     .function
                     .clone()
-                    .launch(launch_cfg, (&qg, &mut q, &mut gate, cfg.num_q_heads as u32, cfg.head_dim as u32, rows as u32))
+                    .launch(
+                        launch_cfg,
+                        (
+                            &qg,
+                            &mut q,
+                            &mut gate,
+                            cfg.num_q_heads as u32,
+                            cfg.head_dim as u32,
+                            rows as u32,
+                        ),
+                    )
                     .map_err(|e| format!("split_qg launch: {e}"))?;
             }
         }
@@ -3844,35 +5271,79 @@ impl Model {
         let mut k = self.gemm(&normed, &w.attn_k, rows)?;
         let v = self.gemm(&normed, &w.attn_v, rows)?;
 
-        q = self.rmsnorm(&q, &w.attn_q_norm.data, rows * cfg.num_q_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
-        k = self.rmsnorm(&k, &w.attn_k_norm.data, rows * cfg.num_kv_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
+        q = self.rmsnorm(
+            &q,
+            &w.attn_q_norm.data,
+            rows * cfg.num_q_heads,
+            cfg.head_dim,
+            cfg.rmsnorm_eps,
+        )?;
+        k = self.rmsnorm(
+            &k,
+            &w.attn_k_norm.data,
+            rows * cfg.num_kv_heads,
+            cfg.head_dim,
+            cfg.rmsnorm_eps,
+        )?;
 
-        self.rope_batch(&mut q, start_pos, cfg.num_q_heads, cfg.head_dim, cfg.rotary_dim, rows, cfg.rope_base)?;
-        self.rope_batch(&mut k, start_pos, cfg.num_kv_heads, cfg.head_dim, cfg.rotary_dim, rows, cfg.rope_base)?;
+        self.rope_batch(
+            &mut q,
+            start_pos,
+            cfg.num_q_heads,
+            cfg.head_dim,
+            cfg.rotary_dim,
+            rows,
+            cfg.rope_base,
+        )?;
+        self.rope_batch(
+            &mut k,
+            start_pos,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            cfg.rotary_dim,
+            rows,
+            cfg.rope_base,
+        )?;
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
         let offset = start_pos * kv_stride;
         let write_len = rows * kv_stride;
         {
             let mut dst = k_cache.slice_mut(offset..offset + write_len);
-            self.device.dtod_copy(&k, &mut dst).map_err(|e| format!("gated-attn-batched kv-cache dtod k: {e}"))?;
+            self.device
+                .dtod_copy(&k, &mut dst)
+                .map_err(|e| format!("gated-attn-batched kv-cache dtod k: {e}"))?;
         }
         {
             let mut dst = v_cache.slice_mut(offset..offset + write_len);
-            self.device.dtod_copy(&v, &mut dst).map_err(|e| format!("gated-attn-batched kv-cache dtod v: {e}"))?;
+            self.device
+                .dtod_copy(&v, &mut dst)
+                .map_err(|e| format!("gated-attn-batched kv-cache dtod v: {e}"))?;
         }
         let seq_len = start_pos + rows;
 
         let k_view = k_cache.slice(0..seq_len * kv_stride);
         let v_view = v_cache.slice(0..seq_len * kv_stride);
-        let mut attn_out =
-            self.attention_prefill(&q, &k_view, &v_view, cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim, start_pos, rows)?;
+        let mut attn_out = self.attention_prefill(
+            &q,
+            &k_view,
+            &v_view,
+            cfg.num_q_heads,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            start_pos,
+            rows,
+        )?;
 
         {
             let n = q_elems as u32;
             let threads = 256u32;
             let blocks = n.div_ceil(threads).max(1);
-            let launch_cfg = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 };
+            let launch_cfg = LaunchConfig {
+                grid_dim: (blocks, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
             unsafe {
                 self.sigmoid_gate_k
                     .function
@@ -3895,7 +5366,21 @@ impl Model {
     /// `GatedAttnLayerWeights`'s doc comment), and touching the already
     /// hardware-verified dense/MoE path is not worth the risk for a few
     /// shared lines.
-    fn forward_hybrid_ffn(&self, mut post_mixer: CudaSlice<f32>, norm: &Weight, ffn_gate: &Weight, ffn_up: &Weight, ffn_down: &Weight, hidden_size: usize, ffn_hidden_size: usize, eps: f32) -> Result<CudaSlice<f32>, String> {
+    // Each parameter is a distinct weight tensor or shape/eps value the FFN
+    // math needs; bundling them into a struct would just relocate the count,
+    // not reduce it.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_hybrid_ffn(
+        &self,
+        mut post_mixer: CudaSlice<f32>,
+        norm: &Weight,
+        ffn_gate: &Weight,
+        ffn_up: &Weight,
+        ffn_down: &Weight,
+        hidden_size: usize,
+        ffn_hidden_size: usize,
+        eps: f32,
+    ) -> Result<CudaSlice<f32>, String> {
         let normed = self.rmsnorm(&post_mixer, &norm.data, 1, hidden_size, eps)?;
         let gate = self.gemv(&normed, ffn_gate)?;
         let up = self.gemv(&normed, ffn_up)?;
@@ -3966,8 +5451,13 @@ impl Model {
         let eps = h.attn_cfg.rmsnorm_eps;
 
         match (layer, state) {
-            (HybridLayerWeights::GatedAttention(w), HybridLayerState::Attn { k_cache, v_cache }) => {
-                let post_mixer = self.forward_gated_attn_mixer_batched(h, w, hidden, start_pos, rows, k_cache, v_cache)?;
+            (
+                HybridLayerWeights::GatedAttention(w),
+                HybridLayerState::Attn { k_cache, v_cache },
+            ) => {
+                let post_mixer = self.forward_gated_attn_mixer_batched(
+                    h, w, hidden, start_pos, rows, k_cache, v_cache,
+                )?;
                 self.forward_hybrid_ffn_batched(
                     post_mixer,
                     &w.post_attn_norm,
@@ -3980,13 +5470,28 @@ impl Model {
                     eps,
                 )
             }
-            (HybridLayerWeights::GatedDeltaNet(w), HybridLayerState::Gdn { conv_state, recurrent }) => {
+            (
+                HybridLayerWeights::GatedDeltaNet(w),
+                HybridLayerState::Gdn {
+                    conv_state,
+                    recurrent,
+                },
+            ) => {
                 let mut out = hidden;
                 for row in 0..rows {
                     let row_hidden = self.extract_row(&out, row, hidden_size)?;
-                    let post_mixer = self.forward_gdn_mixer(h, w, row_hidden, conv_state, recurrent)?;
-                    let row_out =
-                        self.forward_hybrid_ffn(post_mixer, &w.post_attn_norm, &w.ffn_gate, &w.ffn_up, &w.ffn_down, hidden_size, ffn_hidden_size, eps)?;
+                    let post_mixer =
+                        self.forward_gdn_mixer(h, w, row_hidden, conv_state, recurrent)?;
+                    let row_out = self.forward_hybrid_ffn(
+                        post_mixer,
+                        &w.post_attn_norm,
+                        &w.ffn_gate,
+                        &w.ffn_up,
+                        &w.ffn_down,
+                        hidden_size,
+                        ffn_hidden_size,
+                        eps,
+                    )?;
                     self.write_row(&mut out, row, hidden_size, &row_out)?;
                 }
                 Ok(out)
@@ -4028,7 +5533,13 @@ impl Model {
         let qk_dim = kv_lora + qk_rope;
         let v_dim = kv_lora;
 
-        let normed = self.rmsnorm(&hidden, &w.attn_norm.data, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let normed = self.rmsnorm(
+            &hidden,
+            &w.attn_norm.data,
+            1,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
 
         // q: [n_head, n_embd_head_k_mla] flat (plain gemv -- is_lite path, no Q-LoRA).
         let q = self.gemv(&normed, &w.wq)?;
@@ -4036,52 +5547,110 @@ impl Model {
         // kv_cmpr_pe: [kv_lora_rank + qk_rope_head_dim] flat (single shared "head").
         let kv_cmpr_pe = self.gemv(&normed, &w.wkv_a_mqa)?;
 
-        let mut k_pe = self.device.alloc_zeros::<f32>(qk_rope).map_err(|e| format!("mla k_pe alloc: {e}"))?;
+        let mut k_pe = self
+            .device
+            .alloc_zeros::<f32>(qk_rope)
+            .map_err(|e| format!("mla k_pe alloc: {e}"))?;
         {
             let src = kv_cmpr_pe.slice(kv_lora..kv_lora + qk_rope);
-            self.device.dtod_copy(&src, &mut k_pe).map_err(|e| format!("mla k_pe dtod: {e}"))?;
+            self.device
+                .dtod_copy(&src, &mut k_pe)
+                .map_err(|e| format!("mla k_pe dtod: {e}"))?;
         }
         match &cfg.yarn {
-            Some(yarn) => self.rope_norm_yarn(m, yarn, &mut k_pe, 1, qk_rope, qk_rope, position, cfg.rope_base)?,
+            Some(yarn) => self.rope_norm_yarn(
+                m,
+                yarn,
+                &mut k_pe,
+                1,
+                qk_rope,
+                qk_rope,
+                position,
+                cfg.rope_base,
+            )?,
             None => self.rope_norm(m, &mut k_pe, 1, qk_rope, qk_rope, position, cfg.rope_base)?,
         }
 
-        let mut kv_cmpr_owned = self.device.alloc_zeros::<f32>(kv_lora).map_err(|e| format!("mla kv_cmpr alloc: {e}"))?;
+        let mut kv_cmpr_owned = self
+            .device
+            .alloc_zeros::<f32>(kv_lora)
+            .map_err(|e| format!("mla kv_cmpr alloc: {e}"))?;
         {
             let src = kv_cmpr_pe.slice(0..kv_lora);
-            self.device.dtod_copy(&src, &mut kv_cmpr_owned).map_err(|e| format!("mla kv_cmpr dtod: {e}"))?;
+            self.device
+                .dtod_copy(&src, &mut kv_cmpr_owned)
+                .map_err(|e| format!("mla kv_cmpr dtod: {e}"))?;
         }
-        let kv_cmpr_normed = self.rmsnorm(&kv_cmpr_owned, &w.attn_kv_a_norm.data, 1, kv_lora, cfg.rmsnorm_eps)?;
+        let kv_cmpr_normed = self.rmsnorm(
+            &kv_cmpr_owned,
+            &w.attn_kv_a_norm.data,
+            1,
+            kv_lora,
+            cfg.rmsnorm_eps,
+        )?;
 
         // Gather q_pe (all heads) into its own contiguous [n_head, qk_rope_head_dim]
         // buffer before RoPE -- `Self::rope` expects one contiguous multi-head buffer,
         // and q_pe is a strided sub-slice of each head's [n_embd_head_k_mla]-wide row
         // in `q`, not itself contiguous across heads.
-        let mut q_pe = self.device.alloc_zeros::<f32>(n_head * qk_rope).map_err(|e| format!("mla q_pe alloc: {e}"))?;
+        let mut q_pe = self
+            .device
+            .alloc_zeros::<f32>(n_head * qk_rope)
+            .map_err(|e| format!("mla q_pe alloc: {e}"))?;
         for h in 0..n_head {
-            let src = q.slice(h * n_embd_head_k_mla + qk_nope..h * n_embd_head_k_mla + n_embd_head_k_mla);
+            let src =
+                q.slice(h * n_embd_head_k_mla + qk_nope..h * n_embd_head_k_mla + n_embd_head_k_mla);
             let mut dst = q_pe.slice_mut(h * qk_rope..(h + 1) * qk_rope);
-            self.device.dtod_copy(&src, &mut dst).map_err(|e| format!("mla q_pe dtod head {h}: {e}"))?;
+            self.device
+                .dtod_copy(&src, &mut dst)
+                .map_err(|e| format!("mla q_pe dtod head {h}: {e}"))?;
         }
         match &cfg.yarn {
-            Some(yarn) => self.rope_norm_yarn(m, yarn, &mut q_pe, n_head, qk_rope, qk_rope, position, cfg.rope_base)?,
-            None => self.rope_norm(m, &mut q_pe, n_head, qk_rope, qk_rope, position, cfg.rope_base)?,
+            Some(yarn) => self.rope_norm_yarn(
+                m,
+                yarn,
+                &mut q_pe,
+                n_head,
+                qk_rope,
+                qk_rope,
+                position,
+                cfg.rope_base,
+            )?,
+            None => self.rope_norm(
+                m,
+                &mut q_pe,
+                n_head,
+                qk_rope,
+                qk_rope,
+                position,
+                cfg.rope_base,
+            )?,
         }
 
         // Per head: absorb q_nope via wk_b, then concat with the (already-roped)
         // q_pe slice into Qcur's per-head [qk_dim]-wide row.
-        let mut qcur = self.device.alloc_zeros::<f32>(n_head * qk_dim).map_err(|e| format!("mla qcur alloc: {e}"))?;
+        let mut qcur = self
+            .device
+            .alloc_zeros::<f32>(n_head * qk_dim)
+            .map_err(|e| format!("mla qcur alloc: {e}"))?;
         for h in 0..n_head {
             let q_nope_view = q.slice(h * n_embd_head_k_mla..h * n_embd_head_k_mla + qk_nope);
-            let wk_b_view = w.wk_b.data.slice(h * qk_nope * kv_lora..(h + 1) * qk_nope * kv_lora);
+            let wk_b_view = w
+                .wk_b
+                .data
+                .slice(h * qk_nope * kv_lora..(h + 1) * qk_nope * kv_lora);
             let absorbed = self.gemv_view(&q_nope_view, &wk_b_view, qk_nope, kv_lora)?;
 
             let mut dst_nope = qcur.slice_mut(h * qk_dim..h * qk_dim + kv_lora);
-            self.device.dtod_copy(&absorbed, &mut dst_nope).map_err(|e| format!("mla qcur absorbed dtod head {h}: {e}"))?;
+            self.device
+                .dtod_copy(&absorbed, &mut dst_nope)
+                .map_err(|e| format!("mla qcur absorbed dtod head {h}: {e}"))?;
 
             let pe_src = q_pe.slice(h * qk_rope..(h + 1) * qk_rope);
             let mut dst_pe = qcur.slice_mut(h * qk_dim + kv_lora..h * qk_dim + qk_dim);
-            self.device.dtod_copy(&pe_src, &mut dst_pe).map_err(|e| format!("mla qcur pe dtod head {h}: {e}"))?;
+            self.device
+                .dtod_copy(&pe_src, &mut dst_pe)
+                .map_err(|e| format!("mla qcur pe dtod head {h}: {e}"))?;
         }
 
         // Write this position's compressed Kcur (== kv_cmpr_normed ++ k_pe) into the
@@ -4090,11 +5659,15 @@ impl Model {
         let offset = position * qk_dim;
         {
             let mut dst = kv_cache.slice_mut(offset..offset + kv_lora);
-            self.device.dtod_copy(&kv_cmpr_normed, &mut dst).map_err(|e| format!("mla kv_cache dtod cmpr: {e}"))?;
+            self.device
+                .dtod_copy(&kv_cmpr_normed, &mut dst)
+                .map_err(|e| format!("mla kv_cache dtod cmpr: {e}"))?;
         }
         {
             let mut dst = kv_cache.slice_mut(offset + kv_lora..offset + qk_dim);
-            self.device.dtod_copy(&k_pe, &mut dst).map_err(|e| format!("mla kv_cache dtod k_pe: {e}"))?;
+            self.device
+                .dtod_copy(&k_pe, &mut dst)
+                .map_err(|e| format!("mla kv_cache dtod k_pe: {e}"))?;
         }
         let seq_len = position + 1;
 
@@ -4106,7 +5679,8 @@ impl Model {
             Some(yarn) => yarn.attention_scale,
             None => 1.0 / (n_embd_head_k_mla as f32).sqrt(),
         };
-        let compressed_out = self.mla_attention(m, &qcur, &kv_view, n_head, qk_dim, v_dim, seq_len, scale)?;
+        let compressed_out =
+            self.mla_attention(m, &qcur, &kv_view, n_head, qk_dim, v_dim, seq_len, scale)?;
 
         let decompressed = self.gemv_per_head(&compressed_out, &w.wv_b, n_head)?;
         let o_proj = self.gemv(&decompressed, &w.wo)?;
@@ -4149,7 +5723,13 @@ impl Model {
         let qk_dim = kv_lora + qk_rope;
         let v_dim = kv_lora;
 
-        let normed = self.rmsnorm(&hidden, &w.attn_norm.data, rows, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        let normed = self.rmsnorm(
+            &hidden,
+            &w.attn_norm.data,
+            rows,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
 
         // q_batched: [rows, n_head, n_embd_head_k_mla] flat (plain gemm -- is_lite
         // path, no Q-LoRA).
@@ -4161,26 +5741,92 @@ impl Model {
 
         // Extract k_pe/kv_cmpr into their own contiguous [rows, 1, width] buffers
         // (num_heads=1: the whole fused wkv_a_mqa row is treated as a single head).
-        let mut k_pe_batched = self.mla_extract_batch(m, &kv_cmpr_pe_batched, rows, 1, kv_lora + qk_rope, qk_rope, kv_lora)?;
-        let kv_cmpr_batched = self.mla_extract_batch(m, &kv_cmpr_pe_batched, rows, 1, kv_lora + qk_rope, kv_lora, 0)?;
+        let mut k_pe_batched = self.mla_extract_batch(
+            m,
+            &kv_cmpr_pe_batched,
+            rows,
+            1,
+            kv_lora + qk_rope,
+            qk_rope,
+            kv_lora,
+        )?;
+        let kv_cmpr_batched = self.mla_extract_batch(
+            m,
+            &kv_cmpr_pe_batched,
+            rows,
+            1,
+            kv_lora + qk_rope,
+            kv_lora,
+            0,
+        )?;
 
         match &cfg.yarn {
-            Some(yarn) => self.rope_norm_yarn_batch(m, yarn, &mut k_pe_batched, 1, qk_rope, qk_rope, start_pos, rows, cfg.rope_base)?,
-            None => self.rope_norm_batch(m, &mut k_pe_batched, 1, qk_rope, qk_rope, start_pos, rows, cfg.rope_base)?,
+            Some(yarn) => self.rope_norm_yarn_batch(
+                m,
+                yarn,
+                &mut k_pe_batched,
+                1,
+                qk_rope,
+                qk_rope,
+                start_pos,
+                rows,
+                cfg.rope_base,
+            )?,
+            None => self.rope_norm_batch(
+                m,
+                &mut k_pe_batched,
+                1,
+                qk_rope,
+                qk_rope,
+                start_pos,
+                rows,
+                cfg.rope_base,
+            )?,
         }
 
-        let kv_cmpr_normed_batched = self.rmsnorm(&kv_cmpr_batched, &w.attn_kv_a_norm.data, rows, kv_lora, cfg.rmsnorm_eps)?;
+        let kv_cmpr_normed_batched = self.rmsnorm(
+            &kv_cmpr_batched,
+            &w.attn_kv_a_norm.data,
+            rows,
+            kv_lora,
+            cfg.rmsnorm_eps,
+        )?;
 
         // Extract q_pe (all heads, all rows) into its own contiguous
         // [rows, n_head, qk_rope] buffer before RoPE -- q_pe is a strided sub-slice
         // of each head's [n_embd_head_k_mla]-wide row in q_batched, not itself
         // contiguous across heads.
-        let mut q_pe_batched = self.mla_extract_batch(m, &q_batched, rows, n_head, n_embd_head_k_mla, qk_rope, qk_nope)?;
+        let mut q_pe_batched = self.mla_extract_batch(
+            m,
+            &q_batched,
+            rows,
+            n_head,
+            n_embd_head_k_mla,
+            qk_rope,
+            qk_nope,
+        )?;
         match &cfg.yarn {
-            Some(yarn) => {
-                self.rope_norm_yarn_batch(m, yarn, &mut q_pe_batched, n_head, qk_rope, qk_rope, start_pos, rows, cfg.rope_base)?
-            }
-            None => self.rope_norm_batch(m, &mut q_pe_batched, n_head, qk_rope, qk_rope, start_pos, rows, cfg.rope_base)?,
+            Some(yarn) => self.rope_norm_yarn_batch(
+                m,
+                yarn,
+                &mut q_pe_batched,
+                n_head,
+                qk_rope,
+                qk_rope,
+                start_pos,
+                rows,
+                cfg.rope_base,
+            )?,
+            None => self.rope_norm_batch(
+                m,
+                &mut q_pe_batched,
+                n_head,
+                qk_rope,
+                qk_rope,
+                start_pos,
+                rows,
+                cfg.rope_base,
+            )?,
         }
 
         // Absorption: q_nope (read directly out of q_batched via strides -- no
@@ -4199,10 +5845,27 @@ impl Model {
 
         // Qcur = absorbed (nope, now in compressed kv_lora space) ++ q_pe (roped),
         // per head, per row.
-        let qcur_batched = self.mla_concat_qcur_batch(m, &absorbed_batched, &q_pe_batched, rows, n_head, kv_lora, qk_rope)?;
+        let qcur_batched = self.mla_concat_qcur_batch(
+            m,
+            &absorbed_batched,
+            &q_pe_batched,
+            rows,
+            n_head,
+            kv_lora,
+            qk_rope,
+        )?;
 
         // Write this batch's compressed Kcur into the preallocated per-layer cache.
-        self.mla_write_kv_cache_batch(m, kv_cache, &kv_cmpr_normed_batched, &k_pe_batched, start_pos, rows, kv_lora, qk_rope)?;
+        self.mla_write_kv_cache_batch(
+            m,
+            kv_cache,
+            &kv_cmpr_normed_batched,
+            &k_pe_batched,
+            start_pos,
+            rows,
+            kv_lora,
+            qk_rope,
+        )?;
         let seq_len = start_pos + rows;
 
         let kv_view = kv_cache.slice(0..seq_len * qk_dim);
@@ -4210,12 +5873,30 @@ impl Model {
             Some(yarn) => yarn.attention_scale,
             None => 1.0 / (n_embd_head_k_mla as f32).sqrt(),
         };
-        let compressed_out_batched = self.mla_attention_prefill(m, &qcur_batched, &kv_view, n_head, qk_dim, v_dim, start_pos, rows, scale)?;
+        let compressed_out_batched = self.mla_attention_prefill(
+            m,
+            &qcur_batched,
+            &kv_view,
+            n_head,
+            qk_dim,
+            v_dim,
+            start_pos,
+            rows,
+            scale,
+        )?;
 
         // Decompression: already-contiguous [rows, n_head, v_dim] input, standard
         // strides.
-        let decompressed_batched =
-            self.gemv_per_head_batch(m, &compressed_out_batched, &w.wv_b, rows, n_head, n_head * v_dim, v_dim, 0)?;
+        let decompressed_batched = self.gemv_per_head_batch(
+            m,
+            &compressed_out_batched,
+            &w.wv_b,
+            rows,
+            n_head,
+            n_head * v_dim,
+            v_dim,
+            0,
+        )?;
 
         let o_proj = self.gemm(&decompressed_batched, &w.wo, rows)?;
         self.add_inplace(&mut hidden, &o_proj)?;
@@ -4240,7 +5921,8 @@ impl Model {
         rows: usize,
         kv_cache: &mut CudaSlice<f32>,
     ) -> Result<CudaSlice<f32>, String> {
-        let post_attn = self.forward_mla_attn_block_batched(m, layer, hidden, start_pos, rows, kv_cache)?;
+        let post_attn =
+            self.forward_mla_attn_block_batched(m, layer, hidden, start_pos, rows, kv_cache)?;
 
         let cfg = &m.cfg;
         let hidden_size = cfg.hidden_size;
@@ -4248,11 +5930,26 @@ impl Model {
         let eps = cfg.rmsnorm_eps;
 
         match &layer.ffn {
-            MlaFfn::Dense { ffn_gate, ffn_up, ffn_down } => {
-                self.forward_hybrid_ffn_batched(post_attn, &layer.ffn_norm, ffn_gate, ffn_up, ffn_down, hidden_size, ffn_hidden_size, rows, eps)
-            }
+            MlaFfn::Dense {
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+            } => self.forward_hybrid_ffn_batched(
+                post_attn,
+                &layer.ffn_norm,
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+                hidden_size,
+                ffn_hidden_size,
+                rows,
+                eps,
+            ),
             MlaFfn::Moe { .. } => {
-                let moe_cfg = cfg.moe.as_ref().ok_or("internal error: MlaFfn::Moe layer but MlaConfig::moe is None")?;
+                let moe_cfg = cfg
+                    .moe
+                    .as_ref()
+                    .ok_or("internal error: MlaFfn::Moe layer but MlaConfig::moe is None")?;
                 self.forward_mla_moe_ffn_batched(layer, post_attn, hidden_size, rows, moe_cfg, eps)
             }
         }
@@ -4261,8 +5958,13 @@ impl Model {
     /// Hybrid-model counterpart to [`Self::forward_prompt`]: thin wrapper
     /// over [`Self::generate_hybrid_impl`] with no import and exactly one
     /// generated token.
-    fn forward_prompt_hybrid(&self, h: &HybridModel, prompt: &str) -> Result<(u32, String), String> {
-        let (generated, text, _states, _seq_len) = self.generate_hybrid_impl(h, prompt, None, 1, |_logits| {})?;
+    fn forward_prompt_hybrid(
+        &self,
+        h: &HybridModel,
+        prompt: &str,
+    ) -> Result<(u32, String), String> {
+        let (generated, text, _states, _seq_len) =
+            self.generate_hybrid_impl(h, prompt, None, 1, |_logits| {})?;
         Ok((generated[0], text))
     }
 
@@ -4282,15 +5984,25 @@ impl Model {
         extra_headroom: usize,
     ) -> Result<Vec<HybridLayerState>, String> {
         if let Some(cache) = imported {
-            if cache.attn_num_kv_heads != h.attn_cfg.num_kv_heads || cache.attn_head_dim != h.attn_cfg.head_dim {
-                return Err("imported hybrid KV cache's GatedAttention shape doesn't match this model".to_string());
+            if cache.attn_num_kv_heads != h.attn_cfg.num_kv_heads
+                || cache.attn_head_dim != h.attn_cfg.head_dim
+            {
+                return Err(
+                    "imported hybrid KV cache's GatedAttention shape doesn't match this model"
+                        .to_string(),
+                );
             }
             if cache.layers.len() != h.layers.len() {
-                return Err(format!("imported hybrid KV cache has {} layers, model has {}", cache.layers.len(), h.layers.len()));
+                return Err(format!(
+                    "imported hybrid KV cache has {} layers, model has {}",
+                    cache.layers.len(),
+                    h.layers.len()
+                ));
             }
         }
 
-        let attn_kv_cache_len = (start_pos + rows + extra_headroom) * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
+        let attn_kv_cache_len =
+            (start_pos + rows + extra_headroom) * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
         h.layers
             .iter()
             .enumerate()
@@ -4349,7 +6061,7 @@ impl Model {
         prompt: &str,
         imported: Option<&crate::kv_io::HybridKvCache>,
         extra_headroom: usize,
-    ) -> Result<(Vec<u32>, CudaSlice<f32>, Vec<HybridLayerState>, usize), String> {
+    ) -> Result<HybridPrefillResult, String> {
         let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
 
         let mut ids = self.tokenizer.encode(prompt)?;
@@ -4364,7 +6076,8 @@ impl Model {
             return Err("encode produced no tokens".to_string());
         }
 
-        let mut states = self.alloc_hybrid_states(h, imported, start_pos, ids.len(), extra_headroom)?;
+        let mut states =
+            self.alloc_hybrid_states(h, imported, start_pos, ids.len(), extra_headroom)?;
 
         let mut position = start_pos;
         let mut hidden_dev: Option<CudaSlice<f32>> = None;
@@ -4391,7 +6104,7 @@ impl Model {
         prompt: &str,
         imported: Option<&crate::kv_io::HybridKvCache>,
         extra_headroom: usize,
-    ) -> Result<(Vec<u32>, CudaSlice<f32>, Vec<HybridLayerState>, usize), String> {
+    ) -> Result<HybridPrefillResult, String> {
         let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
 
         let mut ids = self.tokenizer.encode(prompt)?;
@@ -4416,7 +6129,10 @@ impl Model {
             host_embd[row * hidden_size..(row + 1) * hidden_size]
                 .copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
         }
-        let mut hidden = self.device.htod_sync_copy(&host_embd).map_err(|e| format!("embedding htod: {e}"))?;
+        let mut hidden = self
+            .device
+            .htod_sync_copy(&host_embd)
+            .map_err(|e| format!("embedding htod: {e}"))?;
 
         for (layer, state) in h.layers.iter().zip(states.iter_mut()) {
             hidden = self.forward_hybrid_layer_batched(h, layer, hidden, start_pos, rows, state)?;
@@ -4441,12 +6157,13 @@ impl Model {
         imported: Option<&crate::kv_io::HybridKvCache>,
         max_new_tokens: usize,
         mut on_first_token: impl FnMut(&[f32]),
-    ) -> Result<(Vec<u32>, String, Vec<HybridLayerState>, usize), String> {
+    ) -> Result<HybridGenerateResult, String> {
         if max_new_tokens == 0 {
             return Err("max_new_tokens must be at least 1".to_string());
         }
 
-        let (ids, hidden_batched, mut states, mut position) = self.prefill_hybrid_batched(h, prompt, imported, max_new_tokens)?;
+        let (ids, hidden_batched, mut states, mut position) =
+            self.prefill_hybrid_batched(h, prompt, imported, max_new_tokens)?;
         let hidden_size = h.attn_cfg.hidden_size;
         let eps = h.attn_cfg.rmsnorm_eps;
         let mut hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
@@ -4470,7 +6187,13 @@ impl Model {
 
     /// Embeds `token_id` and runs it through every hybrid layer at absolute
     /// `position`, dispatching each layer to its mixer/state pair.
-    fn forward_one_token_hybrid(&self, h: &HybridModel, token_id: u32, position: usize, states: &mut [HybridLayerState]) -> Result<CudaSlice<f32>, String> {
+    fn forward_one_token_hybrid(
+        &self,
+        h: &HybridModel,
+        token_id: u32,
+        position: usize,
+        states: &mut [HybridLayerState],
+    ) -> Result<CudaSlice<f32>, String> {
         let hidden_size = h.attn_cfg.hidden_size;
         let ffn_hidden_size = h.attn_cfg.ffn_hidden_size;
         let eps = h.attn_cfg.rmsnorm_eps;
@@ -4482,13 +6205,41 @@ impl Model {
 
         for (layer, state) in h.layers.iter().zip(states.iter_mut()) {
             hidden = match (layer, state) {
-                (HybridLayerWeights::GatedAttention(w), HybridLayerState::Attn { k_cache, v_cache }) => {
-                    let post_mixer = self.forward_gated_attn_mixer(h, w, hidden, position, k_cache, v_cache)?;
-                    self.forward_hybrid_ffn(post_mixer, &w.post_attn_norm, &w.ffn_gate, &w.ffn_up, &w.ffn_down, hidden_size, ffn_hidden_size, eps)?
+                (
+                    HybridLayerWeights::GatedAttention(w),
+                    HybridLayerState::Attn { k_cache, v_cache },
+                ) => {
+                    let post_mixer =
+                        self.forward_gated_attn_mixer(h, w, hidden, position, k_cache, v_cache)?;
+                    self.forward_hybrid_ffn(
+                        post_mixer,
+                        &w.post_attn_norm,
+                        &w.ffn_gate,
+                        &w.ffn_up,
+                        &w.ffn_down,
+                        hidden_size,
+                        ffn_hidden_size,
+                        eps,
+                    )?
                 }
-                (HybridLayerWeights::GatedDeltaNet(w), HybridLayerState::Gdn { conv_state, recurrent }) => {
+                (
+                    HybridLayerWeights::GatedDeltaNet(w),
+                    HybridLayerState::Gdn {
+                        conv_state,
+                        recurrent,
+                    },
+                ) => {
                     let post_mixer = self.forward_gdn_mixer(h, w, hidden, conv_state, recurrent)?;
-                    self.forward_hybrid_ffn(post_mixer, &w.post_attn_norm, &w.ffn_gate, &w.ffn_up, &w.ffn_down, hidden_size, ffn_hidden_size, eps)?
+                    self.forward_hybrid_ffn(
+                        post_mixer,
+                        &w.post_attn_norm,
+                        &w.ffn_gate,
+                        &w.ffn_up,
+                        &w.ffn_down,
+                        hidden_size,
+                        ffn_hidden_size,
+                        eps,
+                    )?
                 }
                 _ => return Err("internal error: hybrid layer/state kind mismatch".to_string()),
             };
@@ -4501,23 +6252,51 @@ impl Model {
     /// downloads every layer's state (attn `k_cache`/`v_cache` sliced to
     /// exactly the positions written; GDN `conv_state`/`recurrent` in full,
     /// since they're already fixed-size) to host memory for `--export-kv`.
-    pub fn forward_prompt_capture_kv_hybrid(&self, prompt: &str) -> Result<((u32, String), crate::kv_io::HybridKvCache), String> {
-        let h = self.hybrid.as_ref().ok_or("forward_prompt_capture_kv_hybrid called on a non-hybrid model")?;
-        let (generated, text, states, seq_len) = self.generate_hybrid_impl(h, prompt, None, 1, |_logits| {})?;
+    pub fn forward_prompt_capture_kv_hybrid(
+        &self,
+        prompt: &str,
+    ) -> Result<((u32, String), crate::kv_io::HybridKvCache), String> {
+        let h = self
+            .hybrid
+            .as_ref()
+            .ok_or("forward_prompt_capture_kv_hybrid called on a non-hybrid model")?;
+        let (generated, text, states, seq_len) =
+            self.generate_hybrid_impl(h, prompt, None, 1, |_logits| {})?;
 
         let attn_len = seq_len * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
         let mut layers = Vec::with_capacity(states.len());
         for state in &states {
             match state {
                 HybridLayerState::Attn { k_cache, v_cache } => {
-                    let k_host = self.device.dtoh_sync_copy(&k_cache.slice(0..attn_len)).map_err(|e| format!("hybrid k_cache dtoh: {e}"))?;
-                    let v_host = self.device.dtoh_sync_copy(&v_cache.slice(0..attn_len)).map_err(|e| format!("hybrid v_cache dtoh: {e}"))?;
-                    layers.push(crate::kv_io::HybridLayerCacheData::Attn { k_cache: k_host, v_cache: v_host });
+                    let k_host = self
+                        .device
+                        .dtoh_sync_copy(&k_cache.slice(0..attn_len))
+                        .map_err(|e| format!("hybrid k_cache dtoh: {e}"))?;
+                    let v_host = self
+                        .device
+                        .dtoh_sync_copy(&v_cache.slice(0..attn_len))
+                        .map_err(|e| format!("hybrid v_cache dtoh: {e}"))?;
+                    layers.push(crate::kv_io::HybridLayerCacheData::Attn {
+                        k_cache: k_host,
+                        v_cache: v_host,
+                    });
                 }
-                HybridLayerState::Gdn { conv_state, recurrent } => {
-                    let conv_host = self.device.dtoh_sync_copy(conv_state).map_err(|e| format!("gdn conv_state dtoh: {e}"))?;
-                    let rec_host = self.device.dtoh_sync_copy(recurrent).map_err(|e| format!("gdn recurrent dtoh: {e}"))?;
-                    layers.push(crate::kv_io::HybridLayerCacheData::Gdn { conv_state: conv_host, recurrent: rec_host });
+                HybridLayerState::Gdn {
+                    conv_state,
+                    recurrent,
+                } => {
+                    let conv_host = self
+                        .device
+                        .dtoh_sync_copy(conv_state)
+                        .map_err(|e| format!("gdn conv_state dtoh: {e}"))?;
+                    let rec_host = self
+                        .device
+                        .dtoh_sync_copy(recurrent)
+                        .map_err(|e| format!("gdn recurrent dtoh: {e}"))?;
+                    layers.push(crate::kv_io::HybridLayerCacheData::Gdn {
+                        conv_state: conv_host,
+                        recurrent: rec_host,
+                    });
                 }
             }
         }
@@ -4560,7 +6339,15 @@ impl Model {
         moe_cfg: &MlaMoeConfig,
         eps: f32,
     ) -> Result<CudaSlice<f32>, String> {
-        let MlaFfn::Moe { ffn_gate_inp, ffn_gate_exps, ffn_up_exps, ffn_down_exps, ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp } = &layer.ffn
+        let MlaFfn::Moe {
+            ffn_gate_inp,
+            ffn_gate_exps,
+            ffn_up_exps,
+            ffn_down_exps,
+            ffn_gate_shexp,
+            ffn_up_shexp,
+            ffn_down_shexp,
+        } = &layer.ffn
         else {
             return Err("internal error: forward_mla_moe_ffn called on a Dense layer".to_string());
         };
@@ -4568,12 +6355,24 @@ impl Model {
         let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, 1, hidden_size, eps)?;
 
         let router_logits_dev = self.gemv(&ffn_normed, ffn_gate_inp)?;
-        let router_logits = self.device.dtoh_sync_copy(&router_logits_dev).map_err(|e| format!("mla moe router dtoh: {e}"))?;
-        let routed = route_top_k_with_norm(&router_logits, moe_cfg.expert_used_count, moe_cfg.normalize_top_k)?;
+        let router_logits = self
+            .device
+            .dtoh_sync_copy(&router_logits_dev)
+            .map_err(|e| format!("mla moe router dtoh: {e}"))?;
+        let routed = route_top_k_with_norm(
+            &router_logits,
+            moe_cfg.expert_used_count,
+            moe_cfg.normalize_top_k,
+        )?;
 
-        let mut ffn_out_dev =
-            self.device.alloc_zeros::<f32>(hidden_size).map_err(|e| format!("mla moe ffn_out alloc: {e}"))?;
-        let dest_row0 = self.device.htod_sync_copy(&[0u32]).map_err(|e| format!("mla moe dest_row htod: {e}"))?;
+        let mut ffn_out_dev = self
+            .device
+            .alloc_zeros::<f32>(hidden_size)
+            .map_err(|e| format!("mla moe ffn_out alloc: {e}"))?;
+        let dest_row0 = self
+            .device
+            .htod_sync_copy(&[0u32])
+            .map_err(|e| format!("mla moe dest_row htod: {e}"))?;
         for (expert_idx, weight) in routed {
             let gate = self.gemv_expert(&ffn_normed, ffn_gate_exps, expert_idx)?;
             let up = self.gemv_expert(&ffn_normed, ffn_up_exps, expert_idx)?;
@@ -4583,7 +6382,13 @@ impl Model {
                 .device
                 .htod_sync_copy(&[weight * moe_cfg.routed_scaling_factor])
                 .map_err(|e| format!("mla moe weight htod: {e}"))?;
-            self.moe_scatter_add(&down, &dest_row0, &weight_dev, &mut ffn_out_dev, hidden_size)?;
+            self.moe_scatter_add(
+                &down,
+                &dest_row0,
+                &weight_dev,
+                &mut ffn_out_dev,
+                hidden_size,
+            )?;
         }
 
         // Always-on shared expert(s) -- a single fused dense FFN, not gated by the
@@ -4620,9 +6425,19 @@ impl Model {
         moe_cfg: &MlaMoeConfig,
         eps: f32,
     ) -> Result<CudaSlice<f32>, String> {
-        let MlaFfn::Moe { ffn_gate_inp, ffn_gate_exps, ffn_up_exps, ffn_down_exps, ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp } = &layer.ffn
+        let MlaFfn::Moe {
+            ffn_gate_inp,
+            ffn_gate_exps,
+            ffn_up_exps,
+            ffn_down_exps,
+            ffn_gate_shexp,
+            ffn_up_shexp,
+            ffn_down_shexp,
+        } = &layer.ffn
         else {
-            return Err("internal error: forward_mla_moe_ffn_batched called on a Dense layer".to_string());
+            return Err(
+                "internal error: forward_mla_moe_ffn_batched called on a Dense layer".to_string(),
+            );
         };
 
         let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, rows, hidden_size, eps)?;
@@ -4632,11 +6447,15 @@ impl Model {
         let shared_hidden_size = ffn_gate_shexp.shape[1] as usize;
         let shared_gate = self.gemm(&ffn_normed, ffn_gate_shexp, rows)?;
         let shared_up = self.gemm(&ffn_normed, ffn_up_shexp, rows)?;
-        let shared_activated = self.silu_and_mul(&shared_gate, &shared_up, rows * shared_hidden_size)?;
+        let shared_activated =
+            self.silu_and_mul(&shared_gate, &shared_up, rows * shared_hidden_size)?;
         let mut ffn_out = self.gemm(&shared_activated, ffn_down_shexp, rows)?;
 
         let router_logits_dev = self.gemm(&ffn_normed, ffn_gate_inp, rows)?;
-        let router_logits = self.device.dtoh_sync_copy(&router_logits_dev).map_err(|e| format!("mla moe router dtoh: {e}"))?;
+        let router_logits = self
+            .device
+            .dtoh_sync_copy(&router_logits_dev)
+            .map_err(|e| format!("mla moe router dtoh: {e}"))?;
         let num_experts = router_logits.len() / rows;
 
         self.moe_ffn_grouped(
@@ -4662,7 +6481,8 @@ impl Model {
     /// over [`Self::generate_mla_impl`] with no import and exactly one
     /// generated token.
     fn forward_prompt_mla(&self, m: &MlaModel, prompt: &str) -> Result<(u32, String), String> {
-        let (generated, text, _kv_caches, _seq_len) = self.generate_mla_impl(m, prompt, None, 1, |_logits| {})?;
+        let (generated, text, _kv_caches, _seq_len) =
+            self.generate_mla_impl(m, prompt, None, 1, |_logits| {})?;
         Ok((generated[0], text))
     }
 
@@ -4695,12 +6515,18 @@ impl Model {
                 ));
             }
             if cache.kv_caches.len() != m.layers.len() {
-                return Err(format!("imported KV cache has {} layers, model has {}", cache.kv_caches.len(), m.layers.len()));
+                return Err(format!(
+                    "imported KV cache has {} layers, model has {}",
+                    cache.kv_caches.len(),
+                    m.layers.len()
+                ));
             }
             let imported_len = cache.seq_len * qk_dim;
             for (layer_idx, kv_host) in cache.kv_caches.iter().enumerate() {
                 let mut dst = kv_caches[layer_idx].slice_mut(0..imported_len);
-                self.device.htod_sync_copy_into(kv_host, &mut dst).map_err(|e| format!("import mla kv_cache htod layer {layer_idx}: {e}"))?;
+                self.device
+                    .htod_sync_copy_into(kv_host, &mut dst)
+                    .map_err(|e| format!("import mla kv_cache htod layer {layer_idx}: {e}"))?;
             }
         }
         Ok(kv_caches)
@@ -4721,7 +6547,7 @@ impl Model {
         prompt: &str,
         imported: Option<&crate::kv_io::MlaKvCache>,
         extra_headroom: usize,
-    ) -> Result<(Vec<u32>, CudaSlice<f32>, Vec<CudaSlice<f32>>, usize), String> {
+    ) -> Result<MlaPrefillResult, String> {
         let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
 
         let mut ids = self.tokenizer.encode(prompt)?;
@@ -4736,7 +6562,8 @@ impl Model {
             return Err("encode produced no tokens".to_string());
         }
 
-        let mut kv_caches = self.alloc_mla_kv_caches(m, imported, start_pos, ids.len(), extra_headroom)?;
+        let mut kv_caches =
+            self.alloc_mla_kv_caches(m, imported, start_pos, ids.len(), extra_headroom)?;
 
         let mut position = start_pos;
         let mut hidden_dev: Option<CudaSlice<f32>> = None;
@@ -4763,7 +6590,7 @@ impl Model {
         prompt: &str,
         imported: Option<&crate::kv_io::MlaKvCache>,
         extra_headroom: usize,
-    ) -> Result<(Vec<u32>, CudaSlice<f32>, Vec<CudaSlice<f32>>, usize), String> {
+    ) -> Result<MlaPrefillResult, String> {
         let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
 
         let mut ids = self.tokenizer.encode(prompt)?;
@@ -4779,7 +6606,8 @@ impl Model {
         }
         let rows = ids.len();
 
-        let mut kv_caches = self.alloc_mla_kv_caches(m, imported, start_pos, rows, extra_headroom)?;
+        let mut kv_caches =
+            self.alloc_mla_kv_caches(m, imported, start_pos, rows, extra_headroom)?;
 
         let hidden_size = m.cfg.hidden_size;
         let mut host_embd = vec![0.0f32; rows * hidden_size];
@@ -4788,10 +6616,20 @@ impl Model {
             host_embd[row * hidden_size..(row + 1) * hidden_size]
                 .copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
         }
-        let mut hidden = self.device.htod_sync_copy(&host_embd).map_err(|e| format!("embedding htod: {e}"))?;
+        let mut hidden = self
+            .device
+            .htod_sync_copy(&host_embd)
+            .map_err(|e| format!("embedding htod: {e}"))?;
 
         for (layer_idx, layer) in m.layers.iter().enumerate() {
-            hidden = self.forward_mla_layer_batched(m, layer, hidden, start_pos, rows, &mut kv_caches[layer_idx])?;
+            hidden = self.forward_mla_layer_batched(
+                m,
+                layer,
+                hidden,
+                start_pos,
+                rows,
+                &mut kv_caches[layer_idx],
+            )?;
         }
 
         Ok((ids, hidden, kv_caches, start_pos + rows))
@@ -4816,12 +6654,13 @@ impl Model {
         imported: Option<&crate::kv_io::MlaKvCache>,
         max_new_tokens: usize,
         mut on_first_token: impl FnMut(&[f32]),
-    ) -> Result<(Vec<u32>, String, Vec<CudaSlice<f32>>, usize), String> {
+    ) -> Result<MlaGenerateResult, String> {
         if max_new_tokens == 0 {
             return Err("max_new_tokens must be at least 1".to_string());
         }
 
-        let (ids, hidden_batched, mut kv_caches, mut position) = self.prefill_mla_batched(m, prompt, imported, max_new_tokens)?;
+        let (ids, hidden_batched, mut kv_caches, mut position) =
+            self.prefill_mla_batched(m, prompt, imported, max_new_tokens)?;
         let hidden_size = m.cfg.hidden_size;
         let eps = m.cfg.rmsnorm_eps;
         let mut hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
@@ -4846,7 +6685,13 @@ impl Model {
     /// Embeds `token_id` and runs it through every MLA layer at absolute
     /// `position`, writing this position's compressed `Kcur` into
     /// `kv_caches` (preallocated device buffers, see `generate_mla_impl`).
-    fn forward_one_token_mla(&self, m: &MlaModel, token_id: u32, position: usize, kv_caches: &mut [CudaSlice<f32>]) -> Result<CudaSlice<f32>, String> {
+    fn forward_one_token_mla(
+        &self,
+        m: &MlaModel,
+        token_id: u32,
+        position: usize,
+        kv_caches: &mut [CudaSlice<f32>],
+    ) -> Result<CudaSlice<f32>, String> {
         let cfg = &m.cfg;
         let hidden_size = cfg.hidden_size;
         let ffn_hidden_size = cfg.ffn_hidden_size;
@@ -4858,13 +6703,28 @@ impl Model {
             .map_err(|e| format!("embedding htod: {e}"))?;
 
         for (layer_idx, layer) in m.layers.iter().enumerate() {
-            let post_attn = self.forward_mla_attn_block(m, layer, hidden, position, &mut kv_caches[layer_idx])?;
+            let post_attn =
+                self.forward_mla_attn_block(m, layer, hidden, position, &mut kv_caches[layer_idx])?;
             hidden = match &layer.ffn {
-                MlaFfn::Dense { ffn_gate, ffn_up, ffn_down } => {
-                    self.forward_hybrid_ffn(post_attn, &layer.ffn_norm, ffn_gate, ffn_up, ffn_down, hidden_size, ffn_hidden_size, eps)?
-                }
+                MlaFfn::Dense {
+                    ffn_gate,
+                    ffn_up,
+                    ffn_down,
+                } => self.forward_hybrid_ffn(
+                    post_attn,
+                    &layer.ffn_norm,
+                    ffn_gate,
+                    ffn_up,
+                    ffn_down,
+                    hidden_size,
+                    ffn_hidden_size,
+                    eps,
+                )?,
                 MlaFfn::Moe { .. } => {
-                    let moe_cfg = cfg.moe.as_ref().ok_or("internal error: MlaFfn::Moe layer but MlaConfig::moe is None")?;
+                    let moe_cfg = cfg
+                        .moe
+                        .as_ref()
+                        .ok_or("internal error: MlaFfn::Moe layer but MlaConfig::moe is None")?;
                     self.forward_mla_moe_ffn(layer, post_attn, hidden_size, moe_cfg, eps)?
                 }
             };
@@ -4878,18 +6738,33 @@ impl Model {
     /// single compressed `kv_cache` (sliced to exactly the positions
     /// actually written -- `generate_mla_impl`'s buffers carry extra
     /// headroom this capture doesn't use) to host memory for `--export-kv`.
-    pub fn forward_prompt_capture_kv_mla(&self, prompt: &str) -> Result<((u32, String), crate::kv_io::MlaKvCache), String> {
-        let m = self.mla.as_ref().ok_or("forward_prompt_capture_kv_mla called on a non-MLA model")?;
-        let (generated, text, kv_caches, seq_len) = self.generate_mla_impl(m, prompt, None, 1, |_logits| {})?;
+    pub fn forward_prompt_capture_kv_mla(
+        &self,
+        prompt: &str,
+    ) -> Result<((u32, String), crate::kv_io::MlaKvCache), String> {
+        let m = self
+            .mla
+            .as_ref()
+            .ok_or("forward_prompt_capture_kv_mla called on a non-MLA model")?;
+        let (generated, text, kv_caches, seq_len) =
+            self.generate_mla_impl(m, prompt, None, 1, |_logits| {})?;
 
         let qk_dim = m.cfg.kv_lora_rank + m.cfg.qk_rope_head_dim;
         let per_layer_len = seq_len * qk_dim;
         let kv_caches = kv_caches
             .iter()
-            .map(|c| self.device.dtoh_sync_copy(&c.slice(0..per_layer_len)).map_err(|e| format!("mla kv_cache dtoh: {e}")))
+            .map(|c| {
+                self.device
+                    .dtoh_sync_copy(&c.slice(0..per_layer_len))
+                    .map_err(|e| format!("mla kv_cache dtoh: {e}"))
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let cache = crate::kv_io::MlaKvCache { seq_len, qk_dim, kv_caches };
+        let cache = crate::kv_io::MlaKvCache {
+            seq_len,
+            qk_dim,
+            kv_caches,
+        };
         Ok(((generated[0], text), cache))
     }
 }
@@ -4925,10 +6800,18 @@ mod moe_fixture_tests {
     fn qwen3moe_fixture_has_excluding_topk_and_qk_norm() {
         let file = GgufFile::open(QWEN3MOE_FIXTURE).expect("failed to open qwen3moe fixture");
 
-        let architecture = file.metadata.get("general.architecture").and_then(GgufValue::as_str).unwrap_or("");
-        assert_eq!(architecture, "qwen3moe", "fixture should report the real qwen3moe architecture string");
+        let architecture = file
+            .metadata
+            .get("general.architecture")
+            .and_then(GgufValue::as_str)
+            .unwrap_or("");
+        assert_eq!(
+            architecture, "qwen3moe",
+            "fixture should report the real qwen3moe architecture string"
+        );
 
-        let (_, block_count, moe) = parse_model_config(&file).expect("parse_model_config failed on qwen3moe fixture");
+        let (_, block_count, moe) =
+            parse_model_config(&file).expect("parse_model_config failed on qwen3moe fixture");
         let moe = moe.expect("fixture should be detected as an MoE architecture");
         assert_eq!(moe.expert_count, 8);
         assert_eq!(moe.expert_used_count, 2);
@@ -4962,7 +6845,9 @@ mod moe_fixture_tests {
         let file = GgufFile::open(QWEN3MOE_FIXTURE).expect("failed to open qwen3moe fixture");
         let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
         let model = Model::load(device, &file).expect("failed to load qwen3moe fixture");
-        let (tokens, _text) = model.generate("Once upon a time", 5, None, |_logits| {}).expect("generate failed");
+        let (tokens, _text) = model
+            .generate("Once upon a time", 5, None, |_logits| {})
+            .expect("generate failed");
         assert!(!tokens.is_empty(), "expected at least one generated token");
     }
 }
@@ -4988,35 +6873,62 @@ mod prefill_batching_tests {
     #[test]
     #[ignore]
     fn prefill_dense_batched_matches_sequential_prefill() {
-        let gguf_path = std::env::var("REFLEX_TEST_GGUF").expect("set REFLEX_TEST_GGUF to a real local GGUF path to run this test");
+        let gguf_path = std::env::var("REFLEX_TEST_GGUF")
+            .expect("set REFLEX_TEST_GGUF to a real local GGUF path to run this test");
         let prompt = "The capital of France is";
 
         let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
         let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
         let model = Model::load(device, &file).expect("failed to load model");
 
-        let (seq_ids, seq_hidden, _, _, seq_position) =
-            model.prefill_dense(prompt, None, 0).expect("prefill_dense failed");
-        let (batch_ids, batch_hidden, _, _, batch_position) =
-            model.prefill_dense_batched(prompt, None, 0).expect("prefill_dense_batched failed");
+        let (seq_ids, seq_hidden, _, _, seq_position) = model
+            .prefill_dense(prompt, None, 0)
+            .expect("prefill_dense failed");
+        let (batch_ids, batch_hidden, _, _, batch_position) = model
+            .prefill_dense_batched(prompt, None, 0)
+            .expect("prefill_dense_batched failed");
 
-        assert_eq!(seq_ids, batch_ids, "tokenization must match between the two prefill paths");
-        assert_eq!(seq_position, batch_position, "final position must match between the two prefill paths");
+        assert_eq!(
+            seq_ids, batch_ids,
+            "tokenization must match between the two prefill paths"
+        );
+        assert_eq!(
+            seq_position, batch_position,
+            "final position must match between the two prefill paths"
+        );
 
         let rows = batch_ids.len();
         let hidden_size = model.cfg.hidden_size;
-        let batch_last_row = model.last_row(&batch_hidden, rows, hidden_size).expect("last_row failed");
+        let batch_last_row = model
+            .last_row(&batch_hidden, rows, hidden_size)
+            .expect("last_row failed");
 
-        let seq_host = model.device.dtoh_sync_copy(&seq_hidden).expect("seq hidden dtoh failed");
-        let batch_host = model.device.dtoh_sync_copy(&batch_last_row).expect("batch hidden dtoh failed");
+        let seq_host = model
+            .device
+            .dtoh_sync_copy(&seq_hidden)
+            .expect("seq hidden dtoh failed");
+        let batch_host = model
+            .device
+            .dtoh_sync_copy(&batch_last_row)
+            .expect("batch hidden dtoh failed");
         assert_eq!(seq_host.len(), batch_host.len());
         for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-3, "hidden[{i}]: sequential={a}, batched={b}");
+            assert!(
+                (a - b).abs() < 1e-3,
+                "hidden[{i}]: sequential={a}, batched={b}"
+            );
         }
 
-        let seq_argmax = model.lm_head_argmax(&seq_hidden, hidden_size, model.cfg.rmsnorm_eps).expect("seq argmax failed");
-        let batch_argmax = model.lm_head_argmax(&batch_last_row, hidden_size, model.cfg.rmsnorm_eps).expect("batch argmax failed");
-        assert_eq!(seq_argmax, batch_argmax, "greedy-argmax next token must match between the two prefill paths");
+        let seq_argmax = model
+            .lm_head_argmax(&seq_hidden, hidden_size, model.cfg.rmsnorm_eps)
+            .expect("seq argmax failed");
+        let batch_argmax = model
+            .lm_head_argmax(&batch_last_row, hidden_size, model.cfg.rmsnorm_eps)
+            .expect("batch argmax failed");
+        assert_eq!(
+            seq_argmax, batch_argmax,
+            "greedy-argmax next token must match between the two prefill paths"
+        );
     }
 }
 
@@ -5039,8 +6951,9 @@ mod hybrid_batching_tests {
     #[test]
     #[ignore]
     fn prefill_hybrid_batched_matches_sequential() {
-        let gguf_path = std::env::var("REFLEX_TEST_GGUF")
-            .expect("set REFLEX_TEST_GGUF to a real local Qwen3.5 hybrid GGUF path to run this test");
+        let gguf_path = std::env::var("REFLEX_TEST_GGUF").expect(
+            "set REFLEX_TEST_GGUF to a real local Qwen3.5 hybrid GGUF path to run this test",
+        );
         let prompt = "The capital of France is";
 
         let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
@@ -5048,28 +6961,55 @@ mod hybrid_batching_tests {
         let model = Model::load_hybrid(device, &file).expect("failed to load hybrid model");
         let h = model.hybrid.as_ref().expect("loaded model is not hybrid");
 
-        let (seq_ids, seq_hidden, _, seq_position) = model.prefill_hybrid(h, prompt, None, 0).expect("prefill_hybrid failed");
-        let (batch_ids, batch_hidden, _, batch_position) =
-            model.prefill_hybrid_batched(h, prompt, None, 0).expect("prefill_hybrid_batched failed");
+        let (seq_ids, seq_hidden, _, seq_position) = model
+            .prefill_hybrid(h, prompt, None, 0)
+            .expect("prefill_hybrid failed");
+        let (batch_ids, batch_hidden, _, batch_position) = model
+            .prefill_hybrid_batched(h, prompt, None, 0)
+            .expect("prefill_hybrid_batched failed");
 
-        assert_eq!(seq_ids, batch_ids, "tokenization must match between the two prefill paths");
-        assert_eq!(seq_position, batch_position, "final position must match between the two prefill paths");
+        assert_eq!(
+            seq_ids, batch_ids,
+            "tokenization must match between the two prefill paths"
+        );
+        assert_eq!(
+            seq_position, batch_position,
+            "final position must match between the two prefill paths"
+        );
 
         let rows = batch_ids.len();
         let hidden_size = h.attn_cfg.hidden_size;
-        let batch_last_row = model.last_row(&batch_hidden, rows, hidden_size).expect("last_row failed");
+        let batch_last_row = model
+            .last_row(&batch_hidden, rows, hidden_size)
+            .expect("last_row failed");
 
-        let seq_host = model.device.dtoh_sync_copy(&seq_hidden).expect("seq hidden dtoh failed");
-        let batch_host = model.device.dtoh_sync_copy(&batch_last_row).expect("batch hidden dtoh failed");
+        let seq_host = model
+            .device
+            .dtoh_sync_copy(&seq_hidden)
+            .expect("seq hidden dtoh failed");
+        let batch_host = model
+            .device
+            .dtoh_sync_copy(&batch_last_row)
+            .expect("batch hidden dtoh failed");
         assert_eq!(seq_host.len(), batch_host.len());
         for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-3, "hidden[{i}]: sequential={a}, batched={b}");
+            assert!(
+                (a - b).abs() < 1e-3,
+                "hidden[{i}]: sequential={a}, batched={b}"
+            );
         }
 
         let eps = h.attn_cfg.rmsnorm_eps;
-        let seq_argmax = model.lm_head_argmax(&seq_hidden, hidden_size, eps).expect("seq argmax failed");
-        let batch_argmax = model.lm_head_argmax(&batch_last_row, hidden_size, eps).expect("batch argmax failed");
-        assert_eq!(seq_argmax, batch_argmax, "greedy-argmax next token must match between the two prefill paths");
+        let seq_argmax = model
+            .lm_head_argmax(&seq_hidden, hidden_size, eps)
+            .expect("seq argmax failed");
+        let batch_argmax = model
+            .lm_head_argmax(&batch_last_row, hidden_size, eps)
+            .expect("batch argmax failed");
+        assert_eq!(
+            seq_argmax, batch_argmax,
+            "greedy-argmax next token must match between the two prefill paths"
+        );
     }
 }
 
@@ -5104,19 +7044,41 @@ mod mla_batching_tests {
         let n_head = m.cfg.num_heads;
         let in_features = m.cfg.qk_nope_head_dim;
 
-        let host_x: Vec<f32> = (0..n_head * in_features).map(|i| (i as f32) * 0.01 - 0.5).collect();
+        let host_x: Vec<f32> = (0..n_head * in_features)
+            .map(|i| (i as f32) * 0.01 - 0.5)
+            .collect();
         let x = model.device.htod_sync_copy(&host_x).expect("x htod failed");
 
-        let single = model.gemv_per_head(&x, &layer.wk_b, n_head).expect("gemv_per_head failed");
+        let single = model
+            .gemv_per_head(&x, &layer.wk_b, n_head)
+            .expect("gemv_per_head failed");
         let batched = model
-            .gemv_per_head_batch(m, &x, &layer.wk_b, 1, n_head, n_head * in_features, in_features, 0)
+            .gemv_per_head_batch(
+                m,
+                &x,
+                &layer.wk_b,
+                1,
+                n_head,
+                n_head * in_features,
+                in_features,
+                0,
+            )
             .expect("gemv_per_head_batch failed");
 
-        let single_host = model.device.dtoh_sync_copy(&single).expect("single dtoh failed");
-        let batched_host = model.device.dtoh_sync_copy(&batched).expect("batched dtoh failed");
+        let single_host = model
+            .device
+            .dtoh_sync_copy(&single)
+            .expect("single dtoh failed");
+        let batched_host = model
+            .device
+            .dtoh_sync_copy(&batched)
+            .expect("batched dtoh failed");
         assert_eq!(single_host.len(), batched_host.len());
         for (i, (a, b)) in single_host.iter().zip(batched_host.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-4, "out[{i}]: gemv_per_head={a}, gemv_per_head_batch={b}");
+            assert!(
+                (a - b).abs() < 1e-4,
+                "out[{i}]: gemv_per_head={a}, gemv_per_head_batch={b}"
+            );
         }
     }
 
@@ -5144,28 +7106,55 @@ mod mla_batching_tests {
         let model = Model::load(device, &file).expect("failed to load MLA model");
         let m = model.mla.as_ref().expect("loaded model is not MLA");
 
-        let (seq_ids, seq_hidden, _, seq_position) = model.prefill_mla(m, prompt, None, 0).expect("prefill_mla failed");
-        let (batch_ids, batch_hidden, _, batch_position) =
-            model.prefill_mla_batched(m, prompt, None, 0).expect("prefill_mla_batched failed");
+        let (seq_ids, seq_hidden, _, seq_position) = model
+            .prefill_mla(m, prompt, None, 0)
+            .expect("prefill_mla failed");
+        let (batch_ids, batch_hidden, _, batch_position) = model
+            .prefill_mla_batched(m, prompt, None, 0)
+            .expect("prefill_mla_batched failed");
 
-        assert_eq!(seq_ids, batch_ids, "tokenization must match between the two prefill paths");
-        assert_eq!(seq_position, batch_position, "final position must match between the two prefill paths");
+        assert_eq!(
+            seq_ids, batch_ids,
+            "tokenization must match between the two prefill paths"
+        );
+        assert_eq!(
+            seq_position, batch_position,
+            "final position must match between the two prefill paths"
+        );
 
         let rows = batch_ids.len();
         let hidden_size = m.cfg.hidden_size;
-        let batch_last_row = model.last_row(&batch_hidden, rows, hidden_size).expect("last_row failed");
+        let batch_last_row = model
+            .last_row(&batch_hidden, rows, hidden_size)
+            .expect("last_row failed");
 
-        let seq_host = model.device.dtoh_sync_copy(&seq_hidden).expect("seq hidden dtoh failed");
-        let batch_host = model.device.dtoh_sync_copy(&batch_last_row).expect("batch hidden dtoh failed");
+        let seq_host = model
+            .device
+            .dtoh_sync_copy(&seq_hidden)
+            .expect("seq hidden dtoh failed");
+        let batch_host = model
+            .device
+            .dtoh_sync_copy(&batch_last_row)
+            .expect("batch hidden dtoh failed");
         assert_eq!(seq_host.len(), batch_host.len());
         for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-3, "hidden[{i}]: sequential={a}, batched={b}");
+            assert!(
+                (a - b).abs() < 1e-3,
+                "hidden[{i}]: sequential={a}, batched={b}"
+            );
         }
 
         let eps = m.cfg.rmsnorm_eps;
-        let seq_argmax = model.lm_head_argmax(&seq_hidden, hidden_size, eps).expect("seq argmax failed");
-        let batch_argmax = model.lm_head_argmax(&batch_last_row, hidden_size, eps).expect("batch argmax failed");
-        assert_eq!(seq_argmax, batch_argmax, "greedy-argmax next token must match between the two prefill paths");
+        let seq_argmax = model
+            .lm_head_argmax(&seq_hidden, hidden_size, eps)
+            .expect("seq argmax failed");
+        let batch_argmax = model
+            .lm_head_argmax(&batch_last_row, hidden_size, eps)
+            .expect("batch argmax failed");
+        assert_eq!(
+            seq_argmax, batch_argmax,
+            "greedy-argmax next token must match between the two prefill paths"
+        );
     }
 
     /// Real-`MlaFfn::Moe` counterpart to `prefill_mla_batched_matches_sequential`
@@ -5195,28 +7184,55 @@ mod mla_batching_tests {
         let m = model.mla.as_ref().expect("loaded model is not MLA");
         assert!(m.cfg.moe.is_some(), "REFLEX_TEST_GGUF must be a real deepseek2 checkpoint with MoE layers, not the dense-lead-only synthetic fixture");
 
-        let (seq_ids, seq_hidden, _, seq_position) = model.prefill_mla(m, prompt, None, 0).expect("prefill_mla failed");
-        let (batch_ids, batch_hidden, _, batch_position) =
-            model.prefill_mla_batched(m, prompt, None, 0).expect("prefill_mla_batched failed");
+        let (seq_ids, seq_hidden, _, seq_position) = model
+            .prefill_mla(m, prompt, None, 0)
+            .expect("prefill_mla failed");
+        let (batch_ids, batch_hidden, _, batch_position) = model
+            .prefill_mla_batched(m, prompt, None, 0)
+            .expect("prefill_mla_batched failed");
 
-        assert_eq!(seq_ids, batch_ids, "tokenization must match between the two prefill paths");
-        assert_eq!(seq_position, batch_position, "final position must match between the two prefill paths");
+        assert_eq!(
+            seq_ids, batch_ids,
+            "tokenization must match between the two prefill paths"
+        );
+        assert_eq!(
+            seq_position, batch_position,
+            "final position must match between the two prefill paths"
+        );
 
         let rows = batch_ids.len();
         let hidden_size = m.cfg.hidden_size;
-        let batch_last_row = model.last_row(&batch_hidden, rows, hidden_size).expect("last_row failed");
+        let batch_last_row = model
+            .last_row(&batch_hidden, rows, hidden_size)
+            .expect("last_row failed");
 
-        let seq_host = model.device.dtoh_sync_copy(&seq_hidden).expect("seq hidden dtoh failed");
-        let batch_host = model.device.dtoh_sync_copy(&batch_last_row).expect("batch hidden dtoh failed");
+        let seq_host = model
+            .device
+            .dtoh_sync_copy(&seq_hidden)
+            .expect("seq hidden dtoh failed");
+        let batch_host = model
+            .device
+            .dtoh_sync_copy(&batch_last_row)
+            .expect("batch hidden dtoh failed");
         assert_eq!(seq_host.len(), batch_host.len());
         for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-3, "hidden[{i}]: sequential={a}, batched={b}");
+            assert!(
+                (a - b).abs() < 1e-3,
+                "hidden[{i}]: sequential={a}, batched={b}"
+            );
         }
 
         let eps = m.cfg.rmsnorm_eps;
-        let seq_argmax = model.lm_head_argmax(&seq_hidden, hidden_size, eps).expect("seq argmax failed");
-        let batch_argmax = model.lm_head_argmax(&batch_last_row, hidden_size, eps).expect("batch argmax failed");
-        assert_eq!(seq_argmax, batch_argmax, "greedy-argmax next token must match between the two prefill paths");
+        let seq_argmax = model
+            .lm_head_argmax(&seq_hidden, hidden_size, eps)
+            .expect("seq argmax failed");
+        let batch_argmax = model
+            .lm_head_argmax(&batch_last_row, hidden_size, eps)
+            .expect("batch argmax failed");
+        assert_eq!(
+            seq_argmax, batch_argmax,
+            "greedy-argmax next token must match between the two prefill paths"
+        );
     }
 
     /// `--import-kv` resume equivalence: captures a short prompt's compressed
@@ -5236,26 +7252,47 @@ mod mla_batching_tests {
         let model = Model::load(device, &file).expect("failed to load MLA model");
         let m = model.mla.as_ref().expect("loaded model is not MLA");
 
-        let (_, cache) = model.forward_prompt_capture_kv_mla("The capital of France is").expect("capture_kv failed");
+        let (_, cache) = model
+            .forward_prompt_capture_kv_mla("The capital of France is")
+            .expect("capture_kv failed");
 
         let continuation = " Paris";
-        let (seq_ids, seq_hidden, _, seq_position) =
-            model.prefill_mla(m, continuation, Some(&cache), 0).expect("prefill_mla resume failed");
-        let (batch_ids, batch_hidden, _, batch_position) =
-            model.prefill_mla_batched(m, continuation, Some(&cache), 0).expect("prefill_mla_batched resume failed");
+        let (seq_ids, seq_hidden, _, seq_position) = model
+            .prefill_mla(m, continuation, Some(&cache), 0)
+            .expect("prefill_mla resume failed");
+        let (batch_ids, batch_hidden, _, batch_position) = model
+            .prefill_mla_batched(m, continuation, Some(&cache), 0)
+            .expect("prefill_mla_batched resume failed");
 
-        assert_eq!(seq_ids, batch_ids, "tokenization must match between the two resumed prefill paths");
-        assert_eq!(seq_position, batch_position, "final position must match between the two resumed prefill paths");
+        assert_eq!(
+            seq_ids, batch_ids,
+            "tokenization must match between the two resumed prefill paths"
+        );
+        assert_eq!(
+            seq_position, batch_position,
+            "final position must match between the two resumed prefill paths"
+        );
 
         let rows = batch_ids.len();
         let hidden_size = m.cfg.hidden_size;
-        let batch_last_row = model.last_row(&batch_hidden, rows, hidden_size).expect("last_row failed");
+        let batch_last_row = model
+            .last_row(&batch_hidden, rows, hidden_size)
+            .expect("last_row failed");
 
-        let seq_host = model.device.dtoh_sync_copy(&seq_hidden).expect("seq hidden dtoh failed");
-        let batch_host = model.device.dtoh_sync_copy(&batch_last_row).expect("batch hidden dtoh failed");
+        let seq_host = model
+            .device
+            .dtoh_sync_copy(&seq_hidden)
+            .expect("seq hidden dtoh failed");
+        let batch_host = model
+            .device
+            .dtoh_sync_copy(&batch_last_row)
+            .expect("batch hidden dtoh failed");
         assert_eq!(seq_host.len(), batch_host.len());
         for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
-            assert!((a - b).abs() < 1e-3, "resumed hidden[{i}]: sequential={a}, batched={b}");
+            assert!(
+                (a - b).abs() < 1e-3,
+                "resumed hidden[{i}]: sequential={a}, batched={b}"
+            );
         }
     }
 }
@@ -5278,13 +7315,24 @@ mod system1_tests {
     #[test]
     #[ignore]
     fn gemv_gather_matches_full_vocab_gemv_at_matching_rows() {
-        let gguf_path = std::env::var("REFLEX_TEST_GGUF").expect("set REFLEX_TEST_GGUF to a real local GGUF path to run this test");
+        let gguf_path = std::env::var("REFLEX_TEST_GGUF")
+            .expect("set REFLEX_TEST_GGUF to a real local GGUF path to run this test");
         let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
         let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
         let model = Model::load(device, &file).expect("failed to load model");
 
-        let (_, hidden, _, _, _) = model.prefill_dense("The capital of France is", None, 0).expect("prefill_dense failed");
-        let normed = model.rmsnorm(&hidden, &model.output_norm.data, 1, model.cfg.hidden_size, model.cfg.rmsnorm_eps).expect("rmsnorm failed");
+        let (_, hidden, _, _, _) = model
+            .prefill_dense("The capital of France is", None, 0)
+            .expect("prefill_dense failed");
+        let normed = model
+            .rmsnorm(
+                &hidden,
+                &model.output_norm.data,
+                1,
+                model.cfg.hidden_size,
+                model.cfg.rmsnorm_eps,
+            )
+            .expect("rmsnorm failed");
 
         let full = model.gemv(&normed, &model.lm_head).expect("gemv failed");
         let full_host = model.device.dtoh_sync_copy(&full).expect("dtoh failed");
@@ -5296,14 +7344,24 @@ mod system1_tests {
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(i, _)| i as u32)
             .expect("full_host must not be empty");
-        let row_indices = [0u32, (vocab_size / 2) as u32, (vocab_size - 1) as u32, argmax_id];
+        let row_indices = [
+            0u32,
+            (vocab_size / 2) as u32,
+            (vocab_size - 1) as u32,
+            argmax_id,
+        ];
 
-        let gathered = model.gemv_gather(&normed, &model.lm_head, &row_indices).expect("gemv_gather failed");
+        let gathered = model
+            .gemv_gather(&normed, &model.lm_head, &row_indices)
+            .expect("gemv_gather failed");
 
         for (j, &row) in row_indices.iter().enumerate() {
             let expected = full_host[row as usize];
             let got = gathered[j];
-            assert!((expected - got).abs() < 1e-4, "row {row}: full_vocab={expected}, gathered={got}");
+            assert!(
+                (expected - got).abs() < 1e-4,
+                "row {row}: full_vocab={expected}, gathered={got}"
+            );
         }
     }
 }

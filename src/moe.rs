@@ -42,24 +42,38 @@ pub fn route_top_k(logits: &[f32], k: usize) -> Result<Vec<(usize, f32)>, String
 /// model's `norm_topk_prob` is truthy, so absence there means "don't
 /// renormalize"). See `crate::model::MlaMoeConfig`'s doc comment for how this
 /// gets threaded from GGUF metadata.
-pub fn route_top_k_with_norm(logits: &[f32], k: usize, normalize: bool) -> Result<Vec<(usize, f32)>, String> {
+pub fn route_top_k_with_norm(
+    logits: &[f32],
+    k: usize,
+    normalize: bool,
+) -> Result<Vec<(usize, f32)>, String> {
     if logits.is_empty() {
         return Err("route_top_k: logits must not be empty".to_string());
     }
     if k == 0 || k > logits.len() {
-        return Err(format!("route_top_k: k ({k}) must be in 1..={} (logits.len())", logits.len()));
+        return Err(format!(
+            "route_top_k: k ({k}) must be in 1..={} (logits.len())",
+            logits.len()
+        ));
     }
 
     let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = logits.iter().map(|&l| (l - max_logit).exp()).collect();
     let sum: f32 = exps.iter().sum();
     if !sum.is_finite() || sum <= 0.0 {
-        return Err(format!("route_top_k: softmax sum is non-finite or non-positive ({sum})"));
+        return Err(format!(
+            "route_top_k: softmax sum is non-finite or non-positive ({sum})"
+        ));
     }
     let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
 
     let mut order: Vec<usize> = (0..probs.len()).collect();
-    order.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+    order.sort_unstable_by(|&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
     let top = &order[..k];
 
     if !normalize {
@@ -68,7 +82,9 @@ pub fn route_top_k_with_norm(logits: &[f32], k: usize, normalize: bool) -> Resul
 
     let top_sum: f32 = top.iter().map(|&i| probs[i]).sum();
     if !top_sum.is_finite() || top_sum <= 0.0 {
-        return Err(format!("route_top_k: top-{k} probability mass is non-finite or non-positive ({top_sum})"));
+        return Err(format!(
+            "route_top_k: top-{k} probability mass is non-finite or non-positive ({top_sum})"
+        ));
     }
 
     Ok(top.iter().map(|&i| (i, probs[i] / top_sum)).collect())
@@ -87,17 +103,31 @@ mod tests {
         assert_eq!(routed.len(), 2);
         assert_eq!(routed[0].0, 3);
         assert_eq!(routed[1].0, 2);
-        assert!((routed[0].1 - 4.0 / 7.0).abs() < 1e-5, "got {}", routed[0].1);
-        assert!((routed[1].1 - 3.0 / 7.0).abs() < 1e-5, "got {}", routed[1].1);
+        assert!(
+            (routed[0].1 - 4.0 / 7.0).abs() < 1e-5,
+            "got {}",
+            routed[0].1
+        );
+        assert!(
+            (routed[1].1 - 3.0 / 7.0).abs() < 1e-5,
+            "got {}",
+            routed[1].1
+        );
         let sum: f32 = routed.iter().map(|&(_, w)| w).sum();
-        assert!((sum - 1.0).abs() < 1e-5, "combination weights should sum to 1, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "combination weights should sum to 1, got {sum}"
+        );
     }
 
     #[test]
     fn test_route_top_k_ties_break_by_ascending_expert_index() {
         let logits = [0.0f32; 6];
         let routed = route_top_k(&logits, 3).expect("route_top_k should succeed");
-        assert_eq!(routed.iter().map(|&(i, _)| i).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(
+            routed.iter().map(|&(i, _)| i).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
         for &(_, w) in &routed {
             assert!((w - 1.0 / 3.0).abs() < 1e-6);
         }

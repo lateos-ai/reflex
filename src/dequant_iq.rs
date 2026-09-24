@@ -66,6 +66,11 @@ fn sign_of(cond: bool) -> f32 {
 }
 
 /// Port of `dequantize_row_iq2_xxs`. Block: `d: f16`, `qs: u16[32]`.
+// `l` indexes `aux8` but is also reused in the `aux32_1 >> (7 * l)` shift
+// below, and mirrors the reference's `for (l = 0; l < 4; ++l)` structure
+// line-for-line (see this module's doc comment) -- kept as a range loop
+// rather than `.enumerate()` for that direct diffability.
+#[allow(clippy::needless_range_loop)]
 pub(crate) fn dequantize_block_iq2_xxs(block: &[u8], y: &mut [f32]) {
     let d = le_f16(&block[0..2]);
     let qs = &block[2..66];
@@ -91,6 +96,10 @@ pub(crate) fn dequantize_block_iq2_xxs(block: &[u8], y: &mut [f32]) {
 }
 
 /// Port of `dequantize_row_iq2_xs`. Block: `d: f16`, `qs: u16[32]`, `scales: u8[8]`.
+// `ib32` indexes `scales` but is also reused in the `2 * (4 * ib32 + l)`
+// offset arithmetic below; kept as a range loop for line-for-line
+// diffability against the reference (see this module's doc comment).
+#[allow(clippy::needless_range_loop)]
 pub(crate) fn dequantize_block_iq2_xs(block: &[u8], y: &mut [f32]) {
     let d = le_f16(&block[0..2]);
     let qs = &block[2..66];

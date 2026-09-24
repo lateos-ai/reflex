@@ -125,7 +125,9 @@ pub fn load_kernel_module(
             device
                 .get_func(module_name, function_name)
                 .map(|function| AotKernel { function })
-                .ok_or_else(|| format!("function {function_name} not found in module {module_name}"))
+                .ok_or_else(|| {
+                    format!("function {function_name} not found in module {module_name}")
+                })
         })
         .collect()
 }

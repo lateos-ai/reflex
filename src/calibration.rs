@@ -16,19 +16,26 @@ pub fn softmax_scores(scores: &[f32]) -> Result<Vec<f32>, String> {
 /// `1.0` is a no-op, values below `1.0` sharpen the distribution, above
 /// `1.0` flatten it). Errs if `scores` is empty, `temperature` is not
 /// positive/finite, or the softmax sum is non-finite/non-positive.
-pub fn softmax_scores_with_temperature(scores: &[f32], temperature: f32) -> Result<Vec<f32>, String> {
+pub fn softmax_scores_with_temperature(
+    scores: &[f32],
+    temperature: f32,
+) -> Result<Vec<f32>, String> {
     if scores.is_empty() {
         return Err("softmax_scores: scores must not be empty".to_string());
     }
     if !temperature.is_finite() || temperature <= 0.0 {
-        return Err(format!("softmax_scores: temperature must be positive and finite, got {temperature}"));
+        return Err(format!(
+            "softmax_scores: temperature must be positive and finite, got {temperature}"
+        ));
     }
     let scaled: Vec<f32> = scores.iter().map(|&s| s / temperature).collect();
     let max_s = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = scaled.iter().map(|&s| (s - max_s).exp()).collect();
     let sum: f32 = exps.iter().sum();
     if !sum.is_finite() || sum <= 0.0 {
-        return Err(format!("softmax_scores: softmax sum is non-finite or non-positive ({sum})"));
+        return Err(format!(
+            "softmax_scores: softmax sum is non-finite or non-positive ({sum})"
+        ));
     }
     Ok(exps.iter().map(|&e| e / sum).collect())
 }
@@ -68,10 +75,16 @@ mod tests {
         let probs = softmax_scores(&scores).expect("softmax_scores should succeed");
         assert_eq!(probs.len(), 4);
         for (got, expected) in probs.iter().zip([0.1, 0.2, 0.3, 0.4]) {
-            assert!((got - expected).abs() < 1e-5, "got {got}, expected {expected}");
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "got {got}, expected {expected}"
+            );
         }
         let sum: f32 = probs.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "probabilities should sum to 1, got {sum}");
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "probabilities should sum to 1, got {sum}"
+        );
     }
 
     #[test]
@@ -86,7 +99,10 @@ mod tests {
         let scores = [1.0f32, 2.0f32];
         let flat = softmax_scores_with_temperature(&scores, 10.0).expect("should succeed");
         let sharp = softmax_scores_with_temperature(&scores, 0.1).expect("should succeed");
-        assert!(sharp[1] > flat[1], "lower temperature should sharpen toward the higher score");
+        assert!(
+            sharp[1] > flat[1],
+            "lower temperature should sharpen toward the higher score"
+        );
     }
 
     #[test]
@@ -111,7 +127,10 @@ mod tests {
     #[test]
     fn test_shannon_entropy_uniform_is_log2_n() {
         let entropy = shannon_entropy(&[0.25, 0.25, 0.25, 0.25]).expect("should succeed");
-        assert!((entropy - 2.0).abs() < 1e-5, "got {entropy}, expected log2(4) = 2.0");
+        assert!(
+            (entropy - 2.0).abs() < 1e-5,
+            "got {entropy}, expected log2(4) = 2.0"
+        );
     }
 
     #[test]

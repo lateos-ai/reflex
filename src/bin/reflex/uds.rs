@@ -37,12 +37,15 @@ mod imp {
                 other => panic!("unexpected argument: {other}"),
             }
         }
-        let gguf_path =
-            gguf_path.unwrap_or_else(|| panic!("usage: reflex uds <path-to-gguf> <socket-path> [--lora <adapter.gguf>]"));
-        let socket_path =
-            socket_path.unwrap_or_else(|| panic!("usage: reflex uds <path-to-gguf> <socket-path> [--lora <adapter.gguf>]"));
+        let gguf_path = gguf_path.unwrap_or_else(|| {
+            panic!("usage: reflex uds <path-to-gguf> <socket-path> [--lora <adapter.gguf>]")
+        });
+        let socket_path = socket_path.unwrap_or_else(|| {
+            panic!("usage: reflex uds <path-to-gguf> <socket-path> [--lora <adapter.gguf>]")
+        });
 
-        let file = GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
+        let file = GgufFile::open(&gguf_path)
+            .unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
         let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
         if let Ok(diag) = diagnostics::probe(&device) {
             eprintln!("{diag}");
@@ -50,7 +53,9 @@ mod imp {
         let mut model = Model::load(device, &file).expect("failed to load model");
 
         if let Some(lora_path) = &lora_path {
-            let applied = model.apply_lora(std::path::Path::new(lora_path)).expect("failed to apply LoRA adapter");
+            let applied = model
+                .apply_lora(std::path::Path::new(lora_path))
+                .expect("failed to apply LoRA adapter");
             eprintln!("REFLEX_UDS_LORA_OK path={lora_path:?} tensors_applied={applied}");
         }
 
@@ -64,7 +69,8 @@ mod imp {
                 panic!("failed to remove stale socket at {socket_path:?}: {e}");
             }
         }
-        let listener = UnixListener::bind(&socket_path).unwrap_or_else(|e| panic!("failed to bind UDS at {socket_path:?}: {e}"));
+        let listener = UnixListener::bind(&socket_path)
+            .unwrap_or_else(|e| panic!("failed to bind UDS at {socket_path:?}: {e}"));
         eprintln!("REFLEX_UDS_READY path={gguf_path:?} socket={socket_path:?}");
 
         for stream in listener.incoming() {
@@ -73,7 +79,9 @@ mod imp {
                     let reader = match stream.try_clone() {
                         Ok(s) => BufReader::new(s),
                         Err(e) => {
-                            eprintln!("REFLEX_UDS_CONNECTION_ERROR error=\"failed to clone stream: {e}\"");
+                            eprintln!(
+                                "REFLEX_UDS_CONNECTION_ERROR error=\"failed to clone stream: {e}\""
+                            );
                             continue;
                         }
                     };

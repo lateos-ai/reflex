@@ -49,34 +49,50 @@ fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
 /// exactly `element_count` values (a quantized tensor's element count is
 /// always a multiple of its block size by ggml's own invariant, but this
 /// stays defensive rather than asserting it).
-pub fn dequantize(ggml_type: GgmlType, bytes: &[u8], element_count: u64) -> Result<Vec<f32>, String> {
+pub fn dequantize(
+    ggml_type: GgmlType,
+    bytes: &[u8],
+    element_count: u64,
+) -> Result<Vec<f32>, String> {
     let n = element_count as usize;
     let mut out = match ggml_type {
         GgmlType::F32 => bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect(),
-        GgmlType::F16 => bytes.chunks_exact(2).map(le_f16).collect(),
+        GgmlType::F16 => bytes.as_chunks::<2>().0.iter().map(|c| le_f16(c)).collect(),
         GgmlType::Bf16 => bytes
-            .chunks_exact(2)
-            .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| bf16::from_bits(u16::from_le_bytes(*c)).to_f32())
             .collect(),
         GgmlType::F64 => bytes
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c) as f32)
             .collect(),
         GgmlType::I8 => bytes.iter().map(|&b| b as i8 as f32).collect(),
         GgmlType::I16 => bytes
-            .chunks_exact(2)
-            .map(|c| i16::from_le_bytes(c.try_into().unwrap()) as f32)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes(*c) as f32)
             .collect(),
         GgmlType::I32 => bytes
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes(c.try_into().unwrap()) as f32)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c) as f32)
             .collect(),
         GgmlType::I64 => bytes
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c) as f32)
             .collect(),
         GgmlType::Q4_0 => dequantize_blocks(bytes, 18, 32, dequantize_block_q4_0),
         GgmlType::Q4_1 => dequantize_blocks(bytes, 20, 32, dequantize_block_q4_1),
@@ -116,7 +132,9 @@ pub fn dequantize(ggml_type: GgmlType, bytes: &[u8], element_count: u64) -> Resu
             dequantize_blocks(bytes, 136, QK_K, crate::dequant_iq::dequantize_block_iq4_xs)
         }
         GgmlType::Unknown(t) => {
-            return Err(format!("unknown ggml_type={t}: no dequantizer known for it"))
+            return Err(format!(
+                "unknown ggml_type={t}: no dequantizer known for it"
+            ))
         }
     };
     out.truncate(n);
@@ -387,6 +405,10 @@ fn dequantize_block_q5_k(block: &[u8], y: &mut [f32]) {
 
 /// Port of `dequantize_row_q6_K`. Block layout: `ql[128]`, `qh[64]`,
 /// `scales[16]` (i8), `d: f16`.
+// `qh >> 0` below is a no-op shift, but it's kept for symmetry with the
+// `>> 2`/`>> 4`/`>> 6` siblings it's ported alongside (matches the reference
+// `ggml-quants.c` line-for-line, per this module's doc comment).
+#[allow(clippy::identity_op)]
 fn dequantize_block_q6_k(block: &[u8], y: &mut [f32]) {
     let ql_all = &block[0..128];
     let qh_all = &block[128..192];
@@ -478,7 +500,7 @@ mod tests {
         let mut block = vec![0u8; 22];
         block[0..2].copy_from_slice(&f16_bytes(1.0));
         block[6] = 0x0F; // qs[0] low nibble = 15, high nibble = 0
-        // qh (4 bytes at offset 2..6): bit 0 set -> affects element 0 (j=0).
+                         // qh (4 bytes at offset 2..6): bit 0 set -> affects element 0 (j=0).
         block[2] = 0x01;
         let out = dequantize(GgmlType::Q5_0, &block, 32).unwrap();
         assert_eq!(out[0], 15.0); // (0xF | 0x10) - 16 = 31-16 = 15
@@ -552,7 +574,7 @@ mod tests {
         // q=0 so y = dl*0 - ml = -ml = -(min*1).
         let mut block = vec![0u8; 84];
         block[0] = 0x11; // scales[0]: low nibble 1, high nibble 1
-        // d (offset 80) = 1.0, dmin (offset 82) = 3.0
+                         // d (offset 80) = 1.0, dmin (offset 82) = 3.0
         block[80..82].copy_from_slice(&f16_bytes(1.0));
         block[82..84].copy_from_slice(&f16_bytes(3.0));
         let out = dequantize(GgmlType::Q2K, &block, QK_K as u64).unwrap();
@@ -571,7 +593,7 @@ mod tests {
         block[2..4].copy_from_slice(&f16_bytes(5.0)); // dmin
         block[4] = 10; // scales[0] -> sc=10
         block[8] = 4; // scales[4] -> m=4
-        // qs[0] low nibble = 3 -> element0 = d*sc*3 - dmin*m = 2*10*3 - 5*4 = 60-20=40
+                      // qs[0] low nibble = 3 -> element0 = d*sc*3 - dmin*m = 2*10*3 - 5*4 = 60-20=40
         block[16] = 0x03;
         let out = dequantize(GgmlType::Q4K, &block, QK_K as u64).unwrap();
         assert_eq!(out[0], 40.0);
@@ -584,8 +606,8 @@ mod tests {
         let mut block = vec![0u8; 210];
         block[208..210].copy_from_slice(&f16_bytes(1.0)); // d
         block[192] = 2; // scales[0] (i8) = 2
-        // ql[0] low nibble = 0, qh[0] low 2 bits = 0 -> q1 = (0|0)-32 = -32
-        // y[0] = d * sc[0] * q1 = 1*2*(-32) = -64
+                        // ql[0] low nibble = 0, qh[0] low 2 bits = 0 -> q1 = (0|0)-32 = -32
+                        // y[0] = d * sc[0] * q1 = 1*2*(-32) = -64
         let out = dequantize(GgmlType::Q6K, &block, QK_K as u64).unwrap();
         assert_eq!(out[0], -64.0);
     }

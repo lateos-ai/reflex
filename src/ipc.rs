@@ -76,7 +76,15 @@ pub struct IpcResponse {
 
 impl IpcResponse {
     fn err(id: Option<String>, error: String) -> Self {
-        IpcResponse { id, ok: false, error: Some(error), token_ids: None, text: None, candidates: None, entropy: None }
+        IpcResponse {
+            id,
+            ok: false,
+            error: Some(error),
+            token_ids: None,
+            text: None,
+            candidates: None,
+            entropy: None,
+        }
     }
 }
 
@@ -89,20 +97,35 @@ pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
     let id = req.id.clone();
     if req.candidates.is_empty() {
         match model.generate(&req.prompt, req.max_tokens.max(1), None, |_logits| {}) {
-            Ok((token_ids, text)) => {
-                IpcResponse { id, ok: true, error: None, token_ids: Some(token_ids), text: Some(text), candidates: None, entropy: None }
-            }
+            Ok((token_ids, text)) => IpcResponse {
+                id,
+                ok: true,
+                error: None,
+                token_ids: Some(token_ids),
+                text: Some(text),
+                candidates: None,
+                entropy: None,
+            },
             Err(e) => IpcResponse::err(id, e),
         }
     } else {
-        let candidates: Vec<System1Candidate> = req.candidates.iter().map(|text| System1Candidate { text: text.clone() }).collect();
+        let candidates: Vec<System1Candidate> = req
+            .candidates
+            .iter()
+            .map(|text| System1Candidate { text: text.clone() })
+            .collect();
         match model.system1_evaluate(&req.prompt, &candidates, req.temperature) {
             Ok(response) => {
                 let candidates = response
                     .results
                     .into_iter()
                     .zip(response.probabilities)
-                    .map(|(r, probability)| IpcCandidateResult { text: r.text, token_ids: r.token_ids, score: r.score, probability })
+                    .map(|(r, probability)| IpcCandidateResult {
+                        text: r.text,
+                        token_ids: r.token_ids,
+                        score: r.score,
+                        probability,
+                    })
                     .collect();
                 IpcResponse {
                     id,
@@ -127,11 +150,17 @@ pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
 /// was unreadable) instead of terminating the loop -- one malformed line must not
 /// kill an otherwise-healthy long-lived session. Returns only on EOF or a hard I/O
 /// error; strictly sequential, never spawns a thread.
-pub fn run_request_loop<R: BufRead, W: Write>(model: &Model, mut input: R, mut output: W) -> Result<(), String> {
+pub fn run_request_loop<R: BufRead, W: Write>(
+    model: &Model,
+    mut input: R,
+    mut output: W,
+) -> Result<(), String> {
     let mut line = String::new();
     loop {
         line.clear();
-        let bytes_read = input.read_line(&mut line).map_err(|e| format!("ipc: reading request line: {e}"))?;
+        let bytes_read = input
+            .read_line(&mut line)
+            .map_err(|e| format!("ipc: reading request line: {e}"))?;
         if bytes_read == 0 {
             return Ok(()); // EOF
         }
@@ -145,9 +174,13 @@ pub fn run_request_loop<R: BufRead, W: Write>(model: &Model, mut input: R, mut o
             Err(e) => IpcResponse::err(None, format!("ipc: malformed request JSON: {e}")),
         };
 
-        let response_json = serde_json::to_string(&response).map_err(|e| format!("ipc: serializing response: {e}"))?;
-        writeln!(output, "{response_json}").map_err(|e| format!("ipc: writing response line: {e}"))?;
-        output.flush().map_err(|e| format!("ipc: flushing response: {e}"))?;
+        let response_json = serde_json::to_string(&response)
+            .map_err(|e| format!("ipc: serializing response: {e}"))?;
+        writeln!(output, "{response_json}")
+            .map_err(|e| format!("ipc: writing response line: {e}"))?;
+        output
+            .flush()
+            .map_err(|e| format!("ipc: flushing response: {e}"))?;
     }
 }
 
@@ -191,8 +224,14 @@ mod tests {
         let json = serde_json::to_string(&resp).expect("should serialize");
         assert!(json.contains("\"ok\":false"));
         assert!(json.contains("\"error\":\"boom\""));
-        assert!(!json.contains("token_ids"), "error responses should omit null result fields: {json}");
-        assert!(!json.contains("candidates"), "error responses should omit null result fields: {json}");
+        assert!(
+            !json.contains("token_ids"),
+            "error responses should omit null result fields: {json}"
+        );
+        assert!(
+            !json.contains("candidates"),
+            "error responses should omit null result fields: {json}"
+        );
     }
 
     #[test]
@@ -202,6 +241,9 @@ mod tests {
             Err(e) => IpcResponse::err(None, format!("ipc: malformed request JSON: {e}")),
         };
         assert!(!model_free_response.ok);
-        assert!(model_free_response.error.unwrap().contains("malformed request JSON"));
+        assert!(model_free_response
+            .error
+            .unwrap()
+            .contains("malformed request JSON"));
     }
 }

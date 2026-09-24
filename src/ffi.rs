@@ -56,7 +56,7 @@ pub struct ReflexModel {
 }
 
 thread_local! {
-    static LAST_ERROR: RefCell<Option<CString>> = RefCell::new(None);
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 fn set_last_error(msg: String) {
@@ -64,8 +64,13 @@ fn set_last_error(msg: String) {
     // than lose the message entirely (error text is host-controlled data --
     // a GGUF path, a Result<_, String> from model.rs/lora.rs -- not
     // attacker input, but still not guaranteed NUL-free).
-    let sanitized = if msg.contains('\0') { msg.replace('\0', "") } else { msg };
-    let c = CString::new(sanitized).unwrap_or_else(|_| CString::new("reflex-engine: error message unrepresentable").unwrap());
+    let sanitized = if msg.contains('\0') {
+        msg.replace('\0', "")
+    } else {
+        msg
+    };
+    let c = CString::new(sanitized)
+        .unwrap_or_else(|_| CString::new("reflex-engine: error message unrepresentable").unwrap());
     LAST_ERROR.with(|slot| *slot.borrow_mut() = Some(c));
 }
 
@@ -108,7 +113,10 @@ pub extern "C" fn reflex_last_error() -> *const c_char {
 /// `gguf_path` and, when non-NULL, `lora_path` must each point to a valid
 /// NUL-terminated C string readable for the duration of this call.
 #[no_mangle]
-pub unsafe extern "C" fn reflex_load(gguf_path: *const c_char, lora_path: *const c_char) -> *mut ReflexModel {
+pub unsafe extern "C" fn reflex_load(
+    gguf_path: *const c_char,
+    lora_path: *const c_char,
+) -> *mut ReflexModel {
     let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<ReflexModel, String> {
         if gguf_path.is_null() {
             return Err("reflex_load: gguf_path must not be NULL".to_string());
@@ -126,8 +134,10 @@ pub unsafe extern "C" fn reflex_load(gguf_path: *const c_char, lora_path: *const
             )
         };
 
-        let file = GgufFile::open(gguf_path_str).map_err(|e| format!("reflex_load: failed to open {gguf_path_str:?}: {e}"))?;
-        let device = CudaDevice::new(0).map_err(|e| format!("reflex_load: failed to init CUDA device 0: {e}"))?;
+        let file = GgufFile::open(gguf_path_str)
+            .map_err(|e| format!("reflex_load: failed to open {gguf_path_str:?}: {e}"))?;
+        let device = CudaDevice::new(0)
+            .map_err(|e| format!("reflex_load: failed to init CUDA device 0: {e}"))?;
         let mut model = Model::load(device, &file)?;
         if let Some(lora_path_str) = lora_path_str {
             model.apply_lora(Path::new(lora_path_str))?;
@@ -190,35 +200,42 @@ pub unsafe extern "C" fn reflex_generate(
     max_new_tokens: usize,
     out: *mut ReflexGenerateResult,
 ) -> c_int {
-    let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<ReflexGenerateResult, String> {
-        if handle.is_null() {
-            return Err("reflex_generate: handle must not be NULL".to_string());
-        }
-        if prompt.is_null() {
-            return Err("reflex_generate: prompt must not be NULL".to_string());
-        }
-        if out.is_null() {
-            return Err("reflex_generate: out must not be NULL".to_string());
-        }
-        if max_new_tokens == 0 {
-            return Err("reflex_generate: max_new_tokens must be at least 1".to_string());
-        }
-        let prompt_str = unsafe { CStr::from_ptr(prompt) }
-            .to_str()
-            .map_err(|e| format!("reflex_generate: prompt is not valid UTF-8: {e}"))?;
-        let model = unsafe { &(*handle).model };
+    let result = panic::catch_unwind(AssertUnwindSafe(
+        || -> Result<ReflexGenerateResult, String> {
+            if handle.is_null() {
+                return Err("reflex_generate: handle must not be NULL".to_string());
+            }
+            if prompt.is_null() {
+                return Err("reflex_generate: prompt must not be NULL".to_string());
+            }
+            if out.is_null() {
+                return Err("reflex_generate: out must not be NULL".to_string());
+            }
+            if max_new_tokens == 0 {
+                return Err("reflex_generate: max_new_tokens must be at least 1".to_string());
+            }
+            let prompt_str = unsafe { CStr::from_ptr(prompt) }
+                .to_str()
+                .map_err(|e| format!("reflex_generate: prompt is not valid UTF-8: {e}"))?;
+            let model = unsafe { &(*handle).model };
 
-        let (tokens, text) = model.generate(prompt_str, max_new_tokens, None, |_logits| {})?;
+            let (tokens, text) = model.generate(prompt_str, max_new_tokens, None, |_logits| {})?;
 
-        let mut boxed_tokens = tokens.into_boxed_slice();
-        let token_ids = boxed_tokens.as_mut_ptr();
-        let num_tokens = boxed_tokens.len();
-        std::mem::forget(boxed_tokens);
+            let mut boxed_tokens = tokens.into_boxed_slice();
+            let token_ids = boxed_tokens.as_mut_ptr();
+            let num_tokens = boxed_tokens.len();
+            std::mem::forget(boxed_tokens);
 
-        let text_c = CString::new(text.replace('\0', "")).unwrap_or_else(|_| CString::new("").unwrap());
+            let text_c =
+                CString::new(text.replace('\0', "")).unwrap_or_else(|_| CString::new("").unwrap());
 
-        Ok(ReflexGenerateResult { token_ids, num_tokens, text: text_c.into_raw() })
-    }));
+            Ok(ReflexGenerateResult {
+                token_ids,
+                num_tokens,
+                text: text_c.into_raw(),
+            })
+        },
+    ));
 
     match result {
         Ok(Ok(r)) => {
@@ -252,7 +269,12 @@ pub unsafe extern "C" fn reflex_free_generate_result(result: *mut ReflexGenerate
     }
     let r = unsafe { &mut *result };
     if !r.token_ids.is_null() {
-        unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(r.token_ids, r.num_tokens))) };
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                r.token_ids,
+                r.num_tokens,
+            )))
+        };
         r.token_ids = ptr::null_mut();
         r.num_tokens = 0;
     }
@@ -329,28 +351,32 @@ pub unsafe extern "C" fn reflex_system1_evaluate(
     temperature: f32,
     out: *mut ReflexSystem1Result,
 ) -> c_int {
-    let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<ReflexSystem1Result, String> {
-        if handle.is_null() {
-            return Err("reflex_system1_evaluate: handle must not be NULL".to_string());
-        }
-        if prompt.is_null() {
-            return Err("reflex_system1_evaluate: prompt must not be NULL".to_string());
-        }
-        if candidate_texts.is_null() {
-            return Err("reflex_system1_evaluate: candidate_texts must not be NULL".to_string());
-        }
-        if num_candidates == 0 {
-            return Err("reflex_system1_evaluate: num_candidates must be at least 1".to_string());
-        }
-        if out.is_null() {
-            return Err("reflex_system1_evaluate: out must not be NULL".to_string());
-        }
-        let prompt_str = unsafe { CStr::from_ptr(prompt) }
-            .to_str()
-            .map_err(|e| format!("reflex_system1_evaluate: prompt is not valid UTF-8: {e}"))?;
+    let result = panic::catch_unwind(AssertUnwindSafe(
+        || -> Result<ReflexSystem1Result, String> {
+            if handle.is_null() {
+                return Err("reflex_system1_evaluate: handle must not be NULL".to_string());
+            }
+            if prompt.is_null() {
+                return Err("reflex_system1_evaluate: prompt must not be NULL".to_string());
+            }
+            if candidate_texts.is_null() {
+                return Err("reflex_system1_evaluate: candidate_texts must not be NULL".to_string());
+            }
+            if num_candidates == 0 {
+                return Err(
+                    "reflex_system1_evaluate: num_candidates must be at least 1".to_string()
+                );
+            }
+            if out.is_null() {
+                return Err("reflex_system1_evaluate: out must not be NULL".to_string());
+            }
+            let prompt_str = unsafe { CStr::from_ptr(prompt) }
+                .to_str()
+                .map_err(|e| format!("reflex_system1_evaluate: prompt is not valid UTF-8: {e}"))?;
 
-        let candidate_ptrs = unsafe { std::slice::from_raw_parts(candidate_texts, num_candidates) };
-        let candidates: Vec<System1Candidate> = candidate_ptrs
+            let candidate_ptrs =
+                unsafe { std::slice::from_raw_parts(candidate_texts, num_candidates) };
+            let candidates: Vec<System1Candidate> = candidate_ptrs
             .iter()
             .enumerate()
             .map(|(i, &ptr)| {
@@ -365,29 +391,41 @@ pub unsafe extern "C" fn reflex_system1_evaluate(
             })
             .collect::<Result<_, String>>()?;
 
-        let model = unsafe { &(*handle).model };
-        let response = model.system1_evaluate(prompt_str, &candidates, temperature)?;
-        let entropy = response.entropy;
+            let model = unsafe { &(*handle).model };
+            let response = model.system1_evaluate(prompt_str, &candidates, temperature)?;
+            let entropy = response.entropy;
 
-        let mut boxed_candidates: Vec<ReflexSystem1CandidateResult> = response
-            .results
-            .into_iter()
-            .zip(response.probabilities)
-            .map(|(r, probability)| {
-                let text_c = CString::new(r.text.replace('\0', "")).unwrap_or_else(|_| CString::new("").unwrap());
-                let mut boxed_ids = r.token_ids.into_boxed_slice();
-                let token_ids = boxed_ids.as_mut_ptr();
-                let num_token_ids = boxed_ids.len();
-                std::mem::forget(boxed_ids);
-                ReflexSystem1CandidateResult { text: text_c.into_raw(), token_ids, num_token_ids, score: r.score, probability }
+            let mut boxed_candidates: Vec<ReflexSystem1CandidateResult> = response
+                .results
+                .into_iter()
+                .zip(response.probabilities)
+                .map(|(r, probability)| {
+                    let text_c = CString::new(r.text.replace('\0', ""))
+                        .unwrap_or_else(|_| CString::new("").unwrap());
+                    let mut boxed_ids = r.token_ids.into_boxed_slice();
+                    let token_ids = boxed_ids.as_mut_ptr();
+                    let num_token_ids = boxed_ids.len();
+                    std::mem::forget(boxed_ids);
+                    ReflexSystem1CandidateResult {
+                        text: text_c.into_raw(),
+                        token_ids,
+                        num_token_ids,
+                        score: r.score,
+                        probability,
+                    }
+                })
+                .collect();
+            let candidates_ptr = boxed_candidates.as_mut_ptr();
+            let num_candidates = boxed_candidates.len();
+            std::mem::forget(boxed_candidates);
+
+            Ok(ReflexSystem1Result {
+                candidates: candidates_ptr,
+                num_candidates,
+                entropy,
             })
-            .collect();
-        let candidates_ptr = boxed_candidates.as_mut_ptr();
-        let num_candidates = boxed_candidates.len();
-        std::mem::forget(boxed_candidates);
-
-        Ok(ReflexSystem1Result { candidates: candidates_ptr, num_candidates, entropy })
-    }));
+        },
+    ));
 
     match result {
         Ok(Ok(r)) => {
@@ -423,13 +461,23 @@ pub unsafe extern "C" fn reflex_free_system1_result(result: *mut ReflexSystem1Re
     }
     let r = unsafe { &mut *result };
     if !r.candidates.is_null() {
-        let candidates = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(r.candidates, r.num_candidates)) };
+        let candidates = unsafe {
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                r.candidates,
+                r.num_candidates,
+            ))
+        };
         for c in candidates.into_vec() {
             if !c.text.is_null() {
                 unsafe { drop(CString::from_raw(c.text)) };
             }
             if !c.token_ids.is_null() {
-                unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(c.token_ids, c.num_token_ids))) };
+                unsafe {
+                    drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                        c.token_ids,
+                        c.num_token_ids,
+                    )))
+                };
             }
         }
         r.candidates = ptr::null_mut();

@@ -50,8 +50,17 @@ fn resolve_model_flag(model_spec: Option<&str>, quickstart: bool) -> Option<Stri
     }
     #[cfg(feature = "download")]
     {
-        let resolved = if quickstart { reflex_engine::hf::resolve_quickstart() } else { reflex_engine::hf::resolve_gguf_path(model_spec.unwrap()) };
-        Some(resolved.unwrap_or_else(|e| panic!("{e}")).to_string_lossy().into_owned())
+        let resolved = if quickstart {
+            reflex_engine::hf::resolve_quickstart()
+        } else {
+            reflex_engine::hf::resolve_gguf_path(model_spec.unwrap())
+        };
+        Some(
+            resolved
+                .unwrap_or_else(|e| panic!("{e}"))
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
     #[cfg(not(feature = "download"))]
     {
@@ -74,14 +83,25 @@ pub fn run(args: Vec<String>) {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--export-kv" => export_kv = Some(args.next().expect("--export-kv requires a file path")),
-            "--import-kv" => import_kv = Some(args.next().expect("--import-kv requires a file path")),
+            "--export-kv" => {
+                export_kv = Some(args.next().expect("--export-kv requires a file path"))
+            }
+            "--import-kv" => {
+                import_kv = Some(args.next().expect("--import-kv requires a file path"))
+            }
             "--lora" => lora_path = Some(args.next().expect("--lora requires a file path")),
-            "--model" => model_spec = Some(args.next().expect("--model requires a repo spec, e.g. org/repo:file.gguf")),
+            "--model" => {
+                model_spec = Some(
+                    args.next()
+                        .expect("--model requires a repo spec, e.g. org/repo:file.gguf"),
+                )
+            }
             "--quickstart" => quickstart = true,
             "--max-tokens" => {
                 let raw = args.next().expect("--max-tokens requires a number");
-                max_tokens = raw.parse().unwrap_or_else(|_| panic!("--max-tokens must be a positive integer, got {raw:?}"));
+                max_tokens = raw.parse().unwrap_or_else(|_| {
+                    panic!("--max-tokens must be a positive integer, got {raw:?}")
+                });
             }
             other => positional.push(other.to_string()),
         }
@@ -113,7 +133,8 @@ pub fn run(args: Vec<String>) {
         panic!("--export-kv only captures the cache after the initial prompt pass -- omit --max-tokens (defaults to 1) when exporting");
     }
 
-    let file = GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
+    let file =
+        GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
     let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
@@ -121,15 +142,20 @@ pub fn run(args: Vec<String>) {
     let mut model = Model::load(device, &file).expect("failed to load model");
 
     if let Some(lora_path) = &lora_path {
-        let applied = model.apply_lora(std::path::Path::new(lora_path)).expect("failed to apply LoRA adapter");
+        let applied = model
+            .apply_lora(std::path::Path::new(lora_path))
+            .expect("failed to apply LoRA adapter");
         println!("REFLEX_LORA_OK path={lora_path:?} tensors_applied={applied}");
     }
 
     if let Some(export_path) = &export_kv {
         let (token_id, text) = match model.architecture_kind() {
             ArchitectureKind::Hybrid => {
-                let ((token_id, text), cache) = model.forward_prompt_capture_kv_hybrid(&prompt).expect("forward_prompt_capture_kv_hybrid failed");
-                kv_io::export_hybrid_kv(export_path, &cache).expect("failed to export hybrid KV cache");
+                let ((token_id, text), cache) = model
+                    .forward_prompt_capture_kv_hybrid(&prompt)
+                    .expect("forward_prompt_capture_kv_hybrid failed");
+                kv_io::export_hybrid_kv(export_path, &cache)
+                    .expect("failed to export hybrid KV cache");
                 println!(
                     "REFLEX_GENERATE_KV_EXPORT_OK path={export_path:?} kind=hybrid seq_len={} num_layers={}",
                     cache.seq_len,
@@ -138,7 +164,9 @@ pub fn run(args: Vec<String>) {
                 (token_id, text)
             }
             ArchitectureKind::Dense => {
-                let ((token_id, text), cache) = model.forward_prompt_capture_kv(&prompt).expect("forward_prompt_capture_kv failed");
+                let ((token_id, text), cache) = model
+                    .forward_prompt_capture_kv(&prompt)
+                    .expect("forward_prompt_capture_kv failed");
                 println!(
                     "REFLEX_GENERATE_KV_EXPORT_OK path={export_path:?} kind=dense seq_len={} num_layers={}",
                     cache.seq_len,
@@ -148,7 +176,9 @@ pub fn run(args: Vec<String>) {
                 (token_id, text)
             }
             ArchitectureKind::Mla => {
-                let ((token_id, text), cache) = model.forward_prompt_capture_kv_mla(&prompt).expect("forward_prompt_capture_kv_mla failed");
+                let ((token_id, text), cache) = model
+                    .forward_prompt_capture_kv_mla(&prompt)
+                    .expect("forward_prompt_capture_kv_mla failed");
                 println!(
                     "REFLEX_GENERATE_KV_EXPORT_OK path={export_path:?} kind=mla seq_len={} num_layers={}",
                     cache.seq_len,
@@ -166,7 +196,9 @@ pub fn run(args: Vec<String>) {
         reflex_engine::fast_exit(0);
     }
 
-    let imported = import_kv.as_ref().map(|path| kv_io::import_kv(path).expect("failed to import KV cache"));
+    let imported = import_kv
+        .as_ref()
+        .map(|path| kv_io::import_kv(path).expect("failed to import KV cache"));
 
     let mut first_token_ms: Option<f64> = None;
     let (tokens, text) = model

@@ -76,14 +76,12 @@ impl Tokenizer {
         let mut merge_rank = HashMap::with_capacity(merges_raw.len());
         for (rank, entry) in merges_raw.iter().enumerate() {
             let mut parts = entry.split(' ');
-            let left = parts
-                .next()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| format!("malformed merge entry '{entry}' (expected 'left right')"))?;
-            let right = parts
-                .next()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| format!("malformed merge entry '{entry}' (expected 'left right')"))?;
+            let left = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
+                format!("malformed merge entry '{entry}' (expected 'left right')")
+            })?;
+            let right = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
+                format!("malformed merge entry '{entry}' (expected 'left right')")
+            })?;
             merge_rank.insert((left.to_string(), right.to_string()), rank);
         }
 
@@ -93,8 +91,10 @@ impl Tokenizer {
             .map(|(i, t)| (t.clone(), i as u32))
             .collect();
 
-        let bos_token_id = u64_meta(&file.metadata, "tokenizer.ggml.bos_token_id").map(|v| v as u32);
-        let eos_token_id = u64_meta(&file.metadata, "tokenizer.ggml.eos_token_id").map(|v| v as u32);
+        let bos_token_id =
+            u64_meta(&file.metadata, "tokenizer.ggml.bos_token_id").map(|v| v as u32);
+        let eos_token_id =
+            u64_meta(&file.metadata, "tokenizer.ggml.eos_token_id").map(|v| v as u32);
         let unk_token_id =
             u64_meta(&file.metadata, "tokenizer.ggml.unknown_token_id").map(|v| v as u32);
         let pad_token_id =
@@ -239,11 +239,9 @@ impl Tokenizer {
             }
             self.bpe_merge(&mut symbols);
             for s in symbols {
-                let id = self
-                    .token_to_id
-                    .get(&s)
-                    .copied()
-                    .ok_or_else(|| format!("gpt2 BPE symbol {s:?} not found in vocab (piece {piece:?})"))?;
+                let id = self.token_to_id.get(&s).copied().ok_or_else(|| {
+                    format!("gpt2 BPE symbol {s:?} not found in vocab (piece {piece:?})")
+                })?;
                 ids.push(id);
             }
         }
@@ -259,7 +257,9 @@ impl Tokenizer {
         loop {
             let mut best: Option<(usize, usize)> = None; // (rank, index of left symbol)
             for i in 0..symbols.len().saturating_sub(1) {
-                if let Some(&rank) = self.merge_rank.get(&(symbols[i].clone(), symbols[i + 1].clone()))
+                if let Some(&rank) = self
+                    .merge_rank
+                    .get(&(symbols[i].clone(), symbols[i + 1].clone()))
                 {
                     if best.is_none_or(|(best_rank, _)| rank < best_rank) {
                         best = Some((rank, i));
@@ -290,7 +290,9 @@ impl Tokenizer {
     fn decode_sentencepiece(&self, ids: &[u32]) -> String {
         let mut byte_buf: Vec<u8> = Vec::new();
         for &id in ids {
-            let Some(tok) = self.tokens.get(id as usize) else { continue };
+            let Some(tok) = self.tokens.get(id as usize) else {
+                continue;
+            };
             if let Some(byte) = parse_byte_fallback(tok) {
                 byte_buf.push(byte);
             } else {
@@ -313,7 +315,9 @@ impl Tokenizer {
         let unicode_to_byte = gpt2_unicode_to_byte_table();
         let mut byte_buf: Vec<u8> = Vec::new();
         for &id in ids {
-            let Some(tok) = self.tokens.get(id as usize) else { continue };
+            let Some(tok) = self.tokens.get(id as usize) else {
+                continue;
+            };
             for ch in tok.chars() {
                 if let Some(&b) = unicode_to_byte.get(&ch) {
                     byte_buf.push(b);
@@ -358,7 +362,8 @@ fn gpt2_byte_to_unicode_table() -> &'static [char; 256] {
         }
         let mut table = ['\0'; 256];
         for b in 0..256usize {
-            table[b] = char::from_u32(codepoint[b]).expect("gpt2 byte-to-unicode codepoints are all valid scalar values");
+            table[b] = char::from_u32(codepoint[b])
+                .expect("gpt2 byte-to-unicode codepoints are all valid scalar values");
         }
         table
     })
@@ -425,7 +430,12 @@ fn match_contraction(chars: &[char], i: usize) -> Option<usize> {
     }
     for suffix in ["s", "t", "re", "ve", "m", "ll", "d"] {
         let end = i + 1 + suffix.len();
-        if end <= chars.len() && chars[i + 1..end].iter().collect::<String>().eq_ignore_ascii_case(suffix) {
+        if end <= chars.len()
+            && chars[i + 1..end]
+                .iter()
+                .collect::<String>()
+                .eq_ignore_ascii_case(suffix)
+        {
             return Some(end);
         }
     }
@@ -499,7 +509,10 @@ fn match_blank_lines(chars: &[char], i: usize) -> Option<usize> {
     while j < chars.len() && chars[j].is_whitespace() {
         j += 1;
     }
-    (i..j).rev().find(|&k| chars[k] == '\r' || chars[k] == '\n').map(|k| k + 1)
+    (i..j)
+        .rev()
+        .find(|&k| chars[k] == '\r' || chars[k] == '\n')
+        .map(|k| k + 1)
 }
 
 /// `\s+(?!\S)` — the whole contiguous whitespace run if it reaches
@@ -576,7 +589,10 @@ fn f32_array(value: &GgufValue, key: &str) -> Result<Vec<f32>, String> {
     match value {
         GgufValue::Array(items) => items
             .iter()
-            .map(|v| v.as_f32().ok_or_else(|| format!("expected f32 array element in '{key}', got {v:?}")))
+            .map(|v| {
+                v.as_f32()
+                    .ok_or_else(|| format!("expected f32 array element in '{key}', got {v:?}"))
+            })
             .collect(),
         other => Err(format!("expected array for '{key}', got {other:?}")),
     }
@@ -590,7 +606,9 @@ fn i32_array(value: &GgufValue, key: &str) -> Result<Vec<i32>, String> {
                 GgufValue::I32(x) => Ok(*x),
                 GgufValue::I8(x) => Ok(*x as i32),
                 GgufValue::I16(x) => Ok(*x as i32),
-                other => Err(format!("expected i32 array element in '{key}', got {other:?}")),
+                other => Err(format!(
+                    "expected i32 array element in '{key}', got {other:?}"
+                )),
             })
             .collect(),
         other => Err(format!("expected array for '{key}', got {other:?}")),
@@ -667,7 +685,10 @@ mod tests {
     #[test]
     fn test_encode_empty_string_produces_no_tokens() {
         let tok = build_synthetic_tokenizer();
-        assert_eq!(tok.encode("").expect("encode should succeed"), Vec::<u32>::new());
+        assert_eq!(
+            tok.encode("").expect("encode should succeed"),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
@@ -729,7 +750,10 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut path = std::env::temp_dir();
-        path.push(format!("rft_tokenizer_test_{}_{unique}.gguf", std::process::id()));
+        path.push(format!(
+            "rft_tokenizer_test_{}_{unique}.gguf",
+            std::process::id()
+        ));
         let mut f = File::create(&path).expect("create temp gguf file");
         f.write_all(bytes).expect("write temp gguf file");
         path
@@ -749,7 +773,11 @@ mod tests {
         buf.extend_from_slice(&5u64.to_le_bytes()); // metadata_kv_count
 
         write_kv_string(&mut buf, "tokenizer.ggml.model", "llama");
-        write_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["<unk>", "\u{2581}", "hi"]);
+        write_kv_string_array(
+            &mut buf,
+            "tokenizer.ggml.tokens",
+            &["<unk>", "\u{2581}", "hi"],
+        );
         write_kv_string_array(&mut buf, "tokenizer.ggml.merges", &["\u{2581} hi"]);
         write_kv_u32(&mut buf, "tokenizer.ggml.bos_token_id", 1);
         write_kv_u32(&mut buf, "tokenizer.ggml.eos_token_id", 2);
@@ -802,7 +830,10 @@ mod tests {
         let mut i = 0;
         while i < chars.len() {
             let end = qwen2_pretokenize_one(&chars, i);
-            assert!(end > i, "qwen2_pretokenize_one must always make forward progress");
+            assert!(
+                end > i,
+                "qwen2_pretokenize_one must always make forward progress"
+            );
             pieces.push(chars[i..end].iter().collect::<String>());
             i = end;
         }
@@ -813,7 +844,10 @@ mod tests {
     fn test_qwen2_pretokenize_single_leading_space_glues_to_word() {
         // "Hello world" -> ["Hello", " world"]: the single space between the
         // two words attaches to "world", not its own piece.
-        assert_eq!(qwen2_pretokenize_all("Hello world"), vec!["Hello", " world"]);
+        assert_eq!(
+            qwen2_pretokenize_all("Hello world"),
+            vec!["Hello", " world"]
+        );
     }
 
     #[test]
@@ -839,7 +873,10 @@ mod tests {
     fn test_qwen2_pretokenize_blank_line_run_grouped_with_trailing_newline() {
         // "\n\n" (two blank lines) between "linea"/"lineb" -> the whole run
         // is one piece, ending right after the last newline.
-        assert_eq!(qwen2_pretokenize_all("linea\n\nlineb"), vec!["linea", "\n\n", "lineb"]);
+        assert_eq!(
+            qwen2_pretokenize_all("linea\n\nlineb"),
+            vec!["linea", "\n\n", "lineb"]
+        );
     }
 
     #[test]
@@ -852,7 +889,10 @@ mod tests {
 
     #[test]
     fn test_qwen2_pretokenize_punctuation_run_is_its_own_piece() {
-        assert_eq!(qwen2_pretokenize_all("Hello, world!"), vec!["Hello", ",", " world", "!"]);
+        assert_eq!(
+            qwen2_pretokenize_all("Hello, world!"),
+            vec!["Hello", ",", " world", "!"]
+        );
     }
 
     #[test]
@@ -864,9 +904,17 @@ mod tests {
     fn test_gpt2_byte_to_unicode_table_is_a_real_bijection() {
         let table = gpt2_byte_to_unicode_table();
         let inverse = gpt2_unicode_to_byte_table();
-        assert_eq!(inverse.len(), 256, "every byte must map to a distinct char (a real bijection)");
+        assert_eq!(
+            inverse.len(),
+            256,
+            "every byte must map to a distinct char (a real bijection)"
+        );
         for b in 0..=255u8 {
-            assert_eq!(inverse.get(&table[b as usize]), Some(&b), "round trip failed for byte {b}");
+            assert_eq!(
+                inverse.get(&table[b as usize]),
+                Some(&b),
+                "round trip failed for byte {b}"
+            );
         }
         // Spot-check real, well-known values from OpenAI's own construction:
         // '!' (0x21, first "already printable" byte) maps to itself; space
@@ -901,7 +949,8 @@ mod tests {
             return;
         }
         let file = GgufFile::open(&path).expect("open real Qwen3-0.6B GGUF");
-        let tok = Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf on real Qwen3-0.6B file");
+        let tok =
+            Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf on real Qwen3-0.6B file");
         assert_eq!(tok.architecture, "gpt2");
 
         for text in [
@@ -913,7 +962,9 @@ mod tests {
             "don't can't won't I'll we've",
             "",
         ] {
-            let ids = tok.encode(text).unwrap_or_else(|e| panic!("encode({text:?}) failed: {e}"));
+            let ids = tok
+                .encode(text)
+                .unwrap_or_else(|e| panic!("encode({text:?}) failed: {e}"));
             let decoded = tok.decode(&ids);
             assert_eq!(decoded, text, "round trip failed for {text:?}: ids={ids:?}");
         }

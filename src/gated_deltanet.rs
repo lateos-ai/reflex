@@ -45,10 +45,14 @@ impl GatedDeltaNetConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.hidden_size == 0 || self.num_k_heads == 0 || self.num_v_heads == 0 || self.head_dim == 0 {
+        if self.hidden_size == 0
+            || self.num_k_heads == 0
+            || self.num_v_heads == 0
+            || self.head_dim == 0
+        {
             return Err("GatedDeltaNetConfig has a zero dimension".to_string());
         }
-        if self.num_v_heads % self.num_k_heads != 0 {
+        if !self.num_v_heads.is_multiple_of(self.num_k_heads) {
             return Err(format!(
                 "num_v_heads={} must be a multiple of num_k_heads={}",
                 self.num_v_heads, self.num_k_heads

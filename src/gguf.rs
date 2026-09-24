@@ -233,7 +233,12 @@ impl GgufFile {
             }
             let ggml_type = GgmlType::from_u32(cur.read_u32()?);
             let offset = cur.read_u64()?;
-            tensors.push(GgufTensorInfo { name, shape, ggml_type, offset });
+            tensors.push(GgufTensorInfo {
+                name,
+                shape,
+                ggml_type,
+                offset,
+            });
         }
 
         // The data section starts at the next `alignment`-byte boundary
@@ -249,7 +254,13 @@ impl GgufFile {
             ));
         }
 
-        Ok(GgufFile { mmap, version, metadata, tensors, data_section_start })
+        Ok(GgufFile {
+            mmap,
+            version,
+            metadata,
+            tensors,
+            data_section_start,
+        })
     }
 
     pub fn tensor_info(&self, name: &str) -> Option<&GgufTensorInfo> {
@@ -263,9 +274,13 @@ impl GgufFile {
         let end = start
             .checked_add(nbytes)
             .ok_or_else(|| format!("tensor '{}' byte range overflows usize", info.name))?;
-        self.mmap
-            .get(start..end)
-            .ok_or_else(|| format!("tensor '{}' range {start}..{end} exceeds file length {}", info.name, self.mmap.len()))
+        self.mmap.get(start..end).ok_or_else(|| {
+            format!(
+                "tensor '{}' range {start}..{end} exceeds file length {}",
+                info.name,
+                self.mmap.len()
+            )
+        })
     }
 }
 
@@ -281,12 +296,12 @@ fn ggml_type_size_bytes(ggml_type: GgmlType, element_count: u64) -> Result<usize
         GgmlType::I16 => (1, 2),
         GgmlType::I32 => (1, 4),
         GgmlType::I64 => (1, 8),
-        GgmlType::Q8_0 => (32, 34),   // ggml_fp16_t d + 32 * int8
-        GgmlType::Q8_1 => (32, 36),   // 2x ggml_fp16_t (d, s) + 32 * int8
-        GgmlType::Q4_0 => (32, 18),   // ggml_fp16_t d + 16 bytes (32x nibble)
-        GgmlType::Q4_1 => (32, 20),   // 2x ggml_fp16_t (d, m) + 16 bytes
-        GgmlType::Q5_0 => (32, 22),   // ggml_fp16_t d + 4 bytes high bits + 16 bytes
-        GgmlType::Q5_1 => (32, 24),   // 2x ggml_fp16_t (d, m) + 4 bytes high bits + 16 bytes
+        GgmlType::Q8_0 => (32, 34), // ggml_fp16_t d + 32 * int8
+        GgmlType::Q8_1 => (32, 36), // 2x ggml_fp16_t (d, s) + 32 * int8
+        GgmlType::Q4_0 => (32, 18), // ggml_fp16_t d + 16 bytes (32x nibble)
+        GgmlType::Q4_1 => (32, 20), // 2x ggml_fp16_t (d, m) + 16 bytes
+        GgmlType::Q5_0 => (32, 22), // ggml_fp16_t d + 4 bytes high bits + 16 bytes
+        GgmlType::Q5_1 => (32, 24), // 2x ggml_fp16_t (d, m) + 4 bytes high bits + 16 bytes
         GgmlType::Q2K => (256, 84),
         GgmlType::Q3K => (256, 110),
         GgmlType::Q4K => (256, 144),
@@ -297,16 +312,18 @@ fn ggml_type_size_bytes(ggml_type: GgmlType, element_count: u64) -> Result<usize
         // `block_iq*` struct layouts in `ggml-common.h` (the same standard
         // `dequant.rs` uses for the K-quants), each verified by the
         // `static_assert`s in that header.
-        GgmlType::IQ2XXS => (256, 66),  // f16 d + 32 * u16
-        GgmlType::IQ2XS => (256, 74),   // f16 d + 32 * u16 + u8 scales[8]
-        GgmlType::IQ2S => (256, 82),    // f16 d + u8 qs[64] + qh[8] + scales[8]
-        GgmlType::IQ3XXS => (256, 98),  // f16 d + u8 qs[96]
-        GgmlType::IQ3S => (256, 110),   // f16 d + qs[64] + qh[8] + signs[32] + scales[4]
-        GgmlType::IQ1S => (256, 50),    // f16 d + u8 qs[32] + u16 qh[8]
-        GgmlType::IQ1M => (256, 56),    // u8 qs[32] + qh[16] + scales[8] (packed f16 scale)
-        GgmlType::IQ4XS => (256, 136),  // f16 d + u16 scales_h + scales_l[4] + qs[128]
+        GgmlType::IQ2XXS => (256, 66), // f16 d + 32 * u16
+        GgmlType::IQ2XS => (256, 74),  // f16 d + 32 * u16 + u8 scales[8]
+        GgmlType::IQ2S => (256, 82),   // f16 d + u8 qs[64] + qh[8] + scales[8]
+        GgmlType::IQ3XXS => (256, 98), // f16 d + u8 qs[96]
+        GgmlType::IQ3S => (256, 110),  // f16 d + qs[64] + qh[8] + signs[32] + scales[4]
+        GgmlType::IQ1S => (256, 50),   // f16 d + u8 qs[32] + u16 qh[8]
+        GgmlType::IQ1M => (256, 56),   // u8 qs[32] + qh[16] + scales[8] (packed f16 scale)
+        GgmlType::IQ4XS => (256, 136), // f16 d + u16 scales_h + scales_l[4] + qs[128]
         GgmlType::Unknown(t) => {
-            return Err(format!("unknown ggml_type={t}: on-disk block size not known to this parser"))
+            return Err(format!(
+                "unknown ggml_type={t}: on-disk block size not known to this parser"
+            ))
         }
     };
     let num_blocks = element_count.div_ceil(block_size);
@@ -328,10 +345,12 @@ impl<'a> Cursor<'a> {
             .pos
             .checked_add(n)
             .ok_or_else(|| "cursor offset overflow".to_string())?;
-        let slice = self
-            .data
-            .get(self.pos..end)
-            .ok_or_else(|| format!("unexpected end of file at offset {} (need {n} more bytes)", self.pos))?;
+        let slice = self.data.get(self.pos..end).ok_or_else(|| {
+            format!(
+                "unexpected end of file at offset {} (need {n} more bytes)",
+                self.pos
+            )
+        })?;
         self.pos = end;
         Ok(slice)
     }
@@ -497,7 +516,10 @@ mod tests {
         let mut path = std::env::temp_dir();
         // pid alone collides across tests running in parallel in the same
         // process (they all share one pid) — add a per-call counter too.
-        path.push(format!("rft_gguf_test_{}_{unique}.gguf", std::process::id()));
+        path.push(format!(
+            "rft_gguf_test_{}_{unique}.gguf",
+            std::process::id()
+        ));
         let mut f = File::create(&path).expect("create temp gguf file");
         f.write_all(bytes).expect("write temp gguf file");
         path
@@ -512,11 +534,15 @@ mod tests {
 
         assert_eq!(file.version, 3);
         assert_eq!(
-            file.metadata.get("general.architecture").and_then(GgufValue::as_str),
+            file.metadata
+                .get("general.architecture")
+                .and_then(GgufValue::as_str),
             Some("llama")
         );
         assert_eq!(
-            file.metadata.get("llama.attention.head_count").and_then(GgufValue::as_u64),
+            file.metadata
+                .get("llama.attention.head_count")
+                .and_then(GgufValue::as_u64),
             Some(32)
         );
     }
@@ -535,8 +561,10 @@ mod tests {
         let raw = file.tensor_bytes(info).expect("tensor bytes");
         assert_eq!(raw.len(), 16);
         let values: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0]);
     }
@@ -615,9 +643,17 @@ mod tests {
         ];
         for (id, ty, block_bytes) in cases {
             assert_eq!(GgmlType::from_u32(id), ty, "type id {id}");
-            assert_eq!(ggml_type_size_bytes(ty, 256).unwrap() as u64, block_bytes, "{ty:?}");
+            assert_eq!(
+                ggml_type_size_bytes(ty, 256).unwrap() as u64,
+                block_bytes,
+                "{ty:?}"
+            );
             // 33 elements needs 2 super-blocks -> 2x the per-block size.
-            assert_eq!(ggml_type_size_bytes(ty, 257).unwrap() as u64, 2 * block_bytes, "{ty:?}");
+            assert_eq!(
+                ggml_type_size_bytes(ty, 257).unwrap() as u64,
+                2 * block_bytes,
+                "{ty:?}"
+            );
         }
     }
 }

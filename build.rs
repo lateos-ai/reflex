@@ -14,7 +14,10 @@ use std::process::Command;
 
 fn find_nvcc() -> Option<PathBuf> {
     if let Ok(cuda_path) = env::var("CUDA_PATH").or_else(|_| env::var("CUDA_HOME")) {
-        let candidate = Path::new(&cuda_path).join("bin").join(if cfg!(windows) { "nvcc.exe" } else { "nvcc" });
+        let candidate =
+            Path::new(&cuda_path)
+                .join("bin")
+                .join(if cfg!(windows) { "nvcc.exe" } else { "nvcc" });
         if candidate.exists() {
             return Some(candidate);
         }
@@ -67,18 +70,27 @@ fn main() {
     // needs to know, once, crate-wide, which of build.rs's two output modes
     // produced those bytes -- both modes always agree for a single build (the
     // `-cubin`/`-ptx` flag below is chosen once, not per file).
-    println!("cargo:rustc-env=REFLEX_KERNEL_FORMAT={}", if arch.is_some() { "cubin" } else { "ptx" });
+    println!(
+        "cargo:rustc-env=REFLEX_KERNEL_FORMAT={}",
+        if arch.is_some() { "cubin" } else { "ptx" }
+    );
     // Threaded forward the same way, so `src/diagnostics.rs` can compare the arch a
     // cubin was actually compiled for against the running GPU's real compute
     // capability at startup, instead of letting a mismatch surface as an opaque
     // driver load/launch error. Empty string in the default (portable PTX) build,
     // where no such mismatch is possible.
-    println!("cargo:rustc-env=REFLEX_CUDA_ARCH={}", arch.as_deref().unwrap_or(""));
+    println!(
+        "cargo:rustc-env=REFLEX_CUDA_ARCH={}",
+        arch.as_deref().unwrap_or("")
+    );
 
     let entries = match std::fs::read_dir(src_dir) {
         Ok(e) => e,
         Err(_) => {
-            println!("cargo:warning=no {} directory yet, nothing to compile", src_dir.display());
+            println!(
+                "cargo:warning=no {} directory yet, nothing to compile",
+                src_dir.display()
+            );
             return;
         }
     };
@@ -111,13 +123,24 @@ fn main() {
                 cmd.arg(format!("-arch={a}"));
             }
 
-            let status = cmd.status().unwrap_or_else(|e| panic!("failed to invoke nvcc at {}: {e}", nvcc.display()));
+            let status = cmd
+                .status()
+                .unwrap_or_else(|e| panic!("failed to invoke nvcc at {}: {e}", nvcc.display()));
             if !status.success() {
                 panic!("nvcc failed compiling {}", path.display());
             }
         } else {
-            std::fs::write(&out_file, []).unwrap_or_else(|e| panic!("failed to write placeholder kernel file {}: {e}", out_file.display()));
+            std::fs::write(&out_file, []).unwrap_or_else(|e| {
+                panic!(
+                    "failed to write placeholder kernel file {}: {e}",
+                    out_file.display()
+                )
+            });
         }
-        println!("cargo:rustc-env=REFLEX_KERNEL_{}={}", stem.to_uppercase(), out_file.display());
+        println!(
+            "cargo:rustc-env=REFLEX_KERNEL_{}={}",
+            stem.to_uppercase(),
+            out_file.display()
+        );
     }
 }

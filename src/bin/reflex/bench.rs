@@ -28,7 +28,8 @@ use std::time::Instant;
 const PROMPT_WORD_COUNTS: [usize; 3] = [24, 96, 384];
 
 fn build_prompt(word_count: usize) -> String {
-    "The quick brown fox jumps over the lazy dog near the river bank. ".repeat(word_count.div_ceil(12))
+    "The quick brown fox jumps over the lazy dog near the river bank. "
+        .repeat(word_count.div_ceil(12))
 }
 
 fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
@@ -36,7 +37,13 @@ fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
     sorted_ms[idx.min(sorted_ms.len() - 1)]
 }
 
-fn print_stats(prefix: &str, prompt_tokens: usize, warmup: usize, iters: usize, mut samples_ms: Vec<f64>) {
+fn print_stats(
+    prefix: &str,
+    prompt_tokens: usize,
+    warmup: usize,
+    iters: usize,
+    mut samples_ms: Vec<f64>,
+) {
     samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let min_ms = samples_ms[0];
     let max_ms = samples_ms[samples_ms.len() - 1];
@@ -65,11 +72,15 @@ pub fn run(args: Vec<String>) {
             "--lora" => lora_path = Some(args.next().expect("--lora requires a file path")),
             "--warmup" => {
                 let raw = args.next().expect("--warmup requires a number");
-                warmup = raw.parse().unwrap_or_else(|_| panic!("--warmup must be a non-negative integer, got {raw:?}"));
+                warmup = raw.parse().unwrap_or_else(|_| {
+                    panic!("--warmup must be a non-negative integer, got {raw:?}")
+                });
             }
             "--iters" => {
                 let raw = args.next().expect("--iters requires a number");
-                iters = raw.parse().unwrap_or_else(|_| panic!("--iters must be a positive integer, got {raw:?}"));
+                iters = raw
+                    .parse()
+                    .unwrap_or_else(|_| panic!("--iters must be a positive integer, got {raw:?}"));
             }
             _ if gguf_path.is_none() => gguf_path = Some(arg),
             other => panic!("unexpected argument: {other}"),
@@ -81,7 +92,8 @@ pub fn run(args: Vec<String>) {
         panic!("--iters must be at least 1");
     }
 
-    let file = GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
+    let file =
+        GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
     let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
@@ -94,7 +106,8 @@ pub fn run(args: Vec<String>) {
     let mut model = Model::load(device, &file).expect("failed to load model");
     if let Some(before) = vram_before {
         if let Ok(after) = diagnostics::probe(&device_for_vram) {
-            let resident_mib = before.vram_free_bytes.saturating_sub(after.vram_free_bytes) / (1024 * 1024);
+            let resident_mib =
+                before.vram_free_bytes.saturating_sub(after.vram_free_bytes) / (1024 * 1024);
             println!(
                 "REFLEX_BENCH_VRAM_OK model_resident_mib={resident_mib} free_before_load_mib={} free_after_load_mib={}",
                 before.vram_free_bytes / (1024 * 1024),
@@ -104,32 +117,51 @@ pub fn run(args: Vec<String>) {
     }
 
     if let Some(lora_path) = &lora_path {
-        let applied = model.apply_lora(std::path::Path::new(lora_path)).expect("failed to apply LoRA adapter");
+        let applied = model
+            .apply_lora(std::path::Path::new(lora_path))
+            .expect("failed to apply LoRA adapter");
         println!("REFLEX_LORA_OK path={lora_path:?} tensors_applied={applied}");
     }
 
-    let candidates: Vec<System1Candidate> = candidate_texts.iter().map(|text| System1Candidate { text: text.clone() }).collect();
+    let candidates: Vec<System1Candidate> = candidate_texts
+        .iter()
+        .map(|text| System1Candidate { text: text.clone() })
+        .collect();
 
     for &word_count in &PROMPT_WORD_COUNTS {
         let prompt = build_prompt(word_count);
-        let prompt_tokens = model.encoded_prompt_len(&prompt).expect("encoded_prompt_len failed");
+        let prompt_tokens = model
+            .encoded_prompt_len(&prompt)
+            .expect("encoded_prompt_len failed");
 
         for _ in 0..warmup {
-            model.forward_prompt(&prompt).expect("forward_prompt failed (warmup)");
+            model
+                .forward_prompt(&prompt)
+                .expect("forward_prompt failed (warmup)");
         }
         let mut samples_ms = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t0 = Instant::now();
-            model.forward_prompt(&prompt).expect("forward_prompt failed");
+            model
+                .forward_prompt(&prompt)
+                .expect("forward_prompt failed");
             samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
-        print_stats("REFLEX_BENCH_WARM_OK", prompt_tokens, warmup, iters, samples_ms);
+        print_stats(
+            "REFLEX_BENCH_WARM_OK",
+            prompt_tokens,
+            warmup,
+            iters,
+            samples_ms,
+        );
 
         // Decode throughput: `generate` past the first token measures pure per-token
         // decode cost, isolated from the one-time prefill via `on_first_token`.
         const DECODE_STEPS: usize = 16;
         for _ in 0..warmup {
-            model.generate(&prompt, DECODE_STEPS + 1, None, |_logits| {}).expect("generate failed (throughput warmup)");
+            model
+                .generate(&prompt, DECODE_STEPS + 1, None, |_logits| {})
+                .expect("generate failed (throughput warmup)");
         }
         let mut ms_per_token_samples = Vec::with_capacity(iters);
         for _ in 0..iters {
@@ -159,15 +191,25 @@ pub fn run(args: Vec<String>) {
 
         if !candidates.is_empty() {
             for _ in 0..warmup {
-                model.system1_evaluate(&prompt, &candidates, 1.0).expect("system1_evaluate failed (warmup)");
+                model
+                    .system1_evaluate(&prompt, &candidates, 1.0)
+                    .expect("system1_evaluate failed (warmup)");
             }
             let mut samples_ms = Vec::with_capacity(iters);
             for _ in 0..iters {
                 let t0 = Instant::now();
-                model.system1_evaluate(&prompt, &candidates, 1.0).expect("system1_evaluate failed");
+                model
+                    .system1_evaluate(&prompt, &candidates, 1.0)
+                    .expect("system1_evaluate failed");
                 samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
             }
-            print_stats("REFLEX_BENCH_SYSTEM1_OK", prompt_tokens, warmup, iters, samples_ms);
+            print_stats(
+                "REFLEX_BENCH_SYSTEM1_OK",
+                prompt_tokens,
+                warmup,
+                iters,
+                samples_ms,
+            );
         }
     }
     reflex_engine::fast_exit(0);

@@ -41,7 +41,9 @@ pub fn run(args: Vec<String>) {
             "--lora" => lora_path = Some(args.next().expect("--lora requires a file path")),
             "--temperature" => {
                 let raw = args.next().expect("--temperature requires a number");
-                temperature = raw.parse().unwrap_or_else(|_| panic!("--temperature must be a positive number, got {raw:?}"));
+                temperature = raw.parse().unwrap_or_else(|_| {
+                    panic!("--temperature must be a positive number, got {raw:?}")
+                });
             }
             _ if gguf_path.is_none() => gguf_path = Some(arg),
             _ if prompt.is_none() => prompt = Some(arg),
@@ -59,7 +61,8 @@ pub fn run(args: Vec<String>) {
         panic!("at least one --candidate is required");
     }
 
-    let file = GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
+    let file =
+        GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
     let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
@@ -67,14 +70,26 @@ pub fn run(args: Vec<String>) {
     let mut model = Model::load(device, &file).expect("failed to load model");
 
     if let Some(lora_path) = &lora_path {
-        let applied = model.apply_lora(std::path::Path::new(lora_path)).expect("failed to apply LoRA adapter");
+        let applied = model
+            .apply_lora(std::path::Path::new(lora_path))
+            .expect("failed to apply LoRA adapter");
         println!("REFLEX_LORA_OK path={lora_path:?} tensors_applied={applied}");
     }
 
-    let candidates: Vec<System1Candidate> = candidate_texts.iter().map(|text| System1Candidate { text: text.clone() }).collect();
-    let response = model.system1_evaluate(&prompt, &candidates, temperature).expect("system1_evaluate failed");
+    let candidates: Vec<System1Candidate> = candidate_texts
+        .iter()
+        .map(|text| System1Candidate { text: text.clone() })
+        .collect();
+    let response = model
+        .system1_evaluate(&prompt, &candidates, temperature)
+        .expect("system1_evaluate failed");
 
-    for (idx, (result, probability)) in response.results.iter().zip(&response.probabilities).enumerate() {
+    for (idx, (result, probability)) in response
+        .results
+        .iter()
+        .zip(&response.probabilities)
+        .enumerate()
+    {
         let token_ids: Vec<String> = result.token_ids.iter().map(|t| t.to_string()).collect();
         println!(
             "REFLEX_SYSTEM1_CANDIDATE_OK idx={idx} text={:?} token_ids=[{}] score={:.6} probability={:.6}",

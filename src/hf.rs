@@ -43,7 +43,8 @@ pub fn resolve_gguf_path(spec: &str) -> Result<PathBuf, String> {
         )),
     };
 
-    let api = Api::new().map_err(|e| format!("hf-hub: failed to initialize Hugging Face API client: {e}"))?;
+    let api = Api::new()
+        .map_err(|e| format!("hf-hub: failed to initialize Hugging Face API client: {e}"))?;
     api.model(repo_id.clone())
         .get(&filename)
         .map_err(|e| format!("hf-hub: failed to resolve '{repo_id}:{filename}': {e}"))
@@ -51,7 +52,8 @@ pub fn resolve_gguf_path(spec: &str) -> Result<PathBuf, String> {
 
 /// Resolves the `--quickstart` default model ([`QUICKSTART_REPO`]/[`QUICKSTART_FILE`]).
 pub fn resolve_quickstart() -> Result<PathBuf, String> {
-    let api = Api::new().map_err(|e| format!("hf-hub: failed to initialize Hugging Face API client: {e}"))?;
+    let api = Api::new()
+        .map_err(|e| format!("hf-hub: failed to initialize Hugging Face API client: {e}"))?;
     api.model(QUICKSTART_REPO.to_string())
         .get(QUICKSTART_FILE)
         .map_err(|e| format!("hf-hub: failed to download --quickstart model ({QUICKSTART_REPO}:{QUICKSTART_FILE}): {e}"))
@@ -71,35 +73,56 @@ mod tests {
     #[test]
     #[ignore]
     fn resolve_quickstart_downloads_a_real_gguf() {
-        let path = resolve_quickstart().expect("resolve_quickstart should succeed against the real HF Hub");
-        let metadata = std::fs::metadata(&path).expect("downloaded/cached file should exist on disk");
-        assert!(metadata.len() > 100_000_000, "expected a real, multi-hundred-MB GGUF, got {} bytes at {path:?}", metadata.len());
+        let path = resolve_quickstart()
+            .expect("resolve_quickstart should succeed against the real HF Hub");
+        let metadata =
+            std::fs::metadata(&path).expect("downloaded/cached file should exist on disk");
+        assert!(
+            metadata.len() > 100_000_000,
+            "expected a real, multi-hundred-MB GGUF, got {} bytes at {path:?}",
+            metadata.len()
+        );
 
         // Local-file short-circuit: resolving the already-downloaded path directly
         // (no ':' suffix, so it's not even parsed as a repo spec) must not touch
         // the network and must return it unchanged.
         let path_str = path.to_str().expect("cached path should be valid UTF-8");
-        let resolved_again = resolve_gguf_path(path_str).expect("resolving an existing local path should succeed");
+        let resolved_again =
+            resolve_gguf_path(path_str).expect("resolving an existing local path should succeed");
         assert_eq!(resolved_again, path);
 
         // repo:filename parsing against the same real repo, via the general-purpose
         // `resolve_gguf_path` entry point (not the `resolve_quickstart` constant path).
         let spec = format!("{QUICKSTART_REPO}:{QUICKSTART_FILE}");
-        let resolved_via_spec = resolve_gguf_path(&spec).expect("resolve_gguf_path should succeed for a real repo:filename spec");
-        assert_eq!(resolved_via_spec, path, "should resolve to the same cached file");
+        let resolved_via_spec = resolve_gguf_path(&spec)
+            .expect("resolve_gguf_path should succeed for a real repo:filename spec");
+        assert_eq!(
+            resolved_via_spec, path,
+            "should resolve to the same cached file"
+        );
 
         // The actual model-compatibility check this constant choice depends on:
         // `crate::model::parse_model_config` only accepts `general.architecture ==
         // "qwen3"` (or an MoE architecture) -- confirm the real downloaded file
         // reports exactly that, independent of any GPU/CUDA availability.
         let file = crate::gguf::GgufFile::open(&path).expect("downloaded GGUF should parse");
-        let architecture = file.metadata.get("general.architecture").and_then(crate::gguf::GgufValue::as_str);
-        assert_eq!(architecture, Some("qwen3"), "quickstart model must be a qwen3-architecture GGUF");
+        let architecture = file
+            .metadata
+            .get("general.architecture")
+            .and_then(crate::gguf::GgufValue::as_str);
+        assert_eq!(
+            architecture,
+            Some("qwen3"),
+            "quickstart model must be a qwen3-architecture GGUF"
+        );
     }
 
     #[test]
     fn resolve_gguf_path_errs_on_a_spec_with_no_colon_and_no_local_file() {
         let err = resolve_gguf_path("not-a-real-local-file-and-no-colon").unwrap_err();
-        assert!(err.contains("':<filename>'"), "expected a clear 'missing :<filename>' error, got: {err}");
+        assert!(
+            err.contains("':<filename>'"),
+            "expected a clear 'missing :<filename>' error, got: {err}"
+        );
     }
 }

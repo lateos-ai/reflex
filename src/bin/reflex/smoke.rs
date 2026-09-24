@@ -14,8 +14,8 @@
 //! why a graceful return costs several extra seconds of CUDA-context-
 //! teardown wall-clock time on GPU-virtualized rented instances.
 
-use reflex_engine::{aot, diagnostics};
 use cudarc::driver::{LaunchAsync, LaunchConfig};
+use reflex_engine::{aot, diagnostics};
 use std::time::Instant;
 
 pub fn run(_args: Vec<String>) {
@@ -28,8 +28,13 @@ pub fn run(_args: Vec<String>) {
     // skew this subcommand's whole reason for existing: the smallest possible
     // process-start-to-first-kernel-result measurement.
     let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
-    let kernel = aot::load_kernel(&device, include_bytes!(env!("REFLEX_KERNEL_SMOKE")), "smoke", "axpy_f32")
-        .expect("failed to load AOT smoke kernel");
+    let kernel = aot::load_kernel(
+        &device,
+        include_bytes!(env!("REFLEX_KERNEL_SMOKE")),
+        "smoke",
+        "axpy_f32",
+    )
+    .expect("failed to load AOT smoke kernel");
 
     let n = 1024usize;
     let x = device.htod_copy(vec![1.0f32; n]).unwrap();
@@ -48,9 +53,16 @@ pub fn run(_args: Vec<String>) {
     let elapsed = t0.elapsed();
 
     let result = device.dtoh_sync_copy(&out).unwrap();
-    assert!((result[0] - 5.0).abs() < 1e-5, "wrong result: {}", result[0]);
+    assert!(
+        (result[0] - 5.0).abs() < 1e-5,
+        "wrong result: {}",
+        result[0]
+    );
 
-    println!("REFLEX_SMOKE_OK process_start_to_first_result_ms={:.3}", elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "REFLEX_SMOKE_OK process_start_to_first_result_ms={:.3}",
+        elapsed.as_secs_f64() * 1000.0
+    );
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }

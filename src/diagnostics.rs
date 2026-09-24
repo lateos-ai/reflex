@@ -38,15 +38,23 @@ impl std::fmt::Display for GpuDiagnostics {
 /// current for `device` -- there is no per-device-handle overload in this cudarc
 /// version).
 pub fn probe(device: &Arc<CudaDevice>) -> Result<GpuDiagnostics, String> {
-    let name = device.name().map_err(|e| format!("querying GPU name: {e}"))?;
+    let name = device
+        .name()
+        .map_err(|e| format!("querying GPU name: {e}"))?;
     let major = device
         .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
         .map_err(|e| format!("querying compute capability major: {e}"))?;
     let minor = device
         .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
         .map_err(|e| format!("querying compute capability minor: {e}"))?;
-    let (vram_free_bytes, vram_total_bytes) = result::mem_get_info().map_err(|e| format!("querying VRAM: {e}"))?;
-    Ok(GpuDiagnostics { name, compute_capability: (major, minor), vram_free_bytes, vram_total_bytes })
+    let (vram_free_bytes, vram_total_bytes) =
+        result::mem_get_info().map_err(|e| format!("querying VRAM: {e}"))?;
+    Ok(GpuDiagnostics {
+        name,
+        compute_capability: (major, minor),
+        vram_free_bytes,
+        vram_total_bytes,
+    })
 }
 
 /// Wraps `CudaDevice::new(ordinal)`, turning the common failure modes (no GPU found,
@@ -74,11 +82,17 @@ fn parse_arch(arch: &str) -> Result<(i32, i32), String> {
         .take_while(|c| c.is_ascii_digit())
         .collect();
     if digits.len() < 2 {
-        return Err(format!("couldn't parse compute capability out of REFLEX_CUDA_ARCH={arch:?}"));
+        return Err(format!(
+            "couldn't parse compute capability out of REFLEX_CUDA_ARCH={arch:?}"
+        ));
     }
     let (major, minor) = digits.split_at(digits.len() - 1);
-    let major = major.parse::<i32>().map_err(|e| format!("parsing major compute capability from {arch:?}: {e}"))?;
-    let minor = minor.parse::<i32>().map_err(|e| format!("parsing minor compute capability from {arch:?}: {e}"))?;
+    let major = major
+        .parse::<i32>()
+        .map_err(|e| format!("parsing major compute capability from {arch:?}: {e}"))?;
+    let minor = minor
+        .parse::<i32>()
+        .map_err(|e| format!("parsing minor compute capability from {arch:?}: {e}"))?;
     Ok((major, minor))
 }
 

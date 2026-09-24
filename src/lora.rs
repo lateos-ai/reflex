@@ -73,7 +73,8 @@ pub struct LoraAdapter {
 /// small low-rank factors, not worth a device round trip) -- no CUDA device
 /// is touched here; `Model::apply_lora` does the one-time upload.
 pub fn load(path: &Path) -> Result<LoraAdapter, String> {
-    let file = GgufFile::open(path).map_err(|e| format!("failed to open LoRA adapter {path:?}: {e}"))?;
+    let file =
+        GgufFile::open(path).map_err(|e| format!("failed to open LoRA adapter {path:?}: {e}"))?;
 
     let adapter_type = file
         .metadata
@@ -81,17 +82,23 @@ pub fn load(path: &Path) -> Result<LoraAdapter, String> {
         .and_then(GgufValue::as_str)
         .ok_or_else(|| format!("{path:?} is missing the required 'adapter.type' metadata key -- not a llama.cpp-format LoRA adapter GGUF"))?;
     if adapter_type != "lora" {
-        return Err(format!("{path:?} has adapter.type={adapter_type:?} (only \"lora\" is supported)"));
+        return Err(format!(
+            "{path:?} has adapter.type={adapter_type:?} (only \"lora\" is supported)"
+        ));
     }
     let alpha = file
         .metadata
         .get("adapter.lora.alpha")
         .and_then(GgufValue::as_f32)
-        .ok_or_else(|| format!("{path:?} is missing the required 'adapter.lora.alpha' metadata key"))?;
+        .ok_or_else(|| {
+            format!("{path:?} is missing the required 'adapter.lora.alpha' metadata key")
+        })?;
 
     let mut targets = Vec::new();
     for info in &file.tensors {
-        let Some(base_name) = info.name.strip_suffix(".lora_a") else { continue };
+        let Some(base_name) = info.name.strip_suffix(".lora_a") else {
+            continue;
+        };
         let lora_b_name = format!("{base_name}.lora_b");
         let b_info = file
             .tensor_info(&lora_b_name)
@@ -106,7 +113,12 @@ pub fn load(path: &Path) -> Result<LoraAdapter, String> {
 
         let (in_features, rank) = match info.shape.as_slice() {
             [in_features, rank] => (*in_features as usize, *rank as usize),
-            other => return Err(format!("{path:?}: '{}' has unexpected shape {other:?} (expected 2-D [in_features, rank])", info.name)),
+            other => {
+                return Err(format!(
+                "{path:?}: '{}' has unexpected shape {other:?} (expected 2-D [in_features, rank])",
+                info.name
+            ))
+            }
         };
         let (rank_b, out_features) = match b_info.shape.as_slice() {
             [rank_b, out_features] => (*rank_b as usize, *out_features as usize),
@@ -133,7 +145,13 @@ pub fn load(path: &Path) -> Result<LoraAdapter, String> {
             }
         }
 
-        targets.push(LoraTarget { name: base_name.to_string(), in_features, out_features, rank, delta });
+        targets.push(LoraTarget {
+            name: base_name.to_string(),
+            in_features,
+            out_features,
+            rank,
+            delta,
+        });
     }
 
     if targets.is_empty() {

@@ -37,7 +37,9 @@ impl PyModel {
         let device = diagnostics::init_device_with_diagnostics(0).map_err(to_py_err)?;
         let mut model = Model::load(device, &file).map_err(to_py_err)?;
         if let Some(lora_path) = lora_path {
-            model.apply_lora(std::path::Path::new(lora_path)).map_err(to_py_err)?;
+            model
+                .apply_lora(std::path::Path::new(lora_path))
+                .map_err(to_py_err)?;
         }
         Ok(PyModel { inner: model })
     }
@@ -46,7 +48,9 @@ impl PyModel {
     /// `Model::generate` with no imported KV cache (state import/export isn't
     /// exposed through this binding this round).
     fn generate(&self, prompt: &str, max_new_tokens: usize) -> PyResult<(Vec<u32>, String)> {
-        self.inner.generate(prompt, max_new_tokens, None, |_logits| {}).map_err(to_py_err)
+        self.inner
+            .generate(prompt, max_new_tokens, None, |_logits| {})
+            .map_err(to_py_err)
     }
 
     /// Single-pass candidate scoring (`Model::system1_evaluate`). Returns a dict:
@@ -54,9 +58,21 @@ impl PyModel {
     /// -- `entropy` is `crate::calibration::shannon_entropy` (bits) of the
     /// `probability` distribution across `results`.
     #[pyo3(signature = (prompt, candidates, temperature=1.0))]
-    fn system1_evaluate(&self, py: Python<'_>, prompt: &str, candidates: Vec<String>, temperature: f32) -> PyResult<PyObject> {
-        let candidates: Vec<System1Candidate> = candidates.into_iter().map(|text| System1Candidate { text }).collect();
-        let response = self.inner.system1_evaluate(prompt, &candidates, temperature).map_err(to_py_err)?;
+    fn system1_evaluate(
+        &self,
+        py: Python<'_>,
+        prompt: &str,
+        candidates: Vec<String>,
+        temperature: f32,
+    ) -> PyResult<PyObject> {
+        let candidates: Vec<System1Candidate> = candidates
+            .into_iter()
+            .map(|text| System1Candidate { text })
+            .collect();
+        let response = self
+            .inner
+            .system1_evaluate(prompt, &candidates, temperature)
+            .map_err(to_py_err)?;
 
         let results = PyList::empty_bound(py);
         for (r, probability) in response.results.into_iter().zip(response.probabilities) {
