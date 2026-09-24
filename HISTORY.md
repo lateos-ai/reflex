@@ -1355,3 +1355,48 @@ former "Known debt" entry, now closed, for the pointer.
 Note this verifies the *image* runs correctly under `--gpus all` on real hardware; it
 does not itself validate `docs/aws-deployment.md`'s full ASG/EFS/ECR/scale-to-zero
 pattern, which remains a separate, larger, still-undeployed scope.
+
+### CI follow-up: wire `cargo fmt --check` and `cargo clippy` in (2026-09-24)
+
+Closes the gap the original CI entry above deliberately left open. `cargo fmt
+--check` found the same tree-wide non-compliance noted then (24 files, `build.rs`
+included); applied `cargo fmt` and verified the result is whitespace/punctuation-only
+by diffing identifier/keyword/string-literal token streams before and after for every
+touched file — all identical, confirming no behavior change slipped in via the
+formatter.
+
+`cargo clippy --all-targets` found more this time than the original ffi.rs pass
+already fixed. Two are worth recording: clippy's own machine-applicable fix for
+`chunks_exact_to_as_chunks` (8 sites in `dequant.rs`/`kv_io.rs`/`gguf.rs`) does not
+compile as suggested — `cargo clippy --fix` applied it, then rolled it back after the
+resulting tree failed to build (`&[u8;N]` chunk items don't satisfy the `TryFrom`
+bound the surrounding `.try_into().unwrap()` code expected) — rewritten by hand
+instead. `large_enum_variant` on `HybridLayerWeights`/`MlaFfn::Moe` was fixed by
+boxing the oversized variant fields, which needed no call-site changes beyond the two
+construction sites, since every match arm reads through `Box`'s `Deref`/`DerefMut`
+unchanged.
+
+Not every lint got a code change. `dequant.rs`/`dequant_iq.rs` are explicitly
+line-for-line ports of `ggml-quants.c` kept diffable against the C by eye (see those
+files' own doc comments) — `identity_op`'s `qh >> 0` and two `needless_range_loop`
+sites are deliberate mirrors of the reference's loop/shift structure, not oversights,
+so those got a scoped, commented `#[allow]` instead of a "fix" that would have broken
+that diffability. Same reasoning for `too_many_arguments` on 5 GPU-kernel-dispatch
+helpers (`rope_norm`, `attention`, `mla_concat_qcur_batch`, `gdn_l2_norm`,
+`forward_hybrid_ffn`) — their argument lists mirror their CUDA kernel's launch
+parameters 1:1, so a params-struct wrapper would only relocate the count, not reduce
+it. Everything else (7 duplicated tuple return types collapsed into named type
+aliases, 3 `ffi.rs` raw-pointer sites hardened to build the slice pointer without
+materializing a reference first, `missing_const_for_thread_local`,
+`manual_is_multiple_of`) got a real fix.
+
+Both steps landed in `ci.yml` on the same `[ubuntu-latest, windows-latest]` matrix,
+clippy gated with `-D warnings`. Verified locally exactly as CI runs it
+(`REFLEX_SKIP_CUDA=1`): `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, `cargo build --locked --all-targets`, `cargo test --locked` (74
+passed/0 failed/9 ignored — the GPU-only tests), then confirmed on the actual
+GitHub-hosted runners after pushing (both matrix legs green, including the two new
+steps). Also rebuilt `target/release/reflex` per this project's `cargo test`-doesn't-
+rebuild-the-binary gotcha — builds clean under `REFLEX_SKIP_CUDA=1`, but this dev
+machine has no CUDA toolkit/GPU, so `smoke`/`generate` real-kernel verification still
+wasn't possible here (same constraint the CI runners themselves have).

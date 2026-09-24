@@ -264,7 +264,8 @@ planned. The user has asked to queue up three release-hardening items, in this o
    `cargo build --locked --all-targets` + `cargo test --locked` under
    `REFLEX_SKIP_CUDA=1` on an `[ubuntu-latest, windows-latest]` matrix (no
    GitHub-hosted runner has a GPU). `cargo fmt --check`/`cargo clippy` deliberately
-   left out — see HISTORY.md's CI entry and "Known debt" below for why. This does
+   left out at the time — see HISTORY.md's CI entry and "Known debt" below for why.
+   **Both wired in 2026-09-24** — see HISTORY.md's follow-up CI entry. This does
    not replace real-hardware verification, only catches non-GPU-dependent breakage.
 2. ~~**Verify `docker run --rm --gpus all`** end-to-end~~ — **done 2026-09-24**: a real
    EC2 `g4dn.xlarge` (On-Demand; Spot capacity was exhausted in every `us-east-1` AZ at
@@ -334,9 +335,14 @@ larger model — left for a future round.
   `include/reflex_engine.h` is identical except for the new doc comments (`unsafe` is
   a Rust-only annotation with no C-side representation), `ffi-test/smoke_test.c`'s
   plain C calls need no changes, and no in-crate Rust code calls these functions
-  directly. `cargo test` still 74 passed/0 failed under `REFLEX_SKIP_CUDA=1`. `cargo
-  clippy` is still not wired into CI (the pre-existing `cargo fmt` non-compliance
-  found the same CI session remains open), but this specific blocker is resolved.
+  directly. `cargo test` still 74 passed/0 failed under `REFLEX_SKIP_CUDA=1`. At the
+  time, `cargo clippy` was still not wired into CI (the pre-existing `cargo fmt`
+  non-compliance found the same CI session remained open), though this specific
+  blocker was resolved. **Both closed 2026-09-24** — see HISTORY.md's follow-up CI
+  entry: `cargo fmt` applied tree-wide (verified whitespace-only via token-stream
+  diffing), every remaining `cargo clippy --all-targets` warning fixed or scoped-
+  `#[allow]`ed with a documented reason, and both wired into `ci.yml` with
+  `-D warnings`.
 - **Phase 2 round 3 on-device dequant scope**: only `Q4_K`/`Q6_K` dequantize on-GPU
   (`kernels_cuda/dequant.cu`). Every other GGUF block type (`Q4_0/1`, `Q5_0/1`,
   `Q8_0/1`, `Q2_K`/`Q3_K`/`Q5_K`/`Q8_K`, all 8 IQ-family formats, plus F32/F16/Bf16/int
