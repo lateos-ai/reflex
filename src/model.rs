@@ -102,32 +102,103 @@ struct Weight {
 /// table `gguf.rs::ggml_type_size_bytes` computes independently for the same
 /// types.
 const QK_K: usize = 256;
+const QK_LEGACY: usize = 32;
 const Q4K_BLOCK_BYTES: usize = 144;
 const Q5K_BLOCK_BYTES: usize = 176;
 const Q6K_BLOCK_BYTES: usize = 210;
+const Q4_0_BLOCK_BYTES: usize = 18;
+const Q4_1_BLOCK_BYTES: usize = 20;
+const Q5_0_BLOCK_BYTES: usize = 22;
+const Q5_1_BLOCK_BYTES: usize = 24;
+const Q8_0_BLOCK_BYTES: usize = 34;
+const Q8_1_BLOCK_BYTES: usize = 36;
+const Q2K_BLOCK_BYTES: usize = 84;
+const Q3K_BLOCK_BYTES: usize = 110;
+const Q8K_BLOCK_BYTES: usize = 292;
+
+/// Every on-device dequant kernel (`src/kernels_cuda/dequant.cu`), loaded
+/// once at model-load time and threaded through `Model::load`/`load_hybrid`/
+/// `load_mla`'s `load_weight` closures. Bundled into one struct rather than
+/// growing `dequantize_tensor_to_device`/`load_weight_device`'s parameter
+/// list by one `&AotKernel` per newly-ported format.
+struct DequantKernels {
+    q4k: AotKernel,
+    q5k: AotKernel,
+    q6k: AotKernel,
+    q4_0: AotKernel,
+    q4_1: AotKernel,
+    q5_0: AotKernel,
+    q5_1: AotKernel,
+    q8_0: AotKernel,
+    q8_1: AotKernel,
+    q2k: AotKernel,
+    q3k: AotKernel,
+    q8k: AotKernel,
+}
+
+/// Loads every on-device dequant kernel from the AOT-compiled `dequant`
+/// module in one call -- shared by `Model::load`/`load_hybrid`/`load_mla`,
+/// which each used to repeat this loading boilerplate individually.
+fn load_dequant_kernels(device: &Arc<CudaDevice>) -> Result<DequantKernels, String> {
+    let names = [
+        "dequantize_q4k_kernel",
+        "dequantize_q5k_kernel",
+        "dequantize_q6k_kernel",
+        "dequantize_q4_0_kernel",
+        "dequantize_q4_1_kernel",
+        "dequantize_q5_0_kernel",
+        "dequantize_q5_1_kernel",
+        "dequantize_q8_0_kernel",
+        "dequantize_q8_1_kernel",
+        "dequantize_q2k_kernel",
+        "dequantize_q3k_kernel",
+        "dequantize_q8k_kernel",
+    ];
+    let mut fns = aot::load_kernel_module(device, include_bytes!(env!("REFLEX_KERNEL_DEQUANT")), "dequant", &names)?.into_iter();
+    Ok(DequantKernels {
+        q4k: fns.next().ok_or("missing dequantize_q4k_kernel")?,
+        q5k: fns.next().ok_or("missing dequantize_q5k_kernel")?,
+        q6k: fns.next().ok_or("missing dequantize_q6k_kernel")?,
+        q4_0: fns.next().ok_or("missing dequantize_q4_0_kernel")?,
+        q4_1: fns.next().ok_or("missing dequantize_q4_1_kernel")?,
+        q5_0: fns.next().ok_or("missing dequantize_q5_0_kernel")?,
+        q5_1: fns.next().ok_or("missing dequantize_q5_1_kernel")?,
+        q8_0: fns.next().ok_or("missing dequantize_q8_0_kernel")?,
+        q8_1: fns.next().ok_or("missing dequantize_q8_1_kernel")?,
+        q2k: fns.next().ok_or("missing dequantize_q2k_kernel")?,
+        q3k: fns.next().ok_or("missing dequantize_q3k_kernel")?,
+        q8k: fns.next().ok_or("missing dequantize_q8k_kernel")?,
+    })
+}
 
 /// Dequantizes one tensor's raw quantized bytes straight to a device-resident
-/// `f32` buffer. Q4_K/Q5_K/Q6_K (the block types real Q4_K_M/Q5_K_M GGUFs
-/// exercise for the bulk of weight bytes) dequantize on-device via
-/// `src/kernels_cuda/dequant.cu` -- no host `f32` copy is ever materialized
-/// for these, closing the gap with llama.cpp's CUDA backend, which never
-/// materializes one either (see README.md's Phase 2 round 3 writeup). Every
-/// other block type still falls back to the existing host
-/// `dequant::dequantize` path (`src/dequant.rs`/`dequant_iq.rs`) -- correct
-/// but not (yet) GPU-accelerated.
+/// `f32` buffer. Every block-quantized format except the IQ family
+/// dequantizes on-device via `src/kernels_cuda/dequant.cu` -- no host `f32`
+/// copy is ever materialized for these, closing the gap with llama.cpp's
+/// CUDA backend, which never materializes one either (see README.md's Phase
+/// 2 round 3 writeup). The remaining IQ-family formats still fall back to
+/// the existing host `dequant::dequantize` path (`src/dequant.rs`/
+/// `dequant_iq.rs`) -- correct but not (yet) GPU-accelerated.
 fn dequantize_tensor_to_device(
     device: &Arc<CudaDevice>,
-    dequant_q4k_k: &AotKernel,
-    dequant_q5k_k: &AotKernel,
-    dequant_q6k_k: &AotKernel,
+    kernels: &DequantKernels,
     ggml_type: GgmlType,
     bytes: &[u8],
     element_count: u64,
 ) -> Result<CudaSlice<f32>, String> {
     match ggml_type {
-        GgmlType::Q4K => dequantize_on_device(device, dequant_q4k_k, Q4K_BLOCK_BYTES, bytes, element_count),
-        GgmlType::Q5K => dequantize_on_device(device, dequant_q5k_k, Q5K_BLOCK_BYTES, bytes, element_count),
-        GgmlType::Q6K => dequantize_on_device(device, dequant_q6k_k, Q6K_BLOCK_BYTES, bytes, element_count),
+        GgmlType::Q4K => dequantize_on_device(device, &kernels.q4k, Q4K_BLOCK_BYTES, QK_K, bytes, element_count),
+        GgmlType::Q5K => dequantize_on_device(device, &kernels.q5k, Q5K_BLOCK_BYTES, QK_K, bytes, element_count),
+        GgmlType::Q6K => dequantize_on_device(device, &kernels.q6k, Q6K_BLOCK_BYTES, QK_K, bytes, element_count),
+        GgmlType::Q4_0 => dequantize_on_device(device, &kernels.q4_0, Q4_0_BLOCK_BYTES, QK_LEGACY, bytes, element_count),
+        GgmlType::Q4_1 => dequantize_on_device(device, &kernels.q4_1, Q4_1_BLOCK_BYTES, QK_LEGACY, bytes, element_count),
+        GgmlType::Q5_0 => dequantize_on_device(device, &kernels.q5_0, Q5_0_BLOCK_BYTES, QK_LEGACY, bytes, element_count),
+        GgmlType::Q5_1 => dequantize_on_device(device, &kernels.q5_1, Q5_1_BLOCK_BYTES, QK_LEGACY, bytes, element_count),
+        GgmlType::Q8_0 => dequantize_on_device(device, &kernels.q8_0, Q8_0_BLOCK_BYTES, QK_LEGACY, bytes, element_count),
+        GgmlType::Q8_1 => dequantize_on_device(device, &kernels.q8_1, Q8_1_BLOCK_BYTES, QK_LEGACY, bytes, element_count),
+        GgmlType::Q2K => dequantize_on_device(device, &kernels.q2k, Q2K_BLOCK_BYTES, QK_K, bytes, element_count),
+        GgmlType::Q3K => dequantize_on_device(device, &kernels.q3k, Q3K_BLOCK_BYTES, QK_K, bytes, element_count),
+        GgmlType::Q8K => dequantize_on_device(device, &kernels.q8k, Q8K_BLOCK_BYTES, QK_K, bytes, element_count),
         other => {
             let host = dequant::dequantize(other, bytes, element_count)?;
             device.htod_sync_copy(&host).map_err(|e| format!("upload weight to device: {e}"))
@@ -136,23 +207,23 @@ fn dequantize_tensor_to_device(
 }
 
 /// Uploads `bytes` (raw quantized block bytes, unmodified) to device memory
-/// and launches `kernel` (`dequantize_q4k_kernel`/`dequantize_q5k_kernel`/
-/// `dequantize_q6k_kernel`) to unpack them into a fresh `f32` buffer, one
-/// CUDA thread per `QK_K`-element
-/// block. Truncates to `element_count` if the last block is only partially
-/// used (ggml's own invariant is that a quantized tensor's element count is
-/// always a block-size multiple, so this is defensive, matching
-/// `dequant::dequantize`'s own truncation).
+/// and launches `kernel` to unpack them into a fresh `f32` buffer, one CUDA
+/// thread per `block_elems`-element block (`256` for every K-quant format,
+/// `32` for the legacy Q4_0/1-Q8_0/1 family). Truncates to `element_count` if
+/// the last block is only partially used (ggml's own invariant is that a
+/// quantized tensor's element count is always a block-size multiple, so this
+/// is defensive, matching `dequant::dequantize`'s own truncation).
 fn dequantize_on_device(
     device: &Arc<CudaDevice>,
     kernel: &AotKernel,
     block_bytes: usize,
+    block_elems: usize,
     bytes: &[u8],
     element_count: u64,
 ) -> Result<CudaSlice<f32>, String> {
     let num_blocks = bytes.len() / block_bytes;
     let raw = device.htod_sync_copy(bytes).map_err(|e| format!("upload raw quantized bytes: {e}"))?;
-    let out_len = num_blocks * QK_K;
+    let out_len = num_blocks * block_elems;
     let mut dev_out = device.alloc_zeros::<f32>(out_len).map_err(|e| format!("alloc dequant output: {e}"))?;
 
     let threads = 256u32;
@@ -180,19 +251,11 @@ fn dequantize_on_device(
 /// buffer -- shared by `Model::load`/`load_hybrid`/`load_mla`'s own
 /// `load_weight` closures (see [`dequantize_tensor_to_device`] for the
 /// on-device-vs-host dispatch).
-fn load_weight_device(
-    device: &Arc<CudaDevice>,
-    dequant_q4k_k: &AotKernel,
-    dequant_q5k_k: &AotKernel,
-    dequant_q6k_k: &AotKernel,
-    file: &GgufFile,
-    name: &str,
-) -> Result<Weight, String> {
+fn load_weight_device(device: &Arc<CudaDevice>, kernels: &DequantKernels, file: &GgufFile, name: &str) -> Result<Weight, String> {
     let info = file.tensor_info(name).ok_or_else(|| format!("missing weight '{name}'"))?;
     let bytes = file.tensor_bytes(info)?;
-    let data =
-        dequantize_tensor_to_device(device, dequant_q4k_k, dequant_q5k_k, dequant_q6k_k, info.ggml_type, bytes, info.element_count())
-            .map_err(|e| format!("load weight '{name}': {e}"))?;
+    let data = dequantize_tensor_to_device(device, kernels, info.ggml_type, bytes, info.element_count())
+        .map_err(|e| format!("load weight '{name}': {e}"))?;
     Ok(Weight { data, shape: info.shape.clone() })
 }
 
@@ -1134,26 +1197,15 @@ impl Model {
         let sigmoid_gate_k = elementwise_fns.next().ok_or("missing sigmoid_gate_kernel")?;
         let moe_gather_k = elementwise_fns.next().ok_or("missing moe_gather_kernel")?;
         let moe_scatter_add_k = elementwise_fns.next().ok_or("missing moe_scatter_add_kernel")?;
-        let mut dequant_fns = aot::load_kernel_module(
-            &device,
-            include_bytes!(env!("REFLEX_KERNEL_DEQUANT")),
-            "dequant",
-            &["dequantize_q4k_kernel", "dequantize_q5k_kernel", "dequantize_q6k_kernel"],
-        )?
-        .into_iter();
-        let dequant_q4k_k = dequant_fns.next().ok_or("missing dequantize_q4k_kernel")?;
-        let dequant_q5k_k = dequant_fns.next().ok_or("missing dequantize_q5k_kernel")?;
-        let dequant_q6k_k = dequant_fns.next().ok_or("missing dequantize_q6k_kernel")?;
+        let dequant_kernels = load_dequant_kernels(&device)?;
 
         // Dequantizes straight from the mmap'd GGUF bytes (on-device for
-        // Q4_K/Q6_K, Phase 2 round 3; host `Vec<f32>` scratch, immediately
-        // dropped, for every other type) into device memory -- unlike
-        // before round 1, no dequantized weight stays host-resident for the
-        // model's lifetime, and no forward-pass call re-uploads it (see
-        // `Weight`'s doc comment).
-        let load_weight = |name: &str| -> Result<Weight, String> {
-            load_weight_device(&device, &dequant_q4k_k, &dequant_q5k_k, &dequant_q6k_k, file, name)
-        };
+        // every format but the IQ family, Phase 2 round 3 + post-MVP
+        // extensions; host `Vec<f32>` scratch, immediately dropped, for IQ)
+        // into device memory -- unlike before round 1, no dequantized weight
+        // stays host-resident for the model's lifetime, and no forward-pass
+        // call re-uploads it (see `Weight`'s doc comment).
+        let load_weight = |name: &str| -> Result<Weight, String> { load_weight_device(&device, &dequant_kernels, file, name) };
 
         let mut layers = Vec::with_capacity(block_count);
         for i in 0..block_count {
@@ -1215,16 +1267,8 @@ impl Model {
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
-                let data = dequantize_tensor_to_device(
-                    &device,
-                    &dequant_q4k_k,
-                    &dequant_q5k_k,
-                    &dequant_q6k_k,
-                    info.ggml_type,
-                    bytes,
-                    info.element_count(),
-                )
-                .map_err(|e| format!("load weight 'output.weight': {e}"))?;
+                let data = dequantize_tensor_to_device(&device, &dequant_kernels, info.ggml_type, bytes, info.element_count())
+                    .map_err(|e| format!("load weight 'output.weight': {e}"))?;
                 Weight { data, shape: info.shape.clone() }
             }
             None => {
@@ -1364,20 +1408,9 @@ impl Model {
         let gdn_gates_k = gdn_fns.next().ok_or("missing gdn_gates_kernel")?;
         let gdn_delta_k = gdn_fns.next().ok_or("missing gdn_delta_kernel")?;
         let gdn_gated_norm_k = gdn_fns.next().ok_or("missing gdn_gated_norm_kernel")?;
-        let mut dequant_fns = aot::load_kernel_module(
-            &device,
-            include_bytes!(env!("REFLEX_KERNEL_DEQUANT")),
-            "dequant",
-            &["dequantize_q4k_kernel", "dequantize_q5k_kernel", "dequantize_q6k_kernel"],
-        )?
-        .into_iter();
-        let dequant_q4k_k = dequant_fns.next().ok_or("missing dequantize_q4k_kernel")?;
-        let dequant_q5k_k = dequant_fns.next().ok_or("missing dequantize_q5k_kernel")?;
-        let dequant_q6k_k = dequant_fns.next().ok_or("missing dequantize_q6k_kernel")?;
+        let dequant_kernels = load_dequant_kernels(&device)?;
 
-        let load_weight = |name: &str| -> Result<Weight, String> {
-            load_weight_device(&device, &dequant_q4k_k, &dequant_q5k_k, &dequant_q6k_k, file, name)
-        };
+        let load_weight = |name: &str| -> Result<Weight, String> { load_weight_device(&device, &dequant_kernels, file, name) };
 
         let mut layers = Vec::with_capacity(block_count);
         for i in 0..block_count {
@@ -1435,16 +1468,8 @@ impl Model {
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
-                let data = dequantize_tensor_to_device(
-                    &device,
-                    &dequant_q4k_k,
-                    &dequant_q5k_k,
-                    &dequant_q6k_k,
-                    info.ggml_type,
-                    bytes,
-                    info.element_count(),
-                )
-                .map_err(|e| format!("load weight 'output.weight': {e}"))?;
+                let data = dequantize_tensor_to_device(&device, &dequant_kernels, info.ggml_type, bytes, info.element_count())
+                    .map_err(|e| format!("load weight 'output.weight': {e}"))?;
                 Weight { data, shape: info.shape.clone() }
             }
             None => {
@@ -1566,20 +1591,9 @@ impl Model {
             "gemv_per_head_batch",
             "gemv_per_head_batch_kernel",
         )?;
-        let mut dequant_fns = aot::load_kernel_module(
-            &device,
-            include_bytes!(env!("REFLEX_KERNEL_DEQUANT")),
-            "dequant",
-            &["dequantize_q4k_kernel", "dequantize_q5k_kernel", "dequantize_q6k_kernel"],
-        )?
-        .into_iter();
-        let dequant_q4k_k = dequant_fns.next().ok_or("missing dequantize_q4k_kernel")?;
-        let dequant_q5k_k = dequant_fns.next().ok_or("missing dequantize_q5k_kernel")?;
-        let dequant_q6k_k = dequant_fns.next().ok_or("missing dequantize_q6k_kernel")?;
+        let dequant_kernels = load_dequant_kernels(&device)?;
 
-        let load_weight = |name: &str| -> Result<Weight, String> {
-            load_weight_device(&device, &dequant_q4k_k, &dequant_q5k_k, &dequant_q6k_k, file, name)
-        };
+        let load_weight = |name: &str| -> Result<Weight, String> { load_weight_device(&device, &dequant_kernels, file, name) };
 
         let mut layers = Vec::with_capacity(block_count);
         for i in 0..block_count {
@@ -1626,16 +1640,8 @@ impl Model {
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
-                let data = dequantize_tensor_to_device(
-                    &device,
-                    &dequant_q4k_k,
-                    &dequant_q5k_k,
-                    &dequant_q6k_k,
-                    info.ggml_type,
-                    bytes,
-                    info.element_count(),
-                )
-                .map_err(|e| format!("load weight 'output.weight': {e}"))?;
+                let data = dequantize_tensor_to_device(&device, &dequant_kernels, info.ggml_type, bytes, info.element_count())
+                    .map_err(|e| format!("load weight 'output.weight': {e}"))?;
                 Weight { data, shape: info.shape.clone() }
             }
             None => {

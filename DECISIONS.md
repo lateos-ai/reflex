@@ -913,3 +913,78 @@ round — confirmed via the HF repo's own page text (not yet its safetensors hea
 target MoE's per-expert routed-expert projections, which per round 1's own
 "How to apply" note needs new per-expert delta-selection math, not just a widened
 accept list, plus a much larger model to rent for — left for a future round.
+
+## On-device dequant extended to 9 more block types; a real Q2_K/Q3_K token divergence investigated to a non-bug conclusion, not dismissed
+
+**Decision**: `kernels_cuda/dequant.cu` gained 9 more on-device dequant kernels
+(Q4_0/1, Q5_0/1, Q8_0/1, Q2_K, Q3_K, Q8_K), each a line-for-line port of its already-
+existing, already-unit-tested `dequant.rs` host function — no new math, these formats
+were always correctly dequantizable, just not yet GPU-accelerated. `model.rs`'s
+`dequantize_tensor_to_device`/`load_weight_device` used to take three separate
+`&AotKernel` parameters (one per supported format); rather than grow that list to
+twelve, they now take one `&DequantKernels` struct (`load_dequant_kernels` loads all
+twelve kernels from the AOT-compiled module in one call, replacing three near-
+identical manual `aot::load_kernel_module` + `.next()` blocks, one per architecture's
+load site). `dequantize_on_device` gained a `block_elems` parameter (previously
+hardcoded to `QK_K`=256) since the legacy formats use 32-element blocks.
+
+**Why**: matches the precedent Q4_K/Q6_K then Q5_K set — port the common formats
+first, leave the 8 IQ-family formats (which need constant-memory lookup tables from
+`ggml-common.h`, not just this file's per-block-loop pattern) for a future round. The
+`DequantKernels` bundling is a straightforward simplification once a fourth kernel
+would have made the flat-parameter-list pattern unwieldy, not scope creep — it
+doesn't change any load site's behavior, only how the kernel handles get threaded
+through.
+
+**Verification, and a real discrepancy investigated rather than shrugged off**: real
+hardware (A100, `g3jx9w64`). `nvcc` compiled all 9 new kernels clean on first try.
+Quantized a real `Qwen/Qwen3-0.6B` checkpoint with llama.cpp's own `llama-quantize
+--pure` into every real-storable target type this round adds (`Q8_1`/`Q8_K` are
+runtime-only quantized-dot-product intermediates -- `dequant.rs`'s own pre-existing
+doc comments already established this, and `llama-quantize --help` offers no `Q8_1`/
+`Q8_K` target type to confirm it independently -- so those two were verified by code
+review against the now-confirmed-correct `Q8_0` kernel instead of a real GGUF round
+trip, and that gap is disclosed rather than silently folded into "9/9 verified").
+`reflex generate` matched `llama-simple` byte-exact on `Q4_0`/`Q4_1`/`Q5_0`/`Q5_1`/
+`Q8_0` (5/7 real-storable types, all producing `token_id=12095, " Paris"` identically)
+but diverged on `Q2_K` (`" r"` vs. llama.cpp's `"?"`) and `Q3_K` (`" located"` vs.
+`" Paris"`). The instinct to write this off as "expected at 2-3 bits" was deliberately
+not trusted without evidence -- every other format this project has ever shipped
+(`Q4_K`/`Q5_K`/`Q6_K` in earlier rounds, plus this round's other 5) matched byte-exact,
+so a clean divergence isolated to exactly these two formats was treated as a likely
+real bug until proven otherwise. Root-caused instead of assumed: extracted the real
+`blk.0.attn_q.weight` tensor's actual raw block bytes from both quantized GGUFs and
+dequantized them three independent ways -- this project's Rust `dequant::dequantize`,
+llama.cpp's own Python reference implementation (`gguf-py`'s `Q2_K`/
+`Q3_K.dequantize_blocks`, a from-scratch numpy reimplementation maintained by the same
+upstream project, not just another copy of the same C source), and (to isolate the
+CUDA port specifically) a temporary host-only fallback build to confirm the on-device
+kernel and the host function produce bit-identical output -- all three agreed to f32
+precision on real production bytes, not just the existing hand-crafted unit-test
+inputs. That rules out the dequant math (both host and device) as the source. The
+actual explanation: `llama-simple` itself, run on the *same* `Q2_K` file on CPU
+(`-ngl 0`) vs. GPU (`-ngl 99`), produced a *third* different answer (`"ising"`) --
+llama.cpp disagrees with its own two backends on this file, which only makes sense if
+the top-token race is a photo finish that any implementation's floating-point
+summation order can flip, not a race a "correct" implementation is expected to win
+consistently once quantization noise gets this high (2-3 bits on a 0.6B model).
+`Q3_K`'s llama.cpp CPU/GPU backends happened to agree with each other in this one
+instance (both said `"Paris"`), so that specific case has one fewer independent data
+point than `Q2_K`'s -- disclosed as such rather than overclaimed, though the same
+per-block dequant correctness evidence (Rust/gguf-py/CUDA three-way agreement) applies
+equally to both.
+
+**A real tooling gotcha hit along the way, worth remembering past this session**:
+while debugging, a temporary edit was made directly on the remote instance (removing
+the `Q2K`/`Q3K` match arms to force the host fallback for comparison), then the
+working tree was re-synced from the clean local copy via the project's usual `rsync
+-a` recipe to restore it. The rebuild afterward reported `Finished ... in 0.05s` and
+*zero* new compiler warnings where several were expected -- `cargo` had silently
+skipped recompilation. Cause: `rsync -a` preserves the *local* file's mtime, which was
+older than the remote's already-built target artifact from the mid-debugging state,
+so `cargo`'s mtime-based fingerprinting saw "unchanged" and trusted a stale build.
+**How to apply**: after any `rsync` that's meant to overwrite remote edits made
+mid-session (not just the first sync of a fresh instance), `touch` the affected source
+files before rebuilding, or otherwise don't trust a suspiciously-fast "Finished" line
+as proof the new code actually compiled -- check for the warnings/behavior you expect
+to see change, the same instinct that caught this in the first place.

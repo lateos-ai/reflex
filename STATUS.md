@@ -269,11 +269,14 @@ planned. The user has asked to queue up three release-hardening items, in this o
 2. **Verify `docker run --rm --gpus all`** end-to-end — the one remaining unverified
    Docker path (see "Known debt" below), needs a host with genuine VM-level
    virtualization *and* a real NVIDIA GPU/driver.
-3. ~~**On-device dequant for more GGUF block types**~~ — **`Q5_K` done** (see "Known
-   debt" below for the real-hardware verification writeup); extend `dequant.cu`
-   further to the remaining 14+ block types still on the host path (Q4_0/1, Q5_0/1,
-   Q8_0/1, Q2_K/Q3_K/Q8_K, the IQ-family formats) — real kernel work, needs fixtures
-   that exercise those types for the bulk of a model's weight bytes.
+3. ~~**On-device dequant for more GGUF block types**~~ — **`Q5_K` done**, and as of
+   2026-09-24, **Q4_0/1, Q5_0/1, Q8_0/1, Q2_K, Q3_K, Q8_K also done** (see "Known
+   debt" below for the real-hardware verification writeup, which surfaced and
+   root-caused a real Q2_K/Q3_K token-level discrepancy — verified as inherent
+   quantization noise, not a kernel bug). Only the 8 IQ-family formats (IQ2_XXS/XS/S,
+   IQ3_XXS/S, IQ1_S/M, IQ4_XS) remain on the host path — they need constant-memory
+   lookup tables ported from `ggml-common.h`, not just this file's per-block-loop
+   pattern; left for a future round.
 
 Other remaining low-priority follow-ups (not queued, not blocking): Phase 3 round 3's
 own resume path verified only against the dense-only synthetic MLA fixture (see
@@ -482,6 +485,46 @@ larger model — left for a future round.
   `reflex generate "Once upon a time"` produced `token_id=11, ","`, independently
   reproduced byte-exact (same continuation text) by a fresh CUDA-enabled
   `llama-simple` build (`-DCMAKE_CUDA_ARCHITECTURES=89`) against the same file.
+- ~~**On-device dequant extended to Q4_0/1, Q5_0/1, Q8_0/1, Q2_K, Q3_K, Q8_K, not yet
+  real-hardware-verified**~~ — **closed 2026-09-24**: 9 more kernels added to
+  `kernels_cuda/dequant.cu`, each a line-for-line port of its `dequant.rs` host
+  counterpart (all already existed and were unit-tested against hand-computed
+  values, just never GPU-accelerated or exercised end-to-end against a real GGUF).
+  `dequantize_tensor_to_device`'s per-kernel `&AotKernel` parameters were bundled
+  into one `DequantKernels` struct (`load_dequant_kernels`, shared by all three
+  load sites) rather than growing the parameter list by one arg per format.
+  Real-hardware-verified on a fresh A100 (`g3jx9w64`, sm_80): quantized a real
+  `Qwen/Qwen3-0.6B` checkpoint with llama.cpp's own `llama-quantize --pure` into
+  all 7 real-storable target types (Q8_1/Q8_K are runtime-only quantized-dot-
+  product intermediates, never a stored GGUF tensor type in practice — confirmed
+  by `dequant.rs`'s own pre-existing doc comments on both, so verified by code
+  review against the now-confirmed-correct Q8_0 kernel instead, same value
+  semantics). `reflex generate` matched `llama-simple` byte-exact on 5/7
+  (`Q4_0`/`Q4_1`/`Q5_0`/`Q5_1`/`Q8_0`, all producing `token_id=12095, " Paris"`
+  identically) but **diverged on `Q2_K`/`Q3_K`** (`reflex`: `" r"`/`" located"`;
+  `llama-simple`: `"?"`/`" Paris"`) — investigated rather than dismissed. Root
+  cause: **not a dequant bug**. Extracted the real `blk.0.attn_q.weight` tensor's
+  raw block bytes from both quantized GGUFs and dequantized them three ways —
+  this project's Rust (`dequant::dequantize`), llama.cpp's own Python reference
+  (`gguf-py`'s `Q2_K`/`Q3_K.dequantize_blocks`), and (for the CUDA kernel
+  specifically) a temporary host-path fallback to confirm the on-device kernel
+  produces bit-identical output to the already-verified host function — all three
+  agreed to f32 precision. The token-level divergence is inherent numerical
+  instability from 2-3-bit quantization on a 0.6B model, not an implementation
+  defect: proven by running `llama-simple` itself on CPU (`-ngl 0`) vs GPU
+  (`-ngl 99`) for the same `Q2_K` file, which gave a *third* different answer
+  (`"ising"`) — llama.cpp disagrees with its own two backends, meaning the
+  top-token race is a photo finish sensitive to any implementation's floating-
+  point summation order, not something a "correct" implementation is expected to
+  win consistently at this quantization level. `Q3_K`'s CPU/GPU llama.cpp
+  backends happened to agree with each other in this one instance, so that
+  specific case is not as ironclad as `Q2_K`'s, but the same per-block dequant
+  correctness evidence applies equally to both. Caught a real rsync+cargo gotcha
+  along the way: `rsync -a` preserves the local mtime, which can be *older* than
+  a previously-built target on the remote, causing `cargo build` to silently skip
+  recompilation and report success against stale object code — `touch`ing changed
+  source files after an rsync (or after any manual edit-then-revert cycle on the
+  remote) before rebuilding avoids trusting a false-positive "Finished" line.
 - ~~**MoE weighted-sum and Gated-Attention fused-qg gating moved on-device in the
   decode path, not yet real-hardware-verified**~~ — **closed**: `forward_layer_moe`/
   `forward_mla_moe_ffn`'s per-expert weighted accumulate now uses
