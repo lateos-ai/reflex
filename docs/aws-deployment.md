@@ -77,6 +77,38 @@ first-response after long idle periods is not.
   whichever GPU the instance actually has) and accept the driver-JIT cold-start cost
   that reintroduces.
 
+### Model sizing for a T4 (`g4dn.xlarge`, 16GB VRAM)
+
+Reflex dequantizes every weight tensor once and holds it GPU-resident as `f32` (see the
+root [CLAUDE.md](../CLAUDE.md)'s model-loading section) — VRAM need is therefore
+`total_params × 4 bytes`, regardless of the source GGUF's quant level, and for MoE,
+regardless of how many experts are actually "active" per token (every expert is
+dequantized and resident, since routing happens per-token at runtime). Real-hardware-
+verified free VRAM on a `g4dn.xlarge` right after driver init: **14,775 MiB** (`nvidia-smi`
+inside a real `docker run --gpus all` container, see HISTORY.md's "docker run --rm
+--gpus all" entry) — leaving headroom for the KV cache/activation buffers puts the
+practical ceiling around **~3-3.5B total parameters**.
+
+| Model class | Fits on one T4? |
+|---|---|
+| Dense Qwen3-0.6B / Qwen3-1.7B | Yes, comfortably — real-hardware-verified |
+| Qwen3.5-0.8B hybrid (Gated DeltaNet) | Yes, comfortably — real-hardware-verified |
+| Dense Qwen3-4B | No — 4B × 4B = 16GB, over budget before KV cache/activations are even counted |
+| Qwen3-MoE (e.g. `Qwen3-30B-A3B`) | No, not close — every expert is dequantized regardless of top-k routing, so it needs the full ~120GB `f32` footprint, not the "3B active" figure |
+| DeepSeek-V2-Lite (MLA) | No — needed ~63GB even at the smallest real checkpoint; this project verified it on a rented 80GB A100, not a T4-class card |
+
+For latency-sensitive single-pass scoring (the `reflex system1` subcommand), smaller is
+strictly better, not just VRAM-cheaper — both the cold-load time and the per-token
+compute scale with parameter count, so the smallest viable checkpoint (Qwen3-0.6B) is
+the right choice for that use case even when a bigger one would technically fit; see
+DECISIONS.md's TypeSafe Jev comparison entry for the benchmark this reasoning is based
+on. Going to a bigger GPU instance family (`g5`/A10G-24GB, `p3`/V100-16-32GB,
+`p4d`/A100-40-80GB — note every `g4dn` size uses the same 16GB T4, so a larger
+`g4dn.*xlarge` does not buy more VRAM) only matters for going up in *model class*
+(dense Qwen3-4B+, any MoE, or MLA/DeepSeek-V2-class); it does not meaningfully help
+cold-load or single-pass-scoring latency for a model that already fits comfortably on
+a T4.
+
 ## 1. Build and push the sidecar image
 
 The repo's root `Dockerfile` already builds the `reflex` binary and is used unchanged
