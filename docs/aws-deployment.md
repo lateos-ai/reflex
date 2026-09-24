@@ -41,8 +41,8 @@ baked into a custom AMI is possible, but at minimum the container pull/start and
 mount take real time) — on the order of tens of seconds to low minutes, not the
 sub-second `process_start_to_first_token_ms` this project's own cold-start benchmarks
 report for the `reflex` process itself. Reflex's AOT-compiled-kernel cold start is real
-and measured (see [HISTORY.md](../HISTORY.md)), but it happens *after* the EC2 instance
-and container are already running — it is not a substitute for instance boot time.
+and measured, but it happens *after* the EC2 instance and container are already
+running — it is not a substitute for instance boot time.
 
 What this pattern legitimately buys you:
 - **No idle GPU-hour cost.** The instance (and its Spot bill) doesn't exist at all when
@@ -69,7 +69,7 @@ first-response after long idle periods is not.
 - **Pick one GPU instance family up front.** This guide uses `g4dn.xlarge` (NVIDIA T4,
   compute capability `sm_75`) throughout, matched to a `REFLEX_CUDA_ARCH=sm_75` build —
   the zero-driver-JIT cubin path this project's own architecture is built around (see
-  the root [CLAUDE.md](../CLAUDE.md)'s "Core technical bet"). **Do not** put both
+  the root [README](../README.md)'s "Core technical bet" section). **Do not** put both
   `g4dn.xlarge` and `g5.xlarge` (A10G, `sm_86`) in one mixed-instances-policy ASG with a
   pinned cubin build — a `sm_75` cubin will not run on an A10G or vice versa. If you
   deliberately want a multi-family Spot fleet for capacity diversification, build with
@@ -79,15 +79,14 @@ first-response after long idle periods is not.
 
 ### Model sizing for a T4 (`g4dn.xlarge`, 16GB VRAM)
 
-Reflex dequantizes every weight tensor once and holds it GPU-resident as `f32` (see the
-root [CLAUDE.md](../CLAUDE.md)'s model-loading section) — VRAM need is therefore
-`total_params × 4 bytes`, regardless of the source GGUF's quant level, and for MoE,
-regardless of how many experts are actually "active" per token (every expert is
-dequantized and resident, since routing happens per-token at runtime). Real-hardware-
-verified free VRAM on a `g4dn.xlarge` right after driver init: **14,775 MiB** (`nvidia-smi`
-inside a real `docker run --gpus all` container, see HISTORY.md's "docker run --rm
---gpus all" entry) — leaving headroom for the KV cache/activation buffers puts the
-practical ceiling around **~3-3.5B total parameters**.
+Reflex dequantizes every weight tensor once and holds it GPU-resident as `f32` — VRAM
+need is therefore `total_params × 4 bytes`, regardless of the source GGUF's quant
+level, and for MoE, regardless of how many experts are actually "active" per token
+(every expert is dequantized and resident, since routing happens per-token at
+runtime). Real-hardware-verified free VRAM on a `g4dn.xlarge` right after driver
+init: **14,775 MiB** (`nvidia-smi` inside a real `docker run --gpus all` container) —
+leaving headroom for the KV cache/activation buffers puts the practical ceiling
+around **~3-3.5B total parameters**.
 
 | Model class | Fits on one T4? |
 |---|---|
@@ -101,13 +100,13 @@ For latency-sensitive single-pass scoring (the `reflex system1` subcommand), sma
 strictly better, not just VRAM-cheaper — both the cold-load time and the per-token
 compute scale with parameter count, so the smallest viable checkpoint (Qwen3-0.6B) is
 the right choice for that use case even when a bigger one would technically fit; see
-DECISIONS.md's TypeSafe Jev comparison entry for the benchmark this reasoning is based
-on. Going to a bigger GPU instance family (`g5`/A10G-24GB, `p3`/V100-16-32GB,
-`p4d`/A100-40-80GB — note every `g4dn` size uses the same 16GB T4, so a larger
-`g4dn.*xlarge` does not buy more VRAM) only matters for going up in *model class*
-(dense Qwen3-4B+, any MoE, or MLA/DeepSeek-V2-class); it does not meaningfully help
-cold-load or single-pass-scoring latency for a model that already fits comfortably on
-a T4.
+the root [README](../README.md)'s Benchmarks section for the TypeSafe Jev comparison
+this reasoning is based on. Going to a bigger GPU instance family (`g5`/A10G-24GB,
+`p3`/V100-16-32GB, `p4d`/A100-40-80GB — note every `g4dn` size uses the same 16GB T4,
+so a larger `g4dn.*xlarge` does not buy more VRAM) only matters for going up in *model
+class* (dense Qwen3-4B+, any MoE, or MLA/DeepSeek-V2-class); it does not meaningfully
+help cold-load or single-pass-scoring latency for a model that already fits
+comfortably on a T4.
 
 ## 1. Build and push the sidecar image
 

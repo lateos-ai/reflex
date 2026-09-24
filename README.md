@@ -110,8 +110,7 @@ warm/steady-state joules-per-token, not full-lifecycle cold-start cost.
 
 All comparisons are cold-start (process launch to first token/result), same
 ThunderCompute A6000, `n=3`, external wall-clock (`/usr/bin/time -v` — process launch
-to exit, not just Reflex's own internal timer). Full methodology, disclosed caveats,
-and per-run numbers for every comparison below are in `DECISIONS.md` and `HISTORY.md`.
+to exit, not just Reflex's own internal timer).
 
 | vs. | Result | Caveat |
 |---|---|---|
@@ -121,9 +120,7 @@ and per-run numbers for every comparison below are in `DECISIONS.md` and `HISTOR
 | **TypeSafe Jev**, cold-start-to-decision | Reflex loses, **~10–60x slower** | Different deployment model: Jev is an always-warm managed API; this measures a genuine cold local process launch |
 | **TypeSafe Jev**, warm/compute-only | **Competitive, within ~1.3–2x** (19.4ms vs. Jev's cited 10–15ms) | Jev's figures are self-reported/published, not independently reproduced here |
 
-The llama.cpp/Ollama/Jev "loses" results above are reported as-is, not smoothed over —
-see `DECISIONS.md`'s benchmark-methodology entries for why each comparison is framed
-the way it is.
+The llama.cpp/Ollama/Jev "loses" results above are reported as-is, not smoothed over.
 
 ## Core technical bet
 
@@ -153,8 +150,7 @@ not needed on the Windows dev machine that round otherwise developed on, since
 
 ## MVP order
 
-All four steps below are **done** and real-hardware-verified (see `STATUS.md` for
-current state, `HISTORY.md` for the full verification write-up of each):
+All four steps below are **done** and real-hardware-verified:
 
 1. **Dense Qwen3** — the best-understood, most well-documented architecture to build
    against first; proves the AOT-compilation + cold-start-benchmark harness works at all.
@@ -208,7 +204,7 @@ families at all, the next axis is making the *cold-start path itself* faster and
 adoptable — without ever crossing into building a serving platform. The framing: let
 vLLM win the warm-throughput race; Reflex wins by being the fastest way to turn
 cold compute into one output token, then getting out of the way. All four phases below
-are **done** — see `HISTORY.md` for the full per-round write-up of each:
+are **done**:
 
 - **Phase 1** — Single-shot CLI: process launch -> one forward pass -> exit.
 - **Phase 2 — Fast IO**: weights upload to the GPU once (not re-uploaded per kernel

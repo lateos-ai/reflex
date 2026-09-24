@@ -9,7 +9,7 @@ on future PRs from the same GitHub account.
 
 ## Scope
 
-Reflex has deliberate, permanent non-goals — see `CLAUDE.md`'s "Non-goals" section
+Reflex has deliberate, permanent non-goals — see README.md's "Non-goals" section
 before proposing a serving-platform, multi-tenancy, batching, or in-core HTTP/gRPC
 server feature. PRs in that direction will likely be declined regardless of
 implementation quality, so it's worth raising an issue to discuss scope first for
@@ -17,4 +17,4 @@ anything beyond a bug fix or small, self-contained feature.
 
 ## Development
 
-See `CLAUDE.md` for build/run/test commands and architecture notes.
+See README.md's Quickstart section for build/run/test commands.
