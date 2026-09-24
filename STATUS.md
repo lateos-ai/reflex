@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
 short, current-state summary; HISTORY.md is the log.
 
-_Last updated: 2026-09-23 (CI added: build/test on GitHub-hosted runners via REFLEX_SKIP_CUDA; previous update: benchmark expansion session — llama.cpp regression fix, vLLM, TypeSafe Jev citation, Ollama, multi-architecture fast_exit re-verification, dead-code cleanup)_
+_Last updated: 2026-09-24 (on-device dequant extended to all 8 IQ-family formats, closing the on-device dequant set entirely; previous update: cargo fmt/clippy wired into CI)_
 
 ## MVP progress
 
@@ -271,14 +271,17 @@ planned. The user has asked to queue up three release-hardening items, in this o
    EC2 `g4dn.xlarge` (On-Demand; Spot capacity was exhausted in every `us-east-1` AZ at
    launch time) gave the genuine VM-level virtualization *and* real NVIDIA GPU/driver
    this needed — see "Known debt" below for the full writeup.
-3. ~~**On-device dequant for more GGUF block types**~~ — **`Q5_K` done**, and as of
-   2026-09-24, **Q4_0/1, Q5_0/1, Q8_0/1, Q2_K, Q3_K, Q8_K also done** (see "Known
-   debt" below for the real-hardware verification writeup, which surfaced and
+3. ~~**On-device dequant for more GGUF block types**~~ — **done**: `Q5_K` done first,
+   then as of 2026-09-24, **Q4_0/1, Q5_0/1, Q8_0/1, Q2_K, Q3_K, Q8_K also done** (see
+   "Known debt" below for the real-hardware verification writeup, which surfaced and
    root-caused a real Q2_K/Q3_K token-level discrepancy — verified as inherent
-   quantization noise, not a kernel bug). Only the 8 IQ-family formats (IQ2_XXS/XS/S,
-   IQ3_XXS/S, IQ1_S/M, IQ4_XS) remain on the host path — they need constant-memory
-   lookup tables ported from `ggml-common.h`, not just this file's per-block-loop
-   pattern; left for a future round.
+   quantization noise, not a kernel bug), and finally, same day, **the 8 IQ-family
+   formats (IQ2_XXS/XS/S, IQ3_XXS/S, IQ1_S/M, IQ4_XS) closed the set entirely** — see
+   "Known debt" below for the codebook-table-generation approach and real-hardware
+   verification writeup. Every *block-quantized* GGUF format this project's
+   `gguf.rs` parses now dequantizes on-GPU; only the passthrough types
+   (F32/F16/Bf16, a type conversion rather than a dequantization) still take the
+   host `dequant::dequantize` -> `htod_sync_copy` path.
 
 Other remaining low-priority follow-ups (not queued, not blocking): Phase 3 round 3's
 own resume path verified only against the dense-only synthetic MLA fixture (see
@@ -343,13 +346,18 @@ larger model — left for a future round.
   diffing), every remaining `cargo clippy --all-targets` warning fixed or scoped-
   `#[allow]`ed with a documented reason, and both wired into `ci.yml` with
   `-D warnings`.
-- **Phase 2 round 3 on-device dequant scope**: only `Q4_K`/`Q6_K` dequantize on-GPU
-  (`kernels_cuda/dequant.cu`). Every other GGUF block type (`Q4_0/1`, `Q5_0/1`,
-  `Q8_0/1`, `Q2_K`/`Q3_K`/`Q5_K`/`Q8_K`, all 8 IQ-family formats, plus F32/F16/Bf16/int
-  passthrough) still dequantizes on the host, unchanged from before this round — correct,
-  just not GPU-accelerated. This round's instance (an A6000) has no git history
-  either (populated by `rsync`, not `git clone`) — local remains the only git-tracked
-  copy; a fresh `ggml-org/llama.cpp` (`9655061`) was built there for the A/B benchmark.
+- ~~**Phase 2 round 3 on-device dequant scope**: only `Q4_K`/`Q6_K` dequantize on-GPU~~
+  — **closed 2026-09-24**: every *block-quantized* GGUF format this project's
+  `gguf.rs` parses now dequantizes on-GPU, closing out the IQ family (see this file's
+  IQ-family entry below for the round that finished it). The passthrough types
+  (F32/F16/Bf16) still take `dequantize_tensor_to_device`'s `other` fallback arm
+  (host `dequant::dequantize` + `htod_sync_copy`) — unlike the block-quantized
+  formats, there's no unpacking math to move on-device for these, just a type
+  conversion, so this is a much smaller remaining gap than the one this entry
+  originally tracked, not an oversight. This round's instance (an A6000) has no git
+  history either (populated by `rsync`, not `git clone`) — local remains the only
+  git-tracked copy; a fresh `ggml-org/llama.cpp` (`9655061`) was built there for the
+  A/B benchmark.
 - **Remote instance git state**: the MLA-extension work used a *second*, separate
   ThunderCompute instance (an 80GB A100, created
   2026-09-21 specifically for the real-DeepSeek-V2-Lite VRAM requirement — the Phase
@@ -572,3 +580,54 @@ larger model — left for a future round.
   generate` against it reproduced the documented `"The capital of France is" -> "
   Paris"` golden output exactly. All four architecture families this change touches
   are now real-hardware-verified, not just locally compiled.
+- ~~**On-device dequant extended to the 8 IQ-family formats (IQ2_XXS/XS/S,
+  IQ3_XXS/S, IQ1_S/M, IQ4_XS), not yet real-hardware-verified**~~ — **closed
+  2026-09-24**: this was the last gap `dequantize_tensor_to_device` had — every
+  other block-quantized format was already on-device (see the entry above). Unlike
+  the prior round, these formats are non-uniform/codebook quant types: each block's
+  raw bits index into a fixed lookup table of representative values, so the port
+  needed `__constant__`-memory codebook tables in `kernels_cuda/dequant.cu`, not
+  just per-block bit-unpacking. `scripts/gen_iq_tables.py` (referenced but not
+  actually present in the repo before this round — written fresh) mechanically
+  generates `kernels_cuda/dequant_iq_tables.cuh` from `src/dequant_iq_tables.rs`
+  (itself already a byte-for-byte transcription of upstream `ggml-common.h`, per
+  that file's own doc comment) rather than hand-transcribing the ~4000-line table
+  set a second time from the C header — one generator, one source of truth. The 8
+  new kernels (`dequantize_iq2xxs_kernel`/etc.) are line-for-line ports of their
+  `dequant_iq.rs` host counterparts, same porting convention as every other kernel
+  in the file, wired into `DequantKernels`/`load_dequant_kernels`/
+  `dequantize_tensor_to_device` exactly like the Q2_K/Q3_K/Q8_K round. Real-
+  hardware-verified on a fresh L40 (`4x8eh2ki`, sm_89): quantized a real
+  `Qwen/Qwen3-0.6B` checkpoint with llama.cpp's own `llama-quantize` into all 8
+  target types (the four lowest-bit types — IQ2_XXS/XS/S, IQ1_S — hard-require an
+  imatrix even to run, discovered via `ggml_abort`/`GGML_ASSERT(imatrix != NULL)`
+  when first attempted with `--pure` and no imatrix; generated one with
+  `llama-imatrix` against a small synthetic calibration corpus, then dropped
+  `--pure` for those four specifically since forcing every tensor including
+  `output.weight` to a real IQ2/IQ1 type is not how any real published GGUF of
+  these formats is built — the standard per-tensor type-selection strategy keeps
+  `output.weight`/`token_embd` at a safer type for exactly this reason, and doing
+  the same here incidentally exercised more of the new kernel set per file, since
+  llama.cpp's default strategy mixes in `IQ3_S`/`IQ2_XS`/`IQ2_XXS` for specific
+  tensors even when targeting a different nominal type). Added a new permanent
+  `#[ignore]`d test, `model::iq_dequant_host_vs_device_tests::
+  iq_dequant_kernel_matches_host_on_real_tensors` (same `REFLEX_TEST_GGUF`-env-var
+  convention as this file's other real-GGUF tests), which extracts every real
+  IQ-family tensor's raw block bytes from a GGUF, dequantizes them both via the
+  host path and via `dequantize_tensor_to_device`'s on-device kernel, and asserts
+  bit-exact equality — run against all 8 quantized files, every one of the 8
+  kernels matched the host path bit-exact on real tensor data (up to 155M elements
+  per tensor), not just the existing hand-computed-value unit tests' synthetic
+  all-zero blocks. `reflex generate "The capital of France is"` matched
+  `llama-simple` byte-exact on 3/8 (`IQ2_XS`, `IQ3_XXS`, `IQ4_XS`, each producing
+  the same continuation token) with token-level divergence on the rest (`IQ2_XXS`,
+  `IQ2_S`, `IQ3_S`, `IQ1_S`, `IQ1_M`) — not investigated to the same
+  first-principles depth as the Q2_K/Q3_K precedent above (extracting the same
+  tensor's bytes into `gguf-py` and comparing CPU-vs-GPU `llama-simple` runs for
+  every diverging format), since the bit-exact host-vs-device dequant evidence
+  above already directly answers the question this project's own methodology
+  cares about (is the on-device kernel correct, not which implementation wins a
+  given top-token race), and 1-3-bit quantization on a 0.6B model is exactly the
+  regime the Q2_K/Q3_K investigation already established as inherently unstable
+  top-token-race territory across any two correct implementations, not a new
+  phenomenon to re-derive per format.

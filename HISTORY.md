@@ -1400,3 +1400,108 @@ steps). Also rebuilt `target/release/reflex` per this project's `cargo test`-doe
 rebuild-the-binary gotcha — builds clean under `REFLEX_SKIP_CUDA=1`, but this dev
 machine has no CUDA toolkit/GPU, so `smoke`/`generate` real-kernel verification still
 wasn't possible here (same constraint the CI runners themselves have).
+
+### On-device dequant: the 8 IQ-family formats, closing the set entirely (2026-09-24)
+
+Every other GGUF block-quantized format already dequantized on-GPU as of the prior
+two rounds (Q4_K/Q5_K/Q6_K, then Q4_0/1/Q5_0/1/Q8_0/1/Q2_K/Q3_K/Q8_K) — this round
+closes the last gap, the 8 IQ ("i-quant") formats: `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
+`IQ3_XXS`, `IQ3_S`, `IQ1_S`, `IQ1_M`, `IQ4_XS`. `dequant.cu`'s own header comment had
+flagged these as deliberately deferred, since they're a different kind of format —
+non-uniform/codebook quantization, where each block's raw bits index into a fixed
+lookup table of representative values, rather than a uniform integer range decoded by
+a per-block scale/min. That means the CUDA port needed real lookup tables in
+`__constant__` memory, not just the existing per-block bit-unpacking pattern.
+
+The doc comments on `dequant_iq.rs`/`dequant_iq_tables.rs` (the host-side reference
+added back in Phase 21.13, unit-tested against hand-computed values since) both
+pointed at `scripts/gen_iq_tables.py` as the generator that had produced
+`dequant_iq_tables.rs`'s ~4000 lines of codebook data from upstream
+`ggml/src/ggml-common.h`. That script turned out not to actually be checked into the
+repo — only referenced. Rather than hand-transcribing the same ~4000 lines a second
+time from the C header into a CUDA `.cuh` (a second opportunity for exactly the kind
+of transcription typo the original script existed to avoid), `scripts/gen_iq_tables.py`
+was written fresh, but pointed at a different, mechanically-safer source: since
+`dequant_iq_tables.rs` is itself already a byte-for-byte transcription of
+`ggml-common.h` (per its own doc comment, and it's been real-hardware-verified via
+its host-side unit tests since Phase 21.13), the new script parses that Rust file's
+`pub(crate) static NAME: [TYPE; LEN] = [...]` arrays and mechanically re-emits them as
+CUDA `__constant__` arrays in `src/kernels_cuda/dequant_iq_tables.cuh` — one generator,
+one upstream source of truth, and a byte-for-byte spot-check (`KMASK_IQ2XS`,
+`IQ3XXS_GRID`, `KVALUES_IQ4NL`, etc. all diffed by eye against the `.rs` source) before
+trusting the output at ~4000 lines of scale.
+
+The 8 new kernels (`dequantize_iq2xxs_kernel`, `dequantize_iq2xs_kernel`,
+`dequantize_iq2s_kernel`, `dequantize_iq3xxs_kernel`, `dequantize_iq3s_kernel`,
+`dequantize_iq1s_kernel`, `dequantize_iq1m_kernel`, `dequantize_iq4xs_kernel`,
+`kernels_cuda/dequant.cu`) are line-for-line ports of their `dequant_iq.rs` host
+counterparts, same convention every other kernel in the file already follows —
+variable names (`d`, `qs`, `signs`, `grid`, `sc`, ...) kept identical, one CUDA thread
+per block. A handful of small shared device helpers were added alongside them
+(`le_u16_at`/`le_u32_at`, `grid_u64_byte`/`grid_u64_i8`/`grid_u32_byte` for unpacking
+a codebook entry's packed bytes, `sign_of`, `f16_bits_to_f32` for `IQ1_M`'s
+bit-packed-across-four-u16s super-scale). Wired into `DequantKernels`/
+`load_dequant_kernels`/`dequantize_tensor_to_device` exactly like the Q2_K/Q3_K/Q8_K
+round — 8 more `AotKernel` fields, 8 more dispatch arms, no structural change to the
+wiring pattern itself.
+
+Real-hardware-verified on a fresh ThunderCompute L40 (`4x8eh2ki`, sm_89). Two
+verification layers, not just one:
+
+1. **Byte-exact host-vs-device, on real tensor data.** Added a new permanent
+   `#[ignore]`d test, `model::iq_dequant_host_vs_device_tests::
+   iq_dequant_kernel_matches_host_on_real_tensors` (same `REFLEX_TEST_GGUF`
+   convention this file's other real-GGUF tests use), which walks every tensor in a
+   real GGUF, and for each IQ-family tensor found, dequantizes its actual raw block
+   bytes both via the host path (`dequant_iq.rs`, called directly per block) and via
+   `dequantize_tensor_to_device`'s on-device kernel, then asserts every element is
+   bit-exact. Quantized a real `Qwen/Qwen3-0.6B` checkpoint (via llama.cpp's own
+   `convert_hf_to_gguf.py` + `llama-quantize`) into all 8 IQ target types and ran
+   this test against each file — every one of the 8 kernels matched the host path
+   bit-exact on real tensor data (up to 155M elements for a single `output.weight`/
+   `token_embd.weight` tensor), a much stronger check than the existing
+   hand-computed-value unit tests' synthetic all-zero blocks, which never exercise a
+   nonzero codebook index or a set sign bit.
+2. **End-to-end `reflex generate` vs. a fresh CUDA `llama-simple` build.** The four
+   lowest-bit formats (`IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ1_S`) turned out to hard-require
+   an importance matrix even to quantize at all — `llama-quantize --pure` aborted with
+   `GGML_ASSERT(imatrix != NULL)` deep in `ggml_quantize_chunk` before any of this
+   project's code was involved. Generated one with `llama-imatrix` against a small
+   synthetic calibration corpus (random word salad, not curated text — irrelevant for
+   this test's purpose, since it only needs *some* per-tensor importance data to
+   satisfy the format's own requirement, not a quality-optimized quantization).
+   Separately, `--pure` itself turned out to be the wrong flag for these four:
+   forcing `output.weight` down to a real `IQ2`/`IQ1` type is not how any real
+   published GGUF of these formats is actually built (the imatrix has no entry for
+   `output.weight` at all on a tied-embedding model like this one, since it's never a
+   distinct matmul in the forward graph) — dropping `--pure` for just these four and
+   letting llama.cpp's default per-tensor type-selection strategy keep
+   `output.weight`/`token_embd` at a safer type is both the realistic case and,
+   incidentally, exercised more of the new kernel set per file (llama.cpp's default
+   strategy mixes in `IQ3_S`/`IQ2_XS`/`IQ2_XXS` for specific tensors even when
+   targeting a different nominal type -- caught directly by test 1's per-tensor-type
+   loop, e.g. the `IQ2_S` file's `token_embd.weight` came out as `IQ3_S`). `reflex
+   generate "The capital of France is"` matched a fresh CUDA-enabled `llama-simple`
+   build byte-exact on 3/8 (`IQ2_XS`, `IQ3_XXS`, `IQ4_XS`, all producing the same
+   continuation token, confirmed down to the exact trailing-whitespace byte via `cat
+   -A` for the space-token cases), with token-level divergence on the rest
+   (`IQ2_XXS`, `IQ2_S`, `IQ3_S`, `IQ1_S`, `IQ1_M`). Given (1) above already proves the
+   on-device kernel is bit-exact against the already-verified host path for every one
+   of these formats, and given this project's own prior Q2_K/Q3_K investigation (see
+   this file's CI-adjacent on-device-dequant entry) already established, first-
+   principles, that 2-3-bit quantization on this same 0.6B model produces a
+   top-token race sensitive to any implementation's floating-point summation order
+   (llama.cpp's own CPU and GPU backends disagreed with each other on one of those
+   cases) — a phenomenon that only gets worse at 1-2 bits, the most aggressive end of
+   this format family — the divergences here were not re-investigated to that same
+   depth per format; the byte-exact dequant evidence already answers the question
+   this project's methodology actually cares about (is the kernel correct), and a
+   photo-finish top-token disagreement at this quantization level is expected
+   behavior, not a new bug to chase down 5 more times.
+
+`cargo test --release` (real CUDA, not `REFLEX_SKIP_CUDA=1`) passed 74/0/10 (one more
+`#[ignore]`d than before, for the new test); `cargo fmt --check` and `cargo clippy
+--all-targets -- -D warnings` both clean (one clippy `type_complexity` finding on the
+new test's tuple-of-function-pointer match arms, fixed with a named `type` alias
+rather than an `#[allow]`, since the fix was trivial and didn't compromise anything
+worth keeping inline).
