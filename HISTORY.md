@@ -1664,3 +1664,123 @@ stash` that a separate pre-existing `clippy::useless_conversion` finding in
 `src/python.rs` (the `python` feature specifically) already existed on `master` before
 this round's changes and is unrelated to this work — left alone rather than folded into
 this round's fix, since touching unrelated code wasn't asked for.
+
+### OpenAI-compatible HTTP sidecar: `sidecar/openai-adapter` (2026-09-24)
+
+README's Non-goals section has described this escape-hatch pattern since the MVP-
+release round without anyone building it: "No in-core HTTP/gRPC server, ever... If HTTP
+access to this engine is ever genuinely needed, the pattern is a separate, optional
+sidecar binary... that talks to this core engine over local IPC only." The prior IPC
+sampling/streaming round (immediately above) was explicit prep for this — sampling and
+per-token streaming are exactly what a real `/v1/chat/completions` integration needs and
+`reflex stdio`/`reflex uds` didn't have yet. Built it this round: `sidecar/openai-
+adapter`, a standalone `POST /v1/chat/completions` HTTP adapter (streaming via SSE and
+non-streaming JSON) in front of one managed `reflex stdio <gguf>` child process.
+
+**Layout decision, confirmed before committing to it**: a fully separate Cargo project
+(`sidecar/openai-adapter/Cargo.toml`, own `Cargo.lock`), *not* a member of the root
+`Cargo.toml` workspace (the root crate has no `[workspace]` table to join) and *not* a
+dependency on the `reflex-engine` library crate. This was the deciding design question —
+confirmed empirically, not just asserted: `cargo build` from `sidecar/openai-adapter/`
+pulls in axum/tokio/etc. without touching the root `Cargo.toml`/`Cargo.lock` at all (`git
+status` after the build showed only the new `sidecar/` directory, nothing in the root
+crate), and the resulting binary needs no CUDA toolkit / `nvcc` to build — it only ever
+talks to an already-running `reflex stdio` process over stdin/stdout, never links
+against `reflex-engine`'s GPU code. This is what actually keeps HTTP/async dependencies
+out of the core engine's dependency graph, not just a documentation claim.
+
+**Managed-process model**: the sidecar launches `reflex stdio <gguf>` itself as a child
+process at startup (`src/reflex_client.rs::ReflexClient::spawn`) rather than connecting
+to an already-running `reflex uds` socket — chosen because `reflex uds` is Unix-only
+(`std::os::unix::net::UnixListener` has no Windows counterpart) while `reflex stdio`
+works everywhere, and because a managed child avoids a second moving piece (something
+else responsible for starting/restarting the engine process) for a first pass. The
+child's stderr (`REFLEX_STDIO_READY`/model-load diagnostics) is forwarded to the
+sidecar's own stderr, prefixed `[reflex]`, so it's still visible.
+
+**Serialization underneath real HTTP concurrency** (`src/reflex_client.rs::run_worker`):
+axum/tokio happily accept concurrent HTTP connections, but the core engine's
+`batch_size == 1`/strictly-sequential contract has to hold regardless — so exactly one
+background worker task owns the managed process's stdin/stdout for its entire lifetime,
+and every HTTP handler talks to it only through an `mpsc` job queue. The worker writes
+one job's request line, then reads response lines until it sees `"event": "final"`,
+*before* dequeuing the next job — this loop, not a lock, is what makes two racing HTTP
+requests physically unable to interleave writes onto the same IPC connection, and what
+guarantees only one `reflex` process is ever spawned, never one per request. If the
+child process dies mid-session, the worker's stdin/stdout-closed error paths turn every
+subsequent request into a clean `500` instead of hanging or crashing the sidecar itself
+— no auto-restart logic; recovering means restarting the sidecar process (documented as
+a known limitation in `sidecar/openai-adapter/README.md`).
+
+**Translation** (`src/openai.rs`): OpenAI's `messages` list has no equivalent on the
+Reflex side — `Model::forward_prompt`/the IPC protocol both take a flat prompt string,
+and Reflex has no chat-template support at all. Kept deliberately simple per the task's
+own instruction not to over-engineer this first pass: `build_prompt` flattens messages
+via plain role-labeled concatenation (`"System: ...\nUser: ...\nAssistant:"`), not the
+loaded GGUF's own `tokenizer.chat_template` metadata (if it has one) — reading and
+applying that would mean either parsing GGUF metadata inside the sidecar (which would
+either duplicate `src/gguf.rs`'s parsing logic or pull in a dependency on
+`reflex-engine`, defeating the whole point of keeping this crate CUDA-toolchain-free) or
+teaching the core engine's IPC protocol to report its own chat template — a real
+follow-up, not attempted here, and flagged explicitly in the README's known limitations
+rather than silently shipped as if it were full parity. `sampling`/`stream` map directly
+onto `IpcSamplingParams`/`IpcRequest::stream` (a positive `temperature` opts into
+sampling, same rule `IpcRequest::sampling_params` already enforces); `top_k` is accepted
+as a Reflex-specific request extension since OpenAI's own schema doesn't have it.
+`finish_reason` (`"length"` vs `"stop"`) and `usage.prompt_tokens` are both documented
+approximations — the IPC protocol has no explicit stop-reason field and no exact
+prompt-token count, so `finish_reason` is inferred from whether the returned
+`token_ids.len()` reached the requested `max_tokens`, and `prompt_tokens` is a
+whitespace-word-count estimate, not a real tokenizer count.
+
+**Verification** (real GPU hardware required end to end, no CPU/mock fallback for
+`reflex stdio` itself, matching this project's standing rule): built and tested on a
+fresh ThunderCompute A100-SXM4-80GB (`zx638gm8`, `sm_80`) — this instance had the NVIDIA
+driver preinstalled (`nvidia-smi` worked out of the box) but no CUDA *toolkit* at all,
+so `nvcc` had to be installed fresh via NVIDIA's `cuda-keyring`/`apt` path
+(`cuda-toolkit-12-6`, matching `cudarc`'s pinned `cuda-12000` feature) alongside a bare
+Rust toolchain (`rustup`) and `libssl-dev`/`pkg-config` (the same `--features download`
+OpenSSL gotcha README already documents) — none of this preinstalled, unlike some past
+ThunderCompute instances. Repo synced via `rsync` (established remote-workflow
+pattern). `cargo build --release --features ipc,download` on the core engine and
+`cargo build --release` on the sidecar both compiled clean; `reflex smoke` passed
+(`process_start_to_first_result_ms=654.522`, `sm_80`). Downloaded a real
+`Qwen/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q8_0.gguf` via the `hf` CLI and launched the sidecar
+against it (`reflex-openai-adapter <gguf> --reflex-bin ./target/release/reflex --port
+8000`), then drove it with `curl` against the real running server:
+
+1. **Non-streaming correctness**: `{"messages":[{"role":"user","content":"The capital
+   of France is"}],"max_tokens":8}` returned `" The capital of France is Paris.\nThe"`
+   — a sane, on-topic completion from the real model, correctly wrapped in an OpenAI
+   `chat.completion` response shape (`id`/`object`/`created`/`model`/`choices[0]
+   .message`/`usage`).
+2. **Streaming is real, not buffered**: a timestamped `curl -N` run against the same
+   prompt with `"stream": true` showed each `chat.completion.chunk` arriving roughly
+   60-70ms apart (12 tokens over ~780ms total), ending in a `finish_reason`-carrying
+   chunk followed by a `data: [DONE]` line — genuine incremental delivery, matching the
+   per-token flush behavior `handle_request_streaming` already provides underneath, not
+   an adapter-side buffering regression.
+3. **Greedy stability**: the same prompt with `temperature: 0` (the default) produced
+   byte-identical output (`" The capital of France is Paris.\nThe"`) across 3 repeated
+   requests.
+4. **Sampling produces real variation**: `temperature: 1.1, top_p: 0.9` against `"Tell
+   me about the ocean"` produced 3 different continuations across 3 runs.
+5. **Multi-turn flattening works end to end**: a 4-message conversation (system + 2
+   user turns + 1 assistant turn, ending "What's 2+2?" / "4" / "And times 3?") produced
+   `" 12\nUser: And times 4"` — correctly used the prior turns' arithmetic context
+   (`2+2=4` carried into `4*3=12`), confirming the flattened prompt actually reaches the
+   model coherently despite being plain concatenation rather than a native chat
+   template.
+6. **Concurrency is serialized correctly, not corrupted**: two `curl` requests fired
+   simultaneously in the background both returned complete, well-formed responses with
+   distinct `chatcmpl-reflex-*` ids and no interleaved/truncated output — the
+   `run_worker` one-job-at-a-time queue actually holds under real concurrent HTTP
+   traffic, not just in the request-shape unit tests.
+7. **Error paths**: an empty `messages` array and a multimodal content-parts array both
+   returned a `400` with a clear OpenAI-shaped `{"error": {...}}` body instead of a
+   panic or a generic 500.
+
+`cargo fmt --check`/`cargo clippy --all-targets -- -D warnings` both clean on this
+crate — checked on both the Windows dev machine (no GPU, used for the initial write-
+build-test-fmt-clippy loop against a local Python stub standing in for `reflex stdio`,
+before ever touching real GPU hardware) and the Linux verification instance.

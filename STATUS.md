@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
 short, current-state summary; HISTORY.md is the log.
 
-_Last updated: 2026-09-24 (temperature/top-k/top-p sampling + per-token streaming added to the IPC layer, chat-completion-integration prep; previous update: on-device dequant extended to all 8 IQ-family formats, closing the on-device dequant set entirely)_
+_Last updated: 2026-09-24 (OpenAI-compatible `/v1/chat/completions` HTTP sidecar built, `sidecar/openai-adapter` — the escape-hatch pattern README's Non-goals section described but had left unbuilt; previous update: temperature/top-k/top-p sampling + per-token streaming added to the IPC layer, chat-completion-integration prep)_
 
 ## MVP progress
 
@@ -371,6 +371,41 @@ touches (`prefill_dense_batched_matches_sequential_prefill`,
 `gemv_gather_matches_full_vocab_gemv_at_matching_rows`); `cargo fmt --check`/
 `cargo clippy --release --features ipc,download --all-targets -- -D warnings`
 both clean.
+
+## OpenAI-compatible HTTP sidecar (`sidecar/openai-adapter`, done 2026-09-24)
+
+Built the sidecar the IPC sampling/streaming round above was prep for, and the escape
+hatch README's Non-goals section has described (but left unbuilt) since the MVP-
+release round: a standalone `POST /v1/chat/completions` HTTP adapter (streaming SSE
+and non-streaming JSON) in front of one managed `reflex stdio <gguf>` child process —
+see HISTORY.md's entry for the full design writeup and `sidecar/openai-adapter/
+README.md` for usage/scope/known limitations (no chat-template support yet — plain
+role-labeled prompt concatenation; `usage.prompt_tokens`/`finish_reason` are
+approximations, no exact-tokenizer/stop-reason info crosses the IPC boundary).
+
+Deliberately its own Cargo project (own `Cargo.toml`/`Cargo.lock`, not a root-workspace
+member, no dependency on `reflex-engine`) so axum/tokio never enter the core engine's
+dependency graph and the sidecar builds with a plain stable Rust toolchain, no CUDA
+toolkit needed. `batch_size == 1`/strictly-sequential is preserved underneath real
+concurrent HTTP traffic by a single background worker task
+(`src/reflex_client.rs::run_worker`) that's the only thing touching the managed
+process's stdin/stdout — it never dequeues the next HTTP-originated request until it
+has read the previous one's `"event": "final"` IPC line.
+
+Real-hardware-verified on a fresh ThunderCompute A100-SXM4-80GB (`zx638gm8`, sm_80,
+CUDA 12.6 toolkit installed fresh — this instance had a driver but no toolkit
+preinstalled) against a real `Qwen/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q8_0.gguf`: non-
+streaming `/v1/chat/completions` returned `" The capital of France is Paris."` for
+that exact prompt; SSE streaming delivered one `chat.completion.chunk` per token at
+~60-70ms intervals (confirmed via timestamped `curl -N` output, not buffered until
+the end); greedy (`temperature` omitted/`0`) was byte-identical across 3 repeated
+requests; `temperature: 1.1`/`top_p: 0.9` produced 3 different continuations across 3
+runs; two concurrent HTTP requests fired simultaneously both completed cleanly with
+distinct `chatcmpl-reflex-*` ids and no interleaved/corrupted output, confirming the
+worker's one-job-at-a-time queue actually serializes concurrent HTTP traffic into the
+single underlying `reflex stdio` process. `cargo fmt --check`/`cargo clippy
+--all-targets -- -D warnings` both clean on this crate, on both Windows (dev machine)
+and Linux (the verification instance).
 
 ## Known debt / limitations
 
