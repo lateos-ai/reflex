@@ -172,11 +172,11 @@ closes both gaps: a real `qwen3moe`-architecture file with `expert_used_count=2 
 expert_count=8`, real Qwen3 QK-Norm tensors, and a `gpt2`-style tokenizer — verified
 against this project's own parser
 (`model::moe_fixture_tests::qwen3moe_fixture_has_excluding_topk_and_qk_norm`, host-only,
-no GPU needed). Its real-hardware end-to-end generation test
-(`qwen3moe_fixture_generates_without_error`) is written but not yet run against real
-GPU hardware. Real GGUF test fixtures otherwise live outside this repo (`.gguf` is
-gitignored) — check with the user for their location before assuming another fixture
-path is valid.
+no GPU needed) and, since, real-hardware-verified too: `qwen3moe_fixture_generates_without_error`
+passed on a real L40 GPU, and `prefill_dense_batched_matches_sequential_prefill`
+(batched-vs-sequential MoE routing, byte-exact) passed against it as well. Real GGUF
+test fixtures otherwise live outside this repo (`.gguf` is gitignored) — check with
+the user for their location before assuming another fixture path is valid.
 
 No small real `deepseek2`-architecture GGUF exists publicly at all (not just locally
 — see HISTORY.md's MLA section). `test-data/deepseek-tiny-mla.gguf` is a fully

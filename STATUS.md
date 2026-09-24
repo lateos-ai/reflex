@@ -269,11 +269,11 @@ planned. The user has asked to queue up three release-hardening items, in this o
 2. **Verify `docker run --rm --gpus all`** end-to-end — the one remaining unverified
    Docker path (see "Known debt" below), needs a host with genuine VM-level
    virtualization *and* a real NVIDIA GPU/driver.
-3. **On-device dequant for more GGUF block types** — extend Phase 2 round 3's
-   `dequant.cu` beyond `Q4_K`/`Q6_K` to the other 15+ block types still on the host
-   path (Q4_0/1, Q5_0/1, Q8_0/1, Q2_K/Q3_K/Q5_K/Q8_K, the IQ-family formats) —
-   real kernel work, needs fixtures that exercise those types for the bulk of a
-   model's weight bytes.
+3. ~~**On-device dequant for more GGUF block types**~~ — **`Q5_K` done** (see "Known
+   debt" below for the real-hardware verification writeup); extend `dequant.cu`
+   further to the remaining 14+ block types still on the host path (Q4_0/1, Q5_0/1,
+   Q8_0/1, Q2_K/Q3_K/Q8_K, the IQ-family formats) — real kernel work, needs fixtures
+   that exercise those types for the bulk of a model's weight bytes.
 
 Other remaining low-priority follow-ups (not queued, not blocking): Phase 3 round 3's
 own resume path verified only against the dense-only synthetic MLA fixture (see
@@ -338,11 +338,11 @@ subset, not a full accept. Neither has been inspected (`adapter_config.json`'s
   even when a raw prompt is passed via `-p` — no `--no-cnv` flag exists in the current
   build. Use `examples/simple`'s `llama-simple` binary instead for true prompt-in/
   token-out comparisons with no chat wrapping.
-- ~~**MoE test fixture**~~ — **partially closed**: `test-data/Tiny-Moe.Q4_K_M.gguf` is
-  still a Mixtral-style synthetic model (`general.architecture="llama"`,
-  `expert_count=2`, `expert_used_count=2` — top-k always selects every expert, so it
-  can't prove routing actually excludes an expert; no QK-Norm tensors; `llama`-arch
-  SentencePiece tokenizer blocks text-level byte-exact resume verification). Added
+- ~~**MoE test fixture**~~ — **closed**: `test-data/Tiny-Moe.Q4_K_M.gguf` is still a
+  Mixtral-style synthetic model (`general.architecture="llama"`, `expert_count=2`,
+  `expert_used_count=2` — top-k always selects every expert, so it can't prove routing
+  actually excludes an expert; no QK-Norm tensors; `llama`-arch SentencePiece tokenizer
+  blocks text-level byte-exact resume verification). Added
   `test-data/tiny-qwen3moe.gguf`, a real `qwen3moe`-architecture fixture built the same
   way as `deepseek-tiny-mla.gguf` (hand-built HF `config.json`/`safetensors`, random
   weights, run through llama.cpp's own real, unmodified `convert_hf_to_gguf.py` --
@@ -352,11 +352,11 @@ subset, not a full accept. Neither has been inspected (`adapter_config.json`'s
   from `deepseek-tiny-mla`'s, enabling the same byte-exact resume verification bar
   Phase 3 round 2 established). Verified locally against this project's own
   `GgufFile`/`parse_model_config` (host-only, no GPU:
-  `model::moe_fixture_tests::qwen3moe_fixture_has_excluding_topk_and_qk_norm`).
-  **Still open**: a real-hardware pass (`qwen3moe_fixture_generates_without_error`,
-  written and `#[ignore]`d, ready to run) hasn't been executed on a real GPU yet, so
-  routing-exclusion and resume behavior are metadata-verified but not yet
-  forward-pass-verified against this fixture.
+  `model::moe_fixture_tests::qwen3moe_fixture_has_excluding_topk_and_qk_norm`), and
+  since real-hardware-verified on a fresh L40 (sm_89) instance:
+  `qwen3moe_fixture_generates_without_error` (a real `Model::generate` pass) and
+  `prefill_dense_batched_matches_sequential_prefill` (batched-vs-sequential MoE
+  routing comparison, byte-exact) both passed against it.
 - **Cargo/binary staleness gotcha**: `cargo test --release` does not rebuild
   `target/release/<bin-name>` — only `target/release/deps/`. After any source change,
   run `cargo build --release --bin <name>` explicitly before trusting a binary run
@@ -452,17 +452,18 @@ subset, not a full accept. Neither has been inspected (`adapter_config.json`'s
   path has been exercised against real MoE routing, the always-on shared expert, and
   YaRN RoPE scaling together, not just architecturally reasoned to be independent of
   them.
-- **On-device dequant extended to Q5_K, not yet real-hardware-verified**: added
-  `dequantize_q5k_kernel` (`kernels_cuda/dequant.cu`, line-for-line port of
-  `dequant.rs`'s `dequantize_block_q5_k`, reusing the same `get_scale_min_k4` device
-  helper Q4_K's kernel already established) and wired it into
+- ~~**On-device dequant extended to Q5_K, not yet real-hardware-verified**~~ —
+  **closed**: added `dequantize_q5k_kernel` (`kernels_cuda/dequant.cu`, line-for-line
+  port of `dequant.rs`'s `dequantize_block_q5_k`, reusing the same `get_scale_min_k4`
+  device helper Q4_K's kernel already established) and wired it into
   `dequantize_tensor_to_device`'s dispatch at all three load sites (dense/MoE, hybrid,
-  MLA). Compiles clean under `REFLEX_SKIP_CUDA=1`; not yet run against a real GGUF
-  using `Q5_K` for the bulk of its weight bytes on real GPU hardware — no such local
-  fixture exists yet (same gap the "On-device dequant for more GGUF block types"
-  planned-next-work entry above already named).
-- **MoE weighted-sum and Gated-Attention fused-qg gating moved on-device in the
-  decode path, not yet real-hardware-verified**: `forward_layer_moe`/
+  MLA). Real-hardware-verified on a fresh L40 (sm_89) instance: downloaded a real,
+  publicly hosted `Q5_K_M` quant (`unsloth/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q5_K_M.gguf`),
+  `reflex generate "Once upon a time"` produced `token_id=11, ","`, independently
+  reproduced byte-exact (same continuation text) by a fresh CUDA-enabled
+  `llama-simple` build (`-DCMAKE_CUDA_ARCHITECTURES=89`) against the same file.
+- ~~**MoE weighted-sum and Gated-Attention fused-qg gating moved on-device in the
+  decode path, not yet real-hardware-verified**~~ — **closed**: `forward_layer_moe`/
   `forward_mla_moe_ffn`'s per-expert weighted accumulate now uses
   `Self::moe_scatter_add` (the same kernel `forward_layer_moe_batched`'s grouped-GEMM
   path already used, called once per selected expert with a single-row group) instead
@@ -470,11 +471,19 @@ subset, not a full accept. Neither has been inspected (`adapter_config.json`'s
   MLA shared expert now uses `Self::add_inplace` directly. `forward_gated_attn_mixer`
   now calls `Self::split_qg_k`/`Self::sigmoid_gate_k` (the exact kernels
   `forward_gated_attn_mixer_batched` uses, both already generic over row count) with
-  `rows=1` instead of two host round trips. Compiles clean under `REFLEX_SKIP_CUDA=1`,
-  all 74 existing tests still pass — but this is a hot-path change to every MoE/hybrid
-  decode step, so it needs a real-hardware byte-exact re-verification (dense/MoE and
-  hybrid `--import-kv` resume tests, plus a fresh `reflex generate` run against
-  `Tiny-Moe.Q4_K_M.gguf`/`Qwen3.5-0.8B-Q4_K_M.gguf`/the real DeepSeek-V2-Lite
-  checkpoint, comparing token-for-token against this project's own documented golden
-  outputs) before being trusted, same bar every other device-residency change in this
-  project has cleared.
+  `rows=1` instead of two host round trips. Real-hardware-verified on the same L40
+  instance plus a fresh 80GB A100: `prefill_dense_batched_matches_sequential_prefill`
+  passed against `test-data/tiny-qwen3moe.gguf` (exercises `forward_layer_moe`'s
+  changed weighted-sum against real MoE routing, byte-exact vs. the unmodified batched
+  path); `prefill_hybrid_batched_matches_sequential` passed against a freshly
+  downloaded real `unsloth/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q4_K_M.gguf` (exercises
+  `forward_gated_attn_mixer`'s changed gating, byte-exact vs. the unmodified batched
+  path), and a plain `reflex generate` against the same file reproduced the
+  previously-documented golden token (`token_id=11, ","`) exactly; on a fresh 80GB
+  A100, `prefill_mla_batched_matches_sequential_real_moe_checkpoint` passed against a
+  freshly re-downloaded/re-converted real `deepseek-ai/DeepSeek-V2-Lite` (exercises
+  `forward_mla_moe_ffn`'s changed weighted-sum + shared-expert add against real MoE
+  routing, the always-on shared expert, and YaRN RoPE scaling together), and `reflex
+  generate` against it reproduced the documented `"The capital of France is" -> "
+  Paris"` golden output exactly. All four architecture families this change touches
+  are now real-hardware-verified, not just locally compiled.
