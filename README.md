@@ -126,6 +126,48 @@ to exit, not just Reflex's own internal timer).
 
 The llama.cpp/Ollama/Jev "loses" results above are reported as-is, not smoothed over.
 
+### Cold-start phase breakdown
+
+A single aggregate number hides where the time actually goes, so `reflex generate`
+reports four phase timings on its `REFLEX_GENERATE_OK` line (`gguf_open_ms`,
+`cuda_init_ms`, `model_load_ms`, `prompt_eval_ms`, each a delta between
+`Instant::now()` checkpoints around the corresponding call) and
+`scripts/bench_cold_start_phases.sh <gguf> [n_runs]` runs it N times (fresh cold
+process each time, external `/usr/bin/time -v` wall clock, raw logs kept, no results
+discarded) to report p50/p95 per phase instead of one sample. "Process launch" (OS
+`exec`/dynamic-linking/CRT init before `main()` runs) isn't something the process can
+report about itself — it's derived as external wall clock minus the internal total,
+the same gap this page's other benchmark numbers already rely on.
+
+Real numbers, `n=30` (two back-to-back batches of 10 and 20), real `NVIDIA L40` (46GB),
+`Qwen/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q8_0.gguf`, rented ThunderCompute instance:
+
+| phase | p50 | p95 |
+|---|---|---|
+| process launch (external − internal) | ~155–165 ms | ~188–208 ms |
+| CUDA init (`CudaDevice::new`) | 417.9 ms | 542.6 ms |
+| model load (dequantize + upload every weight tensor) | 2635.7 ms | 4954.3 ms |
+| prompt eval (forward pass to first token) | 357.2 ms | 896.7 ms |
+| **total** (`process_start_to_first_token_ms`) | 3502.8 ms | 6498.8 ms |
+
+What this breakdown actually shows: **CUDA init is small and stable** (~420–540ms
+regardless of overall system noise) — this is where the AOT-compiled-kernel bet pays
+off, since there's no NVRTC JIT tax hiding in this phase. **Model load dominates and
+is the least stable phase** — the two batches (10 runs, then 20 runs, same session)
+showed materially different noise levels across *every* run in the second batch, not
+just a single outlier, which points at real host-level contention on a shared rented
+GPU instance rather than pure measurement noise. That's disclosed here, not smoothed
+over: **session-to-session variance on rented cloud GPU hardware can exceed
+intra-session variance**, so treat any single-session cold-start number (including
+the comparison table above) as illustrative, not lab-controlled.
+
+**Not yet covered, flagged as real follow-up work, not silently skipped**: host-vs-
+container (does `cgroups`/the NVIDIA Container Toolkit/device-plugin limits change
+CUDA-init overhead vs. bare metal?) and persistent-vs-`exec`'d rows (does keeping one
+`reflex` process warm and re-using it change anything the `smoke`/`generate`
+one-shot-process model doesn't already show?) — both real, specific, harder-to-answer
+questions than the phase breakdown itself, deliberately scoped out of this round.
+
 ## Core technical bet
 
 Every CUDA kernel is compiled **ahead of time** (`build.rs` invokes `nvcc`, see
