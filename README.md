@@ -198,9 +198,10 @@ network socket. That sidecar now exists:
 `reflex-engine`) implementing an OpenAI-compatible `POST /v1/chat/completions`
 (streaming and non-streaming) in front of one managed `reflex stdio` child process —
 real HTTP concurrency on the sidecar's front door, still strictly one request at a
-time into the core engine underneath. See its own README for usage and known
-limitations (notably: no chat-template support yet, plain role-labeled prompt
-concatenation instead).
+time into the core engine underneath. Renders the loaded GGUF's own
+`tokenizer.chat_template` (falling back to plain role-labeled prompt concatenation
+when one isn't present or fails to render) — see its own README for usage and known
+limitations.
 
 For local, non-network ergonomics, this engine may instead expose: a **stdio JSON-line
 mode** (`reflex stdio`, one JSON request per stdin line, fully processed before the next
