@@ -2188,3 +2188,250 @@ instance-profile) was torn down at the end of this session — confirmed via a c
 ec2 describe-instances`/`s3api list-buckets`/`iam list-roles` sweep, nothing billable
 left running. Item 1 (f16 weight residency) remains the only unstarted item on the perf
 plan, deliberately, pending the numerics-methodology decision STATUS.md flags for it.
+
+### Pipelined model load (item 5), 2026-09-25
+
+STATUS.md's warm-latency perf plan item 5 -- "pinned double-buffered staging, async H2D
+on two streams; `alloc_zeros`->`alloc` for dequant kernel outputs", estimated at -20-40%
+of the load phase. Implemented as `WeightLoadPipeline` in `src/model.rs` and verified on
+a fresh AWS EC2 `g4dn.xlarge` (Tesla T4), reusing the same throwaway-infra recipe as the
+item 2/3/4 round (SSM-only IAM role, repo + local-only fixtures staged through a temp S3
+bucket, native build against the `base-with-single-cuda-ubuntu-22.04` DLAMI).
+
+**What it does.** The pre-change path called `CudaDevice::htod_sync_copy` -- a *blocking*
+H2D copy of each tensor's raw quantized bytes -- then launched that tensor's dequant
+kernel, sequentially, ~310 times for a Qwen3-0.6B GGUF. Nothing overlapped tensor N+1's
+transfer with tensor N's kernel. The pipeline stages raw bytes through one of two
+`cuMemHostAlloc`'d pinned host buffers (cudarc 0.11.9 exposes no pinned-host allocation
+at all, so this drops to `cudarc::driver::sys` raw FFI -- the precedent `diagnostics.rs`
+already set for driver calls the safe layer doesn't cover) and issues the upload
+asynchronously on a forked copy stream, while the dequant kernel for a previous tensor
+is still running on the device's default stream. Both dequant output buffers
+(`dev_out`, `truncated`) switched from `alloc_zeros` to `alloc`, since the kernel and
+the `dtod_copy` respectively overwrite every element.
+
+**Two real bugs found in this session's own code before it was trusted**, both caught by
+re-reading the implementation rather than by a failing test -- worth recording because
+neither would have crashed:
+
+1. **A host/device race.** The first version guarded the pinned staging buffer with a
+   GPU-side `cuStreamWaitEvent`. But the pinned buffer is written by the *CPU*, and
+   every other operation in the loop is asynchronous, so the host runs arbitrarily far
+   ahead of the GPU: on slot reuse it would overwrite (or, on growth, `cuMemFreeHost`)
+   a buffer whose previous H2D transfer was still in flight -- silently wrong weight
+   bytes, no crash. A stream wait orders streams; it does not block the host. Fixed with
+   a host-side `cuEventSynchronize` on that slot's previous copy-completion event, which
+   in steady state blocks for ~0 because a whole other tensor's copy and kernel were
+   enqueued in between.
+2. **A self-inflicted serialization that silently erased the benefit.** Allocating the
+   device-side staging buffer per tensor via `CudaDevice::alloc` stream-orders it on the
+   compute stream, and the cross-stream event then needed to let the copy stream write
+   into that fresh allocation *also* drags in every kernel already queued on the compute
+   stream -- so copy N+1 could not start until kernel N finished, which is exactly the
+   overlap the type exists to create. This version was correct but measured only
+   ~2-3% (896.8ms -> 879.6ms), i.e. essentially the serialized case. Fixed by
+   preallocating and *reusing* two device staging buffers (grown lazily, never shrunk)
+   so no per-tensor allocation happens at all, with the slot's device buffer protected
+   by a GPU-side wait on the prior kernel -- the mechanism the first version had applied
+   to the wrong buffer.
+
+**Performance, A/B/A/B interleaved on one instance**
+(`scripts/bench_cold_start_phases_system1.sh`, n=10 per invocation,
+`Qwen3-0.6B-Q4_K_M.gguf`, binaries prebuilt and swapped so no compile ever ran
+concurrently with a measurement). Interleaving matters: the two baseline and two
+pipelined measurements form cleanly separated clusters, so the delta is a real effect
+rather than drift.
+
+| phase (p50) | baseline A1 | pipelined B1 | baseline A2 | pipelined B2 |
+|---|---:|---:|---:|---:|
+| process launch | 121.892ms | 121.330ms | 119.775ms | 121.503ms |
+| cuda init | 139.880ms | 139.554ms | 139.433ms | 138.918ms |
+| **model load** | **902.108ms** | **871.299ms** | **897.970ms** | **864.842ms** |
+| prompt eval | 39.096ms | 39.120ms | 39.037ms | 38.938ms |
+| **total** | **1118.380ms** | **1088.322ms** | **1114.842ms** | **1080.124ms** |
+
+Averaging the paired p50s: `model_load_ms` **900.0ms -> 868.1ms (-3.5%)**, total cold
+start **1116.6ms -> 1084.2ms (-2.9%)**. The hybrid `Qwen3.5-0.8B-Q4_K_M.gguf` (5 runs
+each) moved 1557.0ms -> 1537.1ms by median, a similar ~20-30ms absolute saving.
+
+**Why that is far short of the estimated -20-40%, measured rather than guessed.** A pair
+of throwaway instrumented builds (timing `eprintln!`s inside `Model::load`, applied only
+on the remote instance and never committed to the working tree) broke the load phase
+down, 3 runs each, means:
+
+| sub-phase | baseline | pipelined | delta |
+|---|---:|---:|---:|
+| AOT kernel module load | 83.09ms | 83.24ms | noise |
+| **per-tensor weights loop** | **153.83ms** | **122.68ms** | **-31.15ms (-20.3%)** |
+| `token_embd` host dequant | 547.59ms | 549.86ms | noise |
+| `lm_head` (lazy, tied -- item 3) | 0.058ms | 0.069ms | ~0 |
+| tokenizer construction | 109.62ms | 111.84ms | noise |
+| **load total** | **894.26ms** | **867.77ms** | **-26.5ms (-3.0%)** |
+
+So the optimization did exactly what item 5 predicted -- **-20.3% of the per-tensor
+weight-loading loop, squarely inside the predicted -20-40% band**. The estimate was
+simply applied to the wrong denominator: it was written as a fraction of
+`model_load_ms`, but pipelining can only touch the H2D+dequant loop, which is ~17% of
+that phase. The ~31ms saved is also about the size of the whole PCIe transfer for
+~380MB of Q4_K_M bytes, which is the ceiling here -- the transfer is now essentially
+fully hidden behind kernel execution, and there is nothing left for this technique to
+win.
+
+**The actual cold-load bottleneck, now on record**: `token_embd`'s host-side dequant is
+**~548ms, 63% of `model_load_ms`** -- `dequant::dequantize` materializes the entire
+151936x1024 embedding table to host `f32` because the embedding lookup is a host-side
+gather, even though a given prompt only ever reads a handful of rows. That is the
+obvious next target (and the same trick item 3 already applied to `lm_head`); it is
+noted in STATUS.md's "Next real step" but deliberately not scoped or implemented here.
+
+**Correctness -- zero numeric drift, which was this item's hard requirement.** Unlike
+item 2's reduction-order change, any numeric difference here would be a bug. Golden
+tokens are byte-identical between the baseline and pipelined builds run back to back on
+the same instance: dense `Qwen3-0.6B` `12095`/`" Paris"` (the long-documented golden
+token), hybrid `Qwen3.5-0.8B` `279`/`" the"`, synthetic MLA `26447`/`" subtle"`, MoE
+`tiny-qwen3moe` `39817`/`" POLITICO"`, and an 8-token dense continuation
+`[12095,13,576,6722,315,9625,374,1083]` identical across both builds. Test suites
+against the pipelined build: 85 host-only tests passed, plus all 10 relevant
+`REFLEX_TEST_GGUF`-gated oracle tests -- `system1_tests` (2, incl. item 3's lazy-lm_head
+check), `prefill_batching_tests` against both the dense and MoE fixtures (1 each),
+`moe_fixture_tests` (2), `hybrid_batching_tests` (1), and `mla_batching_tests` (3,
+synthetic fixture). As in the item 2/3/4 round, only
+`prefill_mla_batched_matches_sequential_real_moe_checkpoint` was skipped, deliberately:
+it needs a real DeepSeek-V2-Lite checkpoint on an 80GB A100.
+
+**Gotcha for future sessions shipping this repo from the Windows dev machine**: a
+`tar`/`git archive` of the working tree carries CRLF line endings, and every
+`scripts/*.sh` then dies on the remote with `/usr/bin/env: 'bash\r': No such file or
+directory` -- which failed quietly enough that a whole benchmark phase produced four
+empty sections before it was noticed. Strip CRLF from `scripts/*.sh` after unpacking,
+and check that benchmark sections actually contain a results table rather than assuming
+a clean exit means they ran.
+
+All throwaway AWS infra (the `g4dn.xlarge`, its S3 bucket, the SSM-only IAM role and
+instance profile) was torn down at the end of the session -- confirmed via a clean `aws
+ec2 describe-instances`/`s3api list-buckets`/`iam list-roles`/`iam
+list-instance-profiles` sweep, nothing billable left running. Item 1 (f16 weight
+residency) is now the only unstarted item on the original perf plan.
+
+### Lazy `token_embd` dequant (item 6), 2026-09-25
+
+STATUS.md's warm-latency perf plan item 6 -- lazy/partial `token_embd` dequant, the
+bottleneck the item 5 session's own profiling found (`token_embd` host-side dequant at
+~548ms, 63% of `model_load_ms`, dwarfing everything item 5's pipelining could reach).
+Implemented and real-hardware-verified on a fresh AWS EC2 `g4dn.xlarge` (Tesla T4),
+reusing the same throwaway-infra recipe as the item 2/3/4/5 rounds (SSM-only IAM role,
+repo + local-only fixtures staged through a temp S3 bucket, native build against the
+`base-with-single-cuda-ubuntu-22.04` DLAMI).
+
+**What it does.** `Model::token_embd` was a `Vec<f32>`, fully dequantized by
+`dequant::dequantize` at load time -- every one of `Qwen3-0.6B`'s 151936 embedding rows,
+even though `forward_prompt`'s embedding lookup is a host-side gather that only ever
+reads a handful of them per token (`batch_size` is always 1 -- see CLAUDE.md's
+Non-goals). It's now `LazyTokenEmbedding`: an owned copy of the tensor's *raw quantized*
+bytes (cheap -- ~78MB for `Qwen3-0.6B`'s `Q4_K_M` `token_embd`, vs. the ~594MB the eager
+`f32` materialization used to produce, since the source mmap doesn't outlive
+`Model::load`/`load_hybrid`/`load_mla`) plus a `RefCell<HashMap<u32, Vec<f32>>>` row
+cache. `Self::row(token_id)` slices out exactly that row's on-disk block range (an exact
+number of blocks, by ggml's own invariant that a quantized tensor's row width is always
+a multiple of its block size -- computed via a new `gguf::ggml_type_block_dims`, factored
+out of the existing `ggml_type_size_bytes` so the two never drift apart) and calls the
+*same* `dequant::dequantize` on just that slice, caching the result. Every one of the 8
+call sites that used to index `self.token_embd[base..base+hidden_size]` directly (dense/
+hybrid/MLA's batched-prefill and single-token embedding gathers, plus
+`gemv_gather_lm_head`'s compact-row loop) now calls `self.token_embd.row(token_id)?`
+instead -- same math, same bytes, just decoded on first touch instead of all up front.
+`LmHead::TiedLazy`'s full-vocab fallback (`Model::lm_head_resident`, and
+`load_hybrid`/`load_mla`'s eager tied-embedding upload, which never used `TiedLazy` to
+begin with -- see those functions' doc comments) needed the *whole* table rather than one
+row; `LazyTokenEmbedding::dequantize_all` covers that by calling the exact same
+`dequant::dequantize` on the full raw buffer, so there is exactly one decode
+implementation, not two to keep in sync.
+
+**Correctness -- the hard requirement, since this is a pure laziness/timing change, not
+new math.** Every row `Self::row` decodes is byte-identical to what eagerly dequantizing
+the whole tensor would have produced at that row's offset, because GGUF block
+dequantization has no cross-block state: decoding a row's blocks in isolation is the same
+computation as decoding them as part of the full tensor. `REFLEX_SKIP_CUDA=1 cargo build/
+test/clippy --all-targets/fmt --check` all clean locally first (one `clippy::
+manual_is_multiple_of` lint fixed). Real-hardware: golden tokens byte-identical to this
+project's own long-documented values across all four architecture fixtures -- dense
+`Qwen3-0.6B` `12095`/`" Paris"`, hybrid `Qwen3.5-0.8B` `279`/`" the"`, MoE
+`tiny-qwen3moe` `39817`/`" POLITICO"`, and synthetic MLA `deepseek-tiny-mla`
+`94216`/`" NavLink"` (matching the twice-documented byte-exact-vs-llama.cpp ground truth
+in this file's MLA section, not the `26447`/`" subtle"` figure the item 5 entry above
+cites for a different, unrecorded prompt -- worth a note for whoever reads this next: the
+item 5 entry's MLA golden-token citation used a prompt this session couldn't identify,
+while `"The capital of France is"` is the one this project has verified against real
+llama.cpp twice). All 85 host-only tests pass, plus the gated `REFLEX_TEST_GGUF` oracle
+suite against each of the four fixtures -- `system1_tests` (both, including the one that
+exercises `gemv_gather_lm_head` against a still-lazy `TiedLazy` `token_embd` directly),
+`prefill_batching_tests`, `hybrid_batching_tests`, `moe_fixture_tests`,
+`mla_batching_tests` (the non-real-checkpoint ones) all green; the two recurring failures
+across every run are expected fixture-availability gaps, not regressions --
+`iq_dequant_kernel_matches_host_on_real_tensors` needs an IQ-family-quantized GGUF this
+session didn't fetch, and `prefill_mla_batched_matches_sequential_real_moe_checkpoint`
+needs the real DeepSeek-V2-Lite checkpoint on an 80GB A100, same as every prior session in
+this perf plan.
+
+**Performance.** `bench_cold_start_phases_system1.sh`, n=10, dense `Qwen3-0.6B-Q4_K_M.gguf`,
+comparing directly against item 5's own already-recorded numbers on the same instance
+class/methodology (system1 never forces `LmHead::TiedLazy`'s full-vocab fallback, so it
+gets this item's win with zero offsetting cost anywhere):
+
+| phase (p50) | item 5 (baseline) | item 6 (this session) | delta |
+|---|---:|---:|---:|
+| model load | 868.1ms | 410.3ms | **-457.8ms (-53%)** |
+| total (`process_start_to_result_ms`) | 1084.2ms | 627.3ms | **-456.9ms (-42%)** |
+
+A throwaway instrumented build (timing `eprintln!`s inside `Model::load`, applied only on
+the remote instance and never committed, same technique the item 5 session used) isolated
+the `token_embd` sub-phase specifically, 3 runs:
+
+| sub-phase | item 5 baseline | item 6 (this session) | delta |
+|---|---:|---:|---:|
+| weights loop + AOT module load | ~203ms | ~202ms | noise |
+| **`token_embd` construction** | **547.6ms** | **~102ms** | **-445.6ms (-81%, ~5.4x)** |
+| tokenizer construction | ~110ms | ~107ms | noise |
+| **load total** | ~868ms | ~410ms | **-458ms (-53%)** |
+
+The residual ~102ms for `token_embd` construction is not compute (a plain byte copy of
+~78MB is far cheaper than that) -- it's the mmap-page-fault-driven cost of touching that
+much of the file for the first time in this process's address space, which the old eager
+path also paid, just hidden inside its larger ~548ms dequant-loop measurement.
+
+**Important, honestly-reported caveat, found by a deliberate follow-up A/B (not something
+the task asked for, but the phase-shift below made it worth checking): this win does not
+apply to `reflex generate` on a *tied*-embedding model.** `Qwen3-0.6B` has no separate
+`output.weight` tensor, so `generate`'s first-token logits call always forces
+`lm_head_resident`'s `TiedLazy` branch, which needs the *whole* vocab -- unlike `system1`,
+which never does. For that caller, this item doesn't eliminate the ~548ms dequant cost,
+it only moves it from `model_load_ms` to `prompt_eval_ms`, and the new unconditional
+~102ms raw-byte-copy paid at load (needed regardless of whether anything ever asks for a
+full-vocab materialization) becomes pure added overhead on top. Measured A/B/A/B
+interleaved on the same instance (3 runs each, built once, binaries swapped between
+measurements per this project's own A/B methodology; clean separation, not noise):
+
+| | item-5-only (baseline) | item 5 + lazy `token_embd` | delta |
+|---|---:|---:|---:|
+| model load | ~853ms | ~406ms | -447ms |
+| prompt eval (now includes the deferred full-vocab dequant) | ~175ms | ~735ms | +560ms |
+| **`reflex generate` total** | **~1206ms** | **~1316ms** | **+110ms (+9%), a regression** |
+
+This is an accepted, scoped trade-off, not a bug to fix: `LmHead::TiedLazy` was already
+documented (see its doc comment and item 3's STATUS.md entry) as "scoped to the one path
+`system1_evaluate` actually needs it for, not a general `Model` win" -- this item is a
+natural, consistent extension of that same accepted design, not a new problem. `system1`
+and any `generate` call on a model with a *separate* `output.weight` tensor (the hybrid
+`Qwen3.5-0.8B` fixture's `generate` never touches `dequantize_all` at all, confirmed by
+its unaffected ~77ms `prompt_eval_ms`) get this item's full win with no offsetting cost;
+only `generate` on a tied dense/MoE model pays a modest, bounded, well-understood tax
+instead. Revisiting `LmHead::TiedLazy` to special-case this (e.g. having `generate`
+itself hint upfront that it will need the full vocab) is out of scope for this item --
+it would be new design, not the laziness/timing change this item's correctness bar was
+scoped to.
+
+All throwaway AWS infra (the `g4dn.xlarge`, its S3 bucket, the SSM-only IAM role and
+instance profile) was torn down at the end of the session -- confirmed via a clean `aws
+ec2 describe-instances`/`s3api list-buckets`/`iam get-role`/`iam get-instance-profile`
+sweep, nothing billable left running. Item 1 (f16 weight residency) is now the only
+unstarted item on the original perf plan.

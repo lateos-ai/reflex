@@ -288,7 +288,19 @@ impl GgufFile {
 /// occupies on disk. Block-quantized types round the element count up to a
 /// full block per GGUF's own on-disk padding rule.
 fn ggml_type_size_bytes(ggml_type: GgmlType, element_count: u64) -> Result<usize, String> {
-    let (block_size, block_bytes): (u64, u64) = match ggml_type {
+    let (block_size, block_bytes) = ggml_type_block_dims(ggml_type)?;
+    let num_blocks = element_count.div_ceil(block_size);
+    Ok((num_blocks * block_bytes) as usize)
+}
+
+/// (elements per block, bytes per block) for one on-disk block of
+/// `ggml_type` -- factored out of `ggml_type_size_bytes` so `model.rs`'s
+/// lazy `token_embd` row-byte-length computation (one row is an exact
+/// number of blocks, by ggml's own invariant that a quantized tensor's
+/// row width is always a multiple of its block size) can share the same
+/// table instead of a third hand-copied one.
+pub(crate) fn ggml_type_block_dims(ggml_type: GgmlType) -> Result<(u64, u64), String> {
+    Ok(match ggml_type {
         GgmlType::F32 => (1, 4),
         GgmlType::F16 | GgmlType::Bf16 => (1, 2),
         GgmlType::F64 => (1, 8),
@@ -325,9 +337,7 @@ fn ggml_type_size_bytes(ggml_type: GgmlType, element_count: u64) -> Result<usize
                 "unknown ggml_type={t}: on-disk block size not known to this parser"
             ))
         }
-    };
-    let num_blocks = element_count.div_ceil(block_size);
-    Ok((num_blocks * block_bytes) as usize)
+    })
 }
 
 struct Cursor<'a> {

@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
 short, current-state summary; HISTORY.md is the log.
 
-_Last updated: 2026-09-25 (items 2/3/4 of the ranked warm-latency-vs-TypeSafe-Jev plan are now real-hardware-verified on a fresh AWS EC2 `g4dn.xlarge` — see "Planned next work: warm-latency perf vs. TypeSafe Jev" below and HISTORY.md's "Real-hardware verification of the warm-latency perf plan" entry for the full numbers: item 2's warp-per-row `gemv_kernel`/`gemv_gather_kernel` rewrite measured a **~4.9x decode-throughput improvement** (15.4 → 74.8 tok/s), item 3's lazy `LmHead` dropped GPU-resident bytes by exactly the predicted ~608 MiB and improved cold-start too, item 4's phase breakdown now reports real, tight p50/p95 numbers. Golden tokens reproduced exactly for dense and hybrid; all 8 relevant internal-consistency oracle tests pass across dense/MoE/hybrid/synthetic-MLA. Item 1 (f16 weight residency) reframed (memory-bandwidth-bound, not tensor-core-FLOP-bound; `CUBLAS_COMPUTE_32F_FAST_16F` for f32 accumulation; land opt-in; do item 5 first) but still unstarted, deliberately, pending a numerics-methodology decision. Previous update: TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry)_
+_Last updated: 2026-09-25 (item 6 of the ranked warm-latency-vs-TypeSafe-Jev plan — lazy/partial `token_embd` dequant, the bottleneck item 5's profiling found — is now implemented and real-hardware-verified on an AWS EC2 `g4dn.xlarge`/Tesla T4: `token_embd` construction dropped from item 5's measured 547.6ms to ~102ms, `model_load_ms` p50 **868.1ms → 410.3ms (-53%)** and total cold start **1084.2ms → 627.3ms (-42%)** for `reflex system1`, with zero numeric drift (golden tokens byte-identical across dense/hybrid/MoE/synthetic-MLA). Honestly-reported caveat found by a follow-up A/B: `reflex generate` on a *tied*-embedding model doesn't get this win (the deferred dequant cost just moves from `model_load_ms` to `prompt_eval_ms`, plus a small fixed added-copy tax) — measured a ~110ms (~9%) *regression* for that specific caller, an accepted trade-off matching `LmHead::TiedLazy`'s already-documented system1-only scope. See HISTORY.md's "Lazy token_embd dequant (item 6)" entry for the full numbers. Previous update: item 5 of the same plan — pipelined model load — dropped the weight-loading loop it targets **153.8ms → 122.7ms (-20.3%)** with zero numeric drift, but that loop is only ~17% of `model_load_ms`, so end-to-end cold start improved just ~3%; that session's sub-phase profiling found the `token_embd` bottleneck item 6 above then closed — see HISTORY.md's "Pipelined model load (item 5)". Before that: items 2/3/4 of the same plan were real-hardware-verified on a fresh AWS EC2 `g4dn.xlarge` — see "Planned next work: warm-latency perf vs. TypeSafe Jev" below and HISTORY.md's "Real-hardware verification of the warm-latency perf plan" entry for the full numbers: item 2's warp-per-row `gemv_kernel`/`gemv_gather_kernel` rewrite measured a **~4.9x decode-throughput improvement** (15.4 → 74.8 tok/s), item 3's lazy `LmHead` dropped GPU-resident bytes by exactly the predicted ~608 MiB and improved cold-start too, item 4's phase breakdown now reports real, tight p50/p95 numbers. Golden tokens reproduced exactly for dense and hybrid; all 8 relevant internal-consistency oracle tests pass across dense/MoE/hybrid/synthetic-MLA. Item 1 (f16 weight residency) reframed (memory-bandwidth-bound, not tensor-core-FLOP-bound; `CUBLAS_COMPUTE_32F_FAST_16F` for f32 accumulation; land opt-in; do item 5 first) but still unstarted, deliberately, pending a numerics-methodology decision. Previous update: TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry)_
 
 ## MVP progress
 
@@ -446,15 +446,77 @@ Ranked plan (payoff vs. risk), **items 3+4 started 2026-09-25**:
 5. **Pipeline model load**: pinned double-buffered staging, async H2D on two
    streams; `alloc_zeros`→`alloc` for dequant kernel outputs (every element
    gets overwritten by the kernel, so zeroing first is wasted work). Est.
-   -20-40% of the load phase. Medium effort, low risk — not started.
+   -20-40% of the load phase. **Done and real-hardware-verified 2026-09-25**
+   (AWS EC2 `g4dn.xlarge`, Tesla T4) — see HISTORY.md's "Pipelined model
+   load (item 5)" entry. `WeightLoadPipeline` in `src/model.rs` stages each
+   tensor's raw quantized bytes through one of two `cuMemHostAlloc`'d pinned
+   host buffers and uploads them asynchronously on a forked copy stream,
+   overlapping tensor N+1's transfer with tensor N's dequant kernel on the
+   default stream; both dequant output buffers switched from `alloc_zeros`
+   to `alloc`. **The estimate was right about the mechanism but wrong about
+   the denominator**: the targeted per-tensor weight-loading loop went
+   **153.8ms → 122.7ms (-20.3%)**, squarely inside the predicted -20-40%
+   band, but that loop is only ~17% of `model_load_ms`, so end to end
+   `model_load_ms` p50 moved only **900.0ms → 868.1ms (-3.5%)** and total
+   cold start **1116.6ms → 1084.2ms (-2.9%)**, measured A/B/A/B interleaved
+   on one instance (n=10 each). Zero numeric drift: every golden token is
+   byte-identical between the baseline and pipelined builds on the same
+   instance.
+   **The real cold-load bottleneck is now measured, not guessed** (throwaway
+   instrumented builds, 3 runs each): of the ~868ms load phase,
+   **`token_embd` host-side dequant is ~548ms (63%)**, tokenizer
+   construction ~112ms (13%), AOT kernel module load ~83ms (10%), and the
+   whole pipelined weights loop only ~123ms (14%). Any further cold-load
+   work should target that 548ms — `dequant::dequantize` materializes the
+   entire 151936x1024 embedding table to host `f32` even though the
+   embedding gather only ever reads the handful of rows in the prompt.
+6. **Lazy/partial `token_embd` dequant** — the item 5 profiling above
+   identified this as the real bottleneck (63% of `model_load_ms`); same
+   lazy-materialization pattern item 3 already proved out for `lm_head`.
+   **Done and real-hardware-verified 2026-09-25** (AWS EC2 `g4dn.xlarge`,
+   Tesla T4) — see HISTORY.md's "Lazy token_embd dequant (item 6)" entry.
+   `LazyTokenEmbedding` (`src/model.rs`) replaces `Model::token_embd`'s
+   eager `Vec<f32>`: an owned copy of the tensor's raw quantized bytes
+   (cheap, e.g. ~78MB vs. the ~594MB `f32` materialization it replaces)
+   plus a per-row-id decode cache, shared by `Model::load`/`load_hybrid`/
+   `load_mla` and by `LmHead::TiedLazy`'s full-vocab fallback (no
+   duplicated decode logic -- both the per-row path and the full-vocab
+   path delegate to the same `dequant::dequantize`). **Sub-phase timing**:
+   `token_embd` construction dropped from item 5's measured 547.6ms to
+   **~102ms** (an owned-byte-copy now, not a 607k-block CPU dequant) -- the
+   residual 102ms is the mmap-page-fault-driven cost of touching ~78MB of
+   file for the first time, not compute. **End-to-end** (`reflex system1`,
+   `bench_cold_start_phases_system1.sh`, n=10, dense `Qwen3-0.6B-Q4_K_M`):
+   `model_load_ms` p50 **868.1ms -> 410.3ms (-53%)**, total cold start
+   **1084.2ms -> 627.3ms (-42%)** -- the single largest win in this
+   project's cold-start history. Golden tokens byte-identical across dense
+   (`12095`/`" Paris"`), hybrid (`279`/`" the"`), MoE (`39817`/
+   `" POLITICO"`), and synthetic MLA (`94216`/`" NavLink"`, matching the
+   twice-documented byte-exact-vs-llama.cpp ground truth in HISTORY.md's
+   MLA section) -- correctness bar met, this is a pure timing change.
+   **Important, honestly-reported caveat, found by a follow-up A/B**: this
+   win does not apply to `reflex generate` on a *tied*-embedding model (no
+   separate `output.weight`, e.g. `Qwen3-0.6B`) -- `lm_head_resident`'s
+   `TiedLazy` branch still needs the full vocab for greedy argmax, so the
+   ~548ms dequant cost isn't eliminated for that caller, only moved from
+   `model_load_ms` to `prompt_eval_ms`, and the new unconditional ~102ms
+   raw-byte-copy at load becomes pure added overhead for it. Measured
+   A/B/A/B interleaved (3 runs each, clean separation, dense fixture):
+   `reflex generate` total **1207ms (item-5-only) -> 1316ms (item 5 + lazy
+   `token_embd`), a ~110ms (~9%) regression**. This is an accepted, scoped
+   trade-off matching `LmHead::TiedLazy`'s own established design (already
+   documented as "scoped to the one path `system1_evaluate` actually needs
+   it for, not a general `Model` win") -- `system1` and any `generate` call
+   on a *non-tied* model (separate `output.weight`, e.g. the hybrid
+   `Qwen3.5-0.8B` fixture, whose `generate` never touches
+   `dequantize_all()` at all) get the full win with zero offsetting cost.
 
-**Next real step**: items 2/3/4 are now all real-hardware-verified (see
-HISTORY.md's "Real-hardware verification of the warm-latency perf plan"
-entry for the full numbers and methodology). Only item 1 (f16 weight
-residency) and item 5 (pipelined model load) remain — item 1 needs the
-numerics-methodology decision flagged above before any code is written;
-item 5 is the next low-risk pickup if more cold-load-time reduction is
-wanted.
+**Next real step**: items 2/3/4/5/6 are all real-hardware-verified now (see
+HISTORY.md's "Real-hardware verification of the warm-latency perf plan",
+"Pipelined model load (item 5)", and "Lazy token_embd dequant (item 6)"
+entries for the full numbers and methodology). Item 1 (f16 weight
+residency) is the only one of the original plan left, and still needs the
+numerics-methodology decision flagged above before any code is written.
 
 ## IPC sampling + streaming (chat-completion-integration prep, done 2026-09-24)
 

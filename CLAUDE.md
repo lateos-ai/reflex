@@ -78,6 +78,16 @@ than llama.cpp until fixed. Only the token embedding table stays host-resident (
 for the host-side embedding-lookup gather); its dequantized bytes are reused for
 `lm_head` when the two are tied, instead of dequantizing twice.
 
+That per-tensor load loop runs through `WeightLoadPipeline`, which double-buffers each
+tensor's raw quantized bytes through pinned host memory and uploads them on a forked
+copy stream so tensor N+1's H2D transfer overlaps tensor N's dequant kernel — **don't
+"simplify" it back to a blocking `htod_sync_copy` per tensor**, and don't make its two
+staging buffers per-tensor allocations: both were measured, and the reasons each
+alternative is wrong (a host/device race in one case, a cross-stream dependency that
+serializes the pipeline in the other) are written up in HISTORY.md's "Pipelined model
+load (item 5)" entry. Note the pipeline is only ~14% of `model_load_ms`; the dominant
+cold-load cost is the host-side `token_embd` dequant above, at ~63%.
+
 `forward_prompt` runs: embedding lookup (host-side gather, `batch_size` always 1) → each
 layer via `forward_layer` (dispatches to `forward_layer_dense` or `forward_layer_moe`,
 both sharing `forward_attn_block`: RMSNorm → QKV → QK-Norm (if present) → RoPE → causal
