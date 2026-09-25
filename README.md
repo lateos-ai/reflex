@@ -34,7 +34,11 @@ tokens), `system1` (single-pass, non-autoregressive candidate scoring — the "S
 decision-loop path), `smoke` (the AOT-pipeline check above), `bench` (warm-latency
 microbenchmark), `check` (byte-exact-vs-reference correctness check, CI-scriptable),
 and `stdio`/`uds` (local JSON-line IPC, both need `--features ipc`). Run `reflex
-<subcommand>` with no further arguments to see that subcommand's own usage.
+<subcommand>` with no further arguments to see that subcommand's own usage. For real
+HTTP clients (OpenRouter, the OpenAI SDKs, curl), see
+[`sidecar/openai-adapter`](sidecar/openai-adapter/README.md) — a separate
+OpenAI-compatible `/v1/chat/completions` sidecar built on top of `reflex stdio`, not
+part of the `reflex` binary itself (see Non-goals below).
 
 ### Example: download a model from Hugging Face, then run a System1 test
 
@@ -182,11 +186,18 @@ orchestrator*, not in this engine:
 to the rule above — a concurrent HTTP listener is the exact same violation
 ("`batch_size` always 1... never a thread pool") under a different name, and an
 adoption/UX ask asking for one doesn't get to reopen it. If HTTP access to this engine
-is ever genuinely needed, the pattern is a **separate, optional sidecar binary** (e.g.
-`system1-openai-adapter`) that talks to this core engine over local IPC only — the core
-engine itself never grows a network socket. Building that sidecar is out of scope for
-now; this paragraph only records the escape-hatch pattern so a future HTTP ask gets
-routed there instead of back into this engine.
+is ever genuinely needed, the pattern is a **separate, optional sidecar binary** that
+talks to this core engine over local IPC only — the core engine itself never grows a
+network socket. That sidecar now exists:
+[`sidecar/openai-adapter`](sidecar/openai-adapter/README.md) is a standalone crate
+(own `Cargo.toml`/`Cargo.lock`, not a workspace member, no dependency on
+`reflex-engine`) implementing an OpenAI-compatible `POST /v1/chat/completions`
+(streaming and non-streaming) in front of one managed `reflex stdio` child process —
+real HTTP concurrency on the sidecar's front door, still strictly one request at a
+time into the core engine underneath. Renders the loaded GGUF's own
+`tokenizer.chat_template` (falling back to plain role-labeled prompt concatenation
+when one isn't present or fails to render) — see its own README for usage and known
+limitations.
 
 For local, non-network ergonomics, this engine may instead expose: a **stdio JSON-line
 mode** (`reflex stdio`, one JSON request per stdin line, fully processed before the next

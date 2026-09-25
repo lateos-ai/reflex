@@ -20,6 +20,12 @@
 //! Usage: `reflex generate <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>]`
 //!        `reflex generate <path-to-gguf> [continuation-prompt] [--max-tokens N] --import-kv <file>`
 //!
+//! `--temperature F` (omitted, or `0.0`, keeps this project's original greedy-argmax
+//! behavior -- the byte-exact-reproducible default `--check`/`DECISIONS.md`'s
+//! methodology depends on). Any positive value switches to temperature/top-k/top-p
+//! sampling (`--top-k N`, `--top-p F`, `--seed N` for a reproducible draw) -- see
+//! `reflex_engine::sampling`'s doc comment.
+//!
 //! `--lora <adapter.gguf>` applies a llama.cpp-format LoRA adapter to the
 //! loaded model's weights once, at load time, before any forward pass runs
 //! (see `model::Model::apply_lora` and `lora`'s module doc comment for the
@@ -79,6 +85,10 @@ pub fn run(args: Vec<String>) {
     let mut lora_path: Option<String> = None;
     let mut model_spec: Option<String> = None;
     let mut quickstart = false;
+    let mut temperature: f32 = 0.0;
+    let mut top_k: Option<usize> = None;
+    let mut top_p: Option<f32> = None;
+    let mut seed: Option<u64> = None;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -103,9 +113,41 @@ pub fn run(args: Vec<String>) {
                     panic!("--max-tokens must be a positive integer, got {raw:?}")
                 });
             }
+            "--temperature" => {
+                let raw = args.next().expect("--temperature requires a number");
+                temperature = raw
+                    .parse()
+                    .unwrap_or_else(|_| panic!("--temperature must be a number, got {raw:?}"));
+            }
+            "--top-k" => {
+                let raw = args.next().expect("--top-k requires a number");
+                top_k =
+                    Some(raw.parse().unwrap_or_else(|_| {
+                        panic!("--top-k must be a positive integer, got {raw:?}")
+                    }));
+            }
+            "--top-p" => {
+                let raw = args.next().expect("--top-p requires a number");
+                top_p = Some(
+                    raw.parse()
+                        .unwrap_or_else(|_| panic!("--top-p must be a number, got {raw:?}")),
+                );
+            }
+            "--seed" => {
+                let raw = args.next().expect("--seed requires a number");
+                seed = Some(raw.parse().unwrap_or_else(|_| {
+                    panic!("--seed must be a non-negative integer, got {raw:?}")
+                }));
+            }
             other => positional.push(other.to_string()),
         }
     }
+    let sampling = reflex_engine::sampling::SamplingParams {
+        temperature,
+        top_k,
+        top_p,
+        seed,
+    };
     if quickstart && model_spec.is_some() {
         panic!("--quickstart and --model cannot be combined in the same run");
     }
@@ -202,9 +244,16 @@ pub fn run(args: Vec<String>) {
 
     let mut first_token_ms: Option<f64> = None;
     let (tokens, text) = model
-        .generate(&prompt, max_tokens, imported.as_ref(), |_logits| {
-            first_token_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
-        })
+        .generate(
+            &prompt,
+            max_tokens,
+            imported.as_ref(),
+            &sampling,
+            |_logits| {
+                first_token_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+            },
+            |_id, _text| {},
+        )
         .expect("generate failed");
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
