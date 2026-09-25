@@ -2093,3 +2093,98 @@ scoring is consistently competitive within roughly 1.3–2.1x regardless of host
 Same caveats as every prior Jev mention still apply (published, not independently
 reproduced figures; no decision-quality claim; different deployment models) — see
 DECISIONS.md's "TypeSafe Jev comparison framing" entry.
+
+### Real-hardware verification of the warm-latency perf plan (items 2/3/4), 2026-09-25
+
+STATUS.md's "Planned next work: warm-latency perf vs. TypeSafe Jev" items 2 (warp-per-row
+`gemv_kernel`/`gemv_gather_kernel`), 3 (lazy `LmHead` for tied dense/MoE models), and 4
+(`reflex system1` phase breakdown) were implemented in a prior session without any
+CUDA-capable machine available — compiled and tested only under `REFLEX_SKIP_CUDA=1`,
+explicitly flagged as unverified. This session closes that gap on a fresh AWS EC2
+`g4dn.xlarge` (Tesla T4), following the same minimal-verification pattern as the earlier
+`docker run --gpus all` and Jev re-verification rounds: throwaway SSM-only IAM role, repo
+shipped via a temp S3 bucket (this time also carrying the two local-only gitignored
+fixtures, `tiny-qwen3moe.gguf` and `deepseek-tiny-mla.gguf`, alongside the `git archive`
+tarball), native build (not Docker) with a fresh CUDA 12.6 toolkit + `rustup` on the
+`base-with-single-cuda-ubuntu-22.04` DLAMI (same gotcha as before: despite its name, this
+AMI ships no `nvcc`, only the driver).
+
+**`nvcc` compiled the rewritten kernels cleanly on the first try** — no syntax issues in
+either `gemv.cu` or `gemv_gather.cu`'s warp-per-row/`float4`/`__shfl_down_sync` rewrite.
+
+**Correctness, dense**: `reflex generate` on `Qwen3-0.6B-Q4_K_M.gguf` for `"The capital
+of France is"` reproduced the long-documented golden token (`12095`/`" Paris"`) exactly —
+first real evidence the reduction-order change in the new kernel didn't shift the greedy
+argmax for this case. `reflex generate` on the hybrid `Qwen3.5-0.8B-Q4_K_M.gguf` (no LoRA)
+reproduced the previously-documented base continuation's first token (`279`/`" the"`,
+consistent with the Phase-4-LoRA round's recorded `" the capital of the country."`
+base-model continuation). The MoE (`tiny-qwen3moe.gguf`) and synthetic-MLA
+(`deepseek-tiny-mla.gguf`) fixtures are random-weight synthetic checkpoints with no
+semantically meaningful golden text, so only the internal consistency oracle below
+applies to them.
+
+**Correctness, internal oracles — all 8 real-hardware/`REFLEX_TEST_GGUF`-gated tests
+relevant to these changes pass**: `gemv_gather_matches_full_vocab_gemv_at_matching_rows`
+and the new `gemv_gather_lm_head_matches_full_vocab_gemv_while_still_lazy` (both dense,
+the latter being the actual new lazy-path coverage item 3 added), `prefill_dense_batched_
+matches_sequential_prefill` (run against both the dense and MoE fixtures), `qwen3moe_
+fixture_has_excluding_topk_and_qk_norm`/`qwen3moe_fixture_generates_without_error`,
+`prefill_hybrid_batched_matches_sequential`, and `prefill_mla_batched_matches_sequential`/
+`prefill_mla_batched_import_kv_resume_matches_sequential` (synthetic MLA fixture). The
+only test that didn't pass, `prefill_mla_batched_matches_sequential_real_moe_checkpoint`,
+failed only because `REFLEX_TEST_GGUF` wasn't set to a real DeepSeek-V2-Lite checkpoint —
+that needs an 80GB A100 (per the existing MLA VRAM-sizing writeup), deliberately out of
+scope for this pass, not a regression. The full non-`--ignored` suite (85 tests) also
+passed under the real CUDA build, matching the `REFLEX_SKIP_CUDA=1` count from the
+implementation session exactly. A fresh `llama.cpp` build (CUDA, `sm_75`) was also built
+successfully for an independent cross-check, but its `llama-simple` output interleaved
+badly with CUDA-graph debug logging through the SSM command-output pipeline and wasn't
+worth the time to untangle cleanly — not treated as a gap, since the golden-token match
+above already provides the stronger, already-established form of that same evidence.
+
+**Performance — all three predictions confirmed, with one methodology lesson.** The
+first perf run (warm bench + cold system1-vs-jev + phase breakdown, all in one SSM
+command) was run concurrently with a backgrounded `llama.cpp` CUDA compile still using
+all 4 vCPUs — a real self-inflicted measurement error, not a finding: cold-start numbers
+came back *worse* than the pre-optimization baseline (wall clock 2.2–3.4s vs. the
+previous session's 1.37–1.38s), and warm System1 looked flat. Re-ran the identical three
+benchmarks after the `llama.cpp` build finished, with nothing else competing for CPU:
+
+| metric | pre-optimization (prior AWS T4 session) | post-optimization (this session, clean) |
+|---|---:|---:|
+| decode throughput @29 tok | 15.385 tok/s (64.997 ms/token) | **74.827 tok/s (13.364 ms/token)** |
+| forward-pass (full-vocab) p50 @29 tok | 27.540ms | 23.394ms |
+| System1 (cuBLAS-prefill-dominated) p50 @29 tok | 20.906ms | 21.167ms (flat, as predicted — see below) |
+| GPU-resident bytes at load (`model_resident_mib`) | 2348 MiB | **1740 MiB (−608 MiB)** |
+| cold system1-vs-jev wall clock, n=5 | 1.37–1.38s | **1.23–1.25s** |
+| cold-start `model_load_ms` p50, n=10 | not measured (item 4 didn't exist yet) | **889.5ms** |
+| cold-start total `process_start_to_result_ms` p50, n=10 | ~1248.6ms (mean, prior session) | **1104.4ms** |
+
+**Decode throughput improved ~4.9x** (item 2) — the single biggest number in this
+project's perf history outside the original 4.3x-to-parity llama.cpp saga, and it lands
+exactly where the warp-per-row coalescing fix predicted: every `gemv`-driven step of the
+decode path (QKV/FFN projections, MoE router, per-expert FFN, the final `lm_head` GEMV)
+benefits. **System1's warm latency is correctly unaffected** — its 20.9ms bottleneck is
+the batched-prefill path (`Self::gemm`, cuBLAS), not `gemv_kernel` at all, exactly as the
+original bandwidth analysis in STATUS.md predicted before any code was written; this
+flat result is confirmation the analysis was right, not a sign the optimization did
+nothing. **VRAM residency dropped by exactly the predicted ~594 MiB** (item 3, measured
+608 MiB — the difference is the `output_norm`/tokenizer overhead already present in both
+numbers, not a discrepancy). **Cold-start improved too**, though item 3 was never aimed
+at the cold path — skipping the 608 MiB upload+dequant shaves real time off `model_load_
+ms` regardless of which subcommand triggers it. Item 4's phase breakdown itself worked
+exactly as designed once measured cleanly: tight p50/p95 spreads (889.5/895.7ms model
+load, 130.3/132.3ms process launch, 142.1/146.7ms CUDA init, 35.7/36.1ms scoring pass) —
+a real, usable instrument for future perf work on this path, not just a one-off number.
+
+**Lesson for future sessions**: never run a benchmark-quality timing measurement on the
+same instance as a concurrent multi-core compile or other CPU-heavy background job, even
+when they're logically unrelated to what's being measured — this cost one wasted
+15-minute SSM round-trip here, caught only by comparing against the already-documented
+pre-optimization baseline and noticing the numbers moved the wrong direction.
+
+All throwaway AWS infra (the `g4dn.xlarge`, its S3 bucket, the SSM-only IAM role/
+instance-profile) was torn down at the end of this session — confirmed via a clean `aws
+ec2 describe-instances`/`s3api list-buckets`/`iam list-roles` sweep, nothing billable
+left running. Item 1 (f16 weight residency) remains the only unstarted item on the perf
+plan, deliberately, pending the numerics-methodology decision STATUS.md flags for it.

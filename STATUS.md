@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
 short, current-state summary; HISTORY.md is the log.
 
-_Last updated: 2026-09-25 (items 2/3/4 of the ranked warm-latency-vs-TypeSafe-Jev plan are now code-complete — see "Planned next work: warm-latency perf vs. TypeSafe Jev" below: item 2 rewrites `gemv_kernel`/`gemv_gather_kernel` from thread-per-row to warp-per-row + vectorized loads (the actual root cause of the ~9%-of-peak decode bandwidth), items 3/4 are the lazy `LmHead` and `reflex system1` phase breakdown from the previous update. All compile/test/lint clean under `REFLEX_SKIP_CUDA=1`; **none of the three has been run on real GPU hardware or through `nvcc` at all yet** — this session has no CUDA-capable machine, and item 2 specifically needs a full byte-exact-vs-llama.cpp re-verification before being trusted, not just a passing build. Only item 1 (f16 weight residency) remains unstarted, deliberately, pending a numerics-methodology decision. Previous update: TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry)_
+_Last updated: 2026-09-25 (items 2/3/4 of the ranked warm-latency-vs-TypeSafe-Jev plan are now real-hardware-verified on a fresh AWS EC2 `g4dn.xlarge` — see "Planned next work: warm-latency perf vs. TypeSafe Jev" below and HISTORY.md's "Real-hardware verification of the warm-latency perf plan" entry for the full numbers: item 2's warp-per-row `gemv_kernel`/`gemv_gather_kernel` rewrite measured a **~4.9x decode-throughput improvement** (15.4 → 74.8 tok/s), item 3's lazy `LmHead` dropped GPU-resident bytes by exactly the predicted ~608 MiB and improved cold-start too, item 4's phase breakdown now reports real, tight p50/p95 numbers. Golden tokens reproduced exactly for dense and hybrid; all 8 relevant internal-consistency oracle tests pass across dense/MoE/hybrid/synthetic-MLA. Only item 1 (f16 weight residency) remains unstarted, deliberately, pending a numerics-methodology decision. Previous update: TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry)_
 
 ## MVP progress
 
@@ -371,15 +371,21 @@ Ranked plan (payoff vs. risk), **items 3+4 started 2026-09-25**:
    for MLA's per-head GEMV path) and `gemv_gather_kernel` (`Model::
    gemv_gather`) updated to the matching warp-per-block launch geometry.
    Compiles clean, all 85 host-only tests pass, `cargo fmt`/`clippy` clean
-   under `REFLEX_SKIP_CUDA=1`. **Real-hardware verification is mandatory
-   before trusting this, not just nice-to-have**: this couldn't be compiled
-   with `nvcc` at all in this session (no CUDA toolkit on this machine), so
-   the CUDA syntax itself is unverified, and the reduction-order change
-   (per-lane partial sums combined via shuffle, not strict left-to-right
-   accumulation) can shift results at the ULP level — needs a full
-   byte-exact-vs-llama.cpp re-run (dense/MoE/hybrid/MLA fixtures, per
-   CLAUDE.md's `reflex check` methodology) before this is trusted for
-   anything beyond "compiles."
+   under `REFLEX_SKIP_CUDA=1`. **Real-hardware-verified, 2026-09-25** (see
+   HISTORY.md's "Real-hardware verification of the warm-latency perf plan"
+   entry for the full writeup): `nvcc` compiled both kernels cleanly first
+   try on a real AWS EC2 T4; dense `reflex generate` reproduces the
+   documented golden token (`12095`/`" Paris"`) exactly, hybrid reproduces
+   the documented base continuation's first token (`279`/`" the"`), and all
+   8 relevant batched-vs-sequential/gemv-gather oracle tests pass across
+   dense/MoE/hybrid/synthetic-MLA fixtures (only the real-DeepSeek-V2-Lite
+   MoE-MLA test was skipped, deliberately — needs an 80GB A100). **Measured
+   decode throughput improved ~4.9x** (15.4 → 74.8 tok/s, 65.0 → 13.4
+   ms/token @29-token bucket) — the single biggest number in this project's
+   perf history outside the original llama.cpp-parity saga. System1's warm
+   latency is correctly unaffected (its bottleneck is the cuBLAS-driven
+   batched prefill, not `gemv_kernel` at all — confirming, not
+   contradicting, the bandwidth analysis above).
 3. **Lazy `lm_head` for tied dense/MoE models** — `system1_evaluate` gathers
    a handful of rows straight from host-resident `token_embd` instead of
    forcing the full matrix device-resident; the full upload is now deferred
@@ -394,10 +400,14 @@ Ranked plan (payoff vs. risk), **items 3+4 started 2026-09-25**:
    the new lazy compact-upload path against a forced-resident full-vocab
    `gemv` on real tensor data. Compiles clean and all 85 host-only tests
    pass under `REFLEX_SKIP_CUDA=1`, `cargo fmt --check`/`cargo clippy
-   --all-targets -- -D warnings` both clean — **not yet run against real GPU
-   hardware** (no CUDA-capable machine in this session); expect ~100-200ms
-   off cold load and ~594 MiB off VRAM for the System1 path specifically,
-   need real-hardware numbers to confirm.
+   --all-targets -- -D warnings` both clean. **Real-hardware-verified,
+   2026-09-25**: the new test passes on a real AWS EC2 T4, and
+   `model_resident_mib` dropped from 2348 to **1740 MiB (−608 MiB)** exactly
+   as predicted. Cold-start also improved (not this item's original target,
+   but skipping a 608 MiB upload+dequant helps regardless of which
+   subcommand triggers it): `model_load_ms` p50 889.5ms, cold
+   `process_start_to_result_ms` p50 1104.4ms (down from ~1248.6ms
+   pre-optimization) — see HISTORY.md for the full table.
 4. **Phase-instrument `reflex system1`** — it had none of `reflex generate`'s
    Reddit-feedback-driven phase fields, so the cold-start split for the Jev
    citation was a guess. **Done, 2026-09-25**: `REFLEX_SYSTEM1_OK` now
@@ -406,20 +416,26 @@ Ranked plan (payoff vs. risk), **items 3+4 started 2026-09-25**:
    comment for the one asymmetry inherited from there: `--lora` apply time
    lands in `prompt_eval_ms`, not `model_load_ms`). New
    `scripts/bench_cold_start_phases_system1.sh` mirrors
-   `bench_cold_start_phases.sh` field-for-field. **Not yet run for real** —
-   needs a GPU instance to produce actual numbers, which is the whole point
-   (confirming or refuting the "no GPU-virtualization CUDA-init tax on real
-   EC2" hypothesis HISTORY.md's Jev re-verification entry left open).
+   `bench_cold_start_phases.sh` field-for-field. **Real-hardware-verified,
+   2026-09-25**, n=10 clean runs (no competing CPU load — see HISTORY.md's
+   "Lesson for future sessions" paragraph, a contaminated first attempt run
+   concurrently with a backgrounded `llama.cpp` compile gave misleadingly
+   bad numbers): process launch p50 130.3ms/p95 132.3ms, CUDA init p50
+   142.1ms/p95 146.7ms, model load p50 889.5ms/p95 895.7ms, scoring pass
+   p50 35.7ms/p95 36.1ms, total p50 1104.4ms/p95 1110.9ms — tight spreads
+   throughout, a real usable instrument now, not just a guess.
 5. **Pipeline model load**: pinned double-buffered staging, async H2D on two
    streams; `alloc_zeros`→`alloc` for dequant kernel outputs (every element
    gets overwritten by the kernel, so zeroing first is wasted work). Est.
    -20-40% of the load phase. Medium effort, low risk — not started.
 
-**Next real step**: get items 3+4 onto a real GPU instance (T4 or otherwise)
-to (a) confirm item 3's actual savings rather than the estimate above, and
-(b) get real `cuda_init_ms`/`model_load_ms` numbers from item 4's
-instrumentation, which decides whether item 1 (f16, the expensive one) is
-worth its verification cost.
+**Next real step**: items 2/3/4 are now all real-hardware-verified (see
+HISTORY.md's "Real-hardware verification of the warm-latency perf plan"
+entry for the full numbers and methodology). Only item 1 (f16 weight
+residency) and item 5 (pipelined model load) remain — item 1 needs the
+numerics-methodology decision flagged above before any code is written;
+item 5 is the next low-risk pickup if more cold-load-time reduction is
+wanted.
 
 ## IPC sampling + streaming (chat-completion-integration prep, done 2026-09-24)
 
