@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
 short, current-state summary; HISTORY.md is the log.
 
-_Last updated: 2026-09-24 (OpenAI-compatible `/v1/chat/completions` HTTP sidecar built, `sidecar/openai-adapter` — the escape-hatch pattern README's Non-goals section described but had left unbuilt; previous update: temperature/top-k/top-p sampling + per-token streaming added to the IPC layer, chat-completion-integration prep)_
+_Last updated: 2026-09-24 (sidecar now renders the GGUF's own `tokenizer.chat_template` instead of generic flattening, and a real special-token tokenization gap in the core engine this surfaced is fixed; previous update: OpenAI-compatible `/v1/chat/completions` HTTP sidecar built, `sidecar/openai-adapter` — the escape-hatch pattern README's Non-goals section described but had left unbuilt)_
 
 ## MVP progress
 
@@ -714,3 +714,53 @@ and Linux (the verification instance).
   regime the Q2_K/Q3_K investigation already established as inherently unstable
   top-token-race territory across any two correct implementations, not a new
   phenomenon to re-derive per format.
+- **Sidecar chat-template rendering added, and it surfaced a real core-engine
+  tokenizer bug that a prior round's own "no chat template" limitation had been
+  hiding** (2026-09-24): `sidecar/openai-adapter` now reads and renders the
+  loaded GGUF's own `tokenizer.chat_template` (via a new standalone
+  `gguf_meta.rs` reader + `minijinja`) instead of always flattening messages
+  into plain role-labeled text — see `sidecar/openai-adapter/README.md`'s
+  updated "Known limitations" for the feature's own scope. Phase 1 (no GPU):
+  the new reader's `tokenizer.chat_template` extraction matched `gguf-py`
+  byte-for-byte, and `minijinja`'s render of the real Qwen3-0.6B ChatML
+  template matched real Python `jinja2` (HF's own `Environment` settings)
+  byte-for-byte, single- and multi-turn. Phase 2 (real GPU): a fresh AWS
+  `g4dn.xlarge` (Tesla T4, `sm_75`, SSM-only access — this account still has no
+  SSH key pairs) built clean and passed `reflex smoke`, but the *first* real
+  chat-templated request came back visibly worse than the old flattening —
+  meta-commentary, an immediate spurious `<|im_end|>`, wrong answers — the
+  opposite of what this feature was supposed to buy. Root-caused with a
+  throwaway host-only probe binary (no GPU needed — pure tokenizer logic;
+  written, used, and deleted again, not kept in the repo) against the real
+  vocab: `src/tokenizer.rs`'s `encode_gpt2` (and `encode_sentencepiece`) had
+  **no special/added-token exact-match pass at all** — a rendered template's
+  literal `<|im_start|>` substring was shredded by generic BPE into 6
+  meaningless byte-fragment tokens (`<`/`|`/`im`/`_start`/`|`/`>`) instead of
+  the model's one real reserved id, corrupting every templated prompt in a way
+  the old flattening (which never contains those literal marker substrings)
+  never triggered. Fixed by adding a `special_tokens` list to `Tokenizer`
+  (every vocab entry whose `tokenizer.ggml.token_type` is `CONTROL` (3) or
+  `USER_DEFINED` (4) — confirmed against the real Qwen3-0.6B GGUF's own
+  metadata: ChatML's markers are `CONTROL`, `<think>`/`<tool_call>`/etc. are
+  `USER_DEFINED`) and a longest-match literal-substring scan in `encode` that
+  runs before the general regex-pretokenize/BPE path, matching how real
+  llama.cpp/HF tokenizers already handle this. Two new unit tests
+  (`test_encode_matches_special_token_as_single_id_not_bpe_fragments`,
+  `test_encode_matches_special_token_mid_text`) cover the regression; the
+  probe confirmed `<|im_start|>` now maps to its real id (151644) on the real
+  GGUF, and a full end-to-end re-run showed the model producing a genuine
+  `<think>...</think>` reasoning trace that explicitly referenced a
+  system-prompt persona ("As a pirate, I need to keep it fun and engaging")
+  before answering in character — the coherence and system-prompt steering
+  this feature was meant to deliver, now real-hardware-confirmed. One small
+  model-quality miss noted honestly, not a plumbing bug: the templated path
+  got a 2-step arithmetic follow-up wrong (answered `2*3=6` instead of
+  `4*3=12`, misreading which prior number "times 3" referred to) where the old
+  flattening happened to get it right by shallow text-continuation pattern-
+  matching — expected variance for a 0.6B model's actual reasoning, not
+  evidence of a remaining correctness bug. One small cosmetic gap also noted,
+  not fixed here (out of scope, core `generate`/decode behavior): the literal
+  EOS marker text (e.g. `<|im_end|>`) can appear in the returned
+  `message.content` when generation stops on it. AWS resources (the
+  `g4dn.xlarge`, its throwaway SSM-only IAM role/instance profile) were fully
+  torn down after verification.

@@ -7,8 +7,10 @@
 //!
 //! Usage: `reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host
 //! <addr>] [--port <port>] [--lora <adapter.gguf>] [--model-name <name>]
-//! [--default-max-tokens <n>]`
+//! [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>]`
 
+mod chat_template;
+mod gguf_meta;
 mod openai;
 mod reflex_client;
 
@@ -18,6 +20,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use chat_template::ChatTemplate;
 use futures::Stream;
 use openai::{
     build_prompt, build_sampling, estimate_prompt_tokens, extract_text_messages, finish_reason,
@@ -35,6 +38,7 @@ struct AppState {
     model_label: String,
     default_max_tokens: usize,
     request_counter: AtomicU64,
+    chat_template: Option<ChatTemplate>,
 }
 
 impl AppState {
@@ -52,6 +56,8 @@ struct Opts {
     port: u16,
     model_label: Option<String>,
     default_max_tokens: usize,
+    no_chat_template: bool,
+    chat_template_file: Option<String>,
 }
 
 impl Opts {
@@ -63,6 +69,8 @@ impl Opts {
         let mut port: u16 = 8000;
         let mut model_label: Option<String> = None;
         let mut default_max_tokens: usize = 256;
+        let mut no_chat_template = false;
+        let mut chat_template_file: Option<String> = None;
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -93,6 +101,13 @@ impl Opts {
                         .parse()
                         .map_err(|_| format!("--default-max-tokens: not a valid number: {raw}"))?;
                 }
+                "--no-chat-template" => {
+                    no_chat_template = true;
+                }
+                "--chat-template-file" => {
+                    chat_template_file =
+                        Some(args.next().ok_or("--chat-template-file requires a path")?);
+                }
                 _ if gguf_path.is_none() => gguf_path = Some(arg),
                 other => return Err(format!("unexpected argument: {other}")),
             }
@@ -101,8 +116,14 @@ impl Opts {
         let gguf_path = gguf_path.ok_or(
             "usage: reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host <addr>] \
              [--port <port>] [--lora <adapter.gguf>] [--model-name <name>] \
-             [--default-max-tokens <n>]",
+             [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>]",
         )?;
+
+        if no_chat_template && chat_template_file.is_some() {
+            return Err(
+                "--no-chat-template and --chat-template-file are mutually exclusive".to_string(),
+            );
+        }
 
         Ok(Opts {
             gguf_path,
@@ -112,6 +133,8 @@ impl Opts {
             port,
             model_label,
             default_max_tokens,
+            no_chat_template,
+            chat_template_file,
         })
     }
 }
@@ -149,11 +172,21 @@ async fn main() {
             }
         };
 
+    // Loaded/render-tested once at boot, not per-request -- see
+    // `chat_template::build`'s doc comment for the fallback rules.
+    let chat_template = if opts.no_chat_template {
+        eprintln!("[adapter] chat template: disabled via --no-chat-template; using generic prompt flattening");
+        None
+    } else {
+        chat_template::build(&opts.gguf_path, opts.chat_template_file.as_deref())
+    };
+
     let state = Arc::new(AppState {
         client,
         model_label,
         default_max_tokens: opts.default_max_tokens,
         request_counter: AtomicU64::new(0),
+        chat_template,
     });
 
     let app = Router::new()
@@ -200,7 +233,19 @@ async fn chat_completions(
         Ok(m) => m,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
     };
-    let prompt = build_prompt(&messages);
+    let prompt = match &state.chat_template {
+        Some(ct) => match ct.render(&messages, true) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "[adapter] chat template render failed for this request ({e}); \
+                     falling back to generic prompt flattening for this request"
+                );
+                build_prompt(&messages)
+            }
+        },
+        None => build_prompt(&messages),
+    };
     let max_tokens = req.max_tokens.unwrap_or(state.default_max_tokens).max(1);
     let sampling = build_sampling(&req);
     let stream = req.stream;

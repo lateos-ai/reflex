@@ -47,7 +47,7 @@ cargo build --release
 ```
 reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host <addr>]
   [--port <port>] [--lora <adapter.gguf>] [--model-name <name>]
-  [--default-max-tokens <n>]
+  [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>]
 ```
 
 - `--lora <adapter.gguf>` is forwarded straight through to `reflex stdio`'s own
@@ -55,6 +55,24 @@ reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host <addr>]
 - `--model-name` sets the `model` field returned in responses when a request doesn't
   specify one of its own; defaults to the GGUF file's stem.
 - `--default-max-tokens` (default `256`) is used when a request omits `max_tokens`.
+- `--no-chat-template` forces the old generic role-labeled flattening
+  (`"System: ...\nUser: ...\nAssistant:"`) even when the loaded GGUF ships its own
+  `tokenizer.chat_template`. Useful as an A/B-comparison switch and as an escape
+  hatch if a template is misbehaving.
+- `--chat-template-file <path>` supplies an explicit Jinja2 chat-template file
+  (same syntax as a GGUF's `tokenizer.chat_template` string) for a GGUF that doesn't
+  ship one of its own. Mutually exclusive with `--no-chat-template`.
+
+At startup the adapter tries to load and render-test the GGUF's own
+`tokenizer.chat_template` metadata once (or `--chat-template-file`'s contents, if
+given) -- not per-request -- and logs exactly one line to stderr saying which source
+it's using, or why it fell back to the generic flattening (no template present, the
+template failed to compile, or it failed a render self-test). If the template loads
+successfully at startup but a specific request still fails to render against it
+(e.g. an unusual message shape a template's own Jinja logic doesn't handle), that one
+request falls back to the flattening too, with its own stderr line -- a bad template
+degrades gracefully, it never takes the sidecar down or silently produces a garbled
+prompt.
 
 Once running, it logs `REFLEX_ADAPTER_READY addr=<host>:<port>` to stderr (the
 managed `reflex` child's own stderr, including its `REFLEX_STDIO_READY` line, is
@@ -104,15 +122,51 @@ supports it. `temperature` omitted or `<= 0` selects greedy argmax, mirroring
 
 ## Known limitations
 
-- **No chat template.** Reflex itself has no chat-template support — `Model::
-  forward_prompt` takes a plain prompt string, not a structured message list. This
-  adapter flattens `messages` into a prompt by simple role-labeled concatenation
-  (`src/openai.rs::build_prompt`: `"System: ...\nUser: ...\nAssistant:"`), not the
-  GGUF's own `tokenizer.chat_template` metadata (if it has one). A model trained
-  against a specific chat-template format (e.g. ChatML's `<|im_start|>` markers) may
-  follow instructions noticeably worse under this generic framing than it would
-  under its native template. Reading and applying the GGUF's own chat template is a
-  natural follow-up, deliberately not attempted here to keep this first pass small.
+- **Chat template support is real but narrow.** Reflex itself has no chat-template
+  support — `Model::forward_prompt` takes a plain prompt string, not a structured
+  message list — so this adapter reads and renders the GGUF's own
+  `tokenizer.chat_template` metadata (a Jinja2 template string, the same mechanism
+  HF's `AutoTokenizer.apply_chat_template` uses) via a minimal standalone GGUF
+  metadata reader (`src/gguf_meta.rs`) and `minijinja` (`src/chat_template.rs`),
+  instead of the old generic role-labeled flattening (`src/openai.rs::build_prompt`:
+  `"System: ...\nUser: ...\nAssistant:"`), whenever one is present and renders
+  successfully. Verified byte-exact against real Python `jinja2`/HF's own template
+  settings on Qwen3-0.6B's real ChatML template (single- and multi-turn), and
+  end-to-end against a real running model on a GPU instance (real Tesla T4):
+  templated requests produce genuinely coherent output, including Qwen3's own
+  `<think>...</think>` reasoning traces that explicitly reference the system
+  prompt's persona, where the old flattening never engages the model's native
+  chat behavior at all. That GPU round also surfaced and fixed a real
+  prerequisite gap in the *core engine's* tokenizer (`src/tokenizer.rs`, not
+  this crate): rendering a real chat template produces prompt text containing
+  literal control-token substrings like `<|im_start|>`, and without special-
+  token-aware tokenization, the core BPE encoder shredded them into meaningless
+  byte fragments instead of their real reserved ids — silently corrupting every
+  templated prompt before this fix landed alongside this feature. What's
+  still out of scope:
+  - **No tool-calling-style templates.** `messages[i].tool_calls`/a `tools` request
+    field aren't modeled — a template branch that expects them (e.g. Qwen3's own
+    template has one) either renders as if no tools were supplied, or fails to
+    render and falls back to flattening, depending on the branch's exact logic.
+  - **No multimodal template blocks** — consistent with this adapter's existing
+    no-multimodal-content-parts limitation below; a template branch expecting an
+    image/audio content part isn't exercised.
+  - A template's `raise_exception(...)` calls (common in real HF templates for
+    input validation, e.g. "system message must come first") are wired to a real
+    minijinja error, so a template correctly rejecting a malformed message list
+    surfaces as a render failure (logged, then falls back to flattening for that
+    request) rather than being silently ignored.
+  - `--no-chat-template` forces the old flattening even when a template is present
+    (A/B comparison / escape hatch); `--chat-template-file <path>` supplies one for
+    a GGUF that doesn't ship its own. See the Usage section above.
+  - **The literal EOS marker (e.g. `<|im_end|>`) can appear in `message.content`**
+    when generation stops on it — observed on real GPU hardware. The core
+    engine's decode path doesn't strip the stop token's own text before
+    returning it over IPC; a real OpenAI API never includes it. Cosmetic, not a
+    correctness bug (the model's actual answer is intact and `finish_reason`
+    still correctly reports `"stop"`), and out of scope for this change (core
+    engine decode/generate-loop behavior, not chat-template rendering) — a
+    follow-up for whoever next touches `Model::generate`'s stop handling.
 - **No function/tool calling, no `logprobs`, no `n > 1`, no multimodal content
   parts.** A `messages[i].content` that isn't a plain string (e.g. an image/text
   content-parts array) is rejected with a `400`.

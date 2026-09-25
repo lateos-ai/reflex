@@ -49,6 +49,26 @@ pub struct Tokenizer {
     pub pad_token_id: Option<u32>,
     token_to_id: HashMap<String, u32>,
     merge_rank: HashMap<(String, String), usize>,
+    /// Vocab entries whose `tokenizer.ggml.token_type` is `CONTROL` (3) or
+    /// `USER_DEFINED` (4) -- e.g. ChatML's `<|im_start|>`/`<|im_end|>`, or
+    /// `<think>`/`</think>`. Sorted longest-first so [`Self::encode`]'s
+    /// literal-match scan prefers the longest special token starting at a
+    /// given position (matters when one special token's text is a prefix of
+    /// another's, though no real vocab this project has seen actually has
+    /// that overlap). Real tokenizers (llama.cpp, HF `tokenizers`) always
+    /// match these literally before any regex-pretokenization/BPE merging,
+    /// never through the general encode path -- confirmed necessary, not
+    /// just a nice-to-have, by a real end-to-end regression: rendering a
+    /// GGUF's own `tokenizer.chat_template` (see `sidecar/openai-adapter`)
+    /// produces prompt text containing literal `<|im_start|>` substrings,
+    /// and without this list, [`Self::encode_gpt2`]'s generic BPE shreds
+    /// that string into 6 meaningless byte-fragment tokens
+    /// (`<`/`|`/`im`/`_start`/`|`/`>`) instead of the model's one real
+    /// special-token id -- garbage input the model never saw in training,
+    /// which produced visibly incoherent generations on a real Qwen3-0.6B
+    /// GGUF on real GPU hardware before this field/the split in `encode`
+    /// existed.
+    special_tokens: Vec<String>,
 }
 
 impl Tokenizer {
@@ -100,6 +120,20 @@ impl Tokenizer {
         let pad_token_id =
             u64_meta(&file.metadata, "tokenizer.ggml.padding_token_id").map(|v| v as u32);
 
+        // CONTROL (3) / USER_DEFINED (4), llama.cpp's `llama_token_type` values --
+        // confirmed against a real Qwen3-0.6B GGUF (ChatML's `<|im_start|>`/
+        // `<|im_end|>`/etc. are CONTROL, `<think>`/`<tool_call>`/etc. are
+        // USER_DEFINED; ordinary vocab entries are NORMAL (1)).
+        const TOKEN_TYPE_CONTROL: i32 = 3;
+        const TOKEN_TYPE_USER_DEFINED: i32 = 4;
+        let mut special_tokens: Vec<String> = tokens
+            .iter()
+            .zip(token_type.iter())
+            .filter(|(_, &ty)| ty == TOKEN_TYPE_CONTROL || ty == TOKEN_TYPE_USER_DEFINED)
+            .map(|(t, _)| t.clone())
+            .collect();
+        special_tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
         Ok(Tokenizer {
             architecture,
             tokens,
@@ -111,6 +145,7 @@ impl Tokenizer {
             pad_token_id,
             token_to_id,
             merge_rank,
+            special_tokens,
         })
     }
 
@@ -131,6 +166,49 @@ impl Tokenizer {
     /// SentencePiece path unchanged, this module's original Phase 21.5.1
     /// scope.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
+        if self.special_tokens.is_empty() {
+            return self.encode_plain(text);
+        }
+
+        let mut ids = Vec::new();
+        let mut plain_start = 0usize;
+        let mut i = 0usize;
+        while i < text.len() {
+            // Every special token is pure ASCII (`<|...|>`-style markers), so any
+            // position one could start at is necessarily a char boundary already --
+            // safe to slice `text[i..]` here without re-checking char boundaries.
+            let matched = self
+                .special_tokens
+                .iter()
+                .find(|s| text[i..].starts_with(s.as_str()));
+            match matched {
+                Some(special) => {
+                    if plain_start < i {
+                        ids.extend(self.encode_plain(&text[plain_start..i])?);
+                    }
+                    // Only reachable when `special_tokens` (built from `tokens`) is
+                    // non-empty, so the lookup below always succeeds.
+                    ids.push(self.token_to_id[special.as_str()]);
+                    i += special.len();
+                    plain_start = i;
+                }
+                None => {
+                    i += text[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+                }
+            }
+        }
+        if plain_start < text.len() {
+            ids.extend(self.encode_plain(&text[plain_start..])?);
+        }
+        Ok(ids)
+    }
+
+    /// The general encode path (regex-pretokenization + BPE, dispatched on
+    /// `self.architecture`) -- used for every span of `text` that isn't a
+    /// literal special-token match. See [`Self::encode`]'s doc for why
+    /// special tokens (this struct's `special_tokens` field) are matched
+    /// separately, before this ever runs on their text.
+    fn encode_plain(&self, text: &str) -> Result<Vec<u32>, String> {
         if self.architecture == "gpt2" {
             self.encode_gpt2(text)
         } else {
@@ -711,6 +789,7 @@ mod tests {
             pad_token_id: None,
             token_to_id,
             merge_rank,
+            special_tokens: Vec::new(),
         }
     }
 
@@ -1053,5 +1132,55 @@ mod tests {
             let decoded = tok.decode(&ids);
             assert_eq!(decoded, text, "round trip failed for {text:?}: ids={ids:?}");
         }
+    }
+
+    /// Regression test for the real end-to-end bug this field/split fixed:
+    /// without `special_tokens`, a literal `<|im_start|>`-style substring (what
+    /// a rendered chat template produces, see `sidecar/openai-adapter`) got
+    /// shredded into per-byte-fragment tokens by the generic BPE path instead
+    /// of mapping to its one reserved vocab id — confirmed on a real
+    /// Qwen3-0.6B GGUF on real GPU hardware before this fix (see HISTORY.md).
+    #[test]
+    fn test_encode_matches_special_token_as_single_id_not_bpe_fragments() {
+        let mut tok = build_synthetic_tokenizer();
+        let special_id = tok.tokens.len() as u32;
+        tok.tokens.push("<|im_start|>".to_string());
+        tok.token_to_id
+            .insert("<|im_start|>".to_string(), special_id);
+        tok.special_tokens = vec!["<|im_start|>".to_string()];
+
+        let ids = tok.encode("<|im_start|>hello").expect("encode");
+        assert_eq!(
+            ids[0], special_id,
+            "expected the special token's own id first, got {ids:?}"
+        );
+        assert!(ids.len() > 1, "expected 'hello' to still encode after it");
+    }
+
+    /// A special token embedded mid-text (not just at position 0) is matched
+    /// too, and the plain-text runs on both sides still go through normal
+    /// BPE encoding untouched.
+    #[test]
+    fn test_encode_matches_special_token_mid_text() {
+        let mut tok = build_synthetic_tokenizer();
+        let special_id = tok.tokens.len() as u32;
+        tok.tokens.push("<|im_start|>".to_string());
+        tok.token_to_id
+            .insert("<|im_start|>".to_string(), special_id);
+        tok.special_tokens = vec!["<|im_start|>".to_string()];
+
+        let ids = tok.encode("hello<|im_start|>world").expect("encode");
+        let special_pos = ids
+            .iter()
+            .position(|&id| id == special_id)
+            .expect("special token id present");
+        assert!(
+            special_pos > 0,
+            "expected plain text before the special token"
+        );
+        assert!(
+            special_pos < ids.len() - 1,
+            "expected plain text after the special token"
+        );
     }
 }

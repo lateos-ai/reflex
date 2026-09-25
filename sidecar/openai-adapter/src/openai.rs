@@ -73,13 +73,13 @@ pub fn extract_text_messages(messages: &[RawMessage]) -> Result<Vec<TextMessage>
         .collect()
 }
 
-/// Flattens a chat message list into a single prompt string, since Reflex itself has
-/// no chat-template support (`src/model.rs`'s `forward_prompt` takes a plain prompt
-/// string, not a message list). **Known limitation** (see this crate's README):
-/// this is plain role-labeled concatenation, not the GGUF's own `tokenizer.chat_template`
-/// (if it has one) -- a model trained on a specific chat-template format (e.g.
-/// ChatML's `<|im_start|>`) may follow instructions noticeably worse with this
-/// generic framing than it would with its native template.
+/// Flattens a chat message list into a single prompt string via plain role-labeled
+/// concatenation, since Reflex itself has no chat-template support (`src/model.rs`'s
+/// `forward_prompt` takes a plain prompt string, not a message list). This is the
+/// fallback path: `main.rs::chat_completions` prefers rendering the GGUF's own
+/// `tokenizer.chat_template` (see `chat_template.rs`) when one loaded successfully at
+/// startup, and only calls this when no template is available, `--no-chat-template`
+/// was passed, or the template fails to render for a given request.
 pub fn build_prompt(messages: &[TextMessage]) -> String {
     let mut prompt = String::new();
     for m in messages {
