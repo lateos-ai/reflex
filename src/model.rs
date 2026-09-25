@@ -186,6 +186,11 @@ enum LmHead {
 /// Q5_K post-MVP) -- must match `dequant.rs`'s `QK_K` and the block-byte-size
 /// table `gguf.rs::ggml_type_size_bytes` computes independently for the same
 /// types.
+/// CUDA warp width -- `gemv_kernel`/`gemv_gather_kernel`'s warp-per-row
+/// launch geometry (`Model::gemv_raw`/`Model::gemv_gather`) assigns exactly
+/// one warp to each output row, so the block size passed to `LaunchConfig`
+/// must always be a multiple of this.
+const WARP_SIZE: u32 = 32;
 const QK_K: usize = 256;
 const QK_LEGACY: usize = 32;
 const Q4K_BLOCK_BYTES: usize = 144;
@@ -2477,8 +2482,14 @@ impl Model {
             .alloc_zeros::<f32>(out_features)
             .map_err(|e| format!("gemv alloc y: {e}"))?;
 
+        // One warp per output row (gemv_kernel's doc comment has the
+        // coalescing rationale) -- 256 threads/block = 8 warps/block, same
+        // total thread count per block as before this rewrite, just
+        // reinterpreted as 8 rows/block instead of 256 threads each doing
+        // one full row.
         let threads = 256u32;
-        let blocks = (out_features as u32).div_ceil(threads).max(1);
+        let warps_per_block = threads / WARP_SIZE;
+        let blocks = (out_features as u32).div_ceil(warps_per_block).max(1);
         let launch_cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads, 1, 1),
@@ -2793,8 +2804,10 @@ impl Model {
             .device
             .alloc_zeros::<f32>(num_rows)
             .map_err(|e| format!("gemv_gather alloc y: {e}"))?;
+        // One warp per gathered row -- see gemv_raw's identical comment.
         let threads = 256u32;
-        let blocks = (num_rows as u32).div_ceil(threads).max(1);
+        let warps_per_block = threads / WARP_SIZE;
+        let blocks = (num_rows as u32).div_ceil(warps_per_block).max(1);
         let launch_cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads, 1, 1),
@@ -3297,8 +3310,12 @@ impl Model {
             .device
             .alloc_zeros::<f32>(out_features)
             .map_err(|e| format!("gemv_view alloc y: {e}"))?;
+        // One warp per output row -- see gemv_raw's identical comment. Same
+        // gemv_kernel, so this must stay in lockstep with gemv_raw's launch
+        // geometry.
         let threads = 256u32;
-        let blocks = (out_features as u32).div_ceil(threads).max(1);
+        let warps_per_block = threads / WARP_SIZE;
+        let blocks = (out_features as u32).div_ceil(warps_per_block).max(1);
         let launch_cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads, 1, 1),

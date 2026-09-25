@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
 short, current-state summary; HISTORY.md is the log.
 
-_Last updated: 2026-09-25 (started a ranked plan to close the remaining warm-latency gap to TypeSafe Jev — see "Planned next work: warm-latency perf vs. TypeSafe Jev" below; items 3 (lazy `LmHead` for tied dense/MoE models, avoids System1 forcing the full ~594 MiB LM-head matrix resident) and 4 (`reflex system1` phase breakdown, matching `reflex generate`'s) are code-complete, compiling/testing clean under `REFLEX_SKIP_CUDA=1`, not yet run on real GPU hardware. Previous update: TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry. Before that: `reflex generate` reports a per-phase cold-start breakdown — CUDA init/model load/prompt eval, p50/p95 across N runs via new `scripts/bench_cold_start_phases.sh` — in response to real Reddit feedback)_
+_Last updated: 2026-09-25 (items 2/3/4 of the ranked warm-latency-vs-TypeSafe-Jev plan are now code-complete — see "Planned next work: warm-latency perf vs. TypeSafe Jev" below: item 2 rewrites `gemv_kernel`/`gemv_gather_kernel` from thread-per-row to warp-per-row + vectorized loads (the actual root cause of the ~9%-of-peak decode bandwidth), items 3/4 are the lazy `LmHead` and `reflex system1` phase breakdown from the previous update. All compile/test/lint clean under `REFLEX_SKIP_CUDA=1`; **none of the three has been run on real GPU hardware or through `nvcc` at all yet** — this session has no CUDA-capable machine, and item 2 specifically needs a full byte-exact-vs-llama.cpp re-verification before being trusted, not just a passing build. Only item 1 (f16 weight residency) remains unstarted, deliberately, pending a numerics-methodology decision. Previous update: TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry)_
 
 ## MVP progress
 
@@ -354,8 +354,32 @@ Ranked plan (payoff vs. risk), **items 3+4 started 2026-09-25**:
    DECISIONS.md entry and a deliberate call before starting** — not free,
    not started.
 2. **Rewrite `gemv_kernel`**: warp-per-row + vectorized loads + shuffle
-   reduction. Est. decode 65ms/tok → ~15-20ms/tok. Medium effort, low risk
-   (verify byte-exactness holds under the new reduction order) — not started.
+   reduction. Est. decode 65ms/tok → ~15-20ms/tok. **Done, 2026-09-25**: both
+   `kernels_cuda/gemv.cu` and `kernels_cuda/gemv_gather.cu` (same anti-pattern,
+   same fix) rewritten from one-thread-per-output-row (strided, uncoalesced
+   access across a warp's lanes — the actual root cause of the ~9%-of-peak
+   decode bandwidth) to one-warp-per-output-row (all 32 lanes read the same
+   row, 32 consecutive elements apart — fully coalesced), plus `float4`
+   vectorized loads when `in_features % 4 == 0` (true for every real hidden/
+   FFN size this project uses; a scalar fallback keeps other sizes correct),
+   plus a `__shfl_down_sync` warp-reduction tree instead of one thread
+   summing serially. Every launch site of the shared `gemv_kernel` handle
+   (`Model::gemv_raw`, `Model::gemv_view` — **initially missed, then found by
+   grepping every call site of `self.gemv_k`/`self.gemv_gather_k` across the
+   whole crate**, since a stale thread-per-row grid/block geometry against
+   the new warp-per-row kernel would have silently computed wrong results
+   for MLA's per-head GEMV path) and `gemv_gather_kernel` (`Model::
+   gemv_gather`) updated to the matching warp-per-block launch geometry.
+   Compiles clean, all 85 host-only tests pass, `cargo fmt`/`clippy` clean
+   under `REFLEX_SKIP_CUDA=1`. **Real-hardware verification is mandatory
+   before trusting this, not just nice-to-have**: this couldn't be compiled
+   with `nvcc` at all in this session (no CUDA toolkit on this machine), so
+   the CUDA syntax itself is unverified, and the reduction-order change
+   (per-lane partial sums combined via shuffle, not strict left-to-right
+   accumulation) can shift results at the ULP level — needs a full
+   byte-exact-vs-llama.cpp re-run (dense/MoE/hybrid/MLA fixtures, per
+   CLAUDE.md's `reflex check` methodology) before this is trusted for
+   anything beyond "compiles."
 3. **Lazy `lm_head` for tied dense/MoE models** — `system1_evaluate` gathers
    a handful of rows straight from host-resident `token_embd` instead of
    forcing the full matrix device-resident; the full upload is now deferred
