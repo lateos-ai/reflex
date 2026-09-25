@@ -59,8 +59,11 @@ use crate::tokenizer::Tokenizer;
 use cudarc::cublas::sys as cublas_sys;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{
-    CudaDevice, CudaSlice, CudaView, DevicePtr, DeviceRepr, DeviceSlice, LaunchAsync, LaunchConfig,
+    result, sys, CudaDevice, CudaSlice, CudaView, DevicePtr, DeviceRepr, DeviceSlice, LaunchAsync,
+    LaunchConfig,
 };
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Prefill result: encoded prompt ids, the final position's hidden state,
@@ -150,11 +153,160 @@ struct Weight {
     shape: Vec<u64>,
 }
 
+/// `token_embd`, dequantized lazily one row at a time instead of eagerly
+/// decoding the whole `[vocab_size, hidden_size]` matrix at load time.
+/// `forward_prompt`'s embedding lookup is a host-side gather that reads only
+/// a handful of rows per token in the prompt/generation loop (`batch_size`
+/// is always 1, see CLAUDE.md's Non-goals), yet the eager version decoded
+/// every row unconditionally -- ~548ms, ~63% of `model_load_ms` for
+/// Qwen3-0.6B-Q4_K_M on a T4, the single largest piece of cold-start time in
+/// the whole engine (see HISTORY.md's "Pipelined model load (item 5)" entry,
+/// which found this while profiling a smaller optimization). Same
+/// lazy-materialization pattern [`LmHead::TiedLazy`] already proved out for
+/// `lm_head` -- not new math, no numerics change: every row this decodes is
+/// byte-identical to what eagerly dequantizing the whole tensor would have
+/// produced at that row's offset, since GGUF block dequantization has no
+/// cross-block state (decoding a row's blocks in isolation is the same
+/// computation as decoding them as part of the full tensor).
+///
+/// `raw` is an owned copy of the tensor's raw quantized bytes (cheap --
+/// e.g. ~78MB for Qwen3-0.6B's Q4_K_M `token_embd`, vs. the ~623MB the
+/// eager `f32` materialization used to produce) since the source mmap
+/// doesn't outlive `Model::load`/`load_hybrid`/`load_mla`.
+struct LazyTokenEmbedding {
+    raw: Vec<u8>,
+    ggml_type: GgmlType,
+    hidden_size: usize,
+    vocab_size: usize,
+    /// Bytes one row (`hidden_size` elements) occupies in `raw` -- an exact
+    /// number of on-disk blocks, by ggml's own invariant that a quantized
+    /// tensor's row width is always a multiple of its block size.
+    row_bytes: usize,
+    /// Rows dequantized so far, keyed by token id -- a repeated token (a
+    /// longer prompt, or the same token recurring across a generation loop)
+    /// reuses the cached decode instead of redoing it. `RefCell`, not a
+    /// `Mutex`: this project never runs more than one request at a time
+    /// (`batch_size` is a permanent constraint, see CLAUDE.md's Non-goals),
+    /// so there is never a concurrent borrower -- the same reasoning
+    /// `LmHead::TiedLazy`'s `OnceLock::get`/`set` already relies on.
+    cache: RefCell<HashMap<u32, Vec<f32>>>,
+}
+
+impl LazyTokenEmbedding {
+    /// `shape` is `token_embd.weight`'s GGUF shape, `[hidden_size,
+    /// vocab_size]` (row-major `(vocab_size, hidden_size)` flat data).
+    fn new(ggml_type: GgmlType, raw: Vec<u8>, shape: &[u64]) -> Result<Self, String> {
+        let hidden_size = shape[0] as usize;
+        let vocab_size = shape[1] as usize;
+        let (block_size, block_bytes) = crate::gguf::ggml_type_block_dims(ggml_type)?;
+        if !(hidden_size as u64).is_multiple_of(block_size) {
+            return Err(format!(
+                "token_embd row width {hidden_size} is not a multiple of {ggml_type:?}'s block size {block_size}"
+            ));
+        }
+        let row_bytes = (hidden_size as u64 / block_size * block_bytes) as usize;
+        Ok(Self {
+            raw,
+            ggml_type,
+            hidden_size,
+            vocab_size,
+            row_bytes,
+            cache: RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// Test-only accessor (mirrors `Self::lm_head_argmax`'s `#[cfg(test)]`
+    /// convention) -- no non-test caller needs the vocab size on its own,
+    /// only `Self::row`/`Self::dequantize_all` internally.
+    #[cfg(test)]
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    /// Dequantizes (or returns the already-cached decode of) row `token_id`
+    /// -- `hidden_size` contiguous `f32`s.
+    fn row(&self, token_id: u32) -> Result<std::cell::Ref<'_, [f32]>, String> {
+        if token_id as usize >= self.vocab_size {
+            return Err(format!(
+                "token id {token_id} out of range (vocab_size={})",
+                self.vocab_size
+            ));
+        }
+        if !self.cache.borrow().contains_key(&token_id) {
+            let start = token_id as usize * self.row_bytes;
+            let end = start + self.row_bytes;
+            let block = self.raw.get(start..end).ok_or_else(|| {
+                format!(
+                    "token_embd row {token_id} byte range {start}..{end} exceeds raw buffer length {}",
+                    self.raw.len()
+                )
+            })?;
+            let decoded = dequant::dequantize(self.ggml_type, block, self.hidden_size as u64)?;
+            self.cache.borrow_mut().insert(token_id, decoded);
+        }
+        Ok(std::cell::Ref::map(self.cache.borrow(), |m| {
+            m.get(&token_id).expect("just inserted above").as_slice()
+        }))
+    }
+
+    /// Dequantizes every row at once, delegating straight to
+    /// `dequant::dequantize` on the full raw buffer -- the exact same call
+    /// the pre-lazy eager load path used to make, so this can never
+    /// disagree with it. Used only by the rare full-vocab callers
+    /// ([`Model::lm_head_resident`]'s `TiedLazy` upload, and
+    /// `load_hybrid`/`load_mla`'s eager tied-embedding `LmHead::Resident`
+    /// upload) -- never `system1_evaluate`'s candidate-gather path, which is
+    /// what this laziness targets.
+    fn dequantize_all(&self) -> Result<Vec<f32>, String> {
+        dequant::dequantize(
+            self.ggml_type,
+            &self.raw,
+            (self.vocab_size * self.hidden_size) as u64,
+        )
+    }
+}
+
+/// The LM head, dense/MoE `Model::load` only (`load_hybrid`/`load_mla` still
+/// always use `Resident` -- this laziness is scoped to the one path
+/// `system1_evaluate` actually needs it for, not a general Model change).
+///
+/// A tied-embedding model (no separate `output.weight` tensor) used to
+/// eagerly re-upload `token_embd`'s already-dequantized host bytes as a
+/// second, full `[hidden_size, vocab_size]` device copy at load time --
+/// unconditionally, even for a `reflex system1` run that only ever gathers a
+/// handful of candidate rows via `Self::gemv_gather`. For `Qwen3-0.6B`
+/// (vocab 151936 x hidden 1024 x 4 bytes), that's ~594 MiB uploaded and
+/// resident for nothing. `TiedLazy` defers that upload until something
+/// actually needs the *full* matrix (`Self::lm_head_resident`, used by
+/// `Self::lm_head_logits`'s full-vocab GEMV) -- `system1_evaluate`'s gather
+/// path (`Self::gemv_gather_lm_head`) instead uploads only the requested
+/// rows straight from the host-resident `token_embd`, and never forces the
+/// full upload at all.
+enum LmHead {
+    /// A real separate `output.weight` tensor, or a tied model whose full
+    /// matrix some earlier full-vocab call already forced resident.
+    Resident(Weight),
+    /// Tied to `token_embd`, not yet forced fully resident. `shape` is
+    /// `output.weight`'s GGUF shape (`[hidden_size, vocab_size]`), needed
+    /// before the upload happens; `token_embd`'s host bytes (row-major
+    /// `(vocab_size, hidden_size)`, same layout `output.weight` would have)
+    /// are the source of truth until `Self::lm_head_resident` is called.
+    TiedLazy {
+        shape: Vec<u64>,
+        cell: std::sync::OnceLock<Weight>,
+    },
+}
+
 /// GGUF super-block sizes for the block types dequantized on-device
 /// (`src/kernels_cuda/dequant.cu`, Phase 2 round 3 for Q4_K/Q6_K, extended to
 /// Q5_K post-MVP) -- must match `dequant.rs`'s `QK_K` and the block-byte-size
 /// table `gguf.rs::ggml_type_size_bytes` computes independently for the same
 /// types.
+/// CUDA warp width -- `gemv_kernel`/`gemv_gather_kernel`'s warp-per-row
+/// launch geometry (`Model::gemv_raw`/`Model::gemv_gather`) assigns exactly
+/// one warp to each output row, so the block size passed to `LaunchConfig`
+/// must always be a multiple of this.
+const WARP_SIZE: u32 = 32;
 const QK_K: usize = 256;
 const QK_LEGACY: usize = 32;
 const Q4K_BLOCK_BYTES: usize = 144;
@@ -263,6 +415,330 @@ fn load_dequant_kernels(device: &Arc<CudaDevice>) -> Result<DequantKernels, Stri
     })
 }
 
+/// One pinned (page-locked) host staging buffer for [`WeightLoadPipeline`],
+/// grown lazily (never shrunk) to the largest tensor byte length seen so
+/// far. Plain pageable host memory (e.g. straight from the mmap'd GGUF)
+/// forces the CUDA driver to silently stage `cuMemcpyHtoDAsync` through its
+/// own temporary pinned buffer instead of actually running it concurrently
+/// with other work -- pinning it ourselves is what makes the H2D transfer
+/// below genuinely overlap a dequant kernel on another stream. cudarc's
+/// safe wrapper doesn't expose `cuMemHostAlloc`/`cuMemFreeHost` at all, so
+/// this drops to the raw driver FFI (`cudarc::driver::sys`), the same
+/// precedent `diagnostics.rs` already set for driver calls the safe layer
+/// doesn't cover.
+struct PinnedHostBuffer {
+    ptr: *mut u8,
+    cap: usize,
+}
+
+impl PinnedHostBuffer {
+    fn new() -> Self {
+        Self {
+            ptr: std::ptr::null_mut(),
+            cap: 0,
+        }
+    }
+
+    /// Grows the buffer to hold at least `len` bytes if it doesn't already
+    /// (real models reuse only a handful of distinct tensor byte lengths
+    /// per slot, so this stops reallocating after the first few calls).
+    ///
+    /// # Safety
+    /// The caller must guarantee no async transfer still reads this slot's
+    /// current allocation -- [`WeightLoadPipeline::dequantize`] only grows
+    /// a slot right after waiting for that slot's prior kernel (which also
+    /// covers the copy that fed it) to finish.
+    unsafe fn ensure_capacity(&mut self, len: usize) -> Result<(), String> {
+        if len <= self.cap {
+            return Ok(());
+        }
+        self.free();
+        let mut raw_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        sys::lib()
+            .cuMemHostAlloc(&mut raw_ptr, len, 0)
+            .result()
+            .map_err(|e| format!("cuMemHostAlloc({len} bytes): {e}"))?;
+        self.ptr = raw_ptr as *mut u8;
+        self.cap = len;
+        Ok(())
+    }
+
+    /// Copies `src` into this buffer's first `src.len()` bytes.
+    ///
+    /// # Safety
+    /// `ensure_capacity(src.len())` must have already succeeded, and no
+    /// async transfer may still be reading this slot's previous contents.
+    unsafe fn write(&mut self, src: &[u8]) {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr, src.len());
+    }
+
+    /// Borrows this buffer's first `len` bytes (`len <= self.cap`).
+    fn as_slice(&self, len: usize) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, len) }
+    }
+
+    fn free(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                let _ = sys::lib().cuMemFreeHost(self.ptr as *mut core::ffi::c_void);
+            }
+            self.ptr = std::ptr::null_mut();
+            self.cap = 0;
+        }
+    }
+}
+
+impl Drop for PinnedHostBuffer {
+    fn drop(&mut self) {
+        self.free();
+    }
+}
+
+/// Double-buffered pipeline for the per-tensor on-device dequant load path
+/// (`Model::load`/`load_hybrid`/`load_mla`'s `load_weight` closures, ~310
+/// calls for a Qwen3-0.6B GGUF). The pre-pipeline code called
+/// `CudaDevice::htod_sync_copy` (a *blocking* H2D copy of each tensor's raw
+/// quantized bytes) before launching that tensor's dequant kernel,
+/// sequentially -- nothing overlapped tensor N+1's transfer with tensor N's
+/// kernel still running. This pipelines the two: raw bytes are staged into
+/// one of two pinned host buffers and uploaded asynchronously on a forked
+/// `copy_stream`, while the dequant kernel for a previous tensor is still
+/// executing on the device's own default stream (`compute_stream` below --
+/// every kernel launch in this codebase already runs there). Every dequant
+/// kernel still reads byte-identical input and produces byte-identical
+/// output to the pre-pipeline sequential path: this is a timing/memory-
+/// movement change only.
+///
+/// Slot lifecycle for tensor `i` (`slot = i % 2`):
+/// 1. If slot `slot` has been used before (tensor `i - 2`), block the
+///    *host* on `copy_done[slot]` via `cuEventSynchronize`. This one is a
+///    CPU-side wait on purpose, and it is the pipeline's only correctness-
+///    critical synchronization: steps 2-5 are all asynchronous, so the CPU
+///    runs arbitrarily far ahead of the GPU, and the pinned buffer is
+///    written by the *CPU*. A GPU-side `cuStreamWaitEvent` would order the
+///    copy stream but would not stop the host from overwriting (or, on
+///    growth, freeing) a staging buffer whose previous H2D transfer is
+///    still in flight -- a silent wrong-weight-bytes race. In steady state
+///    this blocks for ~0: a whole other tensor's copy and kernel were
+///    enqueued since this slot's last use.
+/// 2. Make `copy_stream` wait on `kernel_done[slot]` (GPU-side): the
+///    device-side staging buffer for this slot is reused every other
+///    tensor, so the dequant kernel that last read it must finish before
+///    this tensor's transfer overwrites it. Unlike step 1 this one is
+///    correctly a *stream* wait -- the writer here is the GPU's copy
+///    engine, not the host.
+/// 3. Host-side `memcpy` this tensor's raw bytes into the pinned buffer,
+///    and grow this slot's device staging buffer if this tensor is bigger
+///    than anything seen on that slot so far.
+/// 4. Async H2D copy on `copy_stream`, then record `copy_done[slot]`.
+/// 5. `compute_stream` waits on `copy_done[slot]`, the dequant kernel
+///    launches exactly as before, and `kernel_done[slot]` is recorded right
+///    after it for step 2's use two tensors from now.
+///
+/// Both staging buffers (pinned host and device) are *reused* across
+/// tensors rather than allocated per tensor. That is deliberate: allocating
+/// the device buffer per tensor via `CudaDevice::alloc` would stream-order
+/// it on `compute_stream`, and the cross-stream event that then has to make
+/// `copy_stream` wait for that allocation also drags in every kernel
+/// already queued on `compute_stream` -- which serializes copy N+1 behind
+/// kernel N and destroys exactly the overlap this type exists to create
+/// (measured: ~2% instead of ~20%+ on a real Qwen3-0.6B load).
+struct WeightLoadPipeline {
+    device: Arc<CudaDevice>,
+    copy_stream: sys::CUstream,
+    pinned: [PinnedHostBuffer; 2],
+    /// Device-side raw quantized-byte staging buffers, one per slot, grown
+    /// lazily (never shrunk) like their pinned host counterparts.
+    raw_dev: [Option<CudaSlice<u8>>; 2],
+    raw_cap: [usize; 2],
+    copy_done: [sys::CUevent; 2],
+    /// Recorded on `compute_stream` right after the dequant kernel reading
+    /// a slot is launched; `None` until that slot has been used once.
+    kernel_done: [Option<sys::CUevent>; 2],
+    /// Whether `copy_done[slot]` has ever been recorded -- synchronizing on
+    /// a never-recorded event returns immediately, but this keeps the
+    /// intent explicit rather than relying on that.
+    slot_used: [bool; 2],
+    next: usize,
+}
+
+impl WeightLoadPipeline {
+    fn new(device: &Arc<CudaDevice>) -> Result<Self, String> {
+        let copy_stream = result::stream::create(result::stream::StreamKind::NonBlocking)
+            .map_err(|e| format!("create pipeline copy stream: {e}"))?;
+        let mk_event = || {
+            result::event::create(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
+                .map_err(|e| format!("create pipeline event: {e}"))
+        };
+        Ok(Self {
+            device: device.clone(),
+            copy_stream,
+            pinned: [PinnedHostBuffer::new(), PinnedHostBuffer::new()],
+            raw_dev: [None, None],
+            raw_cap: [0, 0],
+            copy_done: [mk_event()?, mk_event()?],
+            kernel_done: [None, None],
+            slot_used: [false, false],
+            next: 0,
+        })
+    }
+
+    /// Grows slot `slot`'s device-side staging buffer to hold at least
+    /// `len` bytes. Rare after the first few tensors (a real model reuses a
+    /// handful of distinct tensor byte lengths), so the full
+    /// `device.synchronize()` here is cheap: it drains `compute_stream`,
+    /// which both retires the old buffer's readers and guarantees the new
+    /// stream-ordered allocation is materialized before `copy_stream`
+    /// writes into it.
+    fn ensure_raw_capacity(&mut self, slot: usize, len: usize) -> Result<(), String> {
+        if len <= self.raw_cap[slot] {
+            return Ok(());
+        }
+        let buf = unsafe { self.device.alloc::<u8>(len) }
+            .map_err(|e| format!("alloc device staging buffer: {e}"))?;
+        self.raw_dev[slot] = Some(buf);
+        self.raw_cap[slot] = len;
+        self.device
+            .synchronize()
+            .map_err(|e| format!("pipeline: sync after staging-buffer growth: {e}"))?;
+        Ok(())
+    }
+
+    /// Pipelined replacement for the old sequential `htod_sync_copy` +
+    /// kernel-launch (see the struct doc comment for the full slot
+    /// lifecycle) -- same truncation behavior as before if the last block
+    /// is only partially used.
+    fn dequantize(
+        &mut self,
+        kernel: &AotKernel,
+        block_bytes: usize,
+        block_elems: usize,
+        bytes: &[u8],
+        element_count: u64,
+    ) -> Result<CudaSlice<f32>, String> {
+        let slot = self.next % 2;
+        self.next += 1;
+        let compute_stream = *self.device.cu_stream();
+
+        // Host-side wait -- see the struct doc comment's step 1. Without
+        // this, the CPU (which never blocks anywhere else in this method)
+        // would overwrite or free a pinned buffer whose previous async H2D
+        // transfer is still reading it.
+        if self.slot_used[slot] {
+            unsafe { sys::lib().cuEventSynchronize(self.copy_done[slot]) }
+                .result()
+                .map_err(|e| format!("pipeline: await slot {slot}'s prior H2D copy: {e}"))?;
+        }
+
+        // GPU-side wait -- step 2: this slot's device staging buffer is
+        // about to be overwritten by the transfer below, so the kernel that
+        // last read it has to be done first.
+        if let Some(ev) = self.kernel_done[slot] {
+            unsafe {
+                result::stream::wait_event(
+                    self.copy_stream,
+                    ev,
+                    sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+                )
+            }
+            .map_err(|e| format!("pipeline: wait for slot {slot}'s prior kernel: {e}"))?;
+        }
+
+        unsafe {
+            self.pinned[slot].ensure_capacity(bytes.len())?;
+            self.pinned[slot].write(bytes);
+        }
+        self.ensure_raw_capacity(slot, bytes.len())?;
+
+        let raw_ptr = *self.raw_dev[slot]
+            .as_ref()
+            .expect("staging buffer set by ensure_raw_capacity")
+            .device_ptr();
+        unsafe {
+            result::memcpy_htod_async(
+                raw_ptr,
+                self.pinned[slot].as_slice(bytes.len()),
+                self.copy_stream,
+            )
+        }
+        .map_err(|e| format!("pipeline: async H2D copy: {e}"))?;
+        unsafe { result::event::record(self.copy_done[slot], self.copy_stream) }
+            .map_err(|e| format!("pipeline: record copy_done: {e}"))?;
+        self.slot_used[slot] = true;
+        unsafe {
+            result::stream::wait_event(
+                compute_stream,
+                self.copy_done[slot],
+                sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+        }
+        .map_err(|e| format!("pipeline: wait for copy_done: {e}"))?;
+
+        let num_blocks = bytes.len() / block_bytes;
+        let out_len = num_blocks * block_elems;
+        let mut dev_out = unsafe { self.device.alloc::<f32>(out_len) }
+            .map_err(|e| format!("alloc dequant output: {e}"))?;
+
+        let threads = 256u32;
+        let blocks = (num_blocks as u32).div_ceil(threads).max(1);
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let raw = self.raw_dev[slot]
+            .as_ref()
+            .expect("staging buffer set by ensure_raw_capacity");
+        unsafe {
+            kernel
+                .function
+                .clone()
+                .launch(launch_cfg, (raw, &mut dev_out, num_blocks as u32))
+                .map_err(|e| format!("dequant kernel launch: {e}"))?;
+        }
+
+        if self.kernel_done[slot].is_none() {
+            let ev = result::event::create(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
+                .map_err(|e| format!("create pipeline kernel_done event: {e}"))?;
+            self.kernel_done[slot] = Some(ev);
+        }
+        let kdone = self.kernel_done[slot].expect("kernel_done[slot] was just set");
+        unsafe { result::event::record(kdone, compute_stream) }
+            .map_err(|e| format!("pipeline: record kernel_done: {e}"))?;
+
+        if out_len as u64 == element_count {
+            return Ok(dev_out);
+        }
+        let n = element_count as usize;
+        let mut truncated = unsafe { self.device.alloc::<f32>(n) }
+            .map_err(|e| format!("alloc truncated dequant output: {e}"))?;
+        let src = dev_out.slice(0..n);
+        self.device
+            .dtod_copy(&src, &mut truncated)
+            .map_err(|e| format!("truncate dequant output: {e}"))?;
+        Ok(truncated)
+    }
+}
+
+impl Drop for WeightLoadPipeline {
+    fn drop(&mut self) {
+        // Every slot's pinned buffer is about to be freed -- make sure no
+        // async H2D copy on `copy_stream` is still reading it first
+        // (freeing pinned host memory out from under an in-flight transfer
+        // is a real, silently-corrupting driver bug, not just a leak).
+        unsafe {
+            let _ = result::stream::synchronize(self.copy_stream);
+            let _ = result::stream::destroy(self.copy_stream);
+            for ev in self.copy_done {
+                let _ = result::event::destroy(ev);
+            }
+            for ev in self.kernel_done.into_iter().flatten() {
+                let _ = result::event::destroy(ev);
+            }
+        }
+    }
+}
+
 /// Dequantizes one tensor's raw quantized bytes straight to a device-resident
 /// `f32` buffer. Every block-quantized format, including the IQ
 /// (codebook/non-uniform) family, dequantizes on-device via
@@ -275,167 +751,107 @@ fn load_dequant_kernels(device: &Arc<CudaDevice>) -> Result<DequantKernels, Stri
 /// the host `dequant::dequantize` path (`src/dequant.rs`/`dequant_iq.rs`)
 /// rather than a `match` that would need updating for every future format.
 fn dequantize_tensor_to_device(
-    device: &Arc<CudaDevice>,
+    pipeline: &mut WeightLoadPipeline,
     kernels: &DequantKernels,
     ggml_type: GgmlType,
     bytes: &[u8],
     element_count: u64,
 ) -> Result<CudaSlice<f32>, String> {
     match ggml_type {
-        GgmlType::Q4K => dequantize_on_device(
-            device,
-            &kernels.q4k,
-            Q4K_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        GgmlType::Q5K => dequantize_on_device(
-            device,
-            &kernels.q5k,
-            Q5K_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        GgmlType::Q6K => dequantize_on_device(
-            device,
-            &kernels.q6k,
-            Q6K_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        GgmlType::Q4_0 => dequantize_on_device(
-            device,
+        GgmlType::Q4K => {
+            pipeline.dequantize(&kernels.q4k, Q4K_BLOCK_BYTES, QK_K, bytes, element_count)
+        }
+        GgmlType::Q5K => {
+            pipeline.dequantize(&kernels.q5k, Q5K_BLOCK_BYTES, QK_K, bytes, element_count)
+        }
+        GgmlType::Q6K => {
+            pipeline.dequantize(&kernels.q6k, Q6K_BLOCK_BYTES, QK_K, bytes, element_count)
+        }
+        GgmlType::Q4_0 => pipeline.dequantize(
             &kernels.q4_0,
             Q4_0_BLOCK_BYTES,
             QK_LEGACY,
             bytes,
             element_count,
         ),
-        GgmlType::Q4_1 => dequantize_on_device(
-            device,
+        GgmlType::Q4_1 => pipeline.dequantize(
             &kernels.q4_1,
             Q4_1_BLOCK_BYTES,
             QK_LEGACY,
             bytes,
             element_count,
         ),
-        GgmlType::Q5_0 => dequantize_on_device(
-            device,
+        GgmlType::Q5_0 => pipeline.dequantize(
             &kernels.q5_0,
             Q5_0_BLOCK_BYTES,
             QK_LEGACY,
             bytes,
             element_count,
         ),
-        GgmlType::Q5_1 => dequantize_on_device(
-            device,
+        GgmlType::Q5_1 => pipeline.dequantize(
             &kernels.q5_1,
             Q5_1_BLOCK_BYTES,
             QK_LEGACY,
             bytes,
             element_count,
         ),
-        GgmlType::Q8_0 => dequantize_on_device(
-            device,
+        GgmlType::Q8_0 => pipeline.dequantize(
             &kernels.q8_0,
             Q8_0_BLOCK_BYTES,
             QK_LEGACY,
             bytes,
             element_count,
         ),
-        GgmlType::Q8_1 => dequantize_on_device(
-            device,
+        GgmlType::Q8_1 => pipeline.dequantize(
             &kernels.q8_1,
             Q8_1_BLOCK_BYTES,
             QK_LEGACY,
             bytes,
             element_count,
         ),
-        GgmlType::Q2K => dequantize_on_device(
-            device,
-            &kernels.q2k,
-            Q2K_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        GgmlType::Q3K => dequantize_on_device(
-            device,
-            &kernels.q3k,
-            Q3K_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        GgmlType::Q8K => dequantize_on_device(
-            device,
-            &kernels.q8k,
-            Q8K_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        GgmlType::IQ2XXS => dequantize_on_device(
-            device,
+        GgmlType::Q2K => {
+            pipeline.dequantize(&kernels.q2k, Q2K_BLOCK_BYTES, QK_K, bytes, element_count)
+        }
+        GgmlType::Q3K => {
+            pipeline.dequantize(&kernels.q3k, Q3K_BLOCK_BYTES, QK_K, bytes, element_count)
+        }
+        GgmlType::Q8K => {
+            pipeline.dequantize(&kernels.q8k, Q8K_BLOCK_BYTES, QK_K, bytes, element_count)
+        }
+        GgmlType::IQ2XXS => pipeline.dequantize(
             &kernels.iq2xxs,
             IQ2XXS_BLOCK_BYTES,
             QK_K,
             bytes,
             element_count,
         ),
-        GgmlType::IQ2XS => dequantize_on_device(
-            device,
+        GgmlType::IQ2XS => pipeline.dequantize(
             &kernels.iq2xs,
             IQ2XS_BLOCK_BYTES,
             QK_K,
             bytes,
             element_count,
         ),
-        GgmlType::IQ2S => dequantize_on_device(
-            device,
-            &kernels.iq2s,
-            IQ2S_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        GgmlType::IQ3XXS => dequantize_on_device(
-            device,
+        GgmlType::IQ2S => {
+            pipeline.dequantize(&kernels.iq2s, IQ2S_BLOCK_BYTES, QK_K, bytes, element_count)
+        }
+        GgmlType::IQ3XXS => pipeline.dequantize(
             &kernels.iq3xxs,
             IQ3XXS_BLOCK_BYTES,
             QK_K,
             bytes,
             element_count,
         ),
-        GgmlType::IQ3S => dequantize_on_device(
-            device,
-            &kernels.iq3s,
-            IQ3S_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        GgmlType::IQ1S => dequantize_on_device(
-            device,
-            &kernels.iq1s,
-            IQ1S_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        GgmlType::IQ1M => dequantize_on_device(
-            device,
-            &kernels.iq1m,
-            IQ1M_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        GgmlType::IQ4XS => dequantize_on_device(
-            device,
+        GgmlType::IQ3S => {
+            pipeline.dequantize(&kernels.iq3s, IQ3S_BLOCK_BYTES, QK_K, bytes, element_count)
+        }
+        GgmlType::IQ1S => {
+            pipeline.dequantize(&kernels.iq1s, IQ1S_BLOCK_BYTES, QK_K, bytes, element_count)
+        }
+        GgmlType::IQ1M => {
+            pipeline.dequantize(&kernels.iq1m, IQ1M_BLOCK_BYTES, QK_K, bytes, element_count)
+        }
+        GgmlType::IQ4XS => pipeline.dequantize(
             &kernels.iq4xs,
             IQ4XS_BLOCK_BYTES,
             QK_K,
@@ -444,64 +860,12 @@ fn dequantize_tensor_to_device(
         ),
         other => {
             let host = dequant::dequantize(other, bytes, element_count)?;
-            device
+            pipeline
+                .device
                 .htod_sync_copy(&host)
                 .map_err(|e| format!("upload weight to device: {e}"))
         }
     }
-}
-
-/// Uploads `bytes` (raw quantized block bytes, unmodified) to device memory
-/// and launches `kernel` to unpack them into a fresh `f32` buffer, one CUDA
-/// thread per `block_elems`-element block (`256` for every K-quant format,
-/// `32` for the legacy Q4_0/1-Q8_0/1 family). Truncates to `element_count` if
-/// the last block is only partially used (ggml's own invariant is that a
-/// quantized tensor's element count is always a block-size multiple, so this
-/// is defensive, matching `dequant::dequantize`'s own truncation).
-fn dequantize_on_device(
-    device: &Arc<CudaDevice>,
-    kernel: &AotKernel,
-    block_bytes: usize,
-    block_elems: usize,
-    bytes: &[u8],
-    element_count: u64,
-) -> Result<CudaSlice<f32>, String> {
-    let num_blocks = bytes.len() / block_bytes;
-    let raw = device
-        .htod_sync_copy(bytes)
-        .map_err(|e| format!("upload raw quantized bytes: {e}"))?;
-    let out_len = num_blocks * block_elems;
-    let mut dev_out = device
-        .alloc_zeros::<f32>(out_len)
-        .map_err(|e| format!("alloc dequant output: {e}"))?;
-
-    let threads = 256u32;
-    let blocks = (num_blocks as u32).div_ceil(threads).max(1);
-    let launch_cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    unsafe {
-        kernel
-            .function
-            .clone()
-            .launch(launch_cfg, (&raw, &mut dev_out, num_blocks as u32))
-            .map_err(|e| format!("dequant kernel launch: {e}"))?;
-    }
-
-    if out_len as u64 == element_count {
-        return Ok(dev_out);
-    }
-    let n = element_count as usize;
-    let mut truncated = device
-        .alloc_zeros::<f32>(n)
-        .map_err(|e| format!("alloc truncated dequant output: {e}"))?;
-    let src = dev_out.slice(0..n);
-    device
-        .dtod_copy(&src, &mut truncated)
-        .map_err(|e| format!("truncate dequant output: {e}"))?;
-    Ok(truncated)
 }
 
 /// Loads and dequantizes weight `name` straight to a device-resident `f32`
@@ -509,7 +873,7 @@ fn dequantize_on_device(
 /// `load_weight` closures (see [`dequantize_tensor_to_device`] for the
 /// on-device-vs-host dispatch).
 fn load_weight_device(
-    device: &Arc<CudaDevice>,
+    pipeline: &mut WeightLoadPipeline,
     kernels: &DequantKernels,
     file: &GgufFile,
     name: &str,
@@ -518,9 +882,14 @@ fn load_weight_device(
         .tensor_info(name)
         .ok_or_else(|| format!("missing weight '{name}'"))?;
     let bytes = file.tensor_bytes(info)?;
-    let data =
-        dequantize_tensor_to_device(device, kernels, info.ggml_type, bytes, info.element_count())
-            .map_err(|e| format!("load weight '{name}': {e}"))?;
+    let data = dequantize_tensor_to_device(
+        pipeline,
+        kernels,
+        info.ggml_type,
+        bytes,
+        info.element_count(),
+    )
+    .map_err(|e| format!("load weight '{name}': {e}"))?;
     Ok(Weight {
         data,
         shape: info.shape.clone(),
@@ -1286,15 +1655,16 @@ pub struct Model {
     layers: Vec<LayerWeights>,
     /// `k` (top-k expert count), `Some` iff this is an MoE model.
     expert_used_count: Option<usize>,
-    /// `[hidden_size, vocab_size]`, row-major `(vocab_size, hidden_size)`
-    /// flat data -- kept host-resident (unlike every other weight) for
-    /// embedding lookup (host-side gather; batch is always 1 in this MVP, so
-    /// a GPU gather kernel buys nothing). When no separate `output.weight`
-    /// tensor exists, its dequantized bytes are also uploaded to device
-    /// memory once, as `lm_head`, rather than dequantizing them twice.
-    token_embd: Vec<f32>,
+    /// Kept host-resident (unlike every other weight) for embedding lookup
+    /// (host-side gather; batch is always 1 in this MVP, so a GPU gather
+    /// kernel buys nothing) -- lazily dequantized row-by-row, see
+    /// [`LazyTokenEmbedding`]. When no separate `output.weight` tensor
+    /// exists, `lm_head` reuses this same lazy source instead of
+    /// dequantizing it twice (see [`LmHead::TiedLazy`]/
+    /// `Model::lm_head_resident`/`Model::gemv_gather_lm_head`).
+    token_embd: LazyTokenEmbedding,
     output_norm: Weight,
-    lm_head: Weight,
+    lm_head: LmHead,
     tokenizer: Tokenizer,
     /// `Some` iff this is a Qwen3.5 hybrid model (see `Self::load_hybrid`);
     /// `cfg`/`layers`/`expert_used_count` above are unused garbage in that
@@ -1651,15 +2021,18 @@ impl Model {
             .next()
             .ok_or("missing moe_scatter_add_kernel")?;
         let dequant_kernels = load_dequant_kernels(&device)?;
+        let mut pipeline = WeightLoadPipeline::new(&device)?;
 
         // Dequantizes straight from the mmap'd GGUF bytes (on-device for
         // every format but the IQ family, Phase 2 round 3 + post-MVP
         // extensions; host `Vec<f32>` scratch, immediately dropped, for IQ)
         // into device memory -- unlike before round 1, no dequantized weight
         // stays host-resident for the model's lifetime, and no forward-pass
-        // call re-uploads it (see `Weight`'s doc comment).
-        let load_weight = |name: &str| -> Result<Weight, String> {
-            load_weight_device(&device, &dequant_kernels, file, name)
+        // call re-uploads it (see `Weight`'s doc comment). Pipelined across
+        // successive calls via `pipeline` (see `WeightLoadPipeline`'s doc
+        // comment) instead of the old sequential blocking-H2D-copy path.
+        let mut load_weight = |name: &str| -> Result<Weight, String> {
+            load_weight_device(&mut pipeline, &dequant_kernels, file, name)
         };
 
         let mut layers = Vec::with_capacity(block_count);
@@ -1712,42 +2085,40 @@ impl Model {
             .tensor_info("token_embd.weight")
             .ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
         let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
-        let token_embd = dequant::dequantize(
+        let token_embd = LazyTokenEmbedding::new(
             token_embd_info.ggml_type,
-            token_embd_bytes,
-            token_embd_info.element_count(),
+            token_embd_bytes.to_vec(),
+            &token_embd_info.shape,
         )?;
 
         let output_norm = load_weight("output_norm.weight")?;
 
         // Tied-embedding models have no separate `output.weight` tensor --
-        // reuse `token_embd`'s already-dequantized host bytes for the LM
-        // head's device upload instead of dequantizing them a second time.
+        // rather than eagerly re-uploading `token_embd`'s already-dequantized
+        // host bytes as a second full device copy (wasted work for a
+        // `reflex system1` run, which only ever gathers a handful of rows --
+        // see `LmHead`'s doc comment), defer that upload until something
+        // actually needs the full matrix.
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
                 let data = dequantize_tensor_to_device(
-                    &device,
+                    &mut pipeline,
                     &dequant_kernels,
                     info.ggml_type,
                     bytes,
                     info.element_count(),
                 )
                 .map_err(|e| format!("load weight 'output.weight': {e}"))?;
-                Weight {
+                LmHead::Resident(Weight {
                     data,
                     shape: info.shape.clone(),
-                }
+                })
             }
-            None => {
-                let data = device
-                    .htod_sync_copy(&token_embd)
-                    .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
-                Weight {
-                    data,
-                    shape: token_embd_info.shape.clone(),
-                }
-            }
+            None => LmHead::TiedLazy {
+                shape: token_embd_info.shape.clone(),
+                cell: std::sync::OnceLock::new(),
+            },
         };
 
         let tokenizer = Tokenizer::from_gguf(file)?;
@@ -1964,9 +2335,10 @@ impl Model {
         let gdn_delta_k = gdn_fns.next().ok_or("missing gdn_delta_kernel")?;
         let gdn_gated_norm_k = gdn_fns.next().ok_or("missing gdn_gated_norm_kernel")?;
         let dequant_kernels = load_dequant_kernels(&device)?;
+        let mut pipeline = WeightLoadPipeline::new(&device)?;
 
-        let load_weight = |name: &str| -> Result<Weight, String> {
-            load_weight_device(&device, &dequant_kernels, file, name)
+        let mut load_weight = |name: &str| -> Result<Weight, String> {
+            load_weight_device(&mut pipeline, &dequant_kernels, file, name)
         };
 
         let mut layers = Vec::with_capacity(block_count);
@@ -2018,38 +2390,44 @@ impl Model {
             .tensor_info("token_embd.weight")
             .ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
         let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
-        let token_embd = dequant::dequantize(
+        let token_embd = LazyTokenEmbedding::new(
             token_embd_info.ggml_type,
-            token_embd_bytes,
-            token_embd_info.element_count(),
+            token_embd_bytes.to_vec(),
+            &token_embd_info.shape,
         )?;
 
         let output_norm = load_weight("output_norm.weight")?;
 
+        // Unlike dense/MoE `Model::load`, this path keeps the tied case
+        // eager (`LmHead::Resident`, not `TiedLazy`) -- `system1_evaluate`
+        // (the only caller the laziness optimization targets) already
+        // rejects hybrid/MLA models outright, so there's no lazy-gather
+        // win to have here, only a type to match `Model::lm_head`'s field.
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
                 let data = dequantize_tensor_to_device(
-                    &device,
+                    &mut pipeline,
                     &dequant_kernels,
                     info.ggml_type,
                     bytes,
                     info.element_count(),
                 )
                 .map_err(|e| format!("load weight 'output.weight': {e}"))?;
-                Weight {
+                LmHead::Resident(Weight {
                     data,
                     shape: info.shape.clone(),
-                }
+                })
             }
             None => {
+                let full = token_embd.dequantize_all()?;
                 let data = device
-                    .htod_sync_copy(&token_embd)
+                    .htod_sync_copy(&full)
                     .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
-                Weight {
+                LmHead::Resident(Weight {
                     data,
                     shape: token_embd_info.shape.clone(),
-                }
+                })
             }
         };
 
@@ -2237,9 +2615,10 @@ impl Model {
             "gemv_per_head_batch_kernel",
         )?;
         let dequant_kernels = load_dequant_kernels(&device)?;
+        let mut pipeline = WeightLoadPipeline::new(&device)?;
 
-        let load_weight = |name: &str| -> Result<Weight, String> {
-            load_weight_device(&device, &dequant_kernels, file, name)
+        let mut load_weight = |name: &str| -> Result<Weight, String> {
+            load_weight_device(&mut pipeline, &dequant_kernels, file, name)
         };
 
         let mut layers = Vec::with_capacity(block_count);
@@ -2282,38 +2661,44 @@ impl Model {
             .tensor_info("token_embd.weight")
             .ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
         let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
-        let token_embd = dequant::dequantize(
+        let token_embd = LazyTokenEmbedding::new(
             token_embd_info.ggml_type,
-            token_embd_bytes,
-            token_embd_info.element_count(),
+            token_embd_bytes.to_vec(),
+            &token_embd_info.shape,
         )?;
 
         let output_norm = load_weight("output_norm.weight")?;
 
+        // Unlike dense/MoE `Model::load`, this path keeps the tied case
+        // eager (`LmHead::Resident`, not `TiedLazy`) -- `system1_evaluate`
+        // (the only caller the laziness optimization targets) already
+        // rejects hybrid/MLA models outright, so there's no lazy-gather
+        // win to have here, only a type to match `Model::lm_head`'s field.
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
                 let data = dequantize_tensor_to_device(
-                    &device,
+                    &mut pipeline,
                     &dequant_kernels,
                     info.ggml_type,
                     bytes,
                     info.element_count(),
                 )
                 .map_err(|e| format!("load weight 'output.weight': {e}"))?;
-                Weight {
+                LmHead::Resident(Weight {
                     data,
                     shape: info.shape.clone(),
-                }
+                })
             }
             None => {
+                let full = token_embd.dequantize_all()?;
                 let data = device
-                    .htod_sync_copy(&token_embd)
+                    .htod_sync_copy(&full)
                     .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
-                Weight {
+                LmHead::Resident(Weight {
                     data,
                     shape: token_embd_info.shape.clone(),
-                }
+                })
             }
         };
 
@@ -2438,8 +2823,14 @@ impl Model {
             .alloc_zeros::<f32>(out_features)
             .map_err(|e| format!("gemv alloc y: {e}"))?;
 
+        // One warp per output row (gemv_kernel's doc comment has the
+        // coalescing rationale) -- 256 threads/block = 8 warps/block, same
+        // total thread count per block as before this rewrite, just
+        // reinterpreted as 8 rows/block instead of 256 threads each doing
+        // one full row.
         let threads = 256u32;
-        let blocks = (out_features as u32).div_ceil(threads).max(1);
+        let warps_per_block = threads / WARP_SIZE;
+        let blocks = (out_features as u32).div_ceil(warps_per_block).max(1);
         let launch_cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads, 1, 1),
@@ -2754,8 +3145,10 @@ impl Model {
             .device
             .alloc_zeros::<f32>(num_rows)
             .map_err(|e| format!("gemv_gather alloc y: {e}"))?;
+        // One warp per gathered row -- see gemv_raw's identical comment.
         let threads = 256u32;
-        let blocks = (num_rows as u32).div_ceil(threads).max(1);
+        let warps_per_block = threads / WARP_SIZE;
+        let blocks = (num_rows as u32).div_ceil(warps_per_block).max(1);
         let launch_cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads, 1, 1),
@@ -3258,8 +3651,12 @@ impl Model {
             .device
             .alloc_zeros::<f32>(out_features)
             .map_err(|e| format!("gemv_view alloc y: {e}"))?;
+        // One warp per output row -- see gemv_raw's identical comment. Same
+        // gemv_kernel, so this must stay in lockstep with gemv_raw's launch
+        // geometry.
         let threads = 256u32;
-        let blocks = (out_features as u32).div_ceil(threads).max(1);
+        let warps_per_block = threads / WARP_SIZE;
+        let blocks = (out_features as u32).div_ceil(warps_per_block).max(1);
         let launch_cfg = LaunchConfig {
             grid_dim: (blocks, 1, 1),
             block_dim: (threads, 1, 1),
@@ -4545,9 +4942,8 @@ impl Model {
         let hidden_size = self.cfg.hidden_size;
         let mut host_embd = vec![0.0f32; rows * hidden_size];
         for (row, &token_id) in ids.iter().enumerate() {
-            let embd_base = token_id as usize * hidden_size;
             host_embd[row * hidden_size..(row + 1) * hidden_size]
-                .copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
+                .copy_from_slice(&self.token_embd.row(token_id)?);
         }
         let mut hidden = self
             .device
@@ -4775,7 +5171,7 @@ impl Model {
             self.cfg.rmsnorm_eps,
         )?;
         let first_tokens: Vec<u32> = resolved.iter().map(|ids| ids[0]).collect();
-        let mut scores = self.gemv_gather(&normed, &self.lm_head, &first_tokens)?;
+        let mut scores = self.gemv_gather_lm_head(&normed, &first_tokens)?;
 
         // Multi-token candidates: teacher-forced continuation, reusing the
         // shared post-prompt KV headroom sequentially per candidate (safe
@@ -4796,7 +5192,7 @@ impl Model {
                     self.cfg.hidden_size,
                     self.cfg.rmsnorm_eps,
                 )?;
-                scores[i] += self.gemv_gather(&normed_step, &self.lm_head, &[next])?[0];
+                scores[i] += self.gemv_gather_lm_head(&normed_step, &[next])?[0];
             }
         }
 
@@ -4830,11 +5226,9 @@ impl Model {
         k_caches: &mut [CudaSlice<f32>],
         v_caches: &mut [CudaSlice<f32>],
     ) -> Result<CudaSlice<f32>, String> {
-        let hidden_size = self.cfg.hidden_size;
-        let embd_base = token_id as usize * hidden_size;
         let mut hidden = self
             .device
-            .htod_sync_copy(&self.token_embd[embd_base..embd_base + hidden_size])
+            .htod_sync_copy(&self.token_embd.row(token_id)?)
             .map_err(|e| format!("embedding htod: {e}"))?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             hidden = self.forward_layer(
@@ -4880,10 +5274,91 @@ impl Model {
         eps: f32,
     ) -> Result<Vec<f32>, String> {
         let normed = self.rmsnorm(hidden, &self.output_norm.data, 1, hidden_size, eps)?;
-        let logits_dev = self.gemv(&normed, &self.lm_head)?;
+        let logits_dev = self.gemv(&normed, self.lm_head_resident()?)?;
         self.device
             .dtoh_sync_copy(&logits_dev)
             .map_err(|e| format!("logits dtoh: {e}"))
+    }
+
+    /// Forces the LM head fully device-resident, uploading `token_embd`'s
+    /// already-dequantized host bytes if it hasn't been already (see
+    /// [`LmHead`]'s doc comment) -- needed by [`Self::lm_head_logits`], which
+    /// (unlike [`Self::gemv_gather_lm_head`]) genuinely needs every vocab
+    /// row. A no-op past the first call (`Resident`, or a `TiedLazy` some
+    /// earlier call already forced): `OnceLock::get`/`set` rather than the
+    /// still-unstable `get_or_try_init`, safe without a race check because
+    /// this project never runs more than one request at a time (`batch_size`
+    /// is a permanent constraint, see CLAUDE.md's Non-goals) -- there is
+    /// never a second caller to race against.
+    fn lm_head_resident(&self) -> Result<&Weight, String> {
+        match &self.lm_head {
+            LmHead::Resident(w) => Ok(w),
+            LmHead::TiedLazy { shape, cell } => {
+                if let Some(w) = cell.get() {
+                    return Ok(w);
+                }
+                let full = self.token_embd.dequantize_all()?;
+                let data = self
+                    .device
+                    .htod_sync_copy(&full)
+                    .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
+                let _ = cell.set(Weight {
+                    data,
+                    shape: shape.clone(),
+                });
+                Ok(cell.get().expect("just set"))
+            }
+        }
+    }
+
+    /// [`Self::gemv_gather`], but for the LM head specifically -- avoids
+    /// forcing a still-lazy tied LM head fully device-resident just to
+    /// gather a handful of rows (System1's whole reason for existing; see
+    /// [`LmHead`]'s doc comment). If the LM head is already fully resident
+    /// (a real `output.weight` tensor, or a tied one some earlier full-vocab
+    /// call already forced), this is exactly [`Self::gemv_gather`] with no
+    /// extra cost. Otherwise, uploads only the requested rows -- typically a
+    /// handful of candidate tokens, a few KB, not the full matrix's hundreds
+    /// of MB -- straight from the host-resident `token_embd` bytes (same
+    /// row-major `(vocab_size, hidden_size)` layout `output.weight` would
+    /// have, since they're the same tensor when tied), then reuses
+    /// `gemv_gather_kernel` against that compact buffer with trivial indices
+    /// `0..row_indices.len()` (the buffer already IS exactly the selected
+    /// rows, in order) -- same kernel, same math, just a much smaller upload.
+    fn gemv_gather_lm_head(
+        &self,
+        x: &CudaSlice<f32>,
+        row_indices: &[u32],
+    ) -> Result<Vec<f32>, String> {
+        let (shape, cell) = match &self.lm_head {
+            LmHead::Resident(w) => return self.gemv_gather(x, w, row_indices),
+            LmHead::TiedLazy { shape, cell } => (shape, cell),
+        };
+        if let Some(w) = cell.get() {
+            return self.gemv_gather(x, w, row_indices);
+        }
+
+        let hidden_size = shape[0] as usize;
+        let vocab_size = shape[1] as usize;
+        if let Some(&bad) = row_indices.iter().find(|&&r| r as usize >= vocab_size) {
+            return Err(format!(
+                "gemv_gather_lm_head: row index {bad} out of range (vocab_size={vocab_size})"
+            ));
+        }
+        let mut compact = Vec::with_capacity(row_indices.len() * hidden_size);
+        for &r in row_indices {
+            compact.extend_from_slice(&self.token_embd.row(r)?);
+        }
+        let dev_compact = self
+            .device
+            .htod_sync_copy(&compact)
+            .map_err(|e| format!("gemv_gather_lm_head upload compact rows: {e}"))?;
+        let compact_w = Weight {
+            data: dev_compact,
+            shape: vec![hidden_size as u64, row_indices.len() as u64],
+        };
+        let trivial_indices: Vec<u32> = (0..row_indices.len() as u32).collect();
+        self.gemv_gather(x, &compact_w, &trivial_indices)
     }
 
     /// `pub(crate)` (not private) so [`crate::sampling::sample`]'s greedy
@@ -6322,9 +6797,8 @@ impl Model {
         let hidden_size = h.attn_cfg.hidden_size;
         let mut host_embd = vec![0.0f32; rows * hidden_size];
         for (row, &token_id) in ids.iter().enumerate() {
-            let embd_base = token_id as usize * hidden_size;
             host_embd[row * hidden_size..(row + 1) * hidden_size]
-                .copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
+                .copy_from_slice(&self.token_embd.row(token_id)?);
         }
         let mut hidden = self
             .device
@@ -6408,10 +6882,9 @@ impl Model {
         let hidden_size = h.attn_cfg.hidden_size;
         let ffn_hidden_size = h.attn_cfg.ffn_hidden_size;
         let eps = h.attn_cfg.rmsnorm_eps;
-        let embd_base = token_id as usize * hidden_size;
         let mut hidden = self
             .device
-            .htod_sync_copy(&self.token_embd[embd_base..embd_base + hidden_size])
+            .htod_sync_copy(&self.token_embd.row(token_id)?)
             .map_err(|e| format!("embedding htod: {e}"))?;
 
         for (layer, state) in h.layers.iter().zip(states.iter_mut()) {
@@ -6837,9 +7310,8 @@ impl Model {
         let hidden_size = m.cfg.hidden_size;
         let mut host_embd = vec![0.0f32; rows * hidden_size];
         for (row, &token_id) in ids.iter().enumerate() {
-            let embd_base = token_id as usize * hidden_size;
             host_embd[row * hidden_size..(row + 1) * hidden_size]
-                .copy_from_slice(&self.token_embd[embd_base..embd_base + hidden_size]);
+                .copy_from_slice(&self.token_embd.row(token_id)?);
         }
         let mut hidden = self
             .device
@@ -6935,10 +7407,9 @@ impl Model {
         let hidden_size = cfg.hidden_size;
         let ffn_hidden_size = cfg.ffn_hidden_size;
         let eps = cfg.rmsnorm_eps;
-        let embd_base = token_id as usize * hidden_size;
         let mut hidden = self
             .device
-            .htod_sync_copy(&self.token_embd[embd_base..embd_base + hidden_size])
+            .htod_sync_copy(&self.token_embd.row(token_id)?)
             .map_err(|e| format!("embedding htod: {e}"))?;
 
         for (layer_idx, layer) in m.layers.iter().enumerate() {
@@ -7587,10 +8058,11 @@ mod system1_tests {
             )
             .expect("rmsnorm failed");
 
-        let full = model.gemv(&normed, &model.lm_head).expect("gemv failed");
+        let lm_head = model.lm_head_resident().expect("lm_head_resident failed");
+        let full = model.gemv(&normed, lm_head).expect("gemv failed");
         let full_host = model.device.dtoh_sync_copy(&full).expect("dtoh failed");
 
-        let vocab_size = model.lm_head.shape[1] as usize;
+        let vocab_size = lm_head.shape[1] as usize;
         let argmax_id = full_host
             .iter()
             .enumerate()
@@ -7605,7 +8077,7 @@ mod system1_tests {
         ];
 
         let gathered = model
-            .gemv_gather(&normed, &model.lm_head, &row_indices)
+            .gemv_gather(&normed, lm_head, &row_indices)
             .expect("gemv_gather failed");
 
         for (j, &row) in row_indices.iter().enumerate() {
@@ -7614,6 +8086,67 @@ mod system1_tests {
             assert!(
                 (expected - got).abs() < 1e-4,
                 "row {row}: full_vocab={expected}, gathered={got}"
+            );
+        }
+    }
+
+    /// Byte-exact (to `gemv`'s own tolerance) check for the actual new code
+    /// path the lazy-`LmHead` optimization added: `gemv_gather_lm_head`
+    /// called on a *freshly loaded* model, before anything has forced the
+    /// tied LM head fully device-resident, must still return the same
+    /// values a full-vocab `gemv` against the forced-resident matrix would.
+    /// This is the case `gemv_gather_matches_full_vocab_gemv_at_matching_rows`
+    /// above can no longer exercise on its own, since it (correctly) calls
+    /// `lm_head_resident()` first to get the comparison baseline -- by the
+    /// time it calls `gemv_gather`, the lazy path has already been forced
+    /// resident once, so `gemv_gather_lm_head` would take the fast
+    /// already-resident branch instead of the still-lazy compact-upload one
+    /// this test targets. Requires a real *tied-embedding* GGUF (no separate
+    /// `output.weight` tensor) to actually exercise `LmHead::TiedLazy` at
+    /// all -- `#[ignore]`d, `REFLEX_TEST_GGUF`-gated like its sibling above.
+    #[test]
+    #[ignore]
+    fn gemv_gather_lm_head_matches_full_vocab_gemv_while_still_lazy() {
+        let gguf_path = std::env::var("REFLEX_TEST_GGUF")
+            .expect("set REFLEX_TEST_GGUF to a real local GGUF path to run this test");
+        let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
+        let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+        let model = Model::load(device, &file).expect("failed to load model");
+
+        let (_, hidden, _, _, _) = model
+            .prefill_dense("The capital of France is", None, 0)
+            .expect("prefill_dense failed");
+        let normed = model
+            .rmsnorm(
+                &hidden,
+                &model.output_norm.data,
+                1,
+                model.cfg.hidden_size,
+                model.cfg.rmsnorm_eps,
+            )
+            .expect("rmsnorm failed");
+
+        let vocab_size = model.token_embd.vocab_size();
+        let row_indices = [0u32, 1u32, (vocab_size / 2) as u32, (vocab_size - 1) as u32];
+
+        // Exercise the still-lazy path FIRST -- calling `lm_head_resident()`
+        // (directly or via `gemv`) before this would force residency and
+        // make `gemv_gather_lm_head` silently take its already-resident fast
+        // path instead, defeating the point of this test.
+        let gathered_lazy = model
+            .gemv_gather_lm_head(&normed, &row_indices)
+            .expect("gemv_gather_lm_head (lazy) failed");
+
+        let lm_head = model.lm_head_resident().expect("lm_head_resident failed");
+        let full = model.gemv(&normed, lm_head).expect("gemv failed");
+        let full_host = model.device.dtoh_sync_copy(&full).expect("dtoh failed");
+
+        for (j, &row) in row_indices.iter().enumerate() {
+            let expected = full_host[row as usize];
+            let got = gathered_lazy[j];
+            assert!(
+                (expected - got).abs() < 1e-4,
+                "row {row}: full_vocab={expected}, gathered_lazy={got}"
             );
         }
     }
@@ -7645,6 +8178,8 @@ mod iq_dequant_host_vs_device_tests {
         let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
         let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
         let kernels = load_dequant_kernels(&device).expect("failed to load dequant kernels");
+        let mut pipeline =
+            WeightLoadPipeline::new(&device).expect("failed to create weight-load pipeline");
 
         type HostDequantFn = fn(&[u8], &mut [f32]);
 
@@ -7678,9 +8213,14 @@ mod iq_dequant_host_vs_device_tests {
             }
             host_out.truncate(element_count as usize);
 
-            let device_out =
-                dequantize_tensor_to_device(&device, &kernels, ggml_type, bytes, element_count)
-                    .expect("dequantize_tensor_to_device failed");
+            let device_out = dequantize_tensor_to_device(
+                &mut pipeline,
+                &kernels,
+                ggml_type,
+                bytes,
+                element_count,
+            )
+            .expect("dequantize_tensor_to_device failed");
             let device_host = device.dtoh_sync_copy(&device_out).expect("dtoh failed");
 
             assert_eq!(

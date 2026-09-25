@@ -10,6 +10,17 @@
 //! Usage: `reflex system1 <path-to-gguf> <prompt> --candidate <text>
 //! [--candidate <text> ...] [--temperature T] [--lora <adapter.gguf>]`
 //!
+//! **Phase breakdown** (same fields/rationale as `reflex generate`'s -- see
+//! that binary's doc comment; added here so the TypeSafe Jev warm-vs-cold
+//! comparison in HISTORY.md can be re-run with a real per-phase split
+//! instead of guessing from the aggregate number): the `REFLEX_SYSTEM1_OK`
+//! line also reports `gguf_open_ms`, `cuda_init_ms`, `model_load_ms`, and
+//! `prompt_eval_ms` (the single-pass scoring forward pass, including any
+//! `--lora` application time -- same bucketing asymmetry `generate.rs`
+//! already has, not a new inconsistency). `scripts/
+//! bench_cold_start_phases_system1.sh` runs this N times and reports
+//! per-phase p50/p95 across runs, mirroring `bench_cold_start_phases.sh`.
+//!
 //! Exits via `reflex_engine::fast_exit` after printing the result instead
 //! of returning from `run` normally -- see that function's doc comment for
 //! why a graceful return costs several extra seconds of CUDA-context-
@@ -63,11 +74,15 @@ pub fn run(args: Vec<String>) {
 
     let file =
         GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
+    let gguf_open_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
+    let cuda_init_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms;
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }
     let mut model = Model::load(device, &file).expect("failed to load model");
+    let model_load_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms - cuda_init_ms;
+    let model_ready_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     if let Some(lora_path) = &lora_path {
         let applied = model
@@ -83,6 +98,7 @@ pub fn run(args: Vec<String>) {
     let response = model
         .system1_evaluate(&prompt, &candidates, temperature)
         .expect("system1_evaluate failed");
+    let prompt_eval_ms = t0.elapsed().as_secs_f64() * 1000.0 - model_ready_ms;
 
     for (idx, (result, probability)) in response
         .results
@@ -110,7 +126,7 @@ pub fn run(args: Vec<String>) {
 
     let elapsed = t0.elapsed();
     println!(
-        "REFLEX_SYSTEM1_OK process_start_to_result_ms={:.3} num_candidates={} best_idx={best_idx} best_text={:?} entropy={:.6}",
+        "REFLEX_SYSTEM1_OK process_start_to_result_ms={:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} num_candidates={} best_idx={best_idx} best_text={:?} entropy={:.6}",
         elapsed.as_secs_f64() * 1000.0,
         response.results.len(),
         best.text,

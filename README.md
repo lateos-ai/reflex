@@ -168,6 +168,42 @@ CUDA-init overhead vs. bare metal?) and persistent-vs-`exec`'d rows (does keepin
 one-shot-process model doesn't already show?) — both real, specific, harder-to-answer
 questions than the phase breakdown itself, deliberately scoped out of this round.
 
+### Warm-latency perf round: decode throughput, lazy weight residency, lazy dequant
+
+A follow-up round targeted `system1`'s warm-latency decode path and the cold-load
+phase above, real-hardware-verified on an AWS EC2 `g4dn.xlarge` (Tesla T4):
+
+- **`gemv`/`gemv_gather` rewritten to warp-per-row** (one warp per output row instead
+  of one thread, `__shfl_down_sync` for the reduction) — **~4.9x decode-throughput
+  improvement** (15.4 → 74.8 tok/s at a 29-token prompt bucket).
+- **Lazy `lm_head` for tied-embedding dense/MoE models** — `system1` only ever gathers
+  a handful of candidate-token rows, so forcing the whole `[hidden_size, vocab_size]`
+  matrix device-resident at load time was wasted work for that path. Deferred until an
+  actual full-vocab call needs it; dropped GPU-resident bytes by the predicted **~608
+  MiB** and improved cold-start too.
+- **Pipelined model load** — each tensor's raw quantized bytes now stage through
+  pinned host memory and upload asynchronously on a forked copy stream, overlapping
+  tensor N+1's transfer with tensor N's on-GPU dequant kernel. This profiling pass is
+  also what found the next item below: **`token_embd`'s host-side dequant turned out
+  to be ~548ms, 63% of `model_load_ms`** — the single largest piece of cold-start time
+  anywhere in the engine, dwarfing what pipelining alone could reach.
+- **Lazy/partial `token_embd` dequant** — the embedding table is now decoded one row
+  at a time, on first gather, instead of the entire vocab up front (the same trick
+  already applied to `lm_head` above), since a prompt's embedding lookup only ever
+  touches a handful of rows. `model_load_ms` p50 **868.1ms → 410.3ms (-53%)**, total
+  cold start **1084.2ms → 627.3ms (-42%)** for `reflex system1` — the largest single
+  win in this project's cold-start history, with zero numeric drift (every golden
+  token stayed byte-identical across dense/MoE/hybrid/MLA).
+
+**Honestly-reported trade-off, not smoothed over**: that last win doesn't reach
+`reflex generate` on a *tied*-embedding model (no separate `output.weight` tensor) —
+`generate` always needs the full vocab for its first-token logits, so the dequant cost
+isn't eliminated for that caller, only moved from `model_load_ms` to `prompt_eval_ms`,
+and a small fixed raw-byte-copy tax paid at load becomes pure overhead on top —
+measured **~110ms (~9%) slower** total for that specific case. `system1`, and any
+`generate` call on a model with its own separate `output.weight` (no tied-embedding
+full-vocab pass to force), get the full win with no offsetting cost.
+
 ## Core technical bet
 
 Every CUDA kernel is compiled **ahead of time** (`build.rs` invokes `nvcc`, see
