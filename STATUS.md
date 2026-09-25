@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
 short, current-state summary; HISTORY.md is the log.
 
-_Last updated: 2026-09-24 (sidecar now renders the GGUF's own `tokenizer.chat_template` instead of generic flattening, and a real special-token tokenization gap in the core engine this surfaced is fixed; previous update: OpenAI-compatible `/v1/chat/completions` HTTP sidecar built, `sidecar/openai-adapter` — the escape-hatch pattern README's Non-goals section described but had left unbuilt)_
+_Last updated: 2026-09-25 (`reflex generate` reports a per-phase cold-start breakdown — CUDA init/model load/prompt eval, p50/p95 across N runs via new `scripts/bench_cold_start_phases.sh` — in response to real Reddit feedback; previous update: sidecar now renders the GGUF's own `tokenizer.chat_template` instead of generic flattening, and a real special-token tokenization gap in the core engine this surfaced is fixed)_
 
 ## MVP progress
 
@@ -764,3 +764,15 @@ and Linux (the verification instance).
   `message.content` when generation stops on it. AWS resources (the
   `g4dn.xlarge`, its throwaway SSM-only IAM role/instance profile) were fully
   torn down after verification.
+- **Cold-start phase breakdown added** (2026-09-25, real Reddit feedback --
+  see HISTORY.md's "Cold-start phase breakdown" entry): `reflex generate`
+  reports `gguf_open_ms`/`cuda_init_ms`/`model_load_ms`/`prompt_eval_ms`; new
+  `scripts/bench_cold_start_phases.sh` runs N cold processes and reports
+  p50/p95 per phase. Real-hardware-verified on a ThunderCompute L40, n=30
+  (10+20 runs): CUDA init small/stable (417.9ms/542.6ms p50/p95), model load
+  dominates and is the least stable phase, session-to-session variance
+  exceeded intra-session variance in this round's own two batches -- disclosed
+  in README.md's new "Cold-start phase breakdown" subsection rather than
+  smoothed over. **Still open, not yet attempted**: host-vs-container/cgroup
+  rows and a persistent-vs-`exec`'d row (both specifically requested,
+  deliberately scoped out of this round to avoid a multi-day detour).

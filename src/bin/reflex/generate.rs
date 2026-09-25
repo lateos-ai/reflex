@@ -3,6 +3,23 @@
 //! time from process start to the first generated token -- the project's
 //! actual target metric.
 //!
+//! **Phase breakdown** (requested by real user feedback -- a single aggregate
+//! number hides where the time actually goes): the `REFLEX_GENERATE_OK` line
+//! also reports `gguf_open_ms` (mmap + header/metadata parse), `cuda_init_ms`
+//! (`CudaDevice::new` -- driver init + primary context creation), `model_load_ms`
+//! (dequantize-and-upload every weight tensor), and `prompt_eval_ms` (forward
+//! pass through the prompt to the first sampled token) -- each a delta between
+//! consecutive `Instant::now()` checkpoints around the corresponding call, not
+//! an independently-measured wall clock. **Deliberately not included: a
+//! "process launch" phase.** That covers OS `exec`/dynamic-linking/CRT init
+//! *before* `main()` runs at all, which nothing inside this process can
+//! observe -- get it the same way this project's own README benchmark table
+//! already does, by wrapping the whole process in an external timer
+//! (`/usr/bin/time -v`, `hyperfine`, etc.) and subtracting
+//! `process_start_to_first_token_ms` from that external total.
+//! `scripts/bench_cold_start_phases.sh` runs this N times and reports
+//! per-phase p50/p95 across runs.
+//!
 //! Exits via `reflex_engine::fast_exit` after printing the result instead
 //! of returning from `run` normally -- see that function's doc comment for
 //! why a graceful return costs several extra seconds of CUDA-context-
@@ -177,11 +194,15 @@ pub fn run(args: Vec<String>) {
 
     let file =
         GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
+    let gguf_open_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
+    let cuda_init_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms;
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }
     let mut model = Model::load(device, &file).expect("failed to load model");
+    let model_load_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms - cuda_init_ms;
+    let model_ready_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     if let Some(lora_path) = &lora_path {
         let applied = model
@@ -231,8 +252,9 @@ pub fn run(args: Vec<String>) {
             }
         };
         let elapsed = t0.elapsed();
+        let prompt_eval_ms = elapsed.as_secs_f64() * 1000.0 - model_ready_ms;
         println!(
-            "REFLEX_GENERATE_OK process_start_to_first_token_ms={:.3} token_id={token_id} token_text={text:?}",
+            "REFLEX_GENERATE_OK process_start_to_first_token_ms={:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} token_id={token_id} token_text={text:?}",
             elapsed.as_secs_f64() * 1000.0
         );
         reflex_engine::fast_exit(0);
@@ -256,10 +278,11 @@ pub fn run(args: Vec<String>) {
         )
         .expect("generate failed");
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let prompt_eval_ms = first_token_ms.unwrap_or(total_ms) - model_ready_ms;
 
     let token_ids: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
     println!(
-        "REFLEX_GENERATE_OK process_start_to_first_token_ms={:.3} process_start_to_last_token_ms={:.3} num_generated={} token_id={} token_ids=[{}] token_text={text:?}",
+        "REFLEX_GENERATE_OK process_start_to_first_token_ms={:.3} process_start_to_last_token_ms={:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} num_generated={} token_id={} token_ids=[{}] token_text={text:?}",
         first_token_ms.unwrap_or(total_ms),
         total_ms,
         tokens.len(),

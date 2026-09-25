@@ -1919,3 +1919,83 @@ stops on it, instead of being stripped the way a real OpenAI API would.
 (`REFLEX_SKIP_CUDA=1` locally, full CUDA build on the GPU instance) and the sidecar
 crate. The `g4dn.xlarge` instance and its throwaway IAM role/instance profile were both
 torn down at the end of this round — nothing billable left running.
+
+### Cold-start phase breakdown (2026-09-25)
+
+Real, specific feedback from this project's own Reddit thread (u/verstands: "One
+benchmark I'd love to see is p50/p95 time-to-first-token split into process launch,
+model load, CUDA init, and prompt eval... it should show where AOT buys most of the
+win"; u/Flimsy_Homework_3344 followed up asking about host-vs-container/cgroup
+overhead and persistent-vs-`exec`'d kernel costs) pointed at a real, previously-
+unaddressed gap: `reflex generate`/`smoke` only ever reported one aggregate
+`process_start_to_first_token_ms` number, with no way to see which phase actually
+dominates it.
+
+**Instrumentation** (`src/bin/reflex/generate.rs`): four new fields on the
+`REFLEX_GENERATE_OK` line — `gguf_open_ms`, `cuda_init_ms`, `model_load_ms`,
+`prompt_eval_ms` — each a delta between `Instant::now()` checkpoints already sitting
+at the right call sites (`GgufFile::open`, `diagnostics::init_device_with_diagnostics`,
+`Model::load`, the existing first-token sampling callback). Purely additive to the
+existing line, so nothing that already parses `process_start_to_first_token_ms=...`
+breaks. Deliberately does *not* attempt a "process launch" field — that covers OS
+`exec`/dynamic-linking/CRT init before `main()` runs, which nothing inside the process
+can observe; the doc comment points at the existing external-wall-clock-minus-
+internal-timer pattern this project's own README benchmark table already uses instead
+of inventing a new one.
+
+**`scripts/bench_cold_start_phases.sh`** (new): runs `reflex generate` N times (each a
+genuinely fresh cold process, matching this project's whole reason for existing) via
+the existing `bench_cold_common.sh` harness (external `/usr/bin/time -v`, raw
+stdout/time logs kept per run under `bench-results/`, reused rather than reinvented),
+parses each run's phase fields plus its external wall clock, and reports p50/p95 per
+phase via a pure `awk`+`sort` nearest-rank percentile (no `python`, matching this
+project's established CLI-first/shell-script convention for benchmark tooling). The
+percentile math and field-parsing were unit-verified against hand-built synthetic
+`stdout_N.log`/`time_N.log` fixtures before ever touching real GPU hardware — same
+"cheap check first" posture as the chat-template round immediately above.
+
+**Real-hardware run**: a fresh ThunderCompute L40 (46GB VRAM). Worth recording two new
+`tnr`-specific gotchas, since this project's prior ThunderCompute rounds used
+`tnr connect`'s SSH pass-through but never hit these: (1) `tnr create` **does not
+validate flag combinations before provisioning** — running it in a shell loop over
+four GPU types to find one with capacity actually created three separate real
+instances (a100xl, l40, h100) before the fourth (unsupported `t4`) finally errored,
+rather than failing fast on the first bad attempt; caught within about a minute and
+the two extras deleted, but a real lesson for next time: `tnr create` one GPU type at
+a time, check `tnr status` before trying a second. (2) **`tnr connect`'s SSH session
+is PTY-backed, and a large burst of piped stdin (a multi-hundred-line heredoc, e.g. a
+base64-embedded patch) races the terminal's line processing** — lines arrive faster
+than the remote shell can execute and echo them, and the PTY garbles/reorders the
+input instead of running it sequentially (unlike the AWS-RunShellScript pattern the
+chat-template round above used, which executes a real script server-side with no PTY
+involved). Fix: never pipe more than one command line through `tnr connect`'s stdin —
+upload any real script via `tnr scp` first, then pipe exactly one `bash script.sh`
+invocation through `connect`.
+
+**Results, n=30** (10-run then 20-run back-to-back batches, same
+`Qwen3-0.6B-Q8_0.gguf`): CUDA init stayed small and stable (417.9ms p50 / 542.6ms p95)
+regardless of the two batches' otherwise-different noise levels — exactly where the
+AOT-compiled-kernel bet is supposed to show up, no NVRTC JIT tax hiding in this phase.
+Model load dominates total time (2635.7ms p50 / 4954.3ms p95) and was also the least
+stable phase: the second batch (20 runs) ran systematically slower across *every* run
+than the first batch (10 runs), not just a single cold-disk-cache outlier in run 1 of
+the first batch (which was itself separately confirmed by inspecting raw per-run
+model_load_ms values — 4175ms for run 1 vs. 1997–2650ms for runs 2–10 of that batch).
+Reported honestly rather than cherry-picking the calmer batch: **session-to-session
+variance on a shared rented GPU instance can exceed intra-session variance** — a
+real, disclosed limitation of single-session cold-start numbers (including every
+number in this README's existing benchmark table), not something this round's own
+new numbers get to claim exemption from.
+
+**What's deliberately still open**, matching Flimsy_Homework_3344's actual ask rather
+than quietly substituting an easier question: host-vs-container/cgroup rows (does the
+NVIDIA Container Toolkit/device-plugin resource limiting change CUDA-init overhead
+vs. bare metal?) and a persistent-vs-`exec`'d row (does keeping one `reflex` process
+warm change anything the current one-shot-process model doesn't already show?) —
+both real follow-up benchmark rounds, not code changes, deliberately not attempted in
+this pass to avoid the multi-day-detour trap of trying to answer every question in
+one round.
+
+ThunderCompute instance (and the two accidentally-created extras) all deleted at the
+end of this round — total real spend approximately $0.25–0.30 across the mis-click
+and the real ~33-minute L40 session, at ThunderCompute's $0.35/hr L40 rate.
