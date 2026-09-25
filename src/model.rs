@@ -150,6 +150,37 @@ struct Weight {
     shape: Vec<u64>,
 }
 
+/// The LM head, dense/MoE `Model::load` only (`load_hybrid`/`load_mla` still
+/// always use `Resident` -- this laziness is scoped to the one path
+/// `system1_evaluate` actually needs it for, not a general Model change).
+///
+/// A tied-embedding model (no separate `output.weight` tensor) used to
+/// eagerly re-upload `token_embd`'s already-dequantized host bytes as a
+/// second, full `[hidden_size, vocab_size]` device copy at load time --
+/// unconditionally, even for a `reflex system1` run that only ever gathers a
+/// handful of candidate rows via `Self::gemv_gather`. For `Qwen3-0.6B`
+/// (vocab 151936 x hidden 1024 x 4 bytes), that's ~594 MiB uploaded and
+/// resident for nothing. `TiedLazy` defers that upload until something
+/// actually needs the *full* matrix (`Self::lm_head_resident`, used by
+/// `Self::lm_head_logits`'s full-vocab GEMV) -- `system1_evaluate`'s gather
+/// path (`Self::gemv_gather_lm_head`) instead uploads only the requested
+/// rows straight from the host-resident `token_embd`, and never forces the
+/// full upload at all.
+enum LmHead {
+    /// A real separate `output.weight` tensor, or a tied model whose full
+    /// matrix some earlier full-vocab call already forced resident.
+    Resident(Weight),
+    /// Tied to `token_embd`, not yet forced fully resident. `shape` is
+    /// `output.weight`'s GGUF shape (`[hidden_size, vocab_size]`), needed
+    /// before the upload happens; `token_embd`'s host bytes (row-major
+    /// `(vocab_size, hidden_size)`, same layout `output.weight` would have)
+    /// are the source of truth until `Self::lm_head_resident` is called.
+    TiedLazy {
+        shape: Vec<u64>,
+        cell: std::sync::OnceLock<Weight>,
+    },
+}
+
 /// GGUF super-block sizes for the block types dequantized on-device
 /// (`src/kernels_cuda/dequant.cu`, Phase 2 round 3 for Q4_K/Q6_K, extended to
 /// Q5_K post-MVP) -- must match `dequant.rs`'s `QK_K` and the block-byte-size
@@ -1294,7 +1325,7 @@ pub struct Model {
     /// memory once, as `lm_head`, rather than dequantizing them twice.
     token_embd: Vec<f32>,
     output_norm: Weight,
-    lm_head: Weight,
+    lm_head: LmHead,
     tokenizer: Tokenizer,
     /// `Some` iff this is a Qwen3.5 hybrid model (see `Self::load_hybrid`);
     /// `cfg`/`layers`/`expert_used_count` above are unused garbage in that
@@ -1721,8 +1752,11 @@ impl Model {
         let output_norm = load_weight("output_norm.weight")?;
 
         // Tied-embedding models have no separate `output.weight` tensor --
-        // reuse `token_embd`'s already-dequantized host bytes for the LM
-        // head's device upload instead of dequantizing them a second time.
+        // rather than eagerly re-uploading `token_embd`'s already-dequantized
+        // host bytes as a second full device copy (wasted work for a
+        // `reflex system1` run, which only ever gathers a handful of rows --
+        // see `LmHead`'s doc comment), defer that upload until something
+        // actually needs the full matrix.
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
@@ -1734,20 +1768,15 @@ impl Model {
                     info.element_count(),
                 )
                 .map_err(|e| format!("load weight 'output.weight': {e}"))?;
-                Weight {
+                LmHead::Resident(Weight {
                     data,
                     shape: info.shape.clone(),
-                }
+                })
             }
-            None => {
-                let data = device
-                    .htod_sync_copy(&token_embd)
-                    .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
-                Weight {
-                    data,
-                    shape: token_embd_info.shape.clone(),
-                }
-            }
+            None => LmHead::TiedLazy {
+                shape: token_embd_info.shape.clone(),
+                cell: std::sync::OnceLock::new(),
+            },
         };
 
         let tokenizer = Tokenizer::from_gguf(file)?;
@@ -2026,6 +2055,11 @@ impl Model {
 
         let output_norm = load_weight("output_norm.weight")?;
 
+        // Unlike dense/MoE `Model::load`, this path keeps the tied case
+        // eager (`LmHead::Resident`, not `TiedLazy`) -- `system1_evaluate`
+        // (the only caller the laziness optimization targets) already
+        // rejects hybrid/MLA models outright, so there's no lazy-gather
+        // win to have here, only a type to match `Model::lm_head`'s field.
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
@@ -2037,19 +2071,19 @@ impl Model {
                     info.element_count(),
                 )
                 .map_err(|e| format!("load weight 'output.weight': {e}"))?;
-                Weight {
+                LmHead::Resident(Weight {
                     data,
                     shape: info.shape.clone(),
-                }
+                })
             }
             None => {
                 let data = device
                     .htod_sync_copy(&token_embd)
                     .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
-                Weight {
+                LmHead::Resident(Weight {
                     data,
                     shape: token_embd_info.shape.clone(),
-                }
+                })
             }
         };
 
@@ -2290,6 +2324,11 @@ impl Model {
 
         let output_norm = load_weight("output_norm.weight")?;
 
+        // Unlike dense/MoE `Model::load`, this path keeps the tied case
+        // eager (`LmHead::Resident`, not `TiedLazy`) -- `system1_evaluate`
+        // (the only caller the laziness optimization targets) already
+        // rejects hybrid/MLA models outright, so there's no lazy-gather
+        // win to have here, only a type to match `Model::lm_head`'s field.
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
@@ -2301,19 +2340,19 @@ impl Model {
                     info.element_count(),
                 )
                 .map_err(|e| format!("load weight 'output.weight': {e}"))?;
-                Weight {
+                LmHead::Resident(Weight {
                     data,
                     shape: info.shape.clone(),
-                }
+                })
             }
             None => {
                 let data = device
                     .htod_sync_copy(&token_embd)
                     .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
-                Weight {
+                LmHead::Resident(Weight {
                     data,
                     shape: token_embd_info.shape.clone(),
-                }
+                })
             }
         };
 
@@ -4775,7 +4814,7 @@ impl Model {
             self.cfg.rmsnorm_eps,
         )?;
         let first_tokens: Vec<u32> = resolved.iter().map(|ids| ids[0]).collect();
-        let mut scores = self.gemv_gather(&normed, &self.lm_head, &first_tokens)?;
+        let mut scores = self.gemv_gather_lm_head(&normed, &first_tokens)?;
 
         // Multi-token candidates: teacher-forced continuation, reusing the
         // shared post-prompt KV headroom sequentially per candidate (safe
@@ -4796,7 +4835,7 @@ impl Model {
                     self.cfg.hidden_size,
                     self.cfg.rmsnorm_eps,
                 )?;
-                scores[i] += self.gemv_gather(&normed_step, &self.lm_head, &[next])?[0];
+                scores[i] += self.gemv_gather_lm_head(&normed_step, &[next])?[0];
             }
         }
 
@@ -4880,10 +4919,91 @@ impl Model {
         eps: f32,
     ) -> Result<Vec<f32>, String> {
         let normed = self.rmsnorm(hidden, &self.output_norm.data, 1, hidden_size, eps)?;
-        let logits_dev = self.gemv(&normed, &self.lm_head)?;
+        let logits_dev = self.gemv(&normed, self.lm_head_resident()?)?;
         self.device
             .dtoh_sync_copy(&logits_dev)
             .map_err(|e| format!("logits dtoh: {e}"))
+    }
+
+    /// Forces the LM head fully device-resident, uploading `token_embd`'s
+    /// already-dequantized host bytes if it hasn't been already (see
+    /// [`LmHead`]'s doc comment) -- needed by [`Self::lm_head_logits`], which
+    /// (unlike [`Self::gemv_gather_lm_head`]) genuinely needs every vocab
+    /// row. A no-op past the first call (`Resident`, or a `TiedLazy` some
+    /// earlier call already forced): `OnceLock::get`/`set` rather than the
+    /// still-unstable `get_or_try_init`, safe without a race check because
+    /// this project never runs more than one request at a time (`batch_size`
+    /// is a permanent constraint, see CLAUDE.md's Non-goals) -- there is
+    /// never a second caller to race against.
+    fn lm_head_resident(&self) -> Result<&Weight, String> {
+        match &self.lm_head {
+            LmHead::Resident(w) => Ok(w),
+            LmHead::TiedLazy { shape, cell } => {
+                if let Some(w) = cell.get() {
+                    return Ok(w);
+                }
+                let data = self
+                    .device
+                    .htod_sync_copy(&self.token_embd)
+                    .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
+                let _ = cell.set(Weight {
+                    data,
+                    shape: shape.clone(),
+                });
+                Ok(cell.get().expect("just set"))
+            }
+        }
+    }
+
+    /// [`Self::gemv_gather`], but for the LM head specifically -- avoids
+    /// forcing a still-lazy tied LM head fully device-resident just to
+    /// gather a handful of rows (System1's whole reason for existing; see
+    /// [`LmHead`]'s doc comment). If the LM head is already fully resident
+    /// (a real `output.weight` tensor, or a tied one some earlier full-vocab
+    /// call already forced), this is exactly [`Self::gemv_gather`] with no
+    /// extra cost. Otherwise, uploads only the requested rows -- typically a
+    /// handful of candidate tokens, a few KB, not the full matrix's hundreds
+    /// of MB -- straight from the host-resident `token_embd` bytes (same
+    /// row-major `(vocab_size, hidden_size)` layout `output.weight` would
+    /// have, since they're the same tensor when tied), then reuses
+    /// `gemv_gather_kernel` against that compact buffer with trivial indices
+    /// `0..row_indices.len()` (the buffer already IS exactly the selected
+    /// rows, in order) -- same kernel, same math, just a much smaller upload.
+    fn gemv_gather_lm_head(
+        &self,
+        x: &CudaSlice<f32>,
+        row_indices: &[u32],
+    ) -> Result<Vec<f32>, String> {
+        let (shape, cell) = match &self.lm_head {
+            LmHead::Resident(w) => return self.gemv_gather(x, w, row_indices),
+            LmHead::TiedLazy { shape, cell } => (shape, cell),
+        };
+        if let Some(w) = cell.get() {
+            return self.gemv_gather(x, w, row_indices);
+        }
+
+        let hidden_size = shape[0] as usize;
+        let vocab_size = shape[1] as usize;
+        if let Some(&bad) = row_indices.iter().find(|&&r| r as usize >= vocab_size) {
+            return Err(format!(
+                "gemv_gather_lm_head: row index {bad} out of range (vocab_size={vocab_size})"
+            ));
+        }
+        let mut compact = Vec::with_capacity(row_indices.len() * hidden_size);
+        for &r in row_indices {
+            let base = r as usize * hidden_size;
+            compact.extend_from_slice(&self.token_embd[base..base + hidden_size]);
+        }
+        let dev_compact = self
+            .device
+            .htod_sync_copy(&compact)
+            .map_err(|e| format!("gemv_gather_lm_head upload compact rows: {e}"))?;
+        let compact_w = Weight {
+            data: dev_compact,
+            shape: vec![hidden_size as u64, row_indices.len() as u64],
+        };
+        let trivial_indices: Vec<u32> = (0..row_indices.len() as u32).collect();
+        self.gemv_gather(x, &compact_w, &trivial_indices)
     }
 
     /// `pub(crate)` (not private) so [`crate::sampling::sample`]'s greedy
@@ -7587,10 +7707,11 @@ mod system1_tests {
             )
             .expect("rmsnorm failed");
 
-        let full = model.gemv(&normed, &model.lm_head).expect("gemv failed");
+        let lm_head = model.lm_head_resident().expect("lm_head_resident failed");
+        let full = model.gemv(&normed, lm_head).expect("gemv failed");
         let full_host = model.device.dtoh_sync_copy(&full).expect("dtoh failed");
 
-        let vocab_size = model.lm_head.shape[1] as usize;
+        let vocab_size = lm_head.shape[1] as usize;
         let argmax_id = full_host
             .iter()
             .enumerate()
@@ -7605,7 +7726,7 @@ mod system1_tests {
         ];
 
         let gathered = model
-            .gemv_gather(&normed, &model.lm_head, &row_indices)
+            .gemv_gather(&normed, lm_head, &row_indices)
             .expect("gemv_gather failed");
 
         for (j, &row) in row_indices.iter().enumerate() {
@@ -7614,6 +7735,67 @@ mod system1_tests {
             assert!(
                 (expected - got).abs() < 1e-4,
                 "row {row}: full_vocab={expected}, gathered={got}"
+            );
+        }
+    }
+
+    /// Byte-exact (to `gemv`'s own tolerance) check for the actual new code
+    /// path the lazy-`LmHead` optimization added: `gemv_gather_lm_head`
+    /// called on a *freshly loaded* model, before anything has forced the
+    /// tied LM head fully device-resident, must still return the same
+    /// values a full-vocab `gemv` against the forced-resident matrix would.
+    /// This is the case `gemv_gather_matches_full_vocab_gemv_at_matching_rows`
+    /// above can no longer exercise on its own, since it (correctly) calls
+    /// `lm_head_resident()` first to get the comparison baseline -- by the
+    /// time it calls `gemv_gather`, the lazy path has already been forced
+    /// resident once, so `gemv_gather_lm_head` would take the fast
+    /// already-resident branch instead of the still-lazy compact-upload one
+    /// this test targets. Requires a real *tied-embedding* GGUF (no separate
+    /// `output.weight` tensor) to actually exercise `LmHead::TiedLazy` at
+    /// all -- `#[ignore]`d, `REFLEX_TEST_GGUF`-gated like its sibling above.
+    #[test]
+    #[ignore]
+    fn gemv_gather_lm_head_matches_full_vocab_gemv_while_still_lazy() {
+        let gguf_path = std::env::var("REFLEX_TEST_GGUF")
+            .expect("set REFLEX_TEST_GGUF to a real local GGUF path to run this test");
+        let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
+        let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+        let model = Model::load(device, &file).expect("failed to load model");
+
+        let (_, hidden, _, _, _) = model
+            .prefill_dense("The capital of France is", None, 0)
+            .expect("prefill_dense failed");
+        let normed = model
+            .rmsnorm(
+                &hidden,
+                &model.output_norm.data,
+                1,
+                model.cfg.hidden_size,
+                model.cfg.rmsnorm_eps,
+            )
+            .expect("rmsnorm failed");
+
+        let vocab_size = model.token_embd.len() / model.cfg.hidden_size;
+        let row_indices = [0u32, 1u32, (vocab_size / 2) as u32, (vocab_size - 1) as u32];
+
+        // Exercise the still-lazy path FIRST -- calling `lm_head_resident()`
+        // (directly or via `gemv`) before this would force residency and
+        // make `gemv_gather_lm_head` silently take its already-resident fast
+        // path instead, defeating the point of this test.
+        let gathered_lazy = model
+            .gemv_gather_lm_head(&normed, &row_indices)
+            .expect("gemv_gather_lm_head (lazy) failed");
+
+        let lm_head = model.lm_head_resident().expect("lm_head_resident failed");
+        let full = model.gemv(&normed, lm_head).expect("gemv failed");
+        let full_host = model.device.dtoh_sync_copy(&full).expect("dtoh failed");
+
+        for (j, &row) in row_indices.iter().enumerate() {
+            let expected = full_host[row as usize];
+            let got = gathered_lazy[j];
+            assert!(
+                (expected - got).abs() < 1e-4,
+                "row {row}: full_vocab={expected}, gathered_lazy={got}"
             );
         }
     }

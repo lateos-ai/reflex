@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
 short, current-state summary; HISTORY.md is the log.
 
-_Last updated: 2026-09-25 (TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry. Previous update: `reflex generate` reports a per-phase cold-start breakdown — CUDA init/model load/prompt eval, p50/p95 across N runs via new `scripts/bench_cold_start_phases.sh` — in response to real Reddit feedback; before that: sidecar now renders the GGUF's own `tokenizer.chat_template` instead of generic flattening, and a real special-token tokenization gap in the core engine this surfaced is fixed)_
+_Last updated: 2026-09-25 (started a ranked plan to close the remaining warm-latency gap to TypeSafe Jev — see "Planned next work: warm-latency perf vs. TypeSafe Jev" below; items 3 (lazy `LmHead` for tied dense/MoE models, avoids System1 forcing the full ~594 MiB LM-head matrix resident) and 4 (`reflex system1` phase breakdown, matching `reflex generate`'s) are code-complete, compiling/testing clean under `REFLEX_SKIP_CUDA=1`, not yet run on real GPU hardware. Previous update: TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry. Before that: `reflex generate` reports a per-phase cold-start breakdown — CUDA init/model load/prompt eval, p50/p95 across N runs via new `scripts/bench_cold_start_phases.sh` — in response to real Reddit feedback)_
 
 ## MVP progress
 
@@ -323,6 +323,79 @@ Adapters`/`-9B-` remain untested: confirmed (via HF page text, not yet its own
 safetensors header) to target MoE's per-expert routed-expert projections, which really
 does need new per-expert-slice delta math beyond a widened accept list, plus a much
 larger model — left for a future round.
+
+## Planned next work: warm-latency perf vs. TypeSafe Jev (2026-09-25)
+
+Following the AWS EC2 T4 re-verification of the Jev citation (see HISTORY.md's
+"TypeSafe Jev re-verification on real AWS EC2 T4" entry), analyzed where
+System1's warm 20.9ms (shortest bucket) actually goes, using only numbers
+already on record (no profiler needed):
+
+- System1 @29 tok = 20.9ms vs. `forward_prompt` @29 tok = 27.5ms — the 6.6ms
+  delta is exactly the extra full-vocab GEMV over the 594 MiB `lm_head`, so
+  System1's 20.9ms is **entirely the 28-layer batched prefill**.
+- ~1.84GB of layer weights read once per pass in 20.9ms ≈ **88 GB/s** — a T4
+  peaks at 320 GB/s, so this is **~28% of peak, memory-bandwidth-bound**, not
+  launch-overhead-bound (cudarc 0.11.9's allocator is stream-ordered async,
+  ~500 kernel launches/pass is only ~2-3ms — ruled out as the bottleneck).
+- The plain decode-path `gemv_kernel` (`kernels_cuda/gemv.cu`) is scalar,
+  one thread per output row — decode's 65ms/token ≈ 28 GB/s ≈ **9% of peak**,
+  the worst number in the whole benchmark.
+- `Model::load`'s tied-embedding branch uploaded the *entire* ~594 MiB
+  `token_embd`-as-`lm_head` matrix even for a `reflex system1` run that only
+  ever gathers a handful of candidate rows — pure waste for that path.
+
+Ranked plan (payoff vs. risk), **items 3+4 started 2026-09-25**:
+
+1. **f16 weight residency + `cublasGemmEx`/tensor-core GEMM** — est. 20.9ms →
+   ~10-12ms, ~halves VRAM and cold-load bytes too. Largest win, but changes
+   numerics: every golden token in this file and `reflex check`'s whole
+   byte-exact-vs-llama.cpp methodology assumes f32 greedy argmax. **Needs a
+   DECISIONS.md entry and a deliberate call before starting** — not free,
+   not started.
+2. **Rewrite `gemv_kernel`**: warp-per-row + vectorized loads + shuffle
+   reduction. Est. decode 65ms/tok → ~15-20ms/tok. Medium effort, low risk
+   (verify byte-exactness holds under the new reduction order) — not started.
+3. **Lazy `lm_head` for tied dense/MoE models** — `system1_evaluate` gathers
+   a handful of rows straight from host-resident `token_embd` instead of
+   forcing the full matrix device-resident; the full upload is now deferred
+   until an actual full-vocab call needs it (`generate`/`forward_prompt`,
+   unaffected). **Done, 2026-09-25**: `LmHead` enum (`Resident`/`TiedLazy`)
+   in `src/model.rs`, `Model::lm_head_resident`/`Model::gemv_gather_lm_head`,
+   scoped to dense/MoE `Model::load` only (`load_hybrid`/`load_mla` untouched
+   — `system1_evaluate` already rejects those architectures, so there's no
+   win to have there). New test
+   `gemv_gather_lm_head_matches_full_vocab_gemv_while_still_lazy` (real-
+   hardware/`REFLEX_TEST_GGUF`-gated, `#[ignore]`d like its siblings) checks
+   the new lazy compact-upload path against a forced-resident full-vocab
+   `gemv` on real tensor data. Compiles clean and all 85 host-only tests
+   pass under `REFLEX_SKIP_CUDA=1`, `cargo fmt --check`/`cargo clippy
+   --all-targets -- -D warnings` both clean — **not yet run against real GPU
+   hardware** (no CUDA-capable machine in this session); expect ~100-200ms
+   off cold load and ~594 MiB off VRAM for the System1 path specifically,
+   need real-hardware numbers to confirm.
+4. **Phase-instrument `reflex system1`** — it had none of `reflex generate`'s
+   Reddit-feedback-driven phase fields, so the cold-start split for the Jev
+   citation was a guess. **Done, 2026-09-25**: `REFLEX_SYSTEM1_OK` now
+   reports `gguf_open_ms`/`cuda_init_ms`/`model_load_ms`/`prompt_eval_ms`,
+   same fields/bucketing convention as `generate.rs` (see `system1.rs`'s doc
+   comment for the one asymmetry inherited from there: `--lora` apply time
+   lands in `prompt_eval_ms`, not `model_load_ms`). New
+   `scripts/bench_cold_start_phases_system1.sh` mirrors
+   `bench_cold_start_phases.sh` field-for-field. **Not yet run for real** —
+   needs a GPU instance to produce actual numbers, which is the whole point
+   (confirming or refuting the "no GPU-virtualization CUDA-init tax on real
+   EC2" hypothesis HISTORY.md's Jev re-verification entry left open).
+5. **Pipeline model load**: pinned double-buffered staging, async H2D on two
+   streams; `alloc_zeros`→`alloc` for dequant kernel outputs (every element
+   gets overwritten by the kernel, so zeroing first is wasted work). Est.
+   -20-40% of the load phase. Medium effort, low risk — not started.
+
+**Next real step**: get items 3+4 onto a real GPU instance (T4 or otherwise)
+to (a) confirm item 3's actual savings rather than the estimate above, and
+(b) get real `cuda_init_ms`/`model_load_ms` numbers from item 4's
+instrumentation, which decides whether item 1 (f16, the expensive one) is
+worth its verification cost.
 
 ## IPC sampling + streaming (chat-completion-integration prep, done 2026-09-24)
 
