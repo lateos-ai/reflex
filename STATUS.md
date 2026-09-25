@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
 short, current-state summary; HISTORY.md is the log.
 
-_Last updated: 2026-09-25 (items 2/3/4 of the ranked warm-latency-vs-TypeSafe-Jev plan are now real-hardware-verified on a fresh AWS EC2 `g4dn.xlarge` — see "Planned next work: warm-latency perf vs. TypeSafe Jev" below and HISTORY.md's "Real-hardware verification of the warm-latency perf plan" entry for the full numbers: item 2's warp-per-row `gemv_kernel`/`gemv_gather_kernel` rewrite measured a **~4.9x decode-throughput improvement** (15.4 → 74.8 tok/s), item 3's lazy `LmHead` dropped GPU-resident bytes by exactly the predicted ~608 MiB and improved cold-start too, item 4's phase breakdown now reports real, tight p50/p95 numbers. Golden tokens reproduced exactly for dense and hybrid; all 8 relevant internal-consistency oracle tests pass across dense/MoE/hybrid/synthetic-MLA. Only item 1 (f16 weight residency) remains unstarted, deliberately, pending a numerics-methodology decision. Previous update: TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry)_
+_Last updated: 2026-09-25 (items 2/3/4 of the ranked warm-latency-vs-TypeSafe-Jev plan are now real-hardware-verified on a fresh AWS EC2 `g4dn.xlarge` — see "Planned next work: warm-latency perf vs. TypeSafe Jev" below and HISTORY.md's "Real-hardware verification of the warm-latency perf plan" entry for the full numbers: item 2's warp-per-row `gemv_kernel`/`gemv_gather_kernel` rewrite measured a **~4.9x decode-throughput improvement** (15.4 → 74.8 tok/s), item 3's lazy `LmHead` dropped GPU-resident bytes by exactly the predicted ~608 MiB and improved cold-start too, item 4's phase breakdown now reports real, tight p50/p95 numbers. Golden tokens reproduced exactly for dense and hybrid; all 8 relevant internal-consistency oracle tests pass across dense/MoE/hybrid/synthetic-MLA. Item 1 (f16 weight residency) reframed (memory-bandwidth-bound, not tensor-core-FLOP-bound; `CUBLAS_COMPUTE_32F_FAST_16F` for f32 accumulation; land opt-in; do item 5 first) but still unstarted, deliberately, pending a numerics-methodology decision. Previous update: TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry)_
 
 ## MVP progress
 
@@ -347,12 +347,31 @@ already on record (no profiler needed):
 
 Ranked plan (payoff vs. risk), **items 3+4 started 2026-09-25**:
 
-1. **f16 weight residency + `cublasGemmEx`/tensor-core GEMM** — est. 20.9ms →
-   ~10-12ms, ~halves VRAM and cold-load bytes too. Largest win, but changes
-   numerics: every golden token in this file and `reflex check`'s whole
-   byte-exact-vs-llama.cpp methodology assumes f32 greedy argmax. **Needs a
-   DECISIONS.md entry and a deliberate call before starting** — not free,
-   not started.
+1. **f16 weight residency + `cublasGemmEx`** — est. 20.9ms → ~10-12ms, ~halves
+   VRAM and cold-load bytes too. **Reframed 2026-09-25, still not started**:
+   the original framing ("tensor-core GEMM") overstated the mechanism —
+   System1/decode at batch≈1 is memory-bandwidth-bound (confirmed by this
+   session's real measurements: 28-88% of a T4's peak bandwidth, nowhere
+   near compute-bound), so the actual win is **halving bytes moved**, not
+   tensor-core FLOPs. Risk mitigation now concrete rather than hand-waved:
+   use `CUBLAS_COMPUTE_32F_FAST_16F` (f16 storage/math, **f32 accumulation**
+   — confirmed available in the `cudarc` 0.11.9 dependency already in
+   `Cargo.lock`, no version bump needed) everywhere, never full-f16
+   accumulation, to keep summation error close to the existing f32 baseline.
+   **Land it opt-in** (`--fp16` / an env var), not a default flip — every
+   golden token in this file and `reflex check`'s whole byte-exact-vs-
+   llama.cpp methodology assumes f32; don't retroactively invalidate that
+   baseline. A second golden-token set would need establishing for the f16
+   path specifically, compared against llama.cpp's own CUDA build (which
+   already uses reduced-precision kernels for K-quants, so f16-vs-f16 is
+   arguably the fairer comparison, not a weaker one). **Sequencing call**:
+   do item 5 first — it's zero numerics risk, needs no new golden-token
+   verification pass, and item 2 already delivered the outsized win this
+   session (4.9x decode); f16's remaining marginal payoff (~10ms) is
+   smaller than its cost (new kernel variants for every `gemv`/`gemm`/
+   attention op reading a `Weight`, a second verification pass, a
+   DECISIONS.md entry). Still needs a DECISIONS.md entry and a deliberate
+   call before any code is written.
 2. **Rewrite `gemv_kernel`**: warp-per-row + vectorized loads + shuffle
    reduction. Est. decode 65ms/tok → ~15-20ms/tok. **Done, 2026-09-25**: both
    `kernels_cuda/gemv.cu` and `kernels_cuda/gemv_gather.cu` (same anti-pattern,
