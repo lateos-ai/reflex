@@ -782,6 +782,17 @@ HISTORY.md, not just the favorable one — cold-start-to-decision and warm-per-d
 scoring answer genuinely different questions, and reporting only one would be exactly
 the kind of cherry-picking this project's methodology exists to avoid.
 
+**Second addendum**: both citations above were measured on a rented ThunderCompute
+A6000 — the same shared/virtualized environment behind the `fast_exit` regression
+below, raising the question of whether the conclusion was an artifact of that
+specific host. Re-ran both on a real AWS EC2 `g4dn.xlarge` (Tesla T4) and got the
+same qualitative result on independent hardware: cold-start-to-decision still loses
+(though the gap narrows to ~2.5-18x on real dedicated hardware, vs. ~10-60x on
+ThunderCompute), warm scoring stays competitive (~1.4-2.1x vs. ~1.3-2x). See
+HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry for the full
+numbers and the open question of how much of the cold-start gap difference is
+ThunderCompute's GPU-virtualization proxy taxing CUDA init specifically.
+
 ## Fast-exit after printing the benchmark result (`reflex_engine::fast_exit`)
 
 **Decision**: `reflex generate`/`reflex system1`/`reflex smoke` call

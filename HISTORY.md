@@ -1999,3 +1999,97 @@ one round.
 ThunderCompute instance (and the two accidentally-created extras) all deleted at the
 end of this round — total real spend approximately $0.25–0.30 across the mis-click
 and the real ~33-minute L40 session, at ThunderCompute's $0.35/hr L40 rate.
+
+### TypeSafe Jev re-verification on real AWS EC2 T4, both axes (2026-09-25)
+
+Every prior Jev citation (cold and warm) was measured on a rented ThunderCompute
+A6000 — the same shared/virtualized rental environment that caused the earlier
+`fast_exit` CUDA-context-teardown regression. To confirm the Jev comparison's
+conclusion isn't itself an artifact of that environment, re-ran both the cold-start
+and warm-latency citations on a real, dedicated on-demand AWS `g4dn.xlarge` (Tesla
+T4, `sm_75`), the same instance type `docs/aws-deployment.md` already targets.
+
+**Setup, and two new gotchas worth recording**: built natively this time (`nvcc` +
+`cargo`, not through Docker) to get a clean cold-start number with no container
+runtime in the critical path. Picked the `base-with-single-cuda-ubuntu-22.04` DLAMI
+expecting it to ship a CUDA toolkit per its name — **it doesn't**; only the driver
+was present (`nvidia-smi` worked, `nvcc` did not). Installed CUDA 12.6 fresh from
+NVIDIA's own apt repo (`cuda-keyring` + `cuda-toolkit-12-6`) and Rust via `rustup`,
+both straight from scratch on a bare DLAMI, same as this project's established
+ThunderCompute pattern. Separately, `git archive HEAD` on this Windows checkout
+produced CRLF line endings in `scripts/*.sh` (`core.autocrlf` doing its normal
+thing) — invisible until a script actually ran on the Linux instance and failed
+with `line 35: $'\r': command not found`; fixed with `sed -i 's/\r$//' scripts/*.sh`
+after shipping the tree over. Also confirmed the same `Qwen/Qwen3-0.6B-GGUF` repo
+used for the "Entry not found" 404 again — `unsloth/Qwen3-0.6B-GGUF` remains the
+correct source for `Qwen3-0.6B-Q4_K_M.gguf`, consistent with the Q5_K on-device-dequant
+round's finding for a different quant level of the same model. Repo shipped via a
+throwaway S3 bucket + throwaway SSM-only IAM role/instance profile, same minimal
+pattern as the `docker run --gpus all` verification round; both fully torn down
+(instance terminated, bucket/object deleted, IAM role/policy/instance-profile
+deleted) after each of the two runs below, confirmed via a clean `aws ec2
+describe-instances`/`s3api list-buckets`/`iam list-roles` sweep — nothing billable
+left running. **New auto-mode-classifier gotcha, distinct from the known `aws s3
+cp` "Data Exfiltration" block**: `aws iam create-role`/`attach-role-policy`/
+`create-instance-profile`/`add-role-to-instance-profile` are blocked under a
+"Permission Grant" category, even for a throwaway least-privilege SSM-only role in
+the user's own account — same workaround as the S3 case, the user ran those four
+commands themselves.
+
+**Cold** (`scripts/bench_cold_system1_vs_jev.sh`, `n=5`, same
+`Qwen3-0.6B-Q4_K_M.gguf`/prompt/candidates as every prior Jev citation):
+
+| run | internal `process_start_to_result_ms` | external wall clock | peak RSS | user | sys |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1242.609 | 1.37s | 1320 MB | 0.73s | 0.63s |
+| 2 | 1254.330 | 1.38s | 1320 MB | 0.73s | 0.64s |
+| 3 | 1248.231 | 1.37s | 1320 MB | 0.75s | 0.61s |
+| 4 | 1255.863 | 1.38s | 1320 MB | 0.72s | 0.65s |
+| 5 | 1241.866 | 1.37s | 1320 MB | 0.74s | 0.63s |
+
+Internal-metric mean 1248.6ms / median 1248.2ms / min 1241.9ms / max 1255.9ms — a
+14ms spread across 5 runs, tighter than the A6000 round's. Decision output
+byte-identical every run (`" True"` score 9.893751/prob 0.351914, `" False"` score
+10.504386/prob 0.648086, entropy 0.935766).
+
+**Notably narrower gap to Jev than the A6000 citation**: against Jev's published
+70–500ms end-to-end range, this AWS run is **~2.5–18x slower**, vs. the ~10–60x
+figure the original A6000-hosted citation reported for the same comparison. Reflex's
+own cold-start number *dropped* (~1.25s here vs. 4.50–4.78s on the A6000 round),
+even though a T4 is a weaker card than an A6000 — the opposite of what raw compute
+throughput would predict. The likely explanation, **not fully diagnosed in this
+round** (the per-phase `gguf_open_ms`/`cuda_init_ms`/`model_load_ms`/
+`prompt_eval_ms` breakdown from the Reddit-feedback round above wasn't re-run
+here): a real, dedicated EC2 GPU instance has no GPU-virtualization-proxy tax on
+CUDA context init, the same class of overhead `fast_exit`'s `atexit`/teardown fix
+addressed on the *exit* path — this result is consistent with (but doesn't prove)
+that ThunderCompute's shared/virtualized rental environment also inflates the
+*entry*-side CUDA init cost the phase-breakdown round measured at 417.9ms p50 on an
+L40. Worth a real follow-up: `scripts/bench_cold_start_phases.sh` on a real EC2
+instance, to see whether `cuda_init_ms` alone explains the gap.
+
+**Warm** (`reflex bench --warmup 5 --iters 50 --candidate " True" --candidate "
+False"`, same GGUF, three prompt-length buckets, model loaded once —
+`model_resident_mib=2348`, `14807`→`12459` MiB free):
+
+| prompt tokens | forward pass p50/p90/p99/min/max (ms) | decode throughput | System1 p50/p90/p99/min/max (ms) |
+|---:|---|---|---|
+| 29 | 27.540 / 27.667 / 27.805 / 27.327 / 27.805 | 15.385 tok/s, 64.997 ms/tok | 20.906 / 21.021 / 21.112 / 20.600 / 21.112 |
+| 113 | 72.021 / 72.671 / 72.859 / 71.192 / 72.859 | 14.772 tok/s, 67.697 ms/tok | 65.565 / 65.992 / 66.319 / 64.688 / 66.319 |
+| 449 | 391.546 / 392.997 / 394.732 / 389.806 / 394.732 | 13.048 tok/s, 76.643 ms/tok | 387.844 / 388.823 / 389.761 / 384.280 / 389.761 |
+
+Shortest-bucket System1 warm p50 is **20.906ms**, within **~1.4–2.1x** of Jev's
+10–15ms compute figure — a slightly wider multiple than the A6000 round's 19.4ms/
+~1.3–2x (expected: a T4 is the weaker card, and this axis is compute-bound, unlike
+the cold-start axis above), but the same qualitative conclusion: **competitive on
+warm compute, not a loss**, cross-validated on a second GPU vendor/host
+independent of ThunderCompute.
+
+**Overall**: both halves of the Jev citation now hold on two independent rented-GPU
+platforms (ThunderCompute A6000, AWS EC2 T4) — cold-start-to-decision is a real,
+structural loss for self-hosting (though the exact multiple is host-dependent, and
+narrower on real dedicated hardware than on ThunderCompute), warm per-decision
+scoring is consistently competitive within roughly 1.3–2.1x regardless of host.
+Same caveats as every prior Jev mention still apply (published, not independently
+reproduced figures; no decision-quality claim; different deployment models) — see
+DECISIONS.md's "TypeSafe Jev comparison framing" entry.
