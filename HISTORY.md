@@ -2666,3 +2666,75 @@ the IAM role/instance profile) was torn down at the end of the session -- confir
 via a clean sweep before ending. This closes out Phase 4 round 3 (MoE per-expert
 LoRA) entirely -- code-complete AND real-hardware-verified, matching the bar every
 other LoRA round in this project's history has cleared.
+
+
+### Evaluated and not adopted: HySparse2 / DSA-style sparse attention (2026-09-26)
+
+Prompted by a request to assess whether Xiaomi's and DeepSeek's late-2026 long-context
+announcements were relevant to this project. Recording the reasoning because the
+framing those announcements come wrapped in ("the biggest problem in AI") is exactly
+the kind of thing that will come up again, and because the answer is *not* the obvious
+one -- the interesting part isn't "that's a Non-goal", it's that the headline numbers
+are anti-correlated with this project's operating point.
+
+**What was announced.** 2026-09-24, Luo Fuli unveiled **HySparse2**, the architecture
+for Xiaomi's MiMo-V3: two-level KV sharing such that the prefill stage only runs about
+half the model, claimed at **5.02x less prefill compute and 4.5x smaller KV cache at
+1M-token context** versus MiMo-V2.6's Hybrid SWA. Separately, DeepSeek's **DSA**
+(shipped in V3.2-Exp, layered on top of the same MLA this project implemented in MVP
+step 4) splits each attention layer into selection and computation: a lightweight
+"lightning indexer" scores all preceding tokens with a multi-head ReLU-gated dot
+product, takes the top-k, and runs real attention over only those, taking per-layer
+attention from O(L^2) to O(L*k) with **k=2048**. V4.1-Flash adds a causal
+encoder-decoder split (~8B params active during prefill, ~16B during decode). **All of
+these figures are vendor/press-claimed and were not reproduced here** -- they are cited
+to establish what the techniques target, not as measurements this project stands
+behind.
+
+**The problem they solve is a different problem.** All three target long-horizon
+context growth *within a warm session*: an agent loop where each short action returns a
+long observation, the transcript never shrinks, and KV memory plus repeated prefill
+dominate. That is the sustained-serving axis README's Non-goals deliberately cede to
+vLLM. Worth naming the pull explicitly, because the surrounding discourse (cache-read
+pricing, prefix reuse across turns, KV eviction policy) leads directly into the
+in-engine KV-cache-manager / continuous-batching territory that is a permanent
+constraint here, not unclaimed scope.
+
+**The quantitative reason, which is the part worth remembering.** DSA's saving is
+gated on context length: with k=2048, any sequence at or below 2048 tokens selects
+every token it has, so there is no attention work avoided and the indexer pass is pure
+added cost. This project's batched-prefill work was benchmarked at **113 and 449
+prompt tokens** (see the "Batched Prefill GEMM" entry above). At the prompt lengths
+cold start actually runs at, adopting DSA would make Reflex *slower*, not faster --
+which is also why HySparse2's numbers are quoted at 1M context. Sparse attention is a
+technique whose crossover point sits one to three orders of magnitude past this
+engine's operating point. Do not re-evaluate it on the strength of a headline
+multiplier without first checking the crossover length against the prompt sizes
+actually being served.
+
+**One genuine caveat against over-applying that argument**: the crossover reasoning
+covers the *sparse-attention* half only. HySparse2's two-level KV sharing / half-model
+prefill is a structural property of the model, not a length-gated runtime choice, and
+it is not something this engine would "adopt" in the first place -- it either runs
+whatever a GGUF declares or it doesn't. Which is the correct frame for the whole
+question: this is a **model-architecture-support** item, never a perf item.
+
+**As a model-support item (not queued, not planned).** If MiMo-V3 or DeepSeek V3.2+ /
+V4.x appear as common GGUFs, they would be a plausible MVP step 5. DSA sits on top of
+MLA, so step 4's `MlaLayerWeights` / `forward_prompt_mla` path is the base, plus new
+kernels for the indexer and the top-k sparse gather; HySparse2's hybrid structure would
+follow the same `load_hybrid` dispatch pattern MVP step 3 established. **Hard
+prerequisite before any of that**: this project's entire correctness methodology is
+byte-exact comparison against a real llama.cpp build (`reflex check`). No llama.cpp
+support for an architecture means no oracle, and MLA already demonstrated how expensive
+the hand-built-synthetic-fixture fallback is. Check llama.cpp's
+`convert_hf_to_gguf.py` support *first* -- the same cheap-verification-before-download
+discipline recorded in the MLA fixture entries.
+
+**The one takeaway that is actually useful here** is narrative, not technical: these
+announcements are the clearest public statement yet that the agent loop's cost center
+is prefill of a short action's long observation. Reflex answers the same loop from the
+opposite end -- a fresh process per turn, with `--export-kv`/`--import-kv` (Phase 3)
+and the orchestrator owning where that state lives, instead of a resident in-engine
+cache manager. That is a sharper framing for README than "cold start" alone, and it
+costs no code.
