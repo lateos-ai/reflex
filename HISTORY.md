@@ -2094,6 +2094,122 @@ Same caveats as every prior Jev mention still apply (published, not independentl
 reproduced figures; no decision-quality claim; different deployment models) — see
 DECISIONS.md's "TypeSafe Jev comparison framing" entry.
 
+### Jev measured directly via OpenRouter, closing the "cited, not reproduced" gap on one axis (2026-09-25)
+
+Every Jev number above the "warm compute-only" figures was a **published citation**,
+not something this project called ourselves — TypeSafe's own numbers, disclosed as
+such every time. That changed this session: Jev is reachable through OpenRouter
+(`~typesafe/jev-1.13`, `POST https://openrouter.ai/api/v1/systemone`, a
+TypeSafe-compatible endpoint — pricing $0.042/M input tokens, free output), so a real
+end-to-end measurement became cheap and easy (6-16 test calls cost about $0.0002
+total). Ran from this project's local Windows dev machine (not the AWS/ThunderCompute
+rigs used for every other number in this table) against a fraud-classification
+`state`/`questions` payload matching this session's video-demo prompt
+(`"Transaction: $4,200, new device, new country, 2am local time..."`, `noul` question
+`"Is this transaction fraudulent?"`) — decision was consistent across every run,
+`noul` probability 0.79-0.82.
+
+**Two separate numbers, deliberately not collapsed into one**, mirroring the
+cold-start-vs-warm split every other Jev citation already uses:
+
+1. **Fresh-connection, single call** (`n=6`, new HTTPS connection per request, no
+   keep-alive): **min=307.8ms p50=329.0ms p90=404.0ms max=569.6ms**. This is the
+   realistic "what does one cold API call actually cost" number, and it's what the
+   README's "cold-start-to-decision" row now cites in place of Jev's own published
+   70-500ms end-to-end range — notably, our *max* (569.6ms) landed slightly **above**
+   their cited upper bound, not just within it; reported as measured, not trimmed to
+   fit their range.
+2. **Warm, persistent-connection round-trip** (`http.client.HTTPSConnection` reused
+   across every call — one TCP/TLS handshake, then request/response looped on the
+   same connection, mirroring Reflex's own "load once, measure the loop" warm-bench
+   convention): first call (cold connection) was 459.1ms; 2 warmup calls discarded;
+   then `n=10` measured on the now-warm connection: **min=120.6ms p50=141.0ms
+   p90=187.5ms max=190.0ms**. Isolating connection setup this way cut the number by
+   more than half (329ms fresh-connection p50 -> 141ms warm p50) — TLS handshake
+   overhead was the single biggest cost in the fresh-connection number above.
+
+**Still not apples-to-apples with Reflex's 19.4-20.9ms warm-compute figure, and this
+entry says so explicitly rather than implying parity**: the 141ms warm number is a
+real network round-trip (this dev machine -> OpenRouter's edge -> TypeSafe's backend
+and back) plus an OpenRouter proxy hop on top of whatever TypeSafe's own infra takes
+internally, none of which Reflex's number pays at all (`reflex bench` is a local,
+in-process GPU call with zero network component). 141ms sitting far above Jev's own
+cited 10-15ms *compute-only* figure doesn't contradict that citation — it's entirely
+consistent with "most of an external caller's observed latency is network, not
+compute," which is exactly why that compute-only figure remains a citation: no
+external caller, including this measurement, can isolate TypeSafe's internal compute
+time from outside their infra. What this session's measurement *does* replace is the
+"not independently reproduced" caveat on the **end-to-end** axis only (row 1 above) —
+the compute-only axis (row 2's comparison point) is unchanged and still a citation.
+
+**Caveat carried forward**: this ran from a home/office Windows machine over whatever
+network path that implies, not from the same AWS `us-east-1` box Reflex's own T4
+numbers came from — a real methodology gap (different network path on each side of
+the comparison), not just a formality. A tighter future version would run both sides
+from the same AWS instance. Script: `bench_jev_openrouter.py` /
+`bench_jev_openrouter_warm.py` (not committed — throwaway, API key passed via env var,
+never written to disk).
+
+### Making the Jev comparison genuinely apples-to-apples: measure Reflex over the network too (2026-09-25, same day)
+
+The warm comparison above (Reflex 20.9ms local compute vs. Jev 141ms network
+round-trip) drew a fair "not apples-to-apples" criticism: Reflex's number pays zero
+network cost since `reflex bench` is an in-process call, while Jev's necessarily
+crosses the internet. Rather than leave that asymmetry as a caveat, closed it
+directly: put Reflex behind a real HTTP endpoint too, using this project's own
+`sidecar/openai-adapter` (the sanctioned "if HTTP access is ever needed" escape
+hatch — see README's Non-goals), and measure *it* from this same dev machine the
+same way Jev was measured.
+
+**Deliberately did not add a new `system1`-over-HTTP endpoint to the sidecar** to
+make this measurement — that would be real scope creep for a benchmark side-quest.
+Instead: deployed the sidecar on a fresh `g4dn.xlarge` (Tesla T4, same recipe as
+every other AWS session this project uses — throwaway SSM-only IAM role, repo
+shipped via temp S3 bucket, security group opened on port 8000 restricted to this
+dev machine's own IP only, everything torn down immediately after), confirmed it
+came up (`REFLEX_ADAPTER_READY addr=0.0.0.0:8000`, Tesla T4 detected, model
+loaded), then measured the **network floor** to it via its existing `GET /healthz`
+liveness endpoint (near-zero compute, near-zero payload) using the identical warm/
+persistent-connection methodology as the Jev measurement above (1 cold call, 2
+warmup, discard, then `n=10` measured on the reused connection):
+
+```
+min=97.9ms  p50=106.1ms  p90=194.6ms  max=204.0ms
+```
+
+(Two of the ten runs spiked to ~200ms — real network jitter over the public
+internet to `us-east-1`, reported as measured, not trimmed.)
+
+**Constructed comparison** (network floor + Reflex's already-measured 20.9ms local
+compute, vs. Jev's directly-measured round-trip — explicitly a construction, not a
+single real HTTP call returning a typed decision, and labeled as such everywhere
+this number appears):
+
+| | Reflex (network floor + local compute) | Jev (measured round-trip) |
+|---|---|---|
+| min | 118.8ms | 120.6ms |
+| p50 | 127.0ms | 141.0ms |
+| max | 224.9ms | 190.0ms |
+
+Once both sides carry real network transit, the picture changes substantially from
+the network-less comparison: Reflex's edge shrinks from a dramatic ~7x (20.9ms vs.
+141ms) down to roughly 10% at p50, and Reflex's *max* is actually worse than Jev's
+(224.9ms vs. 190.0ms) — the network jitter this dev machine's path to `us-east-1`
+hit outweighs Reflex's compute advantage in the worst case observed. Reported
+exactly this way, including the case where Reflex looks worse, not smoothed to
+favor either side.
+
+**Residual caveats, smaller than before but not zero**: (1) the sidecar's EC2 box
+and Jev's actual backend are presumably in different physical locations, so "same
+dev machine, different destinations" still isn't a perfectly controlled A/B; (2)
+the `/healthz` floor measurement and the real system1-shaped decision call weren't
+literally the same HTTP request (avoided adding new sidecar scope for this), so the
+construction assumes payload-size differences between a liveness check and a real
+decision request don't materially change the network-floor component — plausible
+given both payloads are small, but not verified byte-for-byte. AWS resources (EC2
+instance, security group, IAM role/profile, S3 bucket) fully torn down same
+session — see cost/cleanup pattern in `coldstart-infer-aws-gpu-quota` memory.
+
 ### Real-hardware verification of the warm-latency perf plan (items 2/3/4), 2026-09-25
 
 STATUS.md's "Planned next work: warm-latency perf vs. TypeSafe Jev" items 2 (warp-per-row

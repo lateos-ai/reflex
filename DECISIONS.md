@@ -793,6 +793,42 @@ HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry for the ful
 numbers and the open question of how much of the cold-start gap difference is
 ThunderCompute's GPU-virtualization proxy taxing CUDA init specifically.
 
+**Third addendum: reason (3) above (live-call risk) revisited, one axis upgraded from
+citation to measurement.** Jev turned out to be reachable through OpenRouter
+(`~typesafe/jev-1.13`, a standard public API gateway this project already references
+elsewhere for the `sidecar/openai-adapter`), at $0.042/M input tokens with free
+output — the vendor-dependency/rate-limit/ToS concern reason (3) raised assumed a
+bespoke integration against TypeSafe's own infra; a handful of calls through an
+existing public gateway is a materially smaller version of that risk, so it was
+revisited and a real measurement was taken (cost: ~$0.0002 total for every call this
+session). This upgrades the **cold-start-to-decision** axis from citation to
+independent measurement (Jev side: 307.8-569.6ms, fresh HTTPS connection per call,
+`n=6`). It does **not** upgrade the **warm compute-only** axis — no external caller,
+including this measurement, can isolate TypeSafe's internal compute time from outside
+their infra, so 10-15ms remains a citation. A third, new data point was added instead:
+Jev's warm *round-trip* latency over a persistent connection (120.6-190ms, p50
+141ms) — explicitly not compared 1:1 against Reflex's 19.4-20.9ms compute-only figure,
+since Jev's number includes real network RTT that Reflex's local in-process call never
+pays. See HISTORY.md's "Jev measured directly via OpenRouter" entry for full numbers
+and the network-path caveat (measured from a dev machine, not the AWS rig Reflex's
+numbers came from).
+
+**Fourth addendum: closed the "not apples-to-apples" gap on the warm-round-trip
+comparison itself, same day.** Deployed `sidecar/openai-adapter` (the existing
+escape-hatch pattern, not a new endpoint written for this) on a throwaway
+`g4dn.xlarge`, measured the real network floor to it from this dev machine via its
+`/healthz` endpoint using the identical warm/persistent-connection method as the
+Jev measurement, and added that floor to Reflex's already-measured 20.9ms compute
+figure — an explicit construction, not a single live decision call, but it puts
+real network cost on both sides of the comparison for the first time. Result: the
+warm gap shrank from ~7x (20.9ms vs. 141ms, network-less vs. network-inclusive) to
+~10% at p50 (127.0ms vs. 141.0ms), and Reflex's max was actually *worse* than
+Jev's (224.9ms vs. 190.0ms) — network jitter on this measurement's path to
+`us-east-1`, reported as observed. See HISTORY.md's "Making the Jev comparison
+genuinely apples-to-apples" entry for full numbers and the residual caveats
+(different physical endpoints, `/healthz` vs. a real decision payload not verified
+identical in network-floor terms).
+
 ## Fast-exit after printing the benchmark result (`reflex_engine::fast_exit`)
 
 **Decision**: `reflex generate`/`reflex system1`/`reflex smoke` call
