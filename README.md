@@ -114,15 +114,19 @@ warm/steady-state joules-per-token, not full-lifecycle cold-start cost.
 
 All comparisons are cold-start (process launch to first token/result), same
 ThunderCompute A6000, `n=3`, external wall-clock (`/usr/bin/time -v` — process launch
-to exit, not just Reflex's own internal timer).
+to exit, not just Reflex's own internal timer), except the two Jev *warm* rows below,
+which use a different, explicitly-disclosed methodology (both independently measured
+via calls to Jev's real API through OpenRouter, not published citations, except where
+noted).
 
 | vs. | Result | Caveat |
 |---|---|---|
 | **llama.cpp** | **~1.3–1.4x faster** (4.71–5.05s vs. 6.45–6.56s) | Both AOT-compiled — doesn't exercise the JIT-tax claim below |
 | **vLLM** | **~24–52x faster** (4.71–5.05s vs. 121–244s, depending on `torch.compile` cache state) | Installed vLLM has no GGUF support; ran against an HF safetensors checkpoint instead, disclosed |
 | **Ollama** | Directly competitive when it doesn't stall (~6–7s), but its bundled `llama-server` intermittently hits an internal GPU-discovery-watchdog timeout (~55–62s) | Wraps llama.cpp's own runtime — tests packaging/daemon overhead, not the AOT-vs-JIT bet |
-| **TypeSafe Jev**, cold-start-to-decision | Reflex loses, **~10–60x slower** | Different deployment model: Jev is an always-warm managed API; this measures a genuine cold local process launch |
-| **TypeSafe Jev**, warm/compute-only | **Competitive, within ~1.3–2x** (19.4ms vs. Jev's cited 10–15ms) | Jev's figures are self-reported/published, not independently reproduced here |
+| **TypeSafe Jev**, cold-start-to-decision | Reflex loses, **~33–62x slower** (18.96s vs. Jev's independently measured 307.8–569.6ms) | Different deployment model: Jev is an always-warm managed API; this measures a genuine cold local process launch. Jev's side is now a real measurement, not a citation |
+| **TypeSafe Jev**, warm compute-only | **Competitive, within ~1.3–2x** (19.4ms vs. Jev's cited 10–15ms) | Jev's *compute-only* figure is self-reported/published — structurally unmeasurable from outside their infra, still a citation |
+| **TypeSafe Jev**, warm, both over the network (independently measured) | Reflex 118.8–224.9ms (network floor to a live sidecar + 20.9ms compute) vs. Jev 120.6–190ms (measured round-trip) — **roughly 10% apart at p50, Jev's max is actually better** | The fairer comparison: both sides now carry real network transit. Reflex's number is a construction (measured floor + measured compute, not one live decision call); Jev's is a direct measurement |
 
 The llama.cpp/Ollama/Jev "loses" results above are reported as-is, not smoothed over.
 
