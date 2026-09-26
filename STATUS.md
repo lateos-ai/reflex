@@ -255,6 +255,84 @@ reused the still-running A6000 instance — see DECISIONS.md's Phase 4 round 2 e
 
 This closes Phase 4 (Embeddability) entirely.
 
+## Phase 4 (Embeddability), round 3 (MoE per-expert LoRA, 2026-09-25/26)
+
+`--lora` widened to accept MoE's three per-expert-stacked FFN tensors
+(`ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps`) — the one remaining rejected-tensor
+class from round 1's MoE scope. See HISTORY.md for the full session writeup;
+summary here.
+
+**The real motivating adapters turned out unusable, found before writing any code**:
+`davidanugraha/Qwen3.5-9B-SWE-Smith-LoRA-Adapters` targets zero MoE tensors (that
+model has no MoE layers at all — "A3B" is the 35B variant's suffix, not the 9B's).
+`davidanugraha/Qwen3.5-35B-A3B-SWE-Smith-LoRA-Adapters` (the actual MoE one) does
+target MoE FFN tensors, but its real safetensors header shows a single
+`mlp.experts.lora_A`/`lora_B` pair *per layer*, with no per-expert index in the name
+at all and shapes that don't factor into `(rank, in)`/`(out, rank)` — a Megatron/verl
+fused-grouped-expert LoRA representation from that adapter's own custom RL training
+pipeline (`adapter_config.json` carries `"megatron_core": "megatron.core"`), not
+PEFT's standard one-`nn.Linear`-per-expert layout. Traced llama.cpp's own
+`convert_lora_to_gguf.py`: its only per-expert-stacking mechanism
+(`Qwen2MoeModel.modify_tensors`'s `torch.stack` over `experts.{i}.gate_proj.lora_A`-
+named entries) requires per-expert-indexed tensor names to fire at all — this
+adapter has none, so **it cannot be converted to GGUF by llama.cpp either**, not just
+"needs new math" as an earlier round's note assumed. Confirmed with the user before
+proceeding (see AskUserQuestion in this session): build against a synthetic fixture
+instead of continuing to search for a real one.
+
+**Math derived by tracing the real, unmodified `convert_lora_to_gguf.py`/
+`Qwen2MoeModel.modify_tensors` source** (not run — no local Python `transformers`/
+`torch`/`peft` install, and this project's own established shape/byte-layout
+conventions already cross-checked every step): a standard per-expert-Linear adapter's
+`lora_a`/`lora_b` end up GGUF ne-shape `[in_features, rank, expert_count]`/
+`[rank, out_features, expert_count]` — one more trailing dim than the dense 2-D case,
+same row-major-per-expert-chunk byte layout as the base model's own
+`ffn_*_exps` tensors (`model.rs`'s `expert_weight_view`). `src/lora.rs`'s per-target
+loop now takes an outer per-expert pass over the *same* dense delta math (no new
+math, `LoraTarget` gained one `expert_count: Option<usize>` field); `model.rs`'s
+`apply_lora` shape check now accepts both 2-D and 3-D matches, and `find_lora_target_mut`
+gained three more match arms for `LayerWeights::Moe`. Because the computed delta is
+laid out identically to the base weight's whole buffer, the existing single
+whole-buffer `add_inplace` launch needed no change at all.
+
+**Verified host-only (no GPU on this machine)**: `scripts/build_tiny_moe_lora_fixture.py`
+hand-builds `test-data/tiny-qwen3moe-lora.gguf` (via `gguf.GGUFWriter`, matching
+`test-data/tiny-qwen3moe.gguf`'s real `in_features=out_features=32`,
+`expert_count=8`, 2 MoE layers) with a deterministic per-layer/per-tensor-kind/
+per-expert/per-rank value formula; a new `#[ignore]`d test
+(`lora::moe_expert_lora_fixture_tests::moe_per_expert_lora_matches_hand_computed_delta`)
+loads it via `lora::load` and compares against an independently-recomputed expected
+delta (a separate triple loop, not shared code with the implementation) — passes,
+6/6 targets, byte-exact. `REFLEX_SKIP_CUDA=1 cargo build/test --lib/fmt --check/
+clippy --all-targets` all clean; the other 85 host-only tests unaffected; every
+CUDA-requiring `#[ignore]`d test still fails on this GPU-less machine exactly as
+before (not a new regression — confirmed by re-running the full `--include-ignored`
+suite and checking the failure list is unchanged).
+
+**Real-hardware-verified same day**: rented a fresh AWS EC2 `g4dn.xlarge` (Tesla T4,
+On-Demand — Spot wasn't even tried this time, prior sessions already established
+it's unreliable in this account/region) via the same SSM/S3 throwaway-infra recipe
+[[coldstart-infer-aws-gpu-quota]] documents. `REFLEX_CUDA_ARCH=sm_75 cargo build
+--release` clean; the full `cargo test --release` host-only suite (85 tests) plus
+`qwen3moe_fixture_has_excluding_topk_and_qk_norm`, `qwen3moe_fixture_generates_without_error`,
+and `prefill_dense_batched_matches_sequential_prefill` (byte-exact batched-vs-
+sequential MoE prefill) all passed against `test-data/tiny-qwen3moe.gguf` — zero
+regressions from this round's changes. `reflex generate --lora
+test-data/tiny-qwen3moe-lora.gguf` against `test-data/tiny-qwen3moe.gguf` printed
+`REFLEX_LORA_OK tensors_applied=6` (exactly 2 layers x 3 tensor kinds, confirming
+`find_lora_target_mut`'s three new match arms resolved every target with no silent
+rejections and no shape-mismatch errors) and applied without any crash or panic.
+Output changed dramatically vs. the unadapted baseline (baseline: 5 generated
+tokens, `" homebrewflight sympathCome 67"`; adapted: generation stops after 1 token,
+immediate EOS) -- expected and not a bug, since the fixture's deliberately large,
+easy-to-distinguish synthetic delta values (up to hundreds of thousands before
+scaling, chosen to make addressing bugs obvious, not to produce coherent
+generation) swamp the tiny random base weights, but it's exactly the proof needed
+that the adapter is doing something real, not silently no-op'd. All throwaway AWS
+infra (EC2 instance, S3 bucket + objects, IAM role/instance profile) torn down at
+the end of the session. This closes out Phase 4 round 3 -- MoE per-expert LoRA is
+now fully verified, not just code-complete.
+
 ## Planned next work (post-public-release-prep, 2026-09-23)
 
 Phase 4 (both rounds) is done and no further Phase 4/post-MVP architecture work is
@@ -319,10 +397,10 @@ MTP/NextN rejection — the real upstream checkpoint now ships an MTP draft bloc
 didn't exist when `load_hybrid`'s doc comment was written; worked around by using the
 `unsloth` GGUF as the LoRA base instead (MTP rejection is orthogonal to LoRA and still
 correctly enforced, not disabled). `davidanugraha/Qwen3.5-35B-A3B-SWE-Smith-LoRA-
-Adapters`/`-9B-` remain untested: confirmed (via HF page text, not yet its own
-safetensors header) to target MoE's per-expert routed-expert projections, which really
-does need new per-expert-slice delta math beyond a widened accept list, plus a much
-larger model — left for a future round.
+Adapters`/`-9B-` **superseded, see Phase 4 round 3 below**: their real safetensors
+headers turned out incompatible for a much more fundamental reason than "needs new
+math" — a Megatron/verl fused-expert LoRA representation llama.cpp's own converter
+can't even ingest, not just a shape this project didn't yet accept.
 
 ## Planned next work: warm-latency perf vs. TypeSafe Jev (2026-09-25)
 
@@ -600,6 +678,28 @@ worker's one-job-at-a-time queue actually serializes concurrent HTTP traffic int
 single underlying `reflex stdio` process. `cargo fmt --check`/`cargo clippy
 --all-targets -- -D warnings` both clean on this crate, on both Windows (dev machine)
 and Linux (the verification instance).
+
+## Planned next work: structured/grammar-constrained output (queued 2026-09-26)
+
+Queued as a backlog item, not designed or started yet. Considered alongside MTP/
+speculative decoding when picking what to work on next; speculative decoding was
+ruled out for this project specifically (not a general judgment against it) because
+its whole benefit is steady-state decode throughput across a long generation, which
+CLAUDE.md explicitly frames as "an unwinnable kernel-optimization race" this project
+deliberately doesn't chase — and it would add real cold-load cost (extra draft-head
+weights to dequantize/upload) working against the project's actual headline metric,
+`process_start_to_first_token_ms`.
+
+Structured/grammar-constrained output (JSON-schema- or grammar-constrained sampling)
+has no such conflict: it's sampling-time-only (logit masking ahead of the existing
+argmax/top-k/top-p sampling in `src/sampling.rs`), touches zero cold-start latency,
+and CLAUDE.md already treats sampling-strategy extensions as in-scope, unimplemented
+work rather than a Non-goal — the same framing that justified adding
+`--temperature`/`--top-k`/`--top-p` in the first place (see `sampling.rs`'s own doc
+comment). Left deliberately open for whoever picks this up: JSON Schema vs. a
+general CFG/regex grammar, where the constraint state lives across streamed tokens,
+and which CLI/IPC surfaces (`reflex generate`, `stdio`, `uds`, the OpenAI-compatible
+sidecar) expose it.
 
 ## Known debt / limitations
 

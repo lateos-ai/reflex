@@ -2551,3 +2551,118 @@ instance profile) was torn down at the end of the session -- confirmed via a cle
 ec2 describe-instances`/`s3api list-buckets`/`iam get-role`/`iam get-instance-profile`
 sweep, nothing billable left running. Item 1 (f16 weight residency) is now the only
 unstarted item on the original perf plan.
+
+### MoE per-expert LoRA (Phase 4 round 3), 2026-09-25/26
+
+Widened `--lora` to accept MoE's three per-expert-stacked FFN tensors
+(`ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps`) -- the one remaining rejected-tensor
+class from Phase 4 round 1's MoE scope. See DECISIONS.md's new entry for the full
+reasoning writeup; summary here.
+
+**Both previously-identified real candidate adapters turned out unusable, found by
+reading their real safetensors headers before writing any code** (same discipline the
+round 1 follow-up session established: read the artifact, never paraphrase it).
+`davidanugraha/Qwen3.5-9B-SWE-Smith-LoRA-Adapters` targets zero MoE tensors --
+`-9B` has no MoE layers at all, `-A3B` names only the 35B variant. The 35B-A3B
+adapter does have MoE-shaped LoRA tensors, but as one fused `mlp.experts.lora_A`/
+`lora_B` pair *per layer* with no per-expert index in the name and shapes that don't
+factor into any `(rank, in)`/`(out, rank)` pair for its own `r=32` -- its
+`adapter_config.json` carries `"megatron_core": "megatron.core"`, and the repo is a
+`verl` RL-training export (RLOO/GRPO training patches, FSDP checkpoints, SWE-bench
+eval artifacts throughout its file tree), not a plain HF PEFT checkpoint. Traced
+llama.cpp's real `convert_lora_to_gguf.py`/`Qwen2MoeModel.modify_tensors` source to
+check whether this was an inconvenient shape or a hard blocker: its only per-expert-
+stacking mechanism accumulates per-expert-indexed HF tensor names one at a time into
+a dict, only firing its `torch.stack` once `n_experts * 3` distinct keys have
+accumulated for a layer -- an adapter with one fused tensor per layer never reaches
+that count, so this specific adapter **cannot be converted to GGUF by llama.cpp
+either**, a stronger and different conclusion than the round 1 follow-up's "needs new
+per-expert delta-selection math" note assumed. Confirmed with the user before
+proceeding given this real premise change: build against a synthetic fixture instead
+of continuing to search for (or wait on) a real compatible adapter.
+
+**Math derived by tracing real source, not run** (no local Python `transformers`/
+`torch`/`peft` install on this Windows dev machine, and installing them just to
+execute a shape derivation wasn't judged worth the weight this session): a standard
+per-expert-Linear PEFT adapter's `lora_a`/`lora_b`, once run through the real
+converter, end up GGUF ne-shape `[in_features, rank, expert_count]`/`[rank,
+out_features, expert_count]` -- one more trailing dim than the dense 2-D case,
+`LoraTorchTensor.__torch_function__`'s `torch.stack` arm stacking each expert's A/B
+factors along a new leading dim before the usual PyTorch-to-GGUF dim reversal. Same
+row-major-per-expert-contiguous-chunk byte layout as the base model's own
+`ffn_*_exps` tensors (cross-checked against `model.rs`'s pre-existing
+`expert_weight_view` doc comment).
+
+**Implementation, deliberately minimal**: `src/lora.rs`'s `LoraTarget` gained one
+`expert_count: Option<usize>` field; the per-target parsing loop now accepts a 3-D
+shape alongside the existing 2-D one, and the delta computation gained one outer
+per-expert loop around the *same* row-major math the dense case already used (no new
+math). `model.rs`'s `apply_lora` shape check now accepts a matching 3-D base weight
+shape, and `find_lora_target_mut` gained three more `LayerWeights::Moe` match arms.
+Because the computed delta is laid out identically to the base weight's whole device
+buffer regardless of expert count, the existing single whole-buffer `add_inplace`
+launch needed no change -- no new kernel, no per-expert slicing on the caller's side.
+
+**Verified host-only, GPU verification still pending** (this machine has no
+CUDA-capable GPU): `REFLEX_SKIP_CUDA=1 cargo build/test --lib/fmt --check/clippy
+--all-targets` all clean; the pre-existing 85 host-only tests unaffected, and
+re-running the full `--include-ignored` suite confirmed the same 10 CUDA-requiring
+tests fail for the same pre-existing reason (no GPU here) as before this session's
+changes, not a new regression. New fixture: `scripts/build_tiny_moe_lora_fixture.py`
+hand-builds `test-data/tiny-qwen3moe-lora.gguf` via `gguf.GGUFWriter`, matching
+`test-data/tiny-qwen3moe.gguf`'s real shapes (`in_features=out_features=32`,
+`expert_count=8`, 2 MoE layers), with a deterministic per-layer/per-tensor-kind/
+per-expert/per-rank value formula distinct enough that a mixed-up layer, tensor-kind,
+or expert offset would produce a visibly wrong delta rather than a subtly-close one.
+A new test (`lora::moe_expert_lora_fixture_tests::
+moe_per_expert_lora_matches_hand_computed_delta`) loads it through the real
+`lora::load` and compares against an independently recomputed expected delta (a
+separate triple loop in the test, sharing no code with the implementation) -- passes,
+byte-exact across all 6 targets (2 layers x 3 tensor kinds: gate/up/down). Still
+needed before this is fully closed out: a rented GPU instance to verify
+`Model::apply_lora`'s device-side `add_inplace` launch and an actual forward pass
+through the synthetic-adapter-adapted `tiny-qwen3moe.gguf`, the same bar every other
+LoRA round has cleared.
+
+
+**Update, same day: real-hardware-verified on a fresh AWS EC2 g4dn.xlarge (Tesla T4).**
+Rented On-Demand directly (Spot has been unreliable in this account/region in prior
+sessions, not worth retrying for a short verification run), same SSM/S3
+throwaway-infra recipe as every other AWS-based verification this project has done.
+`REFLEX_CUDA_ARCH=sm_75 cargo build --release` clean (CUDA 13.2 toolkit on the
+`base-with-single-cuda-ubuntu-22.04` DLAMI, nvcc compiled every kernel including the
+unchanged ones fine against a newer CUDA than prior sessions used). Full
+`cargo test --release` host-only suite (85 tests, 0 failed) plus three
+GPU-requiring tests against `test-data/tiny-qwen3moe.gguf`:
+`qwen3moe_fixture_has_excluding_topk_and_qk_norm`,
+`qwen3moe_fixture_generates_without_error` (real forward pass), and
+`prefill_dense_batched_matches_sequential_prefill` (byte-exact batched-vs-sequential
+MoE prefill) -- all passed, confirming this round's changes introduced zero
+regressions in the existing MoE code paths.
+
+`reflex generate test-data/tiny-qwen3moe.gguf "The quick brown fox" --max-tokens 5
+--lora test-data/tiny-qwen3moe-lora.gguf` printed `REFLEX_LORA_OK
+tensors_applied=6` -- exactly 2 layers x 3 MoE FFN tensor kinds, confirming
+`find_lora_target_mut`'s three new match arms resolved every target in the
+synthetic adapter with no silent rejections and no shape-mismatch errors, and the
+CUDA `add_inplace` launch completed without crashing. Comparing against the
+unadapted baseline run (same prompt, no `--lora`): baseline generated 5 tokens
+(`[45729,22560,23860,16773,8275]`, " homebrewflight sympathCome 67"); the
+LoRA-adapted model generated exactly 1 token before hitting EOS
+(`token_id=50256`, "<|endoftext|>"). That's expected, not a bug: the fixture's
+per-layer/per-tensor-kind/per-expert/per-rank value formula
+(`scripts/build_tiny_moe_lora_fixture.py`) was deliberately designed with large,
+easy-to-distinguish magnitudes (values in the hundreds of thousands before the
+`alpha/rank` scale) to make an expert/tensor-kind/layer addressing bug produce an
+obviously-wrong delta, not tuned for post-adaptation generation coherence against
+`tiny-qwen3moe.gguf`'s own random base weights -- a delta of that magnitude
+swamping the logits and collapsing straight to EOS is exactly what a correctly-
+applied (not silently skipped) delta of that size should do. The complete behavior
+change between the two runs is itself the proof this session needed: the adapter
+measurably changed the model, it wasn't a no-op accept.
+
+All throwaway AWS infra (the `g4dn.xlarge` instance, the S3 bucket + its objects,
+the IAM role/instance profile) was torn down at the end of the session -- confirmed
+via a clean sweep before ending. This closes out Phase 4 round 3 (MoE per-expert
+LoRA) entirely -- code-complete AND real-hardware-verified, matching the bar every
+other LoRA round in this project's history has cleared.

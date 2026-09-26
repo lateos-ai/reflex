@@ -1764,15 +1764,20 @@ impl Model {
     /// the "load-time adapter application, no runtime hot-swap multiplexer"
     /// scope README.md's Non-goals section commits this feature to.
     ///
-    /// Deliberately narrow for this round (see `Self::find_lora_target_mut`'s
-    /// doc comment for the exact accepted tensor set): dense/MoE attention
-    /// tensors, Qwen3.5 hybrid Gated-Attention-layer tensors, and the hybrid
-    /// Gated DeltaNet mixer's five 2-D Linear-shaped tensors
-    /// (`attn_qkv`/`attn_gate`/`ssm_alpha`/`ssm_beta`/`ssm_out`) only.
-    /// DeepSeek-V2/V3 MLA is rejected outright below, matching every other
-    /// MLA-excluded feature in this codebase. Any adapter tensor that
-    /// doesn't resolve to a supported base weight, or whose shape doesn't
-    /// match that weight's, is a hard error -- never a silent skip.
+    /// Deliberately narrow (see `Self::find_lora_target_mut`'s doc comment
+    /// for the exact accepted tensor set): dense/MoE attention tensors, MoE's
+    /// three per-expert-stacked FFN tensors (`ffn_gate_exps`/`ffn_up_exps`/
+    /// `ffn_down_exps` -- added after this round; see `lora.rs`'s module doc
+    /// comment for the exact adapter format this expects and why a
+    /// fused/grouped-expert LoRA representation some training frameworks
+    /// produce doesn't qualify), Qwen3.5 hybrid Gated-Attention-layer
+    /// tensors, and the hybrid Gated DeltaNet mixer's five 2-D
+    /// Linear-shaped tensors (`attn_qkv`/`attn_gate`/`ssm_alpha`/`ssm_beta`/
+    /// `ssm_out`) only. DeepSeek-V2/V3 MLA is rejected outright below,
+    /// matching every other MLA-excluded feature in this codebase. Any
+    /// adapter tensor that doesn't resolve to a supported base weight, or
+    /// whose shape doesn't match that weight's, is a hard error -- never a
+    /// silent skip.
     pub fn apply_lora(&mut self, path: &std::path::Path) -> Result<usize, String> {
         if self.mla.is_some() {
             return Err(
@@ -1798,22 +1803,32 @@ impl Model {
 
             let weight = self.find_lora_target_mut(&target.name).ok_or_else(|| {
                 format!(
-                    "LoRA adapter targets '{}' but this project's Model has no matching 2-D weight for it \
-                     (dense-attention/FFN, Qwen3.5 hybrid Gated-Attention-layer tensors, and the hybrid Gated \
-                     DeltaNet mixer's attn_qkv/attn_gate/ssm_alpha/ssm_beta/ssm_out are the only supported LoRA \
-                     targets in this round -- MoE's per-expert-stacked FFN tensors, the mixer's remaining \
-                     non-Linear state-space tensors (ssm_dt/ssm_a/ssm_conv1d/ssm_norm), embeddings, and norms \
-                     are not)",
+                    "LoRA adapter targets '{}' but this project's Model has no matching weight for it \
+                     (dense/MoE attention+FFN including MoE's per-expert-stacked ffn_*_exps tensors, Qwen3.5 \
+                     hybrid Gated-Attention-layer tensors, and the hybrid Gated DeltaNet mixer's \
+                     attn_qkv/attn_gate/ssm_alpha/ssm_beta/ssm_out are the only supported LoRA targets in this \
+                     round -- the mixer's remaining non-Linear state-space tensors (ssm_dt/ssm_a/ssm_conv1d/ \
+                     ssm_norm), embeddings, norms, and MLA are not)",
                     target.name
                 )
             })?;
-            if weight.shape.len() != 2
-                || weight.shape[0] as usize != target.in_features
-                || weight.shape[1] as usize != target.out_features
-            {
+            let shape_ok = match weight.shape.as_slice() {
+                [in_f, out_f] => {
+                    target.expert_count.is_none()
+                        && *in_f as usize == target.in_features
+                        && *out_f as usize == target.out_features
+                }
+                [in_f, out_f, expert_count] => {
+                    target.expert_count == Some(*expert_count as usize)
+                        && *in_f as usize == target.in_features
+                        && *out_f as usize == target.out_features
+                }
+                _ => false,
+            };
+            if !shape_ok {
                 return Err(format!(
-                    "LoRA adapter tensor '{}' has shape [in={}, out={}] but the base model's tensor has shape {:?} -- wrong base model?",
-                    target.name, target.in_features, target.out_features, weight.shape
+                    "LoRA adapter tensor '{}' has shape [in={}, out={}, experts={:?}] but the base model's tensor has shape {:?} -- wrong base model?",
+                    target.name, target.in_features, target.out_features, target.expert_count, weight.shape
                 ));
             }
 
@@ -1840,16 +1855,20 @@ impl Model {
         Ok(applied)
     }
 
-    /// Locates the mutable device-resident 2-D [`Weight`] a LoRA adapter
-    /// target name (`blk.{i}.{suffix}.weight`) refers to, across whichever
+    /// Locates the mutable device-resident [`Weight`] a LoRA adapter target
+    /// name (`blk.{i}.{suffix}.weight`) refers to, across whichever
     /// architecture is loaded (dense/MoE via `self.layers`, Qwen3.5 hybrid
-    /// via `self.hybrid`). Deliberately narrow: only the 2-D `nn.Linear`-
-    /// shaped tensors every supported layer kind actually has are matched --
-    /// MoE's per-expert-stacked FFN tensors (`ffn_gate_exps`/`ffn_up_exps`/
-    /// `ffn_down_exps`, 3-D) and anything outside a `blk.N.*` tensor
-    /// (`token_embd`/`output`/norms) fall through to the `None` arm and are
-    /// rejected by `Self::apply_lora` with a clear error, rather than
-    /// silently mismatched or misapplied.
+    /// via `self.hybrid`). Matches every 2-D `nn.Linear`-shaped tensor each
+    /// supported layer kind has, plus MoE's three per-expert-stacked 3-D FFN
+    /// tensors (`ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps` -- see
+    /// `lora.rs`'s module doc comment for how a standard per-expert-`Linear`
+    /// PEFT adapter's `lora_a`/`lora_b` end up as matching 3-D tensors after
+    /// llama.cpp's `convert_lora_to_gguf.py`, and `Self::apply_lora`'s shape
+    /// check for how the two are told apart). Anything outside a `blk.N.*`
+    /// tensor (`token_embd`/`output`/norms), and the mixer's non-Linear
+    /// state-space tensors, fall through to the `None` arm and are rejected
+    /// by `Self::apply_lora` with a clear error, rather than silently
+    /// mismatched or misapplied.
     ///
     /// The Gated DeltaNet mixer's `attn_qkv`/`attn_gate`/`ssm_alpha`/
     /// `ssm_beta`/`ssm_out` *are* matched here despite an earlier version of
@@ -1909,6 +1928,9 @@ impl Model {
             (LayerWeights::Moe(l), "attn_k") => Some(&mut l.attn_k),
             (LayerWeights::Moe(l), "attn_v") => Some(&mut l.attn_v),
             (LayerWeights::Moe(l), "attn_output") => Some(&mut l.attn_output),
+            (LayerWeights::Moe(l), "ffn_gate_exps") => Some(&mut l.ffn_gate_exps),
+            (LayerWeights::Moe(l), "ffn_up_exps") => Some(&mut l.ffn_up_exps),
+            (LayerWeights::Moe(l), "ffn_down_exps") => Some(&mut l.ffn_down_exps),
             _ => None,
         }
     }

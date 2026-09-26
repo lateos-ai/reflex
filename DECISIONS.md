@@ -1035,3 +1035,101 @@ mid-session (not just the first sync of a fresh instance), `touch` the affected 
 files before rebuilding, or otherwise don't trust a suspiciously-fast "Finished" line
 as proof the new code actually compiled -- check for the warnings/behavior you expect
 to see change, the same instinct that caught this in the first place.
+
+## MoE per-expert LoRA: build against a synthetic fixture after both real candidate adapters turned out unusable
+
+**Decision**: widened `--lora` to accept MoE's three per-expert-stacked FFN tensors
+(`ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps`) for a standard PEFT adapter format
+(one `nn.Linear` per expert, `experts.{i}.{gate,up,down}_proj`), verified against a
+hand-built synthetic adapter (`test-data/tiny-qwen3moe-lora.gguf`,
+`scripts/build_tiny_moe_lora_fixture.py`) rather than a real one, after determining
+neither previously-identified `davidanugraha` candidate could actually be used.
+
+**Why the real candidates were dropped, not just left untested**: round 1's follow-up
+note said these needed "new per-expert delta-selection math" and left them for a
+future round on that assumption. This round read the real safetensors headers before
+writing any code (same lesson as the Tilakoid round above: read the artifact, don't
+paraphrase it) and found something more fundamental. `Qwen3.5-9B-SWE-Smith-LoRA-
+Adapters`' header has zero MoE-shaped tensors at all -- every target
+(`self_attn.*`/`linear_attn.*`/`mlp.{gate,up,down}_proj`) is a plain dense Linear
+already accepted, because the 9B checkpoint has no MoE layers (`-A3B` names the 35B
+variant, not the 9B). `Qwen3.5-35B-A3B-SWE-Smith-LoRA-Adapters`' header does have
+MoE-shaped LoRA tensors (`mlp.experts.lora_A`/`lora_B`), but as a *single pair per
+layer* with no per-expert index anywhere in the name, and shapes
+(`[8192,512]`/`[2048,8192]`) that don't factor into any `(rank, in_features)`/
+`(out_features, rank)` pair for the adapter's own `r=32` -- its `adapter_config.json`
+carries `"megatron_core": "megatron.core"`, and the repo's own file tree
+(`training-image/verl_qwen35_replicated_gdn.patch`, FSDP/RLOO training artifacts) is
+a `verl` RL-training export, not a plain HF PEFT checkpoint. Read llama.cpp's actual
+`convert_lora_to_gguf.py` + `Qwen2MoeModel.modify_tensors` (the code every MoE arch's
+`LoraModel` subclass inherits unchanged) to check whether this was merely an
+inconvenient shape or a hard blocker: its *only* per-expert-stacking mechanism is a
+`torch.stack` over a Python dict keyed by per-expert-indexed HF tensor names
+(`model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight`), populated one entry at a
+time as each expert's tensor streams in, triggered only once `n_experts * 3` entries
+have accumulated for a layer. An adapter with one fused tensor per layer never
+populates that dict in a way that reaches `n_experts * 3` distinct keys -- the
+stacking branch simply never fires, so **this specific adapter cannot be converted to
+GGUF by llama.cpp at all**, independent of whether this project ever added MoE-LoRA
+support. That's a different and stronger conclusion than round 1's "needs new math"
+note assumed, so it's called out explicitly here rather than silently reusing that
+note's framing.
+
+**Confirmed with the user before proceeding** (a real premise change mid-task, not a
+minor detail): given neither real adapter is usable, asked whether to keep searching
+for a real, standard-format MoE LoRA adapter targeting a compatible checkpoint, drop
+the item, or build against a synthetic fixture instead (this project's own established
+pattern for a feature with no real available fixture, e.g. the MLA and qwen3moe base
+fixtures). User chose the synthetic-fixture path.
+
+**Math derivation, not run through the real converter**: no local Python
+`transformers`/`torch`/`peft` install on this machine (and installing them just to
+verify a shape/byte-layout derivation was judged not worth the weight for this
+session), so the standard-format math was derived by tracing the real, unmodified
+`convert_lora_to_gguf.py`/`Qwen2MoeModel.modify_tensors` source directly rather than
+executing it: `LoraTorchTensor.__torch_function__`'s `torch.stack` arm stacks a list
+of per-expert `LoraTorchTensor`s' `_lora_A`/`_lora_B` fields separately along a new
+leading dim, so a per-expert-Linear adapter's stacked `lora_a`/`lora_b` end up GGUF
+ne-shape `[in_features, rank, expert_count]`/`[rank, out_features, expert_count]` --
+one more trailing dim than the dense 2-D case this project already handled, in the
+same row-major-per-expert-contiguous-chunk byte layout as the base model's own
+`ffn_*_exps` tensors (cross-checked against `model.rs`'s pre-existing
+`expert_weight_view` doc comment, which already documents that exact layout for the
+base weights). This is a derivation, not independent execution -- flagged honestly
+below rather than folded into "verified".
+
+**Implementation**: `src/lora.rs`'s per-target parsing loop now accepts either a 2-D
+or a 3-D shape for `lora_a`/`lora_b` (a new `expert_count: Option<usize>` field on
+`LoraTarget`), and its delta computation gained one outer per-expert loop around the
+*same* row-major math the dense case already used -- not new math, just applying the
+existing math once per expert instead of once. `model.rs`'s `apply_lora` shape check
+now accepts a matching 3-D base weight shape (`expert_count` must match too), and
+`find_lora_target_mut` gained three more `LayerWeights::Moe` match arms
+(`ffn_gate_exps`/`ffn_up_exps`/`ffn_down_exps`). Because the computed delta is laid
+out identically to the base weight's whole device buffer regardless of expert count,
+the existing single whole-buffer `add_inplace` launch in `apply_lora` needed no
+change at all -- no new kernel, no per-expert slicing on the caller's side.
+
+**Verification, and what's honestly still missing**: host-only (`REFLEX_SKIP_CUDA=1`
+build/test/fmt/clippy all clean; the other 85 pre-existing host-only tests
+unaffected). `scripts/build_tiny_moe_lora_fixture.py` hand-builds
+`test-data/tiny-qwen3moe-lora.gguf` via `gguf.GGUFWriter` (matching
+`test-data/tiny-qwen3moe.gguf`'s real `in_features=out_features=32`,
+`expert_count=8`, 2 MoE layers) with a deterministic per-layer/per-tensor-kind/
+per-expert/per-rank value formula distinct enough that a mixed-up layer, tensor-kind,
+or expert offset would produce a visibly wrong delta, not a subtly-close one. A new
+test (`lora::moe_expert_lora_fixture_tests::moe_per_expert_lora_matches_hand_computed_delta`)
+loads it through the real `lora::load` and compares against an independently
+recomputed expected delta (a separate triple loop in the test, sharing no code with
+the implementation) -- passes, byte-exact across all 6 targets (2 layers x 3 tensor
+kinds). This machine has no CUDA-capable GPU, so at the time this entry was first
+written, `Model::apply_lora`'s device-side `add_inplace` launch and an actual
+forward pass through the adapted model were not yet verified against real GPU
+hardware -- **closed the same session**: rented a fresh AWS EC2 `g4dn.xlarge`
+(Tesla T4) and confirmed `reflex generate --lora` against the synthetic fixture
+applies `tensors_applied=6` (exactly matching expectation, no silent rejections)
+and measurably changes the model's output vs. the unadapted baseline, with zero
+regressions in the pre-existing MoE test suite (see HISTORY.md's matching entry
+for the full readout, including why the LoRA-adapted run collapsing to immediate
+EOS is expected given the fixture's deliberately large synthetic delta magnitudes,
+not a bug).
