@@ -2,3 +2,8 @@ target/
 test-data/
 .git/
 *.gguf
+# Single, narrow exception: serverless/runpod/Dockerfile bakes this specific model
+# into the image deliberately (avoids a runtime download polluting the cold-start
+# measurement this deployment exists to produce -- see serverless/runpod/README.md).
+# Does not reopen test-data/ or *.gguf generally.
+!serverless/runpod/model.gguf
