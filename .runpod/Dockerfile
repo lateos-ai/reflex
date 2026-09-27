@@ -17,16 +17,22 @@
 # Runpod job to that process's existing POST /v1/chat/completions over loopback.
 # No engine logic is reimplemented in Python.
 #
-# REFLEX_CUDA_ARCH defaults to sm_86 here, matching serverless/runpod/Dockerfile --
-# Runpod's cheapest serverless tier (AMPERE_16) is Ampere (compute capability 8.6).
-# See serverless/runpod/README.md's GPU-selection section: AMPERE_16 is
-# mixed-architecture (also contains sm_89 Ada cards an sm_86 cubin cannot run on) --
-# .runpod/hub.json's gpuIds pins away from those Ada SKUs for the same reason
-# serverless/runpod's endpoint is pinned to RTX A4500 via set-endpoint-gpus.
+# REFLEX_CUDA_ARCH defaults to EMPTY here (portable PTX) -- deliberately NOT sm_86
+# like serverless/runpod/Dockerfile. That deployment can pin the exact GPU SKU at
+# deploy time via set-endpoint-gpus; a Hub listing cannot -- Runpod's own Hub
+# build/test infrastructure schedules the automated test job wherever it wants,
+# and real-hardware evidence (2026-09-27, see .runpod/README.md) shows it does NOT
+# reliably honor either hub.json's gpuIds exclusion list or tests.json's
+# gpuTypeId pin: a real test run landed on an RTX 2000 Ada Generation (sm_89) --
+# exactly one of the SKUs both those fields tried to exclude -- and an sm_86-pinned
+# cubin panicked on it. A portable PTX build (driver-JIT'd to whatever GPU is
+# actually present) is the only build-time property this specific artifact can
+# reliably guarantee correctness with, trading away the zero-JIT cold-start
+# advantage that sm_86-pinning gives serverless/runpod/'s manually-pinned endpoint.
 #
 # Build context must be the repo root:
 #
-#   docker build -f .runpod/Dockerfile --build-arg REFLEX_CUDA_ARCH=sm_86 -t reflex-hub .
+#   docker build -f .runpod/Dockerfile -t reflex-hub .
 #
 # Unlike serverless/runpod/Dockerfile, no PORT is exposed externally here: Runpod
 # queue-based endpoints deliver jobs to the container's handler process directly,
@@ -45,7 +51,7 @@ ENV CUDA_PATH="/usr/local/cuda"
 WORKDIR /build
 COPY . .
 
-ARG REFLEX_CUDA_ARCH="sm_86"
+ARG REFLEX_CUDA_ARCH=""
 RUN set -- --release --bin reflex --features ipc; \
     if [ -n "$REFLEX_CUDA_ARCH" ]; then \
         REFLEX_CUDA_ARCH=$REFLEX_CUDA_ARCH cargo build "$@"; \
