@@ -39,3 +39,39 @@ jobs:
 
       - name: Test (GPU-hardware tests are #[ignore]d and skipped here)
         run: cargo test --locked
+
+  # sidecar/openai-adapter is a deliberately separate Cargo project (own
+  # Cargo.toml/Cargo.lock, not a workspace member, no dependency on reflex-engine --
+  # see its own README) specifically so it never needs nvcc/CUDA. It builds with a
+  # plain stable toolchain, so it runs on the same hosted-runner matrix as the job
+  # above with no REFLEX_SKIP_CUDA or other CUDA-avoidance needed.
+  sidecar-build-and-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: sidecar/openai-adapter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sidecar/openai-adapter
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked

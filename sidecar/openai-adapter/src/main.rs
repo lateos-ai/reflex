@@ -1,13 +1,17 @@
 //! `reflex-openai-adapter`: a standalone OpenAI-compatible HTTP sidecar in front of
 //! one managed `reflex stdio <gguf>` process. Implements `POST /v1/chat/completions`
-//! (streaming via SSE and non-streaming JSON) -- see this crate's README for usage,
-//! scope, and known limitations, and the root CLAUDE.md/README.md's Non-goals
-//! section for why this lives in its own crate/process rather than inside the core
-//! engine.
+//! (streaming via SSE and non-streaming JSON), `GET /v1/models`, and a health check
+//! served at both `/healthz` and `/ping` (identical handler -- `/ping` exists because
+//! Runpod Serverless load-balancing endpoints hard-poll that exact path, confirmed
+//! against a real deployment) -- see this crate's README for usage, scope, and known
+//! limitations, and the root CLAUDE.md/README.md's Non-goals section for why this
+//! lives in its own crate/process rather than inside the core engine.
 //!
 //! Usage: `reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host
 //! <addr>] [--port <port>] [--lora <adapter.gguf>] [--model-name <name>]
-//! [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>]`
+//! [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>]
+//! [--owned-by <name>] [--pricing-prompt <str>] [--pricing-completion <str>]
+//! [--region <str>]`
 
 mod chat_template;
 mod gguf_meta;
@@ -25,13 +29,14 @@ use futures::Stream;
 use openai::{
     build_prompt, build_sampling, estimate_prompt_tokens, extract_text_messages, finish_reason,
     now_unix, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessageOut,
-    Choice, ChunkChoice, Delta, Usage,
+    Choice, ChunkChoice, Delta, ModelInfo, ModelPricing, ModelsResponse, Usage,
 };
 use reflex_client::ReflexClient;
 use serde_json::Value;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 struct AppState {
     client: ReflexClient,
@@ -39,6 +44,7 @@ struct AppState {
     default_max_tokens: usize,
     request_counter: AtomicU64,
     chat_template: Option<ChatTemplate>,
+    model_info: ModelInfo,
 }
 
 impl AppState {
@@ -58,6 +64,10 @@ struct Opts {
     default_max_tokens: usize,
     no_chat_template: bool,
     chat_template_file: Option<String>,
+    owned_by: String,
+    pricing_prompt: String,
+    pricing_completion: String,
+    region: Option<String>,
 }
 
 impl Opts {
@@ -71,6 +81,10 @@ impl Opts {
         let mut default_max_tokens: usize = 256;
         let mut no_chat_template = false;
         let mut chat_template_file: Option<String> = None;
+        let mut owned_by = "reflex".to_string();
+        let mut pricing_prompt = "0".to_string();
+        let mut pricing_completion = "0".to_string();
+        let mut region: Option<String> = None;
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -108,6 +122,19 @@ impl Opts {
                     chat_template_file =
                         Some(args.next().ok_or("--chat-template-file requires a path")?);
                 }
+                "--owned-by" => {
+                    owned_by = args.next().ok_or("--owned-by requires a value")?;
+                }
+                "--pricing-prompt" => {
+                    pricing_prompt = args.next().ok_or("--pricing-prompt requires a value")?;
+                }
+                "--pricing-completion" => {
+                    pricing_completion =
+                        args.next().ok_or("--pricing-completion requires a value")?;
+                }
+                "--region" => {
+                    region = Some(args.next().ok_or("--region requires a value")?);
+                }
                 _ if gguf_path.is_none() => gguf_path = Some(arg),
                 other => return Err(format!("unexpected argument: {other}")),
             }
@@ -116,7 +143,9 @@ impl Opts {
         let gguf_path = gguf_path.ok_or(
             "usage: reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host <addr>] \
              [--port <port>] [--lora <adapter.gguf>] [--model-name <name>] \
-             [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>]",
+             [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>] \
+             [--owned-by <name>] [--pricing-prompt <str>] [--pricing-completion <str>] \
+             [--region <str>]",
         )?;
 
         if no_chat_template && chat_template_file.is_some() {
@@ -135,8 +164,24 @@ impl Opts {
             default_max_tokens,
             no_chat_template,
             chat_template_file,
+            owned_by,
+            pricing_prompt,
+            pricing_completion,
+            region,
         })
     }
+}
+
+/// Reads `<arch>.context_length` from the GGUF's own metadata (the same
+/// arch-prefixed-key convention the core engine's `parse_model_config` uses, per the
+/// root CLAUDE.md) via the standalone `gguf_meta` reader -- best-effort: returns
+/// `None` rather than failing startup if the architecture or key is missing, since
+/// `context_length` is an informational extra for `/v1/models`, not required for the
+/// adapter to function.
+fn read_context_length(gguf_path: &str) -> Option<u64> {
+    let meta = gguf_meta::GgufMeta::open(gguf_path).ok()?;
+    let architecture = meta.get_str("general.architecture")?;
+    meta.get_u64(&format!("{architecture}.context_length"))
 }
 
 #[tokio::main]
@@ -181,17 +226,61 @@ async fn main() {
         chat_template::build(&opts.gguf_path, opts.chat_template_file.as_deref())
     };
 
+    let model_info = ModelInfo {
+        id: model_label.clone(),
+        object: "model",
+        created: now_unix(),
+        owned_by: opts.owned_by,
+        context_length: read_context_length(&opts.gguf_path),
+        pricing: ModelPricing {
+            prompt: opts.pricing_prompt,
+            completion: opts.pricing_completion,
+        },
+        datacenter_location: opts.region,
+    };
+
     let state = Arc::new(AppState {
         client,
         model_label,
         default_max_tokens: opts.default_max_tokens,
         request_counter: AtomicU64::new(0),
         chat_template,
+        model_info,
     });
+
+    // Fails the process fast and observably the moment the managed `reflex` child is
+    // gone, instead of a sidecar that silently keeps returning "ok" from `/healthz`
+    // forever -- see `reflex_client::ReflexClient::is_child_alive`'s doc comment and
+    // this crate's README "Known limitations". Recovery is deliberately left to the
+    // outer process supervisor (Docker `--restart`, or ALB/ASG health-check instance
+    // replacement), not reimplemented here.
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if !state.client.is_child_alive() {
+                    eprintln!(
+                        "[adapter] managed reflex process is gone; exiting so the process \
+                         supervisor can restart this sidecar"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/v1/models", get(list_models))
+        .route("/healthz", get(healthz))
+        // Alias of /healthz, same handler: Runpod Serverless load-balancing endpoints
+        // hard-poll `/ping` for worker health regardless of the documented
+        // `HEALTH_CHECK_PATH` override -- confirmed against a real deployment, where
+        // a worker that loaded correctly and reported /healthz=200 never received any
+        // traffic because Runpod's gateway was polling /ping (404, unhandled) the
+        // whole time. Costs nothing to serve both paths from the same state.
+        .route("/ping", get(healthz))
         .with_state(state);
 
     let addr = format!("{}:{}", opts.host, opts.port);
@@ -207,6 +296,37 @@ async fn main() {
         eprintln!("[adapter] server error: {e}");
         std::process::exit(1);
     }
+}
+
+/// Three-state health check backed by `ReflexClient`'s liveness/readiness flags,
+/// instead of an unconditional `"ok"` -- see the watchdog installed in `main()` and
+/// `reflex_client.rs`'s doc comment:
+/// - `503`/JSON: the managed `reflex` process is gone (dead child).
+/// - `204` (no body): the process is alive but still loading the model -- distinct
+///   from "dead" so a caller that measures cold-start duration from this endpoint
+///   (e.g. a RunPod Serverless load-balancing endpoint, which explicitly treats `204`
+///   as "initializing" and `200` as "healthy") gets an accurate readiness signal
+///   instead of a false-positive "ready" the moment this HTTP server's port is bound,
+///   which happens well before `reflex stdio`'s own model load finishes.
+/// - `200`/plain "ok": alive and ready to serve a request.
+async fn healthz(State(state): State<Arc<AppState>>) -> Response {
+    if !state.client.is_child_alive() {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "managed reflex process is not running",
+        )
+    } else if !state.client.is_ready() {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::OK, "ok").into_response()
+    }
+}
+
+async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse> {
+    Json(ModelsResponse {
+        object: "list",
+        data: vec![state.model_info.clone()],
+    })
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {

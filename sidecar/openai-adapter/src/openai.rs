@@ -183,6 +183,40 @@ pub struct ChatCompletionChunk {
     pub choices: Vec<ChunkChoice>,
 }
 
+/// Pricing strings for [`ModelInfo`] -- kept as strings (not numbers) to match
+/// OpenRouter's own `/models` pricing convention (per-token cost as a decimal
+/// string), since that's the metadata shape this endpoint exists to satisfy.
+#[derive(Debug, Serialize, Clone)]
+pub struct ModelPricing {
+    pub prompt: String,
+    pub completion: String,
+}
+
+/// One entry of `GET /v1/models`'s `data` array. This sidecar only ever manages one
+/// model (the single `reflex stdio` child it spawned at startup), so `data` always
+/// has exactly one element -- see `main.rs`. `context_length`/`datacenter_location`
+/// are OpenAI-schema extensions, not part of the standard `/v1/models` shape, kept
+/// here anyway since they're exactly what a future OpenRouter provider-listing
+/// application needs (see this crate's README).
+#[derive(Debug, Serialize, Clone)]
+pub struct ModelInfo {
+    pub id: String,
+    pub object: &'static str,
+    pub created: u64,
+    pub owned_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    pub pricing: ModelPricing,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub datacenter_location: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelsResponse {
+    pub object: &'static str,
+    pub data: Vec<ModelInfo>,
+}
+
 /// `"length"` if the final response's `token_ids` reached (or exceeded) the
 /// `max_tokens` actually requested from Reflex, `"stop"` otherwise. This is a
 /// heuristic, not information Reflex's IPC protocol reports directly (it has no

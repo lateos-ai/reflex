@@ -11,6 +11,8 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
@@ -21,11 +23,13 @@ struct Job {
 }
 
 /// Handle to the managed `reflex stdio` process. Cloning is cheap (just clones the
-/// job-queue sender) since the actual child process and its I/O are owned by the
-/// background worker task, not by any individual handle.
+/// job-queue sender and the shared liveness flag) since the actual child process and
+/// its I/O are owned by the background worker task, not by any individual handle.
 #[derive(Clone)]
 pub struct ReflexClient {
     job_tx: mpsc::Sender<Job>,
+    child_alive: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
 }
 
 impl ReflexClient {
@@ -52,22 +56,39 @@ impl ReflexClient {
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         let stderr = child.stderr.take().expect("piped stderr");
 
+        let ready = Arc::new(AtomicBool::new(false));
+
         // Forward the child's stderr line-by-line so `REFLEX_STDIO_READY`/model-load
         // diagnostics/panics are still visible, just prefixed to distinguish them
-        // from the adapter's own log lines.
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => eprintln!("[reflex] {line}"),
-                    Ok(None) => break, // child closed stderr (process exited)
-                    Err(e) => {
-                        eprintln!("[reflex] (stderr read error: {e})");
-                        break;
+        // from the adapter's own log lines. Also watches for the `REFLEX_STDIO_READY`
+        // line specifically (printed by `src/bin/reflex/stdio.rs` only after
+        // `Model::load` succeeds, right before it starts its stdin/stdout request
+        // loop) to flip `ready` -- this is what lets `/healthz` distinguish "process
+        // spawned but still loading the model" from "actually able to serve a
+        // request," which matters for any caller (e.g. a RunPod Serverless
+        // load-balancing endpoint's health check) that measures cold-start duration
+        // from this signal.
+        {
+            let ready = Arc::clone(&ready);
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                loop {
+                    match lines.next_line().await {
+                        Ok(Some(line)) => {
+                            if line.starts_with("REFLEX_STDIO_READY") {
+                                ready.store(true, Ordering::SeqCst);
+                            }
+                            eprintln!("[reflex] {line}");
+                        }
+                        Ok(None) => break, // child closed stderr (process exited)
+                        Err(e) => {
+                            eprintln!("[reflex] (stderr read error: {e})");
+                            break;
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
 
         // Leaking the `Child` handle into this task (instead of holding it in
         // `ReflexClient`) is deliberate: `kill_on_drop(true)` above means the process
@@ -77,16 +98,48 @@ impl ReflexClient {
         // `ReflexClient`. If the child exits, `child.wait()` returns and we log it;
         // in-flight/future jobs then fail via the stdin/stdout-closed error paths in
         // `run_worker` below.
+        let child_alive = Arc::new(AtomicBool::new(true));
         let (job_tx, job_rx) = mpsc::channel::<Job>(256);
-        tokio::spawn(run_worker(stdin, stdout, job_rx));
-        tokio::spawn(async move {
-            match child.wait().await {
-                Ok(status) => eprintln!("[adapter] reflex process exited: {status}"),
-                Err(e) => eprintln!("[adapter] reflex process wait() failed: {e}"),
-            }
-        });
+        tokio::spawn(run_worker(stdin, stdout, job_rx, Arc::clone(&child_alive)));
+        // `child.wait()` resolving is the authoritative "the process is gone" signal
+        // -- it fires the moment the process exits, regardless of whether any HTTP
+        // request has ever been sent (the worker's own EOF/error detection above only
+        // ever runs while a job is in flight, so relying on it alone would leave
+        // `child_alive` stuck at `true` for an instance that died before its first
+        // request -- confirmed as a real gap via a real `docker run` where a `reflex`
+        // panic at startup left `/healthz` reporting "ok" indefinitely).
+        {
+            let child_alive = Arc::clone(&child_alive);
+            tokio::spawn(async move {
+                match child.wait().await {
+                    Ok(status) => eprintln!("[adapter] reflex process exited: {status}"),
+                    Err(e) => eprintln!("[adapter] reflex process wait() failed: {e}"),
+                }
+                child_alive.store(false, Ordering::SeqCst);
+            });
+        }
 
-        Ok(ReflexClient { job_tx })
+        Ok(ReflexClient {
+            job_tx,
+            child_alive,
+            ready,
+        })
+    }
+
+    /// `false` once the worker has observed the managed `reflex` process's stdio
+    /// close or error -- see `run_worker`'s EOF/read-error branches below. Backs
+    /// `main.rs`'s `/healthz` handler; this type never tries to respawn the child
+    /// itself (see this module's doc comment and the crate README's "Known
+    /// limitations" -- recovery is the outer process supervisor's job).
+    pub fn is_child_alive(&self) -> bool {
+        self.child_alive.load(Ordering::SeqCst)
+    }
+
+    /// `true` once the child has printed `REFLEX_STDIO_READY` (model loaded, about to
+    /// enter its request loop) -- `false` while it's still spawning/loading. Distinct
+    /// from `is_child_alive`: a freshly-spawned child is alive but not yet ready.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
     }
 
     /// Enqueues one already-serialized IPC request line and returns a channel that
@@ -126,9 +179,14 @@ async fn run_worker(
     mut stdin: tokio::process::ChildStdin,
     mut stdout: BufReader<tokio::process::ChildStdout>,
     mut job_rx: mpsc::Receiver<Job>,
+    child_alive: Arc<AtomicBool>,
 ) {
     while let Some(job) = job_rx.recv().await {
         if let Err(e) = write_request(&mut stdin, &job.line).await {
+            // A broken stdin pipe means the child is gone -- mark it dead so
+            // `/healthz` reflects reality instead of silently returning "ok"
+            // for every request from here on.
+            child_alive.store(false, Ordering::SeqCst);
             let _ = job.events_tx.send(worker_error(&e.to_string())).await;
             continue;
         }
@@ -138,6 +196,7 @@ async fn run_worker(
             match stdout.read_line(&mut line).await {
                 Ok(0) => {
                     // EOF: the reflex process closed stdout (crashed or exited).
+                    child_alive.store(false, Ordering::SeqCst);
                     let _ = job
                         .events_tx
                         .send(worker_error(
@@ -164,6 +223,9 @@ async fn run_worker(
                             }
                         }
                         Err(e) => {
+                            // Malformed output is a protocol-level surprise, not
+                            // evidence the process itself died -- don't flip
+                            // `child_alive` here.
                             let _ = job
                                 .events_tx
                                 .send(worker_error(&format!("malformed reflex output line: {e}")))
@@ -173,6 +235,9 @@ async fn run_worker(
                     }
                 }
                 Err(e) => {
+                    // A read error on the pipe (not a clean EOF) is also treated as
+                    // the child being gone -- both are "we can no longer talk to it."
+                    child_alive.store(false, Ordering::SeqCst);
                     let _ = job
                         .events_tx
                         .send(worker_error(&format!("reading reflex stdout: {e}")))
