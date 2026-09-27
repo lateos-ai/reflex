@@ -61,14 +61,12 @@ compute-capability mismatch panic seen on Runpod's mixed pools (see
 `.runpod/README.md`) -- expected, since Modal's `gpu="L4"` request has no equivalent
 pooling hazard, but confirmed rather than assumed.
 
-**What this is not yet**: a formal Reflex-vs-vLLM head-to-head. Phase 0's own doc is
-explicit that such a comparison is Phase 3's job, not to be cited before Phase 3 
-actually runs its own controlled, multi-run methodology on both engines under the same
-conditions. This is one real run of Reflex alone on Modal, not yet a rigorous p50/p95
-series, and not yet a controlled comparison against Phase 0's vLLM number (different
-run, different day, no shared harness). Treat the ~26x gap between this 7.1s and Phase
-0's 183.6s as a directional signal consistent with Phase 0's hypothesis, not a citable
-benchmark result.
+**What this was not yet, at the time**: a formal Reflex-vs-vLLM head-to-head — that
+comparison has since run as Phase 3, see
+[`docs/modal-phase3-comparison.md`](../docs/modal-phase3-comparison.md) (`n=3` cold starts
+per engine under a shared harness: Reflex median 7.7s vs. vLLM median 190.7s, ~25x). This
+single Phase 1 run (7.1s) is superseded as the citable number by Phase 3's `n=3` sample;
+it stays here as the original packaging-verification result.
 
 ## Cost
 
@@ -86,7 +84,8 @@ roughly two orders of magnitude shorter.
   engine file. This is a fourth, independent, purely additive deployment path.
 - No new engine capability, no batching, no protocol redesign -- see root `CLAUDE.md`'s
   non-goals.
-- Not yet the Phase 3 head-to-head comparison -- see above.
+- The Phase 3 head-to-head comparison lives in
+  [`docs/modal-phase3-comparison.md`](../docs/modal-phase3-comparison.md), not here.
 
 ## What's confirmed vs. not yet verified
 
@@ -94,11 +93,10 @@ roughly two orders of magnitude shorter.
 against this project's existing multi-stage Dockerfile pattern; `add_python` is required
 because the runtime stage has no Python; the `sm_89`-pinned cubin runs correctly on
 Modal's L4; the adapter's existing three-state `/healthz` handler works unmodified as
-the Server's readiness signal; one real end-to-end cold start measured at 7.1s local
-submit → first token.
+the Server's readiness signal; `n=3` real end-to-end cold starts measured (7.0s, 7.7s,
+7.7s local submit → first token — see Phase 3's doc for the full comparison against vLLM).
 
-**Not yet verified**: multiple runs for variance/p50/p95 (this is `n=1`); a persistent
-(`modal deploy`) deployment's behavior under repeated cold starts after
-`scaledown_window` idle periods; behavior under `unauthenticated=False` (real auth
-would be needed for anything beyond this exploratory check); the Phase 3 controlled
-comparison against vLLM.
+**Not yet verified**: a persistent (`modal deploy`) deployment's behavior under repeated
+cold starts after `scaledown_window` idle periods; behavior under
+`unauthenticated=False` (real auth would be needed for anything beyond this exploratory
+check).

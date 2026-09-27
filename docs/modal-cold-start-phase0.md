@@ -13,9 +13,12 @@ the result is the opposite extreme. Phase 1 (building the actual Reflex-on-Modal
 worth pursuing.
 
 **Phase 1 status: done** — see `.modal/README.md` for the real deployment and its measured
-numbers (7.1s local-submit-to-first-token on a real Modal L4 GPU, `n=1`). The formal
-Reflex-vs-vLLM comparison implied by this doc's numbers is still reserved for Phase 3 (see
-"What this does and doesn't prove" below) — Phase 1's own README deliberately does not cite one.
+numbers (7.1s local-submit-to-first-token on a real Modal L4 GPU, `n=1`).
+
+**Phase 3 status: done** — see [`docs/modal-phase3-comparison.md`](modal-phase3-comparison.md)
+for the formal, controlled Reflex-vs-vLLM head-to-head (`n=3` cold starts per engine, same
+L4 GPU, same day): Reflex's median cold start (7.7s) was ~25x faster than vLLM's median
+(190.7s).
 
 ## Why Modal specifically
 
