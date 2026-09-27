@@ -3,3 +3,4 @@ sidecar/*/target
 *.gguf
 test-data/*.tar.gz
 /bench-results
+__pycache__/
