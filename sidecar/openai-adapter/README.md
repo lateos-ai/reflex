@@ -1,7 +1,7 @@
 # reflex-openai-adapter
 
 An OpenAI-compatible `POST /v1/chat/completions` HTTP sidecar in front of the Reflex
-core engine. This is the escape-hatch pattern the root project's `README.md`'s
+core engine. This is the escape-hatch pattern the root project's `README.md`
 Non-goals section describes and defers: **the core `reflex` engine never
 grows a network socket or a thread pool** — this crate is a separate process, in its
 own Cargo project, that translates real HTTP traffic (OpenRouter, the OpenAI Python/
@@ -48,6 +48,8 @@ cargo build --release
 reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host <addr>]
   [--port <port>] [--lora <adapter.gguf>] [--model-name <name>]
   [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>]
+  [--owned-by <name>] [--pricing-prompt <str>] [--pricing-completion <str>]
+  [--region <str>]
 ```
 
 - `--lora <adapter.gguf>` is forwarded straight through to `reflex stdio`'s own
@@ -62,6 +64,10 @@ reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host <addr>]
 - `--chat-template-file <path>` supplies an explicit Jinja2 chat-template file
   (same syntax as a GGUF's `tokenizer.chat_template` string) for a GGUF that doesn't
   ship one of its own. Mutually exclusive with `--no-chat-template`.
+- `--owned-by <name>` (default `reflex`), `--pricing-prompt`/`--pricing-completion
+  <str>` (default `"0"` each), `--region <str>` (no default) populate the
+  `GET /v1/models` metadata described below. None of these affect inference; they're
+  informational fields a caller (or an OpenRouter provider-listing application) reads.
 
 At startup the adapter tries to load and render-test the GGUF's own
 `tokenizer.chat_template` metadata once (or `--chat-template-file`'s contents, if
@@ -112,7 +118,20 @@ this sidecar has no auth (see Known limitations).
 Implements `POST /v1/chat/completions` only, both non-streaming (JSON) and streaming
 (`"stream": true`, Server-Sent Events, `chat.completion.chunk` objects terminated by
 a `data: [DONE]` line) — see `src/main.rs::build_sse_stream`/`non_streaming_response`.
-Also exposes `GET /healthz` (plain `"ok"` body) for basic liveness checks.
+Also exposes `GET /healthz`, a three-state health check (see Known limitations
+below): `200`/plain `"ok"` once the managed `reflex` child has finished loading the
+model and is ready to serve a request; `204`/no body while it's alive but still
+loading; `503`/JSON if the child is gone. The `204` "initializing" state matters for
+callers that measure cold-start duration from this endpoint's transition to healthy
+(e.g. a RunPod Serverless load-balancing endpoint, which treats `204` as
+"initializing" and `200` as "healthy" by the same convention) -- without it, this
+endpoint would report "ready" the moment its own HTTP port is bound, well before
+`reflex stdio`'s model load actually finishes. Also exposes
+`GET /v1/models` (standard OpenAI list-of-one-model shape, plus `context_length`,
+`pricing`, and `datacenter_location` extension fields set via the `--owned-by`/
+`--pricing-*`/`--region` flags above -- useful on their own, and specifically shaped
+for a future OpenRouter provider-listing application, which requires a `/v1/models`
+endpoint with this kind of metadata).
 
 Request fields honored: `model`, `messages` (`role`/`content`, string content only),
 `temperature`, `top_p`, `max_tokens`, `stream`, `seed`. `top_k` is accepted too as a
@@ -181,7 +200,16 @@ supports it. `temperature` omitted or `<= 0` selects greedy argmax, mirroring
   production-hardened gateway — put a real reverse proxy in front of it if either is
   needed. Consistent with this being local sidecar tooling, not a serving platform
   (see the root README's Non-goals section).
-- **One managed `reflex` process, not auto-restarted.** If the child process crashes,
-  every subsequent request fails with a clear `500` (`src/reflex_client.rs`'s
-  stdin/stdout-closed error paths) rather than the sidecar transparently respawning
-  it. Restart the sidecar process itself to recover.
+- **One managed `reflex` process, not auto-restarted -- but the sidecar now fails
+  fast and observably instead of degrading silently.** This crate deliberately does
+  not respawn a dead `reflex` child itself (that's the outer process supervisor's
+  job -- Docker's `--restart unless-stopped`, or an ALB/ASG health-check replacing an
+  unhealthy instance in a fleet deployment -- re-implementing backoff/restart-storm
+  protection here would be scope creep for what's meant to be a small translation
+  shim). What it does do: `GET /healthz` reflects real process liveness
+  (`ReflexClient::is_child_alive`, `503` once the child's stdio closes or errors, not
+  a hardcoded `"ok"`), and a background watchdog in `main.rs` exits the sidecar
+  process itself the moment the child is gone, rather than continuing to accept
+  requests it can no longer serve. Verified via a real `docker run`: killing/crashing
+  the child causes the container to exit within about a second, with a clear log
+  line, instead of running forever while quietly failing every request.

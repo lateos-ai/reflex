@@ -6,7 +6,7 @@ fast local decision gate. See the main [README](../README.md)'s
 "Example: download a model from Hugging Face, then run a System1 test" section
 for the underlying command and what `score`/`probability`/`entropy` mean.
 
-These are shell scripts, not Rust code — this project is CLI-first (see the root
+These are shell scripts, not Rust code — this project is CLI-first (see the main
 README's Non-goals section), and `reflex system1`'s stdout is already a stable,
 parseable `KEY=value` contract (see `scripts/bench_cold_system1_vs_jev.sh` for
 another script that relies on it).

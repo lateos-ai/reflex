@@ -1,0 +1,16 @@
+{
+  "tests": [
+    {
+      "name": "smoke-chat-completion",
+      "input": {
+        "messages": [{"role": "user", "content": "Say hello in exactly three words."}],
+        "max_tokens": 16
+      },
+      "timeout": 120000
+    }
+  ],
+  "config": {
+    "gpuTypeId": "NVIDIA RTX A4500",
+    "gpuCount": 1
+  }
+}

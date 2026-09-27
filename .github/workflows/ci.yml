@@ -39,3 +39,57 @@ jobs:
 
       - name: Test (GPU-hardware tests are #[ignore]d and skipped here)
         run: cargo test --locked
+
+  # sidecar/openai-adapter is a deliberately separate Cargo project (own
+  # Cargo.toml/Cargo.lock, not a workspace member, no dependency on reflex-engine --
+  # see its own README) specifically so it never needs nvcc/CUDA. It builds with a
+  # plain stable toolchain, so it runs on the same hosted-runner matrix as the job
+  # above with no REFLEX_SKIP_CUDA or other CUDA-avoidance needed.
+  sidecar-build-and-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: sidecar/openai-adapter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sidecar/openai-adapter
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Build
+        run: cargo build --locked --all-targets
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+  # .runpod/handler.py is a thin Python translation shim for the Runpod Hub's
+  # queue-based worker requirement (see .runpod/README.md) -- it has no engine
+  # logic of its own, so a syntax-only compile check is proportionate. It is not
+  # imported/run here since that would require pip-installing the runpod SDK and
+  # either mocking or spawning a real reflex-openai-adapter subprocess for no
+  # additional coverage value.
+  hub-handler-syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile-check handler.py (syntax only)
+        run: python -m py_compile .runpod/handler.py
