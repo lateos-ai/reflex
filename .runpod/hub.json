@@ -2,7 +2,7 @@
   "title": "Reflex (GGUF-native cold-start-optimized inference)",
   "description": "OpenAI-compatible chat completions backed by Reflex, a GGUF-native GPU inference engine built for fast cold starts (AOT-compiled CUDA kernels, no runtime NVRTC/JIT tax). Model baked into the image; see the linked repo for architecture support.",
   "type": "serverless",
-  "category": "language-models",
+  "category": "language",
   "iconUrl": "TODO: no hosted icon asset exists for this project yet -- replace before submitting to the Hub",
   "config": {
     "runsOn": "GPU",

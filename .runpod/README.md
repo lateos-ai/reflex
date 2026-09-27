@@ -36,14 +36,21 @@ sends. Streaming would require translating Server-Sent Events into a Runpod gene
 handler — real new logic, out of scope for a shim whose only job is speaking Runpod's job
 envelope format. This is a deliberate, documented v1 limitation, not an oversight.
 
-## GPU pin
+## GPU pin: portable PTX, not sm_86 (unlike `serverless/runpod/`)
 
-Same hazard and same fix as `serverless/runpod/`: the cheapest pool, `AMPERE_16`, is
-mixed-architecture (Ampere `sm_86` RTX A4000/A4500 alongside Ada `sm_89` RTX 2000/4000 Ada) —
-see [`serverless/runpod/README.md`'s GPU-selection section](../serverless/runpod/README.md)
-for the full table and reasoning. `hub.json`'s `gpuIds` excludes both Ada SKUs from the pool
-(`AMPERE_16,-NVIDIA RTX 2000 Ada Generation,-NVIDIA RTX 4000 Ada Generation`) so this sm_86
-build only ever schedules onto compatible hardware.
+The same mixed-architecture hazard documented in
+[`serverless/runpod/README.md`'s GPU-selection section](../serverless/runpod/README.md)
+applies to this pool (`AMPERE_16`: Ampere `sm_86` RTX A4000/A4500 alongside Ada `sm_89` RTX
+2000/4000 Ada), but the *fix* is different here. `serverless/runpod/`'s endpoint is a real,
+already-deployed resource whose GPU can be pinned directly via `set-endpoint-gpus`. A Hub
+listing has no equivalent lever: Runpod's own Hub build/test pipeline schedules the automated
+test job wherever it wants, and **real evidence (2026-09-27, below) shows it does not reliably
+honor either `hub.json`'s `gpuIds` exclusion list or `tests.json`'s `gpuTypeId` pin.** Since an
+`sm_86`-pinned cubin crashes outright on an `sm_89` card (not just slower — a hard panic), this
+build uses **portable PTX** (`REFLEX_CUDA_ARCH` left unset in `.runpod/Dockerfile`, JIT-compiled
+by the driver to whichever GPU is actually present) instead. This trades away the zero-JIT
+cold-start advantage `serverless/runpod/`'s pinned build gets, in exchange for actually working
+regardless of which card in the pool the Hub schedules it onto.
 
 ## Non-goals for this addition
 
@@ -93,8 +100,35 @@ is a different mechanism from an LB endpoint's direct HTTP proxy, and this hasn'
 re-measured across multiple runs the way the LB deployment's numbers were. Treat this as a first
 real data point, not a final benchmark.
 
+## Real Hub build/test findings (2026-09-27)
+
+After linking the `lateos-ai/reflex` repo in Runpod's Hub console (under the `lateos-ai` org,
+not a personal account — the account/org selector in the "Add Repo" dialog defaults to the
+personal account, which is easy to miss if the target repo lives in an org), Runpod's own
+pipeline built `.runpod/Dockerfile` against the `v0.2.0-runpod-hub` release. **The Docker build
+itself succeeded** — the build-time model fetch (see `.runpod/Dockerfile`'s comment) worked
+correctly against Runpod's own build infrastructure, not just locally.
+
+**The automated test job failed**, and the failure is the reason this build no longer pins
+`sm_86` (see the GPU pin section above): the test worker's own startup log reported `GPU: NVIDIA
+RTX 2000 Ada Generation (sm_89)` — one of the exact two SKUs `hub.json`'s `gpuIds` and
+`tests.json`'s `gpuTypeId: "NVIDIA RTX A4500"` both tried to exclude/pin away from. The
+`sm_86`-compiled `reflex` binary panicked on load with a clear, correct error (`"this binary's
+CUDA kernels were compiled for compute capability 8.6 (sm_86), but the detected GPU ... has
+compute capability 8.9"`), and the test timed out. This is strong evidence that at least one of
+Runpod's Hub-specific GPU-selection fields is not honored by the Hub's own test-scheduling
+infrastructure, independent of whatever `set-endpoint-gpus`/`gpu.excludedTypes` behavior a real
+deployed endpoint has (which `serverless/runpod/`'s real deployment *did* confirm works
+correctly — see that README). Switching to portable PTX resolves this by making the GPU
+architecture irrelevant to correctness.
+
+Also fixed from this same first attempt: `hub.json`'s `category` field was set to
+`"language-models"`, a value not in the Hub UI's actual set (`Image`/`Video`/`Audio`/
+`Language`/`Embedding`, confirmed by inspecting the live "Add Repo" form) — corrected to
+`"language"`.
+
 ## Status
 
-Not yet submitted to the Hub (that step needs the repo owner to link the GitHub repo in
-Runpod's console, plus a tagged GitHub release — see the project plan). `iconUrl` in `hub.json`
-is still a placeholder pending a real hosted icon asset.
+Repo is linked in Runpod's Hub console under `lateos-ai`; the portable-PTX fix above is
+pending its own new GitHub release and rebuild before the automated test gate is re-run.
+`iconUrl` in `hub.json` is still a placeholder pending a real hosted icon asset.
