@@ -1067,6 +1067,15 @@ sidecar) expose it.
   dominates and is the least stable phase, session-to-session variance
   exceeded intra-session variance in this round's own two batches -- disclosed
   in README.md's new "Cold-start phase breakdown" subsection rather than
-  smoothed over. **Still open, not yet attempted**: host-vs-container/cgroup
-  rows and a persistent-vs-`exec`'d row (both specifically requested,
-  deliberately scoped out of this round to avoid a multi-day detour).
+  smoothed over. **Closed 2026-09-27** (real Tesla T4 `g4dn.xlarge`,
+  `REFLEX_CUDA_ARCH=sm_75` pinned cubin both sides, `n=10` each): host-vs-
+  container adds ~400ms/~29% external wall-clock overhead entirely attributable
+  to Docker's own container-launch machinery (internal `process_start_to_first_token_ms`
+  is statistically identical, 1303.9ms host vs. 1288.3ms container); a
+  persistent `reflex stdio` process's steady-state request is ~80x faster than
+  this project's own cold-per-process design (16.35ms vs. 1303.9ms), with a
+  real, separately-noted ~709ms one-time compute-kernel warmup cost on a
+  resident process's *first* request that `model_load_ms` doesn't capture. See
+  README.md's "Cold-start phase breakdown" subsection for full numbers and an
+  honestly-unexplained ~16.5s `model_load_ms` outlier on the host's first
+  (of 10) runs, not smoothed over.

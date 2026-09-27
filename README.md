@@ -269,12 +269,58 @@ shared rented GPU instance. **Session-to-session variance on rented cloud GPU ha
 can exceed intra-session variance**, so treat any single-session cold-start number as
 illustrative, not lab-controlled.
 
-**Not yet covered, flagged as real follow-up work, not silently skipped**: host-vs-
-container (does `cgroups`/the NVIDIA Container Toolkit/device-plugin limits change
-CUDA-init overhead vs. bare metal?) and persistent-vs-`exec`'d rows (does keeping one
-`reflex` process warm and re-using it change anything the `smoke`/`generate`
-one-shot-process model doesn't already show?) — both real, specific, harder-to-answer
-questions than the phase breakdown itself, deliberately scoped out of this round.
+**Host-vs-container/cgroup, and persistent-vs-`exec`'d — both closed** (2026-09-27, real
+Tesla T4 `g4dn.xlarge`, `Qwen3-0.6B-Q4_K_M.gguf`, `REFLEX_CUDA_ARCH=sm_75` pinned-cubin
+build on both sides so the comparison isn't confounded by JIT-vs-cubin, `n=10` each):
+
+**Host vs. container.** Same binary, same pinned cubin, run bare (`/usr/bin/time -v
+./target/release/reflex generate ...`) vs. inside `docker run --rm --gpus all` against
+this repo's own root `Dockerfile` image (already built and resident locally — this
+isolates container *runtime* overhead, not registry image-pull time):
+
+| | internal total (`process_start_to_first_token_ms`, p50) | external wall clock (p50) | derived launch overhead |
+|---|---|---|---|
+| Host (bare process) | 1303.9 ms | ~1400 ms | ~96 ms |
+| Container (`docker run --gpus all`) | 1288.3 ms | ~1800 ms | ~512 ms |
+
+Reflex's own internally-reported total is statistically identical either side (1303.9ms
+vs. 1288.3ms, well within run-to-run noise) — the ~400ms/~29% gap in external wall clock
+is entirely attributable to Docker's own container-launch machinery (dispatch to
+`dockerd`, OverlayFS mount, cgroup/namespace setup, the NVIDIA Container Toolkit's device
+injection), not to anything about CUDA execution being slower inside a container. Both
+sides' first run of `n=10` was an outlier and is excluded from the p50s above rather than
+smoothed into them: the container's first run paid an extra ~1.3s in `cuda_init_ms`
+(1400ms vs. ~140ms on every subsequent run — plausibly the container's first-ever access
+to the GPU device nodes through a fresh network/cgroup namespace) and the host's first run
+paid an extraordinary ~16.5s inside `model_load_ms` alone (`cuda_init_ms` on that same run
+was a normal 141.8ms) — real, logged, and unexplained rather than hand-waved: not
+reproducible on any of the other 9 host runs, and not matching any known page-cache-cold
+explanation (the model file had just been written to the same filesystem, so it should
+already have been page-cache-resident). Flagged honestly as an open question for whoever
+re-runs this, not swept under "variance."
+
+**Persistent vs. `exec`'d.** `reflex stdio` started once, `REFLEX_STDIO_READY` awaited,
+then 10 requests sent to the *same* resident process over its existing JSON-line IPC
+(`scripts/`-adjacent throwaway harness, not a checked-in script — see `src/ipc.rs`) vs.
+the cold per-process total above:
+
+| | p50 | note |
+|---|---|---|
+| Cold, one process per request (this project's actual design) | 1303.9 ms | CUDA init + full model load + first token, every time |
+| Persistent, resident process, steady state (requests 2–10) | 16.35 ms | pure inference + IPC round-trip, no reload |
+| Persistent, resident process, *first* request after ready | 708.96 ms | one-time compute-kernel warmup cost `REFLEX_STDIO_READY` doesn't capture |
+
+A resident process's steady-state request is **~80x faster** than this project's own
+cold-start design — expected and not a criticism of the architecture (a resident,
+always-on server is exactly the `batch_size`-1/no-thread-pool serving-platform shape this
+project's Non-goals deliberately reject; see root `CLAUDE.md`). What's genuinely useful
+here: the gap between a resident process's *first* request (708.96ms) and its *second*
+(16.35ms) shows that even a fully warm, already-loaded model still pays a real one-time
+cost the first time it actually runs its compute kernels — a cost `model_load_ms` doesn't
+capture because weight upload uses dequant/memcpy kernels, not the attention/GEMV kernels
+a real forward pass launches for the first time. That first-real-inference tax is not
+currently broken out as its own phase; doing so is a plausible future refinement of this
+breakdown, not scoped here.
 
 ## Core technical bet
 
