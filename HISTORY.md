@@ -2738,3 +2738,73 @@ opposite end -- a fresh process per turn, with `--export-kv`/`--import-kv` (Phas
 and the orchestrator owning where that state lives, instead of a resident in-engine
 cache manager. That is a sharper framing for README than "cold start" alone, and it
 costs no code.
+
+
+### NVML energy measurement, `reflex doctor`, and `--json` output (2026-09-27)
+
+Three additive pieces landed together (commit `a28363b`), closing a real gap in this
+project's own measurement story: every subcommand has reported wall-clock cold-start
+timing since the MVP, but nothing anywhere measured the *energy* half of this project's
+stated thesis ("cold-start energy and latency" per CLAUDE.md's opening line) -- only
+`Instant`-based milliseconds, never joules.
+
+**`src/energy.rs`**: GPU energy sampling via NVML (`nvml-wrapper`), gated behind a new
+`nvml` Cargo feature and `dlopen`/`LoadLibrary`-loaded at runtime (via `libloading`),
+never linked at build time -- so the feature can't break a `REFLEX_SKIP_CUDA=1` dev
+build, and a binary built with `--features nvml` still runs fine, energy fields simply
+absent, on a machine or container lacking `libnvidia-ml.so`/`nvml.dll` entirely. Prefers
+`nvmlDeviceGetTotalEnergyConsumption` (a monotonic millijoule hardware counter,
+Volta+ only); falls back to polling `nvmlDeviceGetPowerUsage` on a background thread and
+numerically integrating `power_mw * dt_s` at `REFLEX_NVML_POLL_MS` cadence (default
+10ms) for pre-Volta GPUs (e.g. this project's own T4 fleet lacks the counter). The
+polling thread is a deliberate non-exception to CLAUDE.md's Non-goals: it's a single
+internal stopwatch-analogue that never accepts a work item or serves a request, not the
+`batch_size`/thread-pool concurrency model those Non-goals govern, and needs no shutdown
+handshake since `fast_exit` already kills every thread the process owns. Measured
+device-wide, not per-process (NVML has no per-process energy API) -- accurate on a
+dedicated/rented instance, this project's stated target, a known overcount on a shared
+GPU. Any NVML failure (missing library, old driver, no permission, unsupported GPU)
+degrades to "no measurement available," never a panic.
+
+**`src/bin/reflex/doctor.rs`**: a new `reflex doctor [--json]` subcommand, a one-shot
+"is this machine set up correctly?" health report -- wires together checks that
+already existed as side effects of other subcommands (`diagnostics.rs`'s GPU probe,
+compute-capability-vs-build-time-`REFLEX_CUDA_ARCH` match, driver-error translation)
+plus two new ones: a real AOT-kernel load+launch check (`aot::verify_kernel_launch`)
+and an NVML-availability probe (`energy::probe_availability`). Same 0/1/2 exit-code
+contract as `reflex check` (0 = all pass, a `warn` like missing NVML is fine; 1 = a
+check failed; 2 = usage error), same `std::process::exit` (not `fast_exit`) for the
+same reason `check.rs` uses it -- the exit code *is* the point here, not a cold-start
+measurement `fast_exit` would otherwise protect. No GGUF/model loading, same scope
+class as `reflex smoke`.
+
+**`src/cli_output.rs`**: a new `json-output` feature giving `generate`/`system1`/
+`bench`/`smoke`/`check`/`doctor` a `--json` flag, one JSON object per existing
+`REFLEX_*_OK`-style stdout line printed at the same call site the plain-text line was
+-- not one aggregated end-of-run object, mirroring each subcommand's existing
+multi-line shape. Field names match each plain-text line's `key=value` names 1:1,
+`Option<T>` + `#[serde(skip_serializing_if = "Option::is_none")]` fields following the
+convention `src/ipc.rs`'s `IpcResponse` already established. `ipc` now depends on
+`json-output` (rather than declaring `dep:serde`/`dep:serde_json` a second time) since
+its own wire protocol needs the same serde machinery. Plain-text output is unchanged
+byte-for-byte when the flag is absent -- every call site branches and calls either its
+existing `println!` or the new `print_json_line`, never both.
+
+**`llms.txt`** (repo root): an agent-facing quickstart listing the literal commands to
+run Reflex on each supported platform (local GPU, Docker, AWS, Runpod, Modal), so an
+agent doesn't have to reconstruct them from README.md/CLAUDE.md prose. Its Runpod
+section currently frames `.runpod/` as a pending Hub *submission* rather than a live
+listing -- see the "Runpod Hub submission" tracking note for when to flip that.
+
+**Verification status, disclosed honestly**: this entry documents the feature as
+implemented and code-complete (`REFLEX_SKIP_CUDA=1 cargo build --features json-output`
+compiles clean), matching this project's source at commit `a28363b`. Unlike every
+other feature entry in this log, **none of the three pieces above have been
+real-hardware-verified yet** -- no run of `reflex doctor` or NVML energy sampling
+against a real GPU has happened. This project's own stated methodology (CLAUDE.md:
+"There is no CPU/mock fallback... real GPU-hardware verification is the only way to
+confirm forward-pass correctness") applies here too: treat `reflex doctor`'s checks and
+`energy.rs`'s joule figures as unverified until a real GPU run confirms `verify_kernel_
+launch` actually launches a kernel, NVML's counter-vs-polled-fallback branch both work
+as designed, and the numbers `--json` emits are sane. Next real-hardware session should
+close this gap before any further claim is made about it in README.md or a benchmark.
