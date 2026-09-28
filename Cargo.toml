@@ -44,11 +44,25 @@ pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optiona
 # ingestion path (no safetensors parsing). Feature-gated for the same reason as
 # `ipc`/`python` above.
 hf-hub = { version = "0.3", optional = true }
+# NVML energy instrumentation (see src/energy.rs), feature-gated for the same
+# reason as `ipc`/`python`/`download` above. Loads libnvidia-ml.so/nvml.dll at
+# runtime via dlopen (never linked at build time), so this feature never breaks
+# a REFLEX_SKIP_CUDA=1 dev build.
+nvml-wrapper = { version = "0.13", optional = true }
 
 [features]
-ipc = ["dep:serde", "dep:serde_json"]
+# `ipc`'s own wire protocol (src/ipc.rs) needs serde too, so it just pulls in
+# `json-output` rather than declaring `dep:serde`/`dep:serde_json` a second
+# time -- cargo unifies the shared deps, no duplication/conflict from having
+# both features on at once.
+ipc = ["json-output"]
 python = ["dep:pyo3"]
 download = ["dep:hf-hub"]
+nvml = ["dep:nvml-wrapper"]
+# --json output on generate/system1/bench/smoke/check/doctor (see
+# src/cli_output.rs) -- deliberately its own feature rather than reusing `ipc`,
+# since JSON output is orthogonal to the IPC transport.
+json-output = ["dep:serde", "dep:serde_json"]
 
 [[bin]]
 name = "reflex"

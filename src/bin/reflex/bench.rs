@@ -13,9 +13,14 @@
 //! two is System1's actual, measured win.
 //!
 //! Usage: `reflex bench <path-to-gguf> [--warmup N] [--iters N]
-//! [--candidate <text> ...] [--lora <adapter.gguf>]`
+//! [--candidate <text> ...] [--lora <adapter.gguf>] [--json]`
+//!
+//! `--json` (needs `cargo build --features json-output`) prints each result
+//! as one line of JSON instead of the plain `REFLEX_*_OK key=value` text --
+//! see `reflex_engine::cli_output`'s doc comment for the exact shapes.
 
 use reflex_engine::diagnostics;
+use reflex_engine::energy;
 use reflex_engine::gguf::GgufFile;
 use reflex_engine::model::{Model, System1Candidate};
 use std::time::Instant;
@@ -37,25 +42,72 @@ fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
     sorted_ms[idx.min(sorted_ms.len() - 1)]
 }
 
+// Only called from a `#[cfg(not(feature = "json-output"))]` arm below --
+// `#[allow(dead_code)]` since a build *with* that feature never reaches it.
+#[allow(dead_code)]
+fn json_output_unavailable() -> ! {
+    panic!("--json requires this binary to be built with `cargo build --features json-output`");
+}
+
+fn print_lora_ok(json: bool, path: &str, tensors_applied: usize) {
+    if !json {
+        println!("REFLEX_LORA_OK path={path:?} tensors_applied={tensors_applied}");
+        return;
+    }
+    #[cfg(feature = "json-output")]
+    reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::LoraAppliedJson {
+        path: path.to_string(),
+        tensors_applied,
+    });
+    #[cfg(not(feature = "json-output"))]
+    json_output_unavailable();
+}
+
+/// `prefix` (e.g. `"REFLEX_BENCH_WARM_OK"`/`"REFLEX_BENCH_SYSTEM1_OK"`) is
+/// this line's plain-text tag; `kind` (e.g. `"warm"`/`"system1"`) is its
+/// `--json` `BenchStatsJson::kind` discriminator -- both name the same
+/// distinction, just in each output mode's own naming convention.
+#[allow(clippy::too_many_arguments)]
 fn print_stats(
+    json: bool,
     prefix: &str,
+    kind: &'static str,
     prompt_tokens: usize,
     warmup: usize,
     iters: usize,
     mut samples_ms: Vec<f64>,
 ) {
+    // `kind` is only read from the `#[cfg(feature = "json-output")]` branch
+    // below -- referenced here too so a build without that feature doesn't
+    // warn about an unused parameter.
+    let _ = kind;
     samples_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let min_ms = samples_ms[0];
     let max_ms = samples_ms[samples_ms.len() - 1];
-    println!(
-        "{prefix} prompt_tokens={prompt_tokens} warmup={warmup} iters={iters} \
-         p50_ms={:.3} p90_ms={:.3} p99_ms={:.3} min_ms={:.3} max_ms={:.3}",
-        percentile(&samples_ms, 0.50),
-        percentile(&samples_ms, 0.90),
-        percentile(&samples_ms, 0.99),
+    let p50_ms = percentile(&samples_ms, 0.50);
+    let p90_ms = percentile(&samples_ms, 0.90);
+    let p99_ms = percentile(&samples_ms, 0.99);
+    if !json {
+        println!(
+            "{prefix} prompt_tokens={prompt_tokens} warmup={warmup} iters={iters} \
+             p50_ms={p50_ms:.3} p90_ms={p90_ms:.3} p99_ms={p99_ms:.3} min_ms={min_ms:.3} max_ms={max_ms:.3}"
+        );
+        return;
+    }
+    #[cfg(feature = "json-output")]
+    reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::BenchStatsJson {
+        kind,
+        prompt_tokens,
+        warmup,
+        iters,
+        p50_ms,
+        p90_ms,
+        p99_ms,
         min_ms,
         max_ms,
-    );
+    });
+    #[cfg(not(feature = "json-output"))]
+    json_output_unavailable();
 }
 
 pub fn run(args: Vec<String>) {
@@ -64,10 +116,12 @@ pub fn run(args: Vec<String>) {
     let mut iters: usize = 50;
     let mut candidate_texts: Vec<String> = Vec::new();
     let mut lora_path: Option<String> = None;
+    let mut json = false;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--json" => json = true,
             "--candidate" => candidate_texts.push(args.next().expect("--candidate requires text")),
             "--lora" => lora_path = Some(args.next().expect("--lora requires a file path")),
             "--warmup" => {
@@ -87,7 +141,7 @@ pub fn run(args: Vec<String>) {
         }
     }
     let gguf_path =
-        gguf_path.unwrap_or_else(|| panic!("usage: reflex bench <path-to-gguf> [--warmup N] [--iters N] [--candidate <text> ...] [--lora <adapter.gguf>]"));
+        gguf_path.unwrap_or_else(|| panic!("usage: reflex bench <path-to-gguf> [--warmup N] [--iters N] [--candidate <text> ...] [--lora <adapter.gguf>] [--json]"));
     if iters == 0 {
         panic!("--iters must be at least 1");
     }
@@ -106,13 +160,24 @@ pub fn run(args: Vec<String>) {
     let mut model = Model::load(device, &file).expect("failed to load model");
     if let Some(before) = vram_before {
         if let Ok(after) = diagnostics::probe(&device_for_vram) {
-            let resident_mib =
+            let free_before_load_mib = before.vram_free_bytes / (1024 * 1024);
+            let free_after_load_mib = after.vram_free_bytes / (1024 * 1024);
+            let model_resident_mib =
                 before.vram_free_bytes.saturating_sub(after.vram_free_bytes) / (1024 * 1024);
-            println!(
-                "REFLEX_BENCH_VRAM_OK model_resident_mib={resident_mib} free_before_load_mib={} free_after_load_mib={}",
-                before.vram_free_bytes / (1024 * 1024),
-                after.vram_free_bytes / (1024 * 1024),
-            );
+            if json {
+                #[cfg(feature = "json-output")]
+                reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::BenchVramJson {
+                    model_resident_mib,
+                    free_before_load_mib,
+                    free_after_load_mib,
+                });
+                #[cfg(not(feature = "json-output"))]
+                json_output_unavailable();
+            } else {
+                println!(
+                    "REFLEX_BENCH_VRAM_OK model_resident_mib={model_resident_mib} free_before_load_mib={free_before_load_mib} free_after_load_mib={free_after_load_mib}"
+                );
+            }
         }
     }
 
@@ -120,7 +185,7 @@ pub fn run(args: Vec<String>) {
         let applied = model
             .apply_lora(std::path::Path::new(lora_path))
             .expect("failed to apply LoRA adapter");
-        println!("REFLEX_LORA_OK path={lora_path:?} tensors_applied={applied}");
+        print_lora_ok(json, lora_path, applied);
     }
 
     let candidates: Vec<System1Candidate> = candidate_texts
@@ -140,6 +205,7 @@ pub fn run(args: Vec<String>) {
                 .expect("forward_prompt failed (warmup)");
         }
         let mut samples_ms = Vec::with_capacity(iters);
+        let energy_sampler = energy::EnergySampler::start(0);
         for _ in 0..iters {
             let t0 = Instant::now();
             model
@@ -147,8 +213,34 @@ pub fn run(args: Vec<String>) {
                 .expect("forward_prompt failed");
             samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
+        // NVML's counter update granularity is coarser than a single forward
+        // pass at bench's scale (single-digit ms) -- bracket the whole
+        // iters-loop instead of trying to attribute energy per-sample.
+        if let Some(m) = energy_sampler.measure() {
+            let joules_per_forward_pass = m.joules / iters as f64;
+            if json {
+                #[cfg(feature = "json-output")]
+                reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::BenchEnergyJson {
+                    prompt_tokens,
+                    iters,
+                    total_joules: m.joules,
+                    joules_per_forward_pass,
+                    energy_method: m.method.as_str(),
+                });
+                #[cfg(not(feature = "json-output"))]
+                json_output_unavailable();
+            } else {
+                println!(
+                    "REFLEX_BENCH_ENERGY_OK prompt_tokens={prompt_tokens} iters={iters} total_joules={:.3} joules_per_forward_pass={joules_per_forward_pass:.6} energy_method={}",
+                    m.joules,
+                    m.method.as_str(),
+                );
+            }
+        }
         print_stats(
+            json,
             "REFLEX_BENCH_WARM_OK",
+            "warm",
             prompt_tokens,
             warmup,
             iters,
@@ -196,12 +288,25 @@ pub fn run(args: Vec<String>) {
         if !ms_per_token_samples.is_empty() {
             ms_per_token_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let ms_per_token = percentile(&ms_per_token_samples, 0.50);
-            println!(
-                "REFLEX_BENCH_THROUGHPUT_OK prompt_tokens={prompt_tokens} decode_tokens={DECODE_STEPS} warmup={warmup} iters={iters} \
-                 tokens_per_sec={:.3} ms_per_token={:.3}",
-                1000.0 / ms_per_token,
-                ms_per_token,
-            );
+            let tokens_per_sec = 1000.0 / ms_per_token;
+            if json {
+                #[cfg(feature = "json-output")]
+                reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::BenchThroughputJson {
+                    prompt_tokens,
+                    decode_tokens: DECODE_STEPS,
+                    warmup,
+                    iters,
+                    tokens_per_sec,
+                    ms_per_token,
+                });
+                #[cfg(not(feature = "json-output"))]
+                json_output_unavailable();
+            } else {
+                println!(
+                    "REFLEX_BENCH_THROUGHPUT_OK prompt_tokens={prompt_tokens} decode_tokens={DECODE_STEPS} warmup={warmup} iters={iters} \
+                     tokens_per_sec={tokens_per_sec:.3} ms_per_token={ms_per_token:.3}"
+                );
+            }
         }
 
         if !candidates.is_empty() {
@@ -219,7 +324,9 @@ pub fn run(args: Vec<String>) {
                 samples_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
             }
             print_stats(
+                json,
                 "REFLEX_BENCH_SYSTEM1_OK",
+                "system1",
                 prompt_tokens,
                 warmup,
                 iters,

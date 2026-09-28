@@ -30,7 +30,7 @@
 //! CUDA driver ultimately loads came from *this process's own binary*, never a
 //! path that only existed on the machine that built it.
 
-use cudarc::driver::{CudaDevice, CudaFunction};
+use cudarc::driver::{CudaDevice, CudaFunction, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
 
@@ -130,4 +130,58 @@ pub fn load_kernel_module(
                 })
         })
         .collect()
+}
+
+/// Loads and launches the same trivial `axpy_f32` smoke kernel `reflex smoke`
+/// runs (`out = a*x + y`), for `reflex doctor`'s "AOT kernel load+launch"
+/// check. Deliberately **not** used by `smoke.rs` itself: that subcommand's
+/// whole reason for existing is measuring process-start-to-first-kernel-
+/// result as precisely as possible (see its doc comment), and it captures
+/// `elapsed` *before* the dtoh copy/assert this function folds in, so
+/// reusing it there would change exactly the timing-critical sequence
+/// `smoke` exists to protect. `doctor` only needs pass/fail, not a
+/// nanosecond-faithful cold-start number, so it gets its own copy of the
+/// same logic here instead. Returns an error string (never panics) so
+/// `doctor` can report it as a failed check rather than aborting the whole
+/// report.
+pub fn verify_kernel_launch(device: &Arc<CudaDevice>) -> Result<(), String> {
+    let kernel = load_kernel(
+        device,
+        include_bytes!(env!("REFLEX_KERNEL_SMOKE")),
+        "smoke",
+        "axpy_f32",
+    )?;
+
+    let n = 1024usize;
+    let x = device
+        .htod_copy(vec![1.0f32; n])
+        .map_err(|e| format!("verify_kernel_launch: htod x: {e}"))?;
+    let y = device
+        .htod_copy(vec![2.0f32; n])
+        .map_err(|e| format!("verify_kernel_launch: htod y: {e}"))?;
+    let mut out = device
+        .alloc_zeros::<f32>(n)
+        .map_err(|e| format!("verify_kernel_launch: alloc out: {e}"))?;
+
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        kernel
+            .function
+            .launch(cfg, (3.0f32, &x, &y, &mut out, n as i32))
+    }
+    .map_err(|e| format!("verify_kernel_launch: launch failed: {e}"))?;
+    device
+        .synchronize()
+        .map_err(|e| format!("verify_kernel_launch: sync failed: {e}"))?;
+
+    let result = device
+        .dtoh_sync_copy(&out)
+        .map_err(|e| format!("verify_kernel_launch: dtoh: {e}"))?;
+    if (result[0] - 5.0).abs() >= 1e-5 {
+        return Err(format!(
+            "verify_kernel_launch: wrong result: expected 5.0, got {}",
+            result[0]
+        ));
+    }
+    Ok(())
 }

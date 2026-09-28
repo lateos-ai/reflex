@@ -8,7 +8,11 @@
 //! different prompts or runs -- see `Model::system1_evaluate`'s doc comment.
 //!
 //! Usage: `reflex system1 <path-to-gguf> <prompt> --candidate <text>
-//! [--candidate <text> ...] [--temperature T] [--lora <adapter.gguf>]`
+//! [--candidate <text> ...] [--temperature T] [--lora <adapter.gguf>] [--json]`
+//!
+//! `--json` (needs `cargo build --features json-output`) prints each result
+//! as one line of JSON instead of the plain `REFLEX_*_OK key=value` text --
+//! see `reflex_engine::cli_output`'s doc comment for the exact shapes.
 //!
 //! **Phase breakdown** (same fields/rationale as `reflex generate`'s -- see
 //! that binary's doc comment; added here so the TypeSafe Jev warm-vs-cold
@@ -26,28 +30,63 @@
 //! why a graceful return costs several extra seconds of CUDA-context-
 //! teardown wall-clock time on GPU-virtualized rented instances.
 //!
-//! Dense/MoE Qwen3 models only (see `Model::system1_evaluate`'s doc
-//! comment) -- hybrid Qwen3.5 and DeepSeek-V2/V3 MLA are rejected with a
-//! clear error, same as every other unsupported-architecture case in this
-//! project.
+//! Supports dense/MoE Qwen3, Qwen3.5 hybrid Gated DeltaNet, and DeepSeek-V2/V3
+//! MLA models (see `Model::system1_evaluate`'s doc comment for how each
+//! architecture is dispatched). **Hybrid models currently only support
+//! single-token candidates** -- a multi-token `--candidate` on a hybrid
+//! model is rejected with a clear error (see
+//! `Model::system1_evaluate_hybrid`'s doc comment for why); dense/MoE and
+//! MLA support both single- and multi-token candidates.
 
 use reflex_engine::diagnostics;
+use reflex_engine::energy;
 use reflex_engine::gguf::GgufFile;
 use reflex_engine::model::{Model, System1Candidate};
 use std::time::Instant;
 
+fn energy_suffix(measurement: Option<&energy::EnergyMeasurement>) -> String {
+    match measurement {
+        Some(m) => format!(" joules={:.3} energy_method={}", m.joules, m.method.as_str()),
+        None => String::new(),
+    }
+}
+
+// Only called from a `#[cfg(not(feature = "json-output"))]` arm below --
+// `#[allow(dead_code)]` since a build *with* that feature never reaches it.
+#[allow(dead_code)]
+fn json_output_unavailable() -> ! {
+    panic!("--json requires this binary to be built with `cargo build --features json-output`");
+}
+
+fn print_lora_ok(json: bool, path: &str, tensors_applied: usize) {
+    if !json {
+        println!("REFLEX_LORA_OK path={path:?} tensors_applied={tensors_applied}");
+        return;
+    }
+    #[cfg(feature = "json-output")]
+    reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::LoraAppliedJson {
+        path: path.to_string(),
+        tensors_applied,
+    });
+    #[cfg(not(feature = "json-output"))]
+    json_output_unavailable();
+}
+
 pub fn run(args: Vec<String>) {
     let t0 = Instant::now();
+    let sampler = energy::EnergySampler::start(0);
 
     let mut gguf_path: Option<String> = None;
     let mut prompt: Option<String> = None;
     let mut candidate_texts: Vec<String> = Vec::new();
     let mut temperature: f32 = 1.0;
     let mut lora_path: Option<String> = None;
+    let mut json = false;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--json" => json = true,
             "--candidate" => candidate_texts.push(args.next().expect("--candidate requires text")),
             "--lora" => lora_path = Some(args.next().expect("--lora requires a file path")),
             "--temperature" => {
@@ -88,7 +127,7 @@ pub fn run(args: Vec<String>) {
         let applied = model
             .apply_lora(std::path::Path::new(lora_path))
             .expect("failed to apply LoRA adapter");
-        println!("REFLEX_LORA_OK path={lora_path:?} tensors_applied={applied}");
+        print_lora_ok(json, lora_path, applied);
     }
 
     let candidates: Vec<System1Candidate> = candidate_texts
@@ -100,20 +139,33 @@ pub fn run(args: Vec<String>) {
         .expect("system1_evaluate failed");
     let prompt_eval_ms = t0.elapsed().as_secs_f64() * 1000.0 - model_ready_ms;
 
-    for (idx, (result, probability)) in response
+    for (idx, (result, &probability)) in response
         .results
         .iter()
         .zip(&response.probabilities)
         .enumerate()
     {
-        let token_ids: Vec<String> = result.token_ids.iter().map(|t| t.to_string()).collect();
-        println!(
-            "REFLEX_SYSTEM1_CANDIDATE_OK idx={idx} text={:?} token_ids=[{}] score={:.6} probability={:.6}",
-            result.text,
-            token_ids.join(","),
-            result.score,
-            probability,
-        );
+        if json {
+            #[cfg(feature = "json-output")]
+            reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::System1CandidateJson {
+                idx,
+                text: result.text.clone(),
+                token_ids: result.token_ids.clone(),
+                score: result.score,
+                probability,
+            });
+            #[cfg(not(feature = "json-output"))]
+            json_output_unavailable();
+        } else {
+            let token_ids: Vec<String> = result.token_ids.iter().map(|t| t.to_string()).collect();
+            println!(
+                "REFLEX_SYSTEM1_CANDIDATE_OK idx={idx} text={:?} token_ids=[{}] score={:.6} probability={:.6}",
+                result.text,
+                token_ids.join(","),
+                result.score,
+                probability,
+            );
+        }
     }
 
     let (best_idx, best) = response
@@ -125,12 +177,33 @@ pub fn run(args: Vec<String>) {
         .expect("system1_evaluate returned no results");
 
     let elapsed = t0.elapsed();
-    println!(
-        "REFLEX_SYSTEM1_OK process_start_to_result_ms={:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} num_candidates={} best_idx={best_idx} best_text={:?} entropy={:.6}",
-        elapsed.as_secs_f64() * 1000.0,
-        response.results.len(),
-        best.text,
-        response.entropy,
-    );
+    let energy_measurement = sampler.measure();
+    let process_start_to_result_ms = elapsed.as_secs_f64() * 1000.0;
+    if json {
+        #[cfg(feature = "json-output")]
+        reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::System1ResultJson {
+            process_start_to_result_ms,
+            gguf_open_ms,
+            cuda_init_ms,
+            model_load_ms,
+            prompt_eval_ms,
+            num_candidates: response.results.len(),
+            best_idx,
+            best_text: best.text.clone(),
+            entropy: response.entropy,
+            joules: energy_measurement.as_ref().map(|m| m.joules),
+            energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
+        });
+        #[cfg(not(feature = "json-output"))]
+        json_output_unavailable();
+    } else {
+        println!(
+            "REFLEX_SYSTEM1_OK process_start_to_result_ms={process_start_to_result_ms:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} num_candidates={} best_idx={best_idx} best_text={:?} entropy={:.6}{}",
+            response.results.len(),
+            best.text,
+            response.entropy,
+            energy_suffix(energy_measurement.as_ref()),
+        );
+    }
     reflex_engine::fast_exit(0);
 }

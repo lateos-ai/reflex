@@ -7,7 +7,7 @@
 //! Only builds/runs where a CUDA toolchain + GPU are present (build.rs requires nvcc
 //! unless REFLEX_SKIP_CUDA=1 is set, in which case this subcommand has nothing to do).
 //!
-//! Usage: `reflex smoke`
+//! Usage: `reflex smoke [--json]`
 //!
 //! Exits via `reflex_engine::fast_exit` after printing the result instead
 //! of returning from `run` normally -- see that function's doc comment for
@@ -15,11 +15,13 @@
 //! teardown wall-clock time on GPU-virtualized rented instances.
 
 use cudarc::driver::{LaunchAsync, LaunchConfig};
-use reflex_engine::{aot, diagnostics};
+use reflex_engine::{aot, diagnostics, energy};
 use std::time::Instant;
 
-pub fn run(_args: Vec<String>) {
+pub fn run(args: Vec<String>) {
+    let json = args.iter().any(|a| a == "--json");
     let t0 = Instant::now();
+    let sampler = energy::EnergySampler::start(0);
 
     // Uses the same underlying `CudaDevice::new` call as before on the success path
     // (no added cost to the timed metric below) -- only the error message improves.
@@ -51,6 +53,7 @@ pub fn run(_args: Vec<String>) {
     device.synchronize().expect("sync failed");
 
     let elapsed = t0.elapsed();
+    let energy_measurement = sampler.measure();
 
     let result = device.dtoh_sync_copy(&out).unwrap();
     assert!(
@@ -59,10 +62,27 @@ pub fn run(_args: Vec<String>) {
         result[0]
     );
 
-    println!(
-        "REFLEX_SMOKE_OK process_start_to_first_result_ms={:.3}",
-        elapsed.as_secs_f64() * 1000.0
-    );
+    let process_start_to_first_result_ms = elapsed.as_secs_f64() * 1000.0;
+    if json {
+        #[cfg(feature = "json-output")]
+        {
+            reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::SmokeResultJson {
+                process_start_to_first_result_ms,
+                joules: energy_measurement.as_ref().map(|m| m.joules),
+                energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
+            });
+        }
+        #[cfg(not(feature = "json-output"))]
+        {
+            panic!("--json requires this binary to be built with `cargo build --features json-output`");
+        }
+    } else {
+        let energy_suffix = match &energy_measurement {
+            Some(m) => format!(" joules={:.3} energy_method={}", m.joules, m.method.as_str()),
+            None => String::new(),
+        };
+        println!("REFLEX_SMOKE_OK process_start_to_first_result_ms={process_start_to_first_result_ms:.3}{energy_suffix}");
+    }
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }

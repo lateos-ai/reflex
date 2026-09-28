@@ -4,10 +4,13 @@
 
 pub mod aot;
 pub mod calibration;
+#[cfg(feature = "json-output")]
+pub mod cli_output;
 pub mod dequant;
 pub mod dequant_iq;
 pub mod dequant_iq_tables;
 pub mod diagnostics;
+pub mod energy;
 pub mod ffi;
 pub mod gated_deltanet;
 pub mod gguf;

@@ -5138,13 +5138,16 @@ impl Model {
     }
 
     /// System1: single-pass, non-autoregressive candidate scoring. Runs
-    /// `prompt` through the same prefill path as `generate_dense_impl`
-    /// (`Self::prefill_dense`) exactly once, then scores every one of
-    /// `candidates` from that single prefill -- no argmax-then-feedback
-    /// decode loop for single-token candidates (one batched gather-GEMV
-    /// covers all of them, `Self::gemv_gather`), and only a short
-    /// teacher-forced continuation for multi-token ones (feeding each
-    /// candidate's own known next token, never a sampled one).
+    /// `prompt` through the same prefill path `generate` uses exactly once,
+    /// then scores every one of `candidates` from that single prefill -- no
+    /// argmax-then-feedback decode loop for single-token candidates (one
+    /// batched gather-GEMV covers all of them, `Self::gemv_gather`), and
+    /// only a short teacher-forced continuation for multi-token ones
+    /// (feeding each candidate's own known next token, never a sampled
+    /// one) where that's supported -- see [`Self::system1_evaluate_dense`]/
+    /// [`Self::system1_evaluate_hybrid`]/[`Self::system1_evaluate_mla`],
+    /// dispatched to here exactly the way `forward_prompt`/`generate`
+    /// dispatch to their own `_dense`/`_hybrid`/`_mla` impls.
     ///
     /// `score` is relative to this candidate set only, not a vocab-wide
     /// log-probability -- computing the latter for a single-token candidate
@@ -5153,22 +5156,37 @@ impl Model {
     /// `crate::calibration::softmax_scores_with_temperature` to produce
     /// `System1Response::probabilities`.
     ///
-    /// Dense/MoE Qwen3 models only as of this version -- errs if
-    /// `self.hybrid`/`self.mla` is set. Every candidate must resolve to at
-    /// least one token (see `Self::resolve_candidate_token_ids`); a
-    /// resolution failure for one candidate fails the whole call.
+    /// Every candidate must resolve to at least one token (see
+    /// `Self::resolve_candidate_token_ids`); a resolution failure for one
+    /// candidate fails the whole call.
     pub fn system1_evaluate(
         &self,
         prompt: &str,
         candidates: &[System1Candidate],
         temperature: f32,
     ) -> Result<System1Response, String> {
-        if self.hybrid.is_some() || self.mla.is_some() {
-            return Err(
-                "system1_evaluate: only dense/MoE Qwen3 models are supported in this version"
-                    .to_string(),
-            );
+        if let Some(h) = &self.hybrid {
+            return self.system1_evaluate_hybrid(h, prompt, candidates, temperature);
         }
+        if let Some(m) = &self.mla {
+            return self.system1_evaluate_mla(m, prompt, candidates, temperature);
+        }
+        self.system1_evaluate_dense(prompt, candidates, temperature)
+    }
+
+    /// Dense/MoE Qwen3 path (the original, and still the only path with a
+    /// committed real-GGUF test fixture) -- see [`Self::system1_evaluate`]'s
+    /// doc comment for the overall approach. Supports both single- and
+    /// multi-token candidates: multi-token continuation reuses the shared
+    /// post-prompt KV headroom sequentially per candidate, safe since K/V is
+    /// position-indexed and each candidate is scored to completion before
+    /// the next one starts.
+    fn system1_evaluate_dense(
+        &self,
+        prompt: &str,
+        candidates: &[System1Candidate],
+        temperature: f32,
+    ) -> Result<System1Response, String> {
         if candidates.is_empty() {
             return Err("system1_evaluate: candidates must not be empty".to_string());
         }
@@ -5218,6 +5236,122 @@ impl Model {
             }
         }
 
+        Self::finish_system1_response(candidates, resolved, scores, temperature)
+    }
+
+    /// Qwen3.5 hybrid Gated DeltaNet path -- see [`Self::system1_evaluate`]'s
+    /// doc comment for the overall approach.
+    ///
+    /// **Single-token candidates only.** Unlike dense/MLA, `GatedDeltaNet`
+    /// sublayers' `conv_state`/`recurrent` (`HybridLayerState::Gdn`) are a
+    /// running recurrent accumulator, not a position-addressed slot --
+    /// dense's/MLA's trick of reusing one shared cache sequentially across
+    /// candidates (safe there because K/V is indexed by position, so a
+    /// later candidate's continuation simply overwrites an earlier one's)
+    /// would instead leave a multi-token candidate's continuation drifted
+    /// past the shared post-prefill snapshot, silently corrupting every
+    /// candidate scored after the first multi-token one. Rejecting
+    /// multi-token candidates here avoids that hazard entirely; this still
+    /// covers System1's own headline use cases (Yes/No, A-D, a 1-10 scale).
+    /// State-cloning to lift this restriction is a real follow-up, not
+    /// attempted here.
+    fn system1_evaluate_hybrid(
+        &self,
+        h: &HybridModel,
+        prompt: &str,
+        candidates: &[System1Candidate],
+        temperature: f32,
+    ) -> Result<System1Response, String> {
+        if candidates.is_empty() {
+            return Err("system1_evaluate: candidates must not be empty".to_string());
+        }
+
+        let resolved: Vec<Vec<u32>> = candidates
+            .iter()
+            .map(|c| self.resolve_candidate_token_ids(prompt, &c.text))
+            .collect::<Result<_, _>>()?;
+        if resolved.iter().any(|ids| ids.len() > 1) {
+            return Err(
+                "system1_evaluate: hybrid Qwen3.5 models currently support single-token candidates only"
+                    .to_string(),
+            );
+        }
+
+        let (ids, hidden_batched, _states, _position) =
+            self.prefill_hybrid_batched(h, prompt, None, 0)?;
+        let hidden_size = h.attn_cfg.hidden_size;
+        let eps = h.attn_cfg.rmsnorm_eps;
+        let hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
+
+        let normed = self.rmsnorm(&hidden, &self.output_norm.data, 1, hidden_size, eps)?;
+        let first_tokens: Vec<u32> = resolved.iter().map(|ids| ids[0]).collect();
+        let scores = self.gemv_gather_lm_head(&normed, &first_tokens)?;
+
+        Self::finish_system1_response(candidates, resolved, scores, temperature)
+    }
+
+    /// DeepSeek-V2/V3 MLA path -- see [`Self::system1_evaluate`]'s doc
+    /// comment for the overall approach. Supports multi-token candidates
+    /// the same way dense does: `MlaPrefillResult`'s per-layer `kv_cache` is
+    /// compressed latent-KV (`[seq_len, kv_lora_rank + qk_rope_head_dim]`)
+    /// but still **position-indexed**, not an unaddressed recurrence like
+    /// hybrid's `GatedDeltaNet` state -- so the same shared-cache,
+    /// score-to-completion-before-the-next-candidate reuse dense relies on
+    /// carries over unmodified.
+    fn system1_evaluate_mla(
+        &self,
+        m: &MlaModel,
+        prompt: &str,
+        candidates: &[System1Candidate],
+        temperature: f32,
+    ) -> Result<System1Response, String> {
+        if candidates.is_empty() {
+            return Err("system1_evaluate: candidates must not be empty".to_string());
+        }
+
+        let resolved: Vec<Vec<u32>> = candidates
+            .iter()
+            .map(|c| self.resolve_candidate_token_ids(prompt, &c.text))
+            .collect::<Result<_, _>>()?;
+        let max_len = resolved.iter().map(Vec::len).max().unwrap_or(1);
+
+        let (ids, hidden_batched, mut kv_caches, base_position) =
+            self.prefill_mla_batched(m, prompt, None, max_len.saturating_sub(1))?;
+        let hidden_size = m.cfg.hidden_size;
+        let eps = m.cfg.rmsnorm_eps;
+        let hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
+
+        let normed = self.rmsnorm(&hidden, &self.output_norm.data, 1, hidden_size, eps)?;
+        let first_tokens: Vec<u32> = resolved.iter().map(|ids| ids[0]).collect();
+        let mut scores = self.gemv_gather_lm_head(&normed, &first_tokens)?;
+
+        for (i, ids) in resolved.iter().enumerate() {
+            if ids.len() < 2 {
+                continue;
+            }
+            for (position, w) in (base_position..).zip(ids.windows(2)) {
+                let (prev, next) = (w[0], w[1]);
+                let h = self.forward_one_token_mla(m, prev, position, &mut kv_caches)?;
+                let normed_step = self.rmsnorm(&h, &self.output_norm.data, 1, hidden_size, eps)?;
+                scores[i] += self.gemv_gather_lm_head(&normed_step, &[next])?[0];
+            }
+        }
+
+        Self::finish_system1_response(candidates, resolved, scores, temperature)
+    }
+
+    /// Shared tail of every `system1_evaluate_*` impl: turns raw per-candidate
+    /// `scores` into a [`System1Response`] (calibrated `probabilities` +
+    /// `entropy`). Factored out since it's identical across all three
+    /// architectures -- unlike the prefill/continuation logic above it,
+    /// which differs enough per architecture (different state shapes,
+    /// different hazards) to be worth keeping separate.
+    fn finish_system1_response(
+        candidates: &[System1Candidate],
+        resolved: Vec<Vec<u32>>,
+        scores: Vec<f32>,
+        temperature: f32,
+    ) -> Result<System1Response, String> {
         let probabilities =
             crate::calibration::softmax_scores_with_temperature(&scores, temperature)?;
         let entropy = crate::calibration::shannon_entropy(&probabilities)?;

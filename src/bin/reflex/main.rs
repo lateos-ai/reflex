@@ -11,12 +11,14 @@
 //!   smoke     - minimal AOT-kernel-launch smoke test, no GGUF needed
 //!   bench     - warm-latency microbenchmark (forward pass, decode, system1)
 //!   check     - byte-exact-vs-reference correctness check, CI-scriptable
+//!   doctor    - one-shot GPU/CUDA/NVML health report, no GGUF needed
 //!   stdio     - local JSON-line IPC over stdio (needs --features ipc)
 //!   uds       - local JSON-line IPC over a Unix Domain Socket (needs
 //!               --features ipc; Unix-only)
 
 mod bench;
 mod check;
+mod doctor;
 mod generate;
 mod smoke;
 mod system1;
@@ -34,6 +36,7 @@ const USAGE: &str = "usage: reflex <subcommand> [args...]\n\
      \x20 smoke      minimal AOT-kernel-launch smoke test\n\
      \x20 bench      warm-latency microbenchmark\n\
      \x20 check      byte-exact-vs-reference correctness check\n\
+     \x20 doctor     one-shot GPU/CUDA/NVML health report\n\
      \x20 stdio      local JSON-line IPC over stdio (needs --features ipc)\n\
      \x20 uds        local JSON-line IPC over a Unix Domain Socket (needs --features ipc, Unix-only)\n\
      \n\
@@ -54,6 +57,7 @@ fn main() {
         "smoke" => smoke::run(rest),
         "bench" => bench::run(rest),
         "check" => check::run(rest),
+        "doctor" => doctor::run(rest),
         #[cfg(feature = "ipc")]
         "stdio" => stdio::run(rest),
         #[cfg(feature = "ipc")]
