@@ -15,6 +15,14 @@
 //! `src/ipc.rs`'s `IpcResponse` already established for fields that are only
 //! sometimes present.
 //!
+//! **Versioning**: the versioned result objects ([`GenerateResultJson`],
+//! [`System1ResultJson`], [`SmokeResultJson`], [`PhaseTimingJson`]) also carry
+//! a `schema_version` field (the current [`SCHEMA_VERSION`]) -- the one field
+//! with no plain-text `key=value` counterpart, added so a JSON consumer can
+//! detect a shape change. It's additive; readers that ignore unknown fields
+//! keep working across a minor bump. See README's "`--json` output contract"
+//! section.
+//!
 //! **Scope boundary**: only the stdout success-path contract lines
 //! (`REFLEX_*_OK`/`REFLEX_CHECK`/`REFLEX_DOCTOR_CHECK`) get a JSON form.
 //! `check.rs`'s `REFLEX_CHECK_FAIL` diagnostics (stderr, varying fields per
@@ -29,6 +37,16 @@
 //! either its existing `println!` or [`print_json_line`], never both.
 
 use serde::Serialize;
+
+/// Version of the `--json` output contract, emitted as the `schema_version`
+/// field on the versioned result objects ([`GenerateResultJson`],
+/// [`System1ResultJson`], [`SmokeResultJson`], and [`PhaseTimingJson`]).
+///
+/// Additive/forward-compatible: `serde` readers that ignore unknown fields
+/// keep working across a minor bump, so a *major* bump is the signal that an
+/// existing field changed meaning or was removed. Keep in sync with the
+/// README's "`--json` output contract" section.
+pub const SCHEMA_VERSION: &str = "1.0.0";
 
 /// Serializes `value` as one line of JSON to stdout, matching `src/ipc.rs`'s
 /// `write_json_line` discipline (flushed immediately) but deliberately not
@@ -63,6 +81,7 @@ pub struct GenerateKvExportJson {
 /// `REFLEX_GENERATE_OK` call sites.
 #[derive(Serialize)]
 pub struct GenerateResultJson {
+    pub schema_version: &'static str,
     pub process_start_to_first_token_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_start_to_last_token_ms: Option<f64>,
@@ -95,6 +114,7 @@ pub struct System1CandidateJson {
 /// `REFLEX_SYSTEM1_OK`.
 #[derive(Serialize)]
 pub struct System1ResultJson {
+    pub schema_version: &'static str,
     pub process_start_to_result_ms: f64,
     pub gguf_open_ms: f64,
     pub cuda_init_ms: f64,
@@ -113,6 +133,7 @@ pub struct System1ResultJson {
 /// `REFLEX_SMOKE_OK`.
 #[derive(Serialize)]
 pub struct SmokeResultJson {
+    pub schema_version: &'static str,
     pub process_start_to_first_result_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub joules: Option<f64>,
@@ -130,6 +151,7 @@ pub struct SmokeResultJson {
 /// short-phase deltas coarse in counter mode.
 #[derive(Serialize)]
 pub struct PhaseTimingJson {
+    pub schema_version: &'static str,
     pub phase: &'static str,
     pub duration_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -215,4 +237,46 @@ pub struct DoctorSummaryJson {
     pub checks_passed: usize,
     pub checks_warned: usize,
     pub checks_failed: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These lock the `--json` contract's one non-plain-text field: the version
+    // is emitted, and (being declared first) serializes first, so a consumer
+    // can read it before the rest of the object. They only run under
+    // `cargo test --features json-output` (the module is feature-gated), not
+    // in CI's default-feature test job -- see ci.yml.
+
+    #[test]
+    fn smoke_result_json_emits_schema_version_first() {
+        let json = serde_json::to_string(&SmokeResultJson {
+            schema_version: SCHEMA_VERSION,
+            process_start_to_first_result_ms: 1.0,
+            joules: None,
+            energy_method: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"schema_version":"1.0.0","process_start_to_first_result_ms":1.0}"#
+        );
+    }
+
+    #[test]
+    fn phase_timing_json_emits_schema_version_first() {
+        let json = serde_json::to_string(&PhaseTimingJson {
+            schema_version: SCHEMA_VERSION,
+            phase: "prompt_eval",
+            duration_ms: 1.0,
+            energy_joules: None,
+            energy_method: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"schema_version":"1.0.0","phase":"prompt_eval","duration_ms":1.0}"#
+        );
+    }
 }

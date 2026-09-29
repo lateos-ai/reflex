@@ -100,6 +100,7 @@ fn print_phase_ok(
     }
     #[cfg(feature = "json-output")]
     reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::PhaseTimingJson {
+        schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
         phase,
         duration_ms,
         energy_joules: energy.map(|m| m.joules),
@@ -278,6 +279,7 @@ pub fn run(args: Vec<String>) {
     if json {
         #[cfg(feature = "json-output")]
         reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::System1ResultJson {
+            schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
             process_start_to_result_ms,
             gguf_open_ms,
             cuda_init_ms,

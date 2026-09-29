@@ -572,6 +572,30 @@ None of these care how kernels get compiled — they're pure host-side GGUF/toke
 logic. There is deliberately no NVRTC runtime-compile-and-load path anywhere in this
 codebase — that's the thing this project's AOT design replaces, not reuses.
 
+## `--json` output contract
+
+With `cargo build --release --features json-output`, `generate`/`system1`/`smoke` (and
+`bench`/`check`/`doctor`) print one JSON object per existing `REFLEX_*_OK` stdout line
+instead of the plain `key=value` text — same call site, same order, one object per line.
+Field names match the plain-text keys 1:1, with one addition: the versioned result
+objects also carry a **`schema_version`** field so a consumer can detect a shape change.
+
+```json
+{"schema_version":"1.0.0","process_start_to_first_token_ms":456.4,"gguf_open_ms":37.3,...}
+```
+
+- **Current version: `1.0.0`** (`SCHEMA_VERSION` in `src/cli_output.rs`).
+- The four versioned objects are `generate`'s `REFLEX_GENERATE_OK` result, `system1`'s
+  `REFLEX_SYSTEM1_OK` result, `smoke`'s `REFLEX_SMOKE_OK` result, and each additive
+  `REFLEX_PHASE_OK` phase object. Per-item lines (`REFLEX_SYSTEM1_CANDIDATE_OK`,
+  `REFLEX_LORA_OK`, `REFLEX_DOCTOR_CHECK`) and the other subcommands' result structs do
+  not carry it yet.
+- **Additive / forward-compatible**: a *minor* bump only adds fields, so a reader that
+  ignores unknown fields keeps working; a *major* bump signals that an existing field
+  changed meaning or was removed.
+- Plain-text output (no `--json`) is byte-for-byte unchanged by this contract, and the
+  existing `REFLEX_*_OK` fields are unchanged by a `schema_version` bump.
+
 ## Docker
 
 A multi-stage `Dockerfile` is included: the builder stage has the full CUDA devel

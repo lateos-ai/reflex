@@ -67,6 +67,7 @@ pub fn run(args: Vec<String>) {
         #[cfg(feature = "json-output")]
         {
             reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::SmokeResultJson {
+                schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
                 process_start_to_first_result_ms,
                 joules: energy_measurement.as_ref().map(|m| m.joules),
                 energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),

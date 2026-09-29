@@ -126,6 +126,7 @@ fn print_phase_ok(
     }
     #[cfg(feature = "json-output")]
     reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::PhaseTimingJson {
+        schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
         phase,
         duration_ms,
         energy_joules: energy.map(|m| m.joules),
@@ -399,6 +400,7 @@ pub fn run(args: Vec<String>) {
         if json {
             #[cfg(feature = "json-output")]
             reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::GenerateResultJson {
+                schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
                 process_start_to_first_token_ms,
                 process_start_to_last_token_ms: None,
                 gguf_open_ms,
@@ -461,6 +463,7 @@ pub fn run(args: Vec<String>) {
     if json {
         #[cfg(feature = "json-output")]
         reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::GenerateResultJson {
+            schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
             process_start_to_first_token_ms: first_token_ms.unwrap_or(total_ms),
             process_start_to_last_token_ms: Some(total_ms),
             gguf_open_ms,
