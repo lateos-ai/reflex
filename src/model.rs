@@ -1954,32 +1954,20 @@ impl Model {
         Self::load_dense(device, file)
     }
 
-    /// Wrapper around [`Self::load_dense_inner`]: builds the `Tokenizer` on a
-    /// one-shot scoped background thread so its ~107ms of allocation/hashing
-    /// overlaps the GPU-bound weight load instead of sitting after it on the
-    /// serial path. Exactly one thread, joined before the `Model` is returned,
-    /// never reused and never accepting a second unit of work -- see
-    /// DECISIONS.md's "Tokenizer construction on a load-time worker thread"
-    /// entry for why this is not a violation of the Non-goals threading rule.
-    fn load_dense(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
-        std::thread::scope(|scope| {
-            let tokenizer = scope.spawn(|| Tokenizer::from_gguf(file));
-            Self::load_dense_inner(device, file, tokenizer)
-        })
-    }
-
-    fn load_dense_inner<'scope>(
-        device: Arc<CudaDevice>,
+    /// Builds the `Tokenizer` and the cuBLAS handle (with `CUBLAS_PEDANTIC_MATH`
+    /// pinned) for the one scoped background thread each `load_*` wrapper spawns,
+    /// so their combined host/driver setup overlaps the GPU-bound weight load
+    /// instead of sitting on the serial path. Both are pure setup needing no loaded
+    /// weights; `CudaBlas::new` binds the primary context to this thread itself
+    /// (`device.bind_to_thread`). Run sequentially on one thread rather than two so
+    /// the load still spawns exactly one extra thread -- see DECISIONS.md's entries
+    /// on the load-time worker thread and the cuBLAS-init overlap.
+    fn load_background_init(
         file: &GgufFile,
-        tokenizer: ScopedJoinHandle<'scope, Result<Tokenizer, String>>,
-    ) -> Result<Self, String> {
-        let (cfg, block_count, moe) = parse_model_config(file)?;
-        let expert_used_count = moe.map(|m| m.expert_used_count);
-
-        // Created once per load, like every AOT kernel handle below -- see
-        // the `cublas` field's doc comment on `Model` for why math mode is
-        // pinned right after creation.
-        let cublas = CudaBlas::new(device.clone()).map_err(|e| format!("cublas handle: {e:?}"))?;
+        device: Arc<CudaDevice>,
+    ) -> Result<(Tokenizer, CudaBlas), String> {
+        let tokenizer = Tokenizer::from_gguf(file)?;
+        let cublas = CudaBlas::new(device).map_err(|e| format!("cublas handle: {e:?}"))?;
         unsafe {
             cublas_sys::lib()
                 .cublasSetMathMode(
@@ -1989,6 +1977,25 @@ impl Model {
                 .result()
                 .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
         }
+        Ok((tokenizer, cublas))
+    }
+
+    fn load_dense(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
+        std::thread::scope(|scope| {
+            let init_device = device.clone();
+            let init = scope.spawn(move || Self::load_background_init(file, init_device));
+            Self::load_dense_inner(device, file, init)
+        })
+    }
+
+    fn load_dense_inner<'scope>(
+        device: Arc<CudaDevice>,
+        file: &GgufFile,
+        init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), String>>,
+    ) -> Result<Self, String> {
+        let (cfg, block_count, moe) = parse_model_config(file)?;
+        let expert_used_count = moe.map(|m| m.expert_used_count);
+
         let rmsnorm_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_RMSNORM")),
@@ -2157,9 +2164,9 @@ impl Model {
             },
         };
 
-        let tokenizer = tokenizer
+        let (tokenizer, cublas) = init
             .join()
-            .map_err(|_| "tokenizer construction thread panicked".to_string())??;
+            .map_err(|_| "background load-init thread panicked".to_string())??;
 
         Ok(Model {
             device,
@@ -2199,15 +2206,16 @@ impl Model {
     /// for what's shared with the dense/MoE path.
     fn load_hybrid(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
         std::thread::scope(|scope| {
-            let tokenizer = scope.spawn(|| Tokenizer::from_gguf(file));
-            Self::load_hybrid_inner(device, file, tokenizer)
+            let init_device = device.clone();
+            let init = scope.spawn(move || Self::load_background_init(file, init_device));
+            Self::load_hybrid_inner(device, file, init)
         })
     }
 
     fn load_hybrid_inner<'scope>(
         device: Arc<CudaDevice>,
         file: &GgufFile,
-        tokenizer: ScopedJoinHandle<'scope, Result<Tokenizer, String>>,
+        init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), String>>,
     ) -> Result<Self, String> {
         let architecture = "qwen35";
         let key = |suffix: &str| format!("{architecture}.{suffix}");
@@ -2284,19 +2292,6 @@ impl Model {
 
         let is_gdn = parse_hybrid_layer_kinds(file, architecture, block_count)?;
 
-        // Created once per load, like every AOT kernel handle below -- see
-        // the `cublas` field's doc comment on `Model` for why math mode is
-        // pinned right after creation.
-        let cublas = CudaBlas::new(device.clone()).map_err(|e| format!("cublas handle: {e:?}"))?;
-        unsafe {
-            cublas_sys::lib()
-                .cublasSetMathMode(
-                    *cublas.handle(),
-                    cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH,
-                )
-                .result()
-                .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
-        }
         let rmsnorm_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_RMSNORM")),
@@ -2483,9 +2478,9 @@ impl Model {
             }
         };
 
-        let tokenizer = tokenizer
+        let (tokenizer, cublas) = init
             .join()
-            .map_err(|_| "tokenizer construction thread panicked".to_string())??;
+            .map_err(|_| "background load-init thread panicked".to_string())??;
 
         Ok(Model {
             device,
@@ -2532,31 +2527,19 @@ impl Model {
     /// `forward_prompt` branches on `self.mla` before touching them.
     fn load_mla(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
         std::thread::scope(|scope| {
-            let tokenizer = scope.spawn(|| Tokenizer::from_gguf(file));
-            Self::load_mla_inner(device, file, tokenizer)
+            let init_device = device.clone();
+            let init = scope.spawn(move || Self::load_background_init(file, init_device));
+            Self::load_mla_inner(device, file, init)
         })
     }
 
     fn load_mla_inner<'scope>(
         device: Arc<CudaDevice>,
         file: &GgufFile,
-        tokenizer: ScopedJoinHandle<'scope, Result<Tokenizer, String>>,
+        init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), String>>,
     ) -> Result<Self, String> {
         let (mla_cfg, block_count, leading_dense) = parse_mla_config(file)?;
 
-        // Created once per load, like every AOT kernel handle below -- see
-        // the `cublas` field's doc comment on `Model` for why math mode is
-        // pinned right after creation.
-        let cublas = CudaBlas::new(device.clone()).map_err(|e| format!("cublas handle: {e:?}"))?;
-        unsafe {
-            cublas_sys::lib()
-                .cublasSetMathMode(
-                    *cublas.handle(),
-                    cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH,
-                )
-                .result()
-                .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
-        }
         let rmsnorm_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_RMSNORM")),
@@ -2768,9 +2751,9 @@ impl Model {
             }
         };
 
-        let tokenizer = tokenizer
+        let (tokenizer, cublas) = init
             .join()
-            .map_err(|_| "tokenizer construction thread panicked".to_string())??;
+            .map_err(|_| "background load-init thread panicked".to_string())??;
 
         let dummy_cfg = LayerConfig {
             hidden_size: mla_cfg.hidden_size,
