@@ -10,7 +10,7 @@ JIT tax on first use, the way there is with a runtime-compilation design. That's
 whole bet: be the fastest way to turn a cold process into one output token, then get
 out of the way.
 
-**Current cold start: 627.3ms p50**, process launch to result — Tesla T4,
+**Current cold start: ~456ms p50**, process launch to result — Tesla T4,
 `Qwen3-0.6B-Q4_K_M`, `reflex system1`, `n=10`. Full phase breakdown
 [below](#cold-start-phase-breakdown).
 
@@ -115,6 +115,11 @@ REFLEX_SYSTEM1_CANDIDATE_OK idx=2 text=" Berlin" token_ids=[19846] score=9.61265
 REFLEX_SYSTEM1_OK process_start_to_result_ms=8524.253 num_candidates=3 best_idx=0 best_text=" Paris" entropy=0.028154
 ```
 
+(That last capture is from an early pre-optimization build — the `token_id`s and scores
+are current, but the `process_start_to_result_ms` figure predates perf items 2–6 and the
+cold-load overlap round; see the [phase breakdown](#cold-start-phase-breakdown) for
+current numbers.)
+
 `probability` is relative to this candidate set only, not a vocab-wide probability —
 see `Model::system1_evaluate`'s doc comment in `src/model.rs`. `system1` currently
 supports dense/MoE Qwen3 only; the Qwen3.5 hybrid mixer and DeepSeek-V2/V3 (MLA) are
@@ -217,46 +222,56 @@ Current numbers, real `Tesla T4` (dedicated AWS EC2 `g4dn.xlarge`),
 
 | phase | p50 |
 |---|---|
+| gguf open + metadata parse | ~37 ms |
 | process launch (external − internal) | ~130 ms |
-| CUDA init (`CudaDevice::new`) | ~142 ms |
-| model load (dequantize + upload every weight tensor) | 410.3 ms |
-| scoring pass (single forward pass) | ~36 ms |
-| **total** (`process_start_to_result_ms`) | **627.3 ms** |
+| CUDA init (`CudaDevice::new`) | ~140 ms |
+| model load (kernel module load + weight dequant/upload; tokenizer and cuBLAS init overlapped on a worker thread) | ~237 ms |
+| scoring pass (single forward pass) | ~39 ms |
+| **total** (`process_start_to_result_ms`) | **~456 ms** |
 
 On this dedicated instance the spread was unusually tight (p95 within ~1% of p50 at the
 point in the optimization sequence where the full p50/p95 table was captured), unlike
 the shared-rented-instance variance discussed below.
 
-That 627.3ms is down from **3502.8ms** in this table's previous revision — but that
+That ~456ms is down from **3502.8ms** in this table's previous revision — but that
 older figure was a *different measurement* (`reflex generate`, `Q8_0`, rented `NVIDIA
-L40`), so it is not a like-for-like 5.6x and shouldn't be quoted as one. On this same
+L40`), so it is not a like-for-like multiple and shouldn't be quoted as one. On this same
 T4/`Q4_K_M`/`system1` setup the starting point was **~1248.6ms** (mean of `n=5`, before
-the warm-latency perf plan) and it is **627.3ms** (p50 of `n=10`) now — roughly a 2x
-improvement, delivered by that plan's items 2–6 (warp-per-row `gemv`, lazy `lm_head`,
-phase instrumentation, pipelined model load, lazy `token_embd` dequant). The
-intermediate per-item before/after numbers come from separate measurement runs and
-don't form one continuous series, so they're not chained here.
+the warm-latency perf plan) and it is **~456ms** (p50 of `n=10`) now — roughly a 2.7x
+improvement, delivered first by that plan's items 2–6 (warp-per-row `gemv`, lazy
+`lm_head`, phase instrumentation, pipelined model load, lazy `token_embd` dequant), then
+by a cold-load overlap round (a fast non-cryptographic tokenizer hasher, and the
+tokenizer construction + cuBLAS handle init moved onto a single worker thread overlapped
+with the weight load). The intermediate per-item before/after numbers come from separate
+measurement runs and don't form one continuous series, so they're not chained here.
 
-What this breakdown shows now: **CUDA init is small and stable** (~142ms) — this is
-where the AOT-compiled-kernel bet pays off, since there's no NVRTC JIT tax hiding in
-this phase. **Model load still dominates** (~410 of ~627ms, ~65%), but after the lazy
-`token_embd` work **no single sub-phase dominates it any more**: inside that ~410ms sit
-the per-tensor weights loop + AOT kernel module load (~202ms), tokenizer construction
-(~107ms), and the `token_embd` raw copy (~102ms, mmap page-fault cost rather than
-compute). There is currently no plan targeting tokenizer construction or AOT module
-load — they only became visible as costs once the larger ones were removed.
+What this breakdown shows now: **CUDA init is small and stable** (~140ms — this is
+`CudaDevice::new`, not kernel loading). The AOT bet shows up *inside* model load: the
+*entire* dense kernel-module load (rmsnorm, rope, silu, gemv, gemv_gather, attention,
+attention_prefill, elementwise, dequant) measures **~3ms** in pinned-cubin mode (and
+~3.5ms in portable PTX) — no JIT tax hiding there. **Model load is now ~237ms of the
+~456ms total (~52%)**, dominated by two memory-bound pieces: the per-tensor weight
+dequant/upload loop (~124ms) and the `token_embd` raw-byte copy (~102ms, mmap page-fault
+cost rather than compute). Tokenizer construction (~100ms) and cuBLAS handle init
+(~81ms) — the two remaining host/driver setup costs the item-6 profiling surfaced — are
+now built concurrently on a single worker thread and no longer sit on the serial path at
+all. There is no longer any measured host-setup cost left to overlap; the remaining
+model-load time is bandwidth-bound.
 
-**Important caveat if you compare against `reflex generate` instead**: the lazy
-`token_embd` win does not apply to `generate` on a *tied*-embedding model (no separate
-`output.weight` — which includes `Qwen3-0.6B`). There the ~548ms cost is only *moved*
-from `model_load_ms` into `prompt_eval_ms`, plus a new unconditional ~102ms copy, for a
-net **+110ms (+9%) regression** on that specific path (~1206ms → ~1316ms). That is an
-accepted, documented trade-off, not an unnoticed one.
+**Note on `reflex generate` with a *tied*-embedding model** (no separate `output.weight`
+— which includes `Qwen3-0.6B`): the lazy `token_embd` optimization (perf item 6)
+initially left a **+110ms (+9%) regression** on that specific path, because the
+full-vocab dequant it defers for `system1` is still needed for `generate`'s greedy
+argmax, so the cost was only *moved* from `model_load_ms` into `prompt_eval_ms`. That
+regression is now **closed and turned into a win**: the tied full-vocab dequant moved
+on-device (2026-09-28), cutting `prompt_eval_ms` by ~426ms on that path in its own A/B
+(`generate` total ~1314ms → ~894ms there).
 
-**The comparison table above predates perf items 2–6** and was measured on an A6000;
-it has not been re-run against the current code. Its Reflex-side figures are therefore
-conservative — the engine has since gotten materially faster — but they are stale
-rather than current measurements either way. Re-running that table is outstanding work.
+**The comparison table above predates perf items 2–6 and the cold-load overlap round**
+and was measured on an A6000; it has not been re-run against the current code. Its
+Reflex-side figures are therefore conservative — the engine has since gotten materially
+faster — but they are stale rather than current measurements either way. Re-running that
+table is outstanding work.
 
 Also disclosed rather than smoothed over: in the earlier L40 measurements, two batches
 in the same session showed materially different noise levels across *every* run of the
@@ -277,10 +292,13 @@ questions than the phase breakdown itself, deliberately scoped out of this round
 Every CUDA kernel is compiled **ahead of time** (`build.rs` invokes `nvcc`, see
 `build.rs` and `src/kernels_cuda/`), never at runtime via NVRTC. `src/aot.rs` loads the
 precompiled PTX/cubin at process start via the CUDA driver API. Default mode emits
-portable PTX (small driver-side JIT-to-SASS cost at load); set `REFLEX_CUDA_ARCH=sm_XX`
-to compile straight to a `cubin` for one target architecture (true zero-JIT, at the cost
-of needing a matching cubin per deployment target). Which one actually wins on real
-hardware is unverified — that's the first thing to measure, not assume.
+portable PTX (driver-side JIT-to-SASS at load); set `REFLEX_CUDA_ARCH=sm_XX` to compile
+straight to a `cubin` for one target architecture (zero JIT, at the cost of needing a
+matching cubin per deployment target). **Measured on a real T4 for this project's dense
+kernel set: the whole module load is ~3ms either way** (portable PTX ~3.5ms vs. pinned
+cubin ~3.1ms), so the driver-side JIT tax is negligible for these kernels. The
+pinned-cubin build is still preferred for true zero-JIT and a simpler load path, but the
+load-phase difference is sub-millisecond.
 
 Run `cargo run --bin reflex -- smoke` on a real GPU instance as the very first
 real-hardware step: it proves the AOT pipeline works end to end and reports actual
