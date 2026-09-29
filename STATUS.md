@@ -705,51 +705,53 @@ sidecar) expose it.
 
 Two costs the item-6 profiling surfaced (README's "Cold-start phase breakdown" calls
 them out as "only became visible as costs once the larger ones were removed") now
-have a plan. Inside `model_load_ms` p50 410.3ms (dense, T4) sit AOT kernel module
-load (~83ms) and tokenizer construction (~107ms), both CPU/driver-side and both
-serialized on the load path in `Model::load` (`src/model.rs`): kernel modules load
-first (lines 1969–2039), the weight loop runs, then `Tokenizer::from_gguf` runs last
-(line 2140). Neither has numerics risk — both are pure "how fast do we get set up"
-changes, so this is a timing-only plan, verified by the existing phase-breakdown
-harness + golden-token regression rather than new numerics methodology. **Item 1 (the
-rope dedup) is done and real-hardware-verified** (see HISTORY.md's "Rope-module dedup"
-entry) — and its measured result reframes the AOT half of this plan; that reframing is
-folded into items #2 and the sequencing note below. The hasher decision item is now also
-**made and implemented** (vendored inline FxHasher, not the `rustc-hash` crate — see
-DECISIONS.md's hasher entry and item #1 of the tokenizer list below, which measured far
-smaller than estimated); the load-time worker-thread item is still a pending DECISIONS.md
-call before any code is written.
+have a plan. Inside `model_load_ms` p50 410.3ms (dense, T4) the plan attributed ~83ms
+to AOT kernel module load and ~107ms to tokenizer construction, both CPU/driver-side and
+both serialized on the load path in `Model::load` (`src/model.rs`). **Both have now been
+measured and both turned out different from the plan's estimate** (2026-09-28): the
+tokenizer is fully overlapped on a worker thread, and the "~83ms AOT module load" was a
+timer-boundary mis-attribution — the real `.cu` module loads are ~3ms, and the ~81ms is
+`cuBLAS` handle init. Neither had numerics risk — both are pure "how fast do we get set
+up" changes, so this was a timing-only plan, verified by phase-breakdown + golden-token
+regression rather than new numerics methodology.
 
-**AOT module load (~83ms)** — root cause is one `cuModuleLoad` per kernel module
-(~10–20 sequential driver round-trips; dense loads rmsnorm, rope×2, silu, gemv,
-gemv_gather, attention, attention_prefill, elementwise, dequant), each via
-`device.load_ptx` in `src/aot.rs` with real fixed per-call driver overhead. Ranked:
+**Status (all four sub-items are now resolved)**: the rope dedup (item 1) and the fast
+hasher (tokenizer item 1) are done and real-hardware-verified; the load-time
+worker-thread overlap (tokenizer item 4) is now implemented and verified too (the
+largest win of the set, ~101ms); and the AOT instrumentation question is answered — the
+`.cu` module loads are ~3ms, and the ~83ms the plan named "AOT module load" is actually
+`cuBLAS` handle init. See the reframed sections below and HISTORY.md's 2026-09-28
+entries.
 
-1. ~~**Kill the duplicate rope load (free, do first).**~~ — **done, real-hardware-
-   verified 2026-09-28**. `rope.cu` turned out to define **6** kernels, loaded once per
-   kernel: 2 `cuModuleLoad`s on dense/hybrid/MoE and **6** on MLA. Collapsed to
-   `load_kernel_module` (dense/hybrid: one 2-fn load; MLA: a 2-fn + a 4-fn load, 6→2).
-   Strict rope-only A/B (before = HEAD `738ea06`, after = HEAD + rope; clean git
-   worktrees so the pre-existing uncommitted `dequantize_all` removal stays out), AWS
-   EC2 `g4dn.xlarge` T4, pinned `sm_75` cubin, interleaved n=10: golden token
-   byte-identical (`12095`/`" Paris"`), `model_load_ms` p50 429.957→428.733ms,
-   total 649.765→648.790ms — **~1ms, inside noise**. The important result is the
-   reframing, not the win: freeing one `cuModuleLoad` saves ~1ms, not the ~8ms the
-   "~83ms ÷ ~10 modules" back-of-envelope assumed, so the ~83ms AOT load is dominated
-   by first-load/context warmup or `dequant.cu` PTX parse — *not* per-call round-trips.
-2. **Coalesce all `.cu` into a single CUDA module — now deprioritized.** Originally
-   framed as "the main win" ~50-60ms; the item-#1 measurement (per-call overhead ~1ms)
-   drops it to **~15-20ms at best**, which no longer obviously justifies the
-   cross-file `__device__`/`static` collision audit + `.cu` restructure. If still
-   pursued: one `cuModuleLoad` via an umbrella `reflex_kernels.cu` that `#include`s the
-   15 sources (`build.rs` compiles one file → one PTX/cubin), `load_kernel_module`
-   resolving every function name. Works identically in PTX and cubin mode (unlike
-   `nvcc -dlink`, cubin-only); function names/order must stay stable. **The real next
-   question for this half is instrumentation, not coalescing**: add a sub-phase timer
-   around `load_dequant_kernels` (vs. the other module loads) to see where the ~83ms
-   actually goes before spending any effort merging modules.
-3. **Rejected:** parallel/threaded `cuModuleLoad` — driver-call serialization and
-   marginal upside vs. complexity; #2 subsumes the same win.
+**AOT module load (~83ms label) — measured down to ~3ms; the real ~81ms is `cuBLAS`
+init.** The original framing (one `cuModuleLoad` per kernel module, ~10–20 sequential
+driver round-trips with real fixed per-call overhead) was disproven twice: the
+rope-dedup measured ~1ms freed per load, and a 2026-09-28 sub-phase instrumentation
+pass (throwaway `eprintln!` timers, never committed — same convention as the item-5
+profiling) measured every dense `cuModuleLoad` directly. Ranked/updated:
+
+1. ~~**Kill the duplicate rope load.**~~ — **done, real-hardware-verified 2026-09-28**
+   (see HISTORY.md's "Rope-module dedup" entry): `rope.cu`'s 6 kernels collapsed from 6
+   loads to 2 on MLA, 2 to 1 on dense/hybrid; ~1ms, inside noise.
+2. ~~**Coalesce all `.cu` into a single CUDA module.**~~ — **now definitively rejected
+   on measurement, not merely deprioritized.** The 2026-09-28 per-module timing shows
+   the *entire* dense AOT module-load set (rmsnorm, rope, silu, gemv, gemv_gather,
+   attention, attention_prefill, elementwise, dequant) is **~3ms total in pinned
+   `sm_75` cubin mode** and **~3.5ms in portable-PTX mode** — no first-load/context
+   warmup spike (the first module costs the same as the rest), and the 20-function
+   `dequant` module is the largest single one at only ~1ms. There is nothing left to
+   coalesce, and portable PTX pays no meaningful driver-JIT tax on these kernels either.
+3. **The real ~81ms is `CudaBlas::new` + `cublasSetMathMode`.** A load-region marker
+   pass on the same build found, per run (3 runs, very tight): `parse_model_config`
+   ~0.01ms; **`CudaBlas::new` + `cublasSetMathMode` ~80.9ms**; all kernel loads +
+   `WeightLoadPipeline::new` ~3.2ms; the per-tensor weight loop ~123.8ms; `token_embd`
+   construction ~102.1ms; `output_norm`/`lm_head` ~0.1ms; and the tokenizer-thread join
+   ~0.01ms (fully hidden). The plan's "AOT kernel module load 83.09ms" was a
+   timer-boundary mistake — that timer evidently started before `CudaBlas::new` and ran
+   through the kernel loads, so it captured cuBLAS handle init, not the module loads.
+   **This ~81ms cuBLAS init is now the largest single remaining cold-load cost after
+   the tokenizer overlap.**
+4. **Rejected:** parallel/threaded `cuModuleLoad` — moot now (module loads are ~3ms).
 
 **Tokenizer construction (~107ms)** — `Tokenizer::from_gguf` (`src/tokenizer.rs:79`)
 on Qwen3-0.6B (vocab 151,936; merges ~150k) clones 151k `String`s into `tokens`,
@@ -798,19 +800,21 @@ these dominates: **allocation/copying, not hashing.** Ranked:
    mattering, so the remaining serial micro-optimizations (item #2/#3) are now
    lower-value than their own measurements suggested.
 
-**Sequencing (revised after the worker-thread measurement)**: the plan's two
-"zero-risk" AOT/hasher items both measured small (rope dedup ~1ms; hasher ~4ms), but the
-worker-thread item (#4) just delivered the full ~101ms it promised — by far the biggest
-cold-load win since item-6 lazy `token_embd` dequant. The remaining tokenizer items are
-now optional rather than a next lever: since the tokenizer construction is off the
-serial path entirely, the arena/duplicate-vocab-copy reduction (item #2) and the cheaper
-merge key (#3) only pay off if they shorten a tokenizer that would otherwise *exceed*
-the GPU-load overlap window, which the measurement says it doesn't. The AOT half is down
-to the leftover instrumentation question (a sub-phase timer around `load_dequant_kernels`
-to find where the ~83ms actually goes) if load time still matters. Next cold-load work
-should be re-ranked against the new ~308ms `model_load_ms` floor rather than the old
-~410ms one; only an interleaved-A/B measurement will say whether anything left is worth
-it.
+**Sequencing (revised after the 2026-09-28 measurements)**: the plan's two "zero-risk"
+AOT/hasher items both measured small (rope dedup ~1ms; hasher ~4ms), but the worker-thread
+item (#4) delivered the full ~101ms it promised — by far the biggest cold-load win since
+item-6 lazy `token_embd` dequant. The remaining *serial* tokenizer items are now optional
+rather than a next lever: with tokenizer construction off the serial path entirely, the
+arena/duplicate-vocab-copy reduction (item #2) and cheaper merge key (#3) only pay off if
+the tokenizer would otherwise *exceed* the GPU-load overlap window, which the measurement
+says it doesn't. The AOT instrumentation question is now answered: the `.cu` module loads
+are ~3ms and the "~83ms" was `cuBLAS` handle init (~81ms). **The new top cold-load lever
+is that `CudaBlas::new` cost** — overlapping or eliminating cuBLAS init is the obvious next
+target (~81ms, comparable to the tokenizer win), but it needs its own decision (can the
+handle be created on a background thread like the tokenizer was, or can `system1`/decode
+avoid cuBLAS entirely?) and a strict A/B before any code. Next cold-load work should be
+re-ranked against the new ~308ms `model_load_ms` floor; only an interleaved-A/B
+measurement will say whether anything left is worth it.
 
 ## Known debt / limitations
 

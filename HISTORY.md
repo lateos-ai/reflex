@@ -3030,3 +3030,40 @@ the tokenizer exceeded the overlap window, which the measurement says it does no
 remaining cold-start win, and it buys a new ~308 ms `model_load_ms` floor to re-rank any
 further load-path work against. See STATUS.md's updated sequencing and DECISIONS.md's
 updated worker-thread entry.
+
+### AOT module-load instrumentation (tokenizer + AOT plan, AOT half), 2026-09-28
+
+The AOT half's own closing question (STATUS.md's "AOT module load" item 3: add a
+sub-phase timer "to see where the ~83 ms actually goes before spending any effort merging
+modules"). Answer: it does not go to the module loads at all.
+
+**Instrumentation (throwaway, never committed)**: env-gated `eprintln!` timers in
+`src/aot.rs` (per `load_kernel`/`load_kernel_module`, splitting the PTX/materialize step
+from the driver `load_ptx`) and region markers in `Model::load`'s dense body, on an AWS
+EC2 `g4dn.xlarge`/T4. Built and run in both pinned `sm_75` cubin and default portable-PTX
+modes. Golden token byte-identical (`12095`/`" Paris"`) on the instrumented build.
+
+**Result 1 -- the module loads are ~3 ms, not ~83 ms.** Per-module, dense, cubin mode,
+5 runs, very tight: rmsnorm ~0.30 ms, rope (2 fns) ~0.58 ms, silu ~0.13 ms, gemv
+~0.18 ms, gemv_gather ~0.17 ms, attention ~0.18 ms, attention_prefill ~0.20 ms,
+elementwise (5 fns) ~0.39 ms, dequant (20 fns) ~0.96 ms -- **~3.1 ms total** -- and the
+*first* module is no slower than the rest, so there is no context/first-load warmup
+spike. A portable-PTX build measured ~3.5 ms total (driver JIT of these kernels is
+likewise negligible here). This confirms the rope-dedup's ~1 ms-per-freed-load number and
+kills module coalescing outright.
+
+**Result 2 -- the ~81 ms is `CudaBlas::new`.** Region markers on the dense load, 3 runs,
+cumulative: `parse_model_config` t=0.01 ms; `CudaBlas::new` + `cublasSetMathMode`
+t=80.9 ms; kernel loads + `WeightLoadPipeline::new` t=84.2 ms; weight loop t=208.0 ms;
+`token_embd` construction t=310.1 ms; `output_norm`/`lm_head` t=310.1 ms;
+pre-tokenizer-join t=310.2 ms; post-join t=310.2 ms. So the item-5 "AOT kernel module
+load 83.09 ms" label was a boundary error -- that timer captured cuBLAS handle init, not
+the module loads. The tokenizer worker-thread join is ~0.01 ms, i.e. the tokenizer is now
+fully hidden.
+
+**Verdict/finding**: module coalescing is dead (nothing to win). `CudaBlas::new`'s
+~81 ms is the largest remaining single cold-load cost after the tokenizer overlap and is
+the next candidate -- but overlapping or avoiding cuBLAS is a real design decision with a
+numerics/verification question, flagged as a new item rather than a follow-on patch. See
+DECISIONS.md's new entry and STATUS.md's updated "Planned next work" section. No code
+changed: the instrumentation was throwaway and the working tree was reverted.

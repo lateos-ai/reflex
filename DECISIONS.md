@@ -1250,3 +1250,40 @@ the call. If a future load-path item wants concurrency too, reuse this same
 `thread::scope` wrapper/inner shape rather than adding a second mechanism. Because this
 is a timing-only change with zero numerics impact, the golden-token check was a
 regression assert, not new first-principles verification.
+
+## AOT module loads are ~3ms; the "~83ms" is cuBLAS init (measured 2026-09-28)
+
+**Decision**: stop treating "AOT kernel module load" as a cold-load cost to optimize —
+every dense `cuModuleLoad` together measures ~3ms. Reject the single-module coalescing
+idea (item 2 of the tokenizer+AOT plan) outright, and re-point the next cold-load work at
+`CudaBlas::new` + `cublasSetMathMode` (~81ms), which the plan's "~83ms AOT module load"
+figure was actually measuring.
+
+**How this was measured**: a throwaway instrumentation build (env-gated `eprintln!`
+timers in `src/aot.rs` and the dense `Model::load` body, applied only on the remote
+instance and never committed — the same convention the item-5 profiling used) on an AWS
+EC2 `g4dn.xlarge`/T4, `sm_75` cubin (and, for the module-load point, a second portable-PTX
+build). Two results:
+- Per-module: the whole dense AOT set (rmsnorm, rope, silu, gemv, gemv_gather, attention,
+  attention_prefill, elementwise, dequant) is **~3ms total** (cubin) / ~3.5ms (portable
+  PTX), with no first-module/context-warmup spike and the 20-fn `dequant` module the
+  largest at ~1ms. The rope-dedup's earlier ~1ms-per-freed-load result already hinted at
+  this; this is the direct confirmation.
+- Per-region: `parse_model_config` ~0.01ms; **`CudaBlas::new` + `cublasSetMathMode`
+  ~80.9ms**; kernel loads + `WeightLoadPipeline::new` ~3.2ms; weight loop ~123.8ms;
+  `token_embd` construction ~102.1ms; `output_norm`/`lm_head` ~0.1ms; tokenizer-thread
+  join ~0.01ms (fully hidden by the worker thread).
+
+**Why the original figure was wrong**: the item-5 "AOT kernel module load 83.09ms" timer
+almost certainly started before `CudaBlas::new` and ran through the kernel loads, so it
+captured cuBLAS handle init *plus* module loads, and the plan then attributed the whole
+thing to the module loads. Same class of error the rope-dedup entry already exposed (a
+back-of-envelope "~8ms per call" vs. a measured ~1ms); the lesson is to instrument the
+actual boundary, not infer it.
+
+**How to apply**: don't revisit module coalescing — there is nothing there. The ~81ms
+`cuBLAS` init is the next candidate (overlap it on a scoped thread like the tokenizer, or
+avoid cuBLAS on the `system1`/decode path where the custom kernels already do the work),
+but that is a real design decision with its own numerics/verification question, not a
+follow-on patch — treat it as a new item, with its own DECISIONS entry and strict A/B,
+before any code is written.
