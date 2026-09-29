@@ -69,6 +69,10 @@ pub fn init_device_with_diagnostics(ordinal: usize) -> Result<Arc<CudaDevice>, S
 /// default portable-PTX build. See `build.rs`'s matching `cargo:rustc-env` line.
 const COMPILED_ARCH: &str = env!("REFLEX_CUDA_ARCH");
 
+/// The `REFLEX_CUDA_ARCHS` build.rs was invoked with (a comma-separated `sm_XX` list
+/// in the multi-arch fatbin mode), or empty otherwise.
+pub const COMPILED_ARCHS: &str = env!("REFLEX_CUDA_ARCHS");
+
 /// Parses a `sm_XY`/`compute_XY` (or bare `XY`) arch string into `(major, minor)`,
 /// matching CUDA's own convention (all digits but the last are major, the last digit
 /// is minor -- e.g. `sm_86` -> `(8, 6)`, `sm_90a` -> `(9, 0)`, the trailing `a`
@@ -105,6 +109,9 @@ fn parse_arch(arch: &str) -> Result<(i32, i32), String> {
 /// CUDA driver load/launch failure.
 pub fn check_kernel_compute_capability(device: &Arc<CudaDevice>) -> Result<(), String> {
     if COMPILED_ARCH.is_empty() {
+        // Portable-PTX (everything JITs) or fatbin (embedded PTX fallback covers any
+        // unlisted arch) -- no hard mismatch is possible in either mode, so nothing
+        // to enforce here. Single-arch cubin is the only mode with no fallback.
         return Ok(());
     }
     let (compiled_major, compiled_minor) = parse_arch(COMPILED_ARCH)?;
@@ -119,6 +126,27 @@ pub fn check_kernel_compute_capability(device: &Arc<CudaDevice>) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// For a fatbin (multi-arch cubin) build: reports whether the detected GPU's compute
+/// capability is covered by a native zero-JIT image among `REFLEX_CUDA_ARCHS`
+/// (`Ok(true)`), or will instead fall back to the fatbin's embedded forward-compatible
+/// PTX and be driver-JIT'd (`Ok(false)`). Only meaningful in fatbin mode -- a
+/// portable-PTX build always JITs and a single-arch cubin build is already enforced
+/// as an exact match by [`check_kernel_compute_capability`].
+pub fn fatbin_native_for_device(device: &Arc<CudaDevice>) -> Result<bool, String> {
+    let diag = probe(device)?;
+    let (major, minor) = diag.compute_capability;
+    for arch in COMPILED_ARCHS
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if parse_arch(arch)? == (major, minor) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn explain_driver_error(ordinal: usize, e: &DriverError) -> String {

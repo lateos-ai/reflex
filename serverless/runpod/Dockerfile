@@ -44,8 +44,15 @@ WORKDIR /build
 COPY . .
 
 ARG REFLEX_CUDA_ARCH="sm_86"
+# Multi-arch fatbin (comma-separated sm_XX list + embedded PTX fallback), mutually
+# exclusive with REFLEX_CUDA_ARCH. A fatbin covering sm_80,sm_86,sm_89,sm_90 would
+# retire the AMPERE_16 mixed-arch-pool SKU-pinning workaround documented above.
+ARG REFLEX_CUDA_ARCHS=""
 RUN set -- --release --bin reflex --features ipc; \
-    if [ -n "$REFLEX_CUDA_ARCH" ]; then \
+    if [ -n "$REFLEX_CUDA_ARCHS" ]; then \
+        unset REFLEX_CUDA_ARCH; \
+        REFLEX_CUDA_ARCHS=$REFLEX_CUDA_ARCHS cargo build "$@"; \
+    elif [ -n "$REFLEX_CUDA_ARCH" ]; then \
         REFLEX_CUDA_ARCH=$REFLEX_CUDA_ARCH cargo build "$@"; \
     else \
         cargo build "$@"; \

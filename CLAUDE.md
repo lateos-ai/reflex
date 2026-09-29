@@ -32,9 +32,21 @@ file in `src/kernels_cuda/` at build time and panics if `nvcc` isn't found.
   `cubin` for one target architecture (zero driver-side JIT, but the binary only runs on
   that compute capability). `sm_86` is a common Ampere-class arch (e.g. an RTX A6000);
   match this to your actual GPU.
+- `REFLEX_CUDA_ARCHS=sm_75,sm_80,sm_86,sm_89,sm_90 cargo build --release` — compile a
+  multi-arch **fatbin** (one native cubin per listed arch + an embedded
+  forward-compatible PTX for the highest listed arch so a newer GPU still loads via
+  driver JIT). This is the "one image, many GPU generations, no per-arch rebuild" mode —
+  the answer to a mixed-architecture GPU pool (see README's "Core technical bet").
+  Mutually exclusive with `REFLEX_CUDA_ARCH` setting both is a build-time panic.
+  `reflex doctor` reports whether the detected GPU gets a native or PTX-fallback image.
 - `REFLEX_SKIP_CUDA=1 cargo build` — skip kernel compilation entirely, for editing/
   type-checking on a machine without CUDA. No subcommand will actually run kernels
   in this mode.
+- The core build has **no default features** (explicit `default = []`): only
+  `cudarc`/`half`/`memmap2`/`rand`. Optional features (`ipc`, `json-output`, `download`,
+  `nvml`, `python`) are each gated behind their own Cargo feature; only `download`
+  (Linux `libssl-dev`+`pkg-config`) and `python` (a Python interpreter) add extra *host*
+  build deps. See README's "Build features" section for the full table.
 - `cargo run --release --bin reflex -- smoke` — the first thing to run on any fresh GPU
   instance; proves the AOT pipeline works end to end and prints
   `process_start_to_first_result_ms`.
@@ -57,13 +69,15 @@ since the whole point of the project is measuring real cold-start behavior.
 ## Architecture
 
 ### Kernel compilation pipeline
-`build.rs` finds `nvcc`, compiles every `src/kernels_cuda/*.cu` to PTX (or cubin if
-`REFLEX_CUDA_ARCH` is set) into `OUT_DIR`, and exposes each kernel's output path to
-the binary via a `REFLEX_KERNEL_<NAME>` env var (read with `env!(...)` at compile
-time — see `src/bin/reflex/smoke.rs`). `src/aot.rs::load_kernel` loads that PTX/cubin file at
+`build.rs` finds `nvcc`, compiles every `src/kernels_cuda/*.cu` into `OUT_DIR` in one of
+three mutually-exclusive modes — portable PTX (default), a single-arch cubin if
+`REFLEX_CUDA_ARCH` is set, or a multi-arch fatbin if `REFLEX_CUDA_ARCHS` is set — and
+exposes each kernel's output path to the binary via a `REFLEX_KERNEL_<NAME>` env var
+(read with `env!(...)` at compile time — see `src/bin/reflex/smoke.rs`).
+`src/aot.rs::load_kernel` loads those bytes at
 process start via `Ptx::from_file` (maps to the driver's `cuModuleLoad`, which accepts
-PTX/cubin/fatbin transparently — this is why the same loader code works for both output
-modes).
+PTX/cubin/fatbin transparently — this is why the same loader code works for all three
+output modes).
 
 ### Model loading and forward pass (`src/model.rs`)
 `Model::load` reads a GGUF file (`src/gguf.rs`, mmap-based parsing) and, per layer, builds either `DenseLayerWeights` or

@@ -31,8 +31,14 @@ WORKDIR /build
 COPY . .
 
 ARG REFLEX_CUDA_ARCH="sm_89"
+# Multi-arch fatbin (comma-separated sm_XX list + embedded PTX fallback), mutually
+# exclusive with REFLEX_CUDA_ARCH -- see build.rs / README's fatbin section.
+ARG REFLEX_CUDA_ARCHS=""
 RUN set -- --release --bin reflex --features ipc; \
-    if [ -n "$REFLEX_CUDA_ARCH" ]; then \
+    if [ -n "$REFLEX_CUDA_ARCHS" ]; then \
+        unset REFLEX_CUDA_ARCH; \
+        REFLEX_CUDA_ARCHS=$REFLEX_CUDA_ARCHS cargo build "$@"; \
+    elif [ -n "$REFLEX_CUDA_ARCH" ]; then \
         REFLEX_CUDA_ARCH=$REFLEX_CUDA_ARCH cargo build "$@"; \
     else \
         cargo build "$@"; \

@@ -100,6 +100,47 @@ HTTP clients (OpenRouter, the OpenAI SDKs, curl), see
 OpenAI-compatible `/v1/chat/completions` sidecar built on top of `reflex stdio`, not
 part of the `reflex` binary itself (see Non-goals below).
 
+## Build features: core engine vs. optional tooling
+
+Reflex's **core engine** has a deliberately minimal dependency footprint: `cudarc`
+(the CUDA driver + cuBLAS bindings), `half`, `memmap2`, and `rand` — no networking,
+no serialization, no Python. Every optional capability is a **Cargo feature** that
+stays off by default, so `cargo build --release` and `cargo build --release
+--no-default-features` are identical today: neither pulls in a single optional
+dependency (the empty `default = []` in `Cargo.toml` makes that a contract, not an
+accident of omission). `--all-features` is a *developer convenience for testing the
+feature matrix*, not a release build — see the table for what it drags in.
+
+| feature | adds | extra host build dependency |
+|---|---|---|
+| *(none — core)* | `generate`/`system1`/`smoke`/`bench`/`check`, all four model architectures | CUDA toolkit only (`nvcc`) |
+| `ipc` | `reflex stdio` / `reflex uds` (also enables `json-output` via `serde`) | none |
+| `json-output` | `--json` on `generate`/`system1`/`bench`/`smoke`/`check`/`doctor` | none |
+| `download` | `--model <org/repo:file.gguf>` / `--quickstart` (HF downloader via `hf-hub`) | `libssl-dev` + `pkg-config` on Linux (**not** Windows/macOS, where `hf-hub` uses a different TLS backend) |
+| `nvml` | `reflex` energy instrumentation (dlopen'd `libnvidia-ml`, never linked) | none |
+| `python` | PyO3 bindings (`src/python.rs`) | a Python 3.8+ interpreter on the build host (`pyo3-build-config` probes for it) |
+
+The host-dependency story in one line: **only `download` (Linux) and `python` ever
+need anything the core build doesn't**, and both are off by default. On Ubuntu/Debian
+for the `download` feature specifically:
+
+```
+sudo apt-get install -y libssl-dev pkg-config
+```
+
+Every Dockerfile in this repo builds an explicit, minimal feature set (`--features ipc`
+for the sidecar/Runpod/Modal images, feature-less for the root image) precisely so the
+released artifacts never pay for `download`/`python` they don't use — see each
+Dockerfile's `REFLEX_FEATURES`/`--features` line rather than assuming `--all-features`.
+
+**Binary size.** The core build stays small by design: the Rust binary itself is on the
+order of a few MB, and the AOT kernel bytes it embeds are tiny (the full `src/kernels_cuda/`
+source is ~87KB; even a multi-arch fatbin stays far under the ~15MB ceiling this project
+targets — well below the multi-GB CUDA base images the kernels are *not* re-shipped
+inside). This is a stated target, not a CI-enforced number yet; a `REFLEX_SKIP_CUDA=1`
+dev build (empty placeholder kernels) measures ~1.5MB, and the real CUDA build's exact
+figure is re-confirmed per release rather than asserted here.
+
 ### Example: download a model from Hugging Face, then run a System1 test
 
 `system1` takes a local GGUF path, so download the file first with the
@@ -369,30 +410,43 @@ breakdown, not scoped here.
 
 Every CUDA kernel is compiled **ahead of time** (`build.rs` invokes `nvcc`, see
 `build.rs` and `src/kernels_cuda/`), never at runtime via NVRTC. `src/aot.rs` loads the
-precompiled PTX/cubin at process start via the CUDA driver API. Default mode emits
-portable PTX (driver-side JIT-to-SASS at load); set `REFLEX_CUDA_ARCH=sm_XX` to compile
-straight to a `cubin` for one target architecture (zero JIT, at the cost of needing a
-matching cubin per deployment target). **Measured on a real T4 for this project's dense
-kernel set: the whole module load is ~3ms either way** (portable PTX ~3.5ms vs. pinned
-cubin ~3.1ms), so the driver-side JIT tax is negligible for these kernels. The
-pinned-cubin build is still preferred for true zero-JIT and a simpler load path, but the
-load-phase difference is sub-millisecond.
+precompiled bytes at process start via the CUDA driver API. Three output modes, chosen
+by env var (`REFLEX_CUDA_ARCH` and `REFLEX_CUDA_ARCHS` are mutually exclusive):
+
+| env var | output | load behavior | fits |
+|---|---|---|---|
+| *(neither)* | portable **PTX** | driver JIT-to-SASS at load, any GPU | the safe default for a distributed image |
+| `REFLEX_CUDA_ARCH=sm_XX` | single-arch **cubin** | zero JIT, exactly that one GPU, hard-fails elsewhere | a known, pinned SKU |
+| `REFLEX_CUDA_ARCHS=sm_XX,sm_YY,...` | **fatbin** (one cubin per listed arch + an embedded forward-compatible PTX) | zero JIT on any listed arch, driver-JIT fallback on anything newer | a mixed-architecture GPU pool (e.g. Runpod's `AMPERE_16`, see [below](#serverless-gpu-platforms-runpod)) |
+
+The fatbin mode is build.rs's answer to "ship one image, run natively on many GPU
+generations without a per-arch rebuild": `nvcc -fatbin` with one
+`-gencode arch=compute_XX,code=sm_XX` per listed arch, plus a trailing
+`-gencode arch=compute_<highest>,code=compute_<highest>` that embeds PTX for the
+highest listed arch so a GPU *newer* than everything listed still loads (via driver
+JIT) instead of failing. Example:
+
+```
+REFLEX_CUDA_ARCHS=sm_75,sm_80,sm_86,sm_89,sm_90 cargo build --release
+```
+
+`cargo build` panics if *both* `REFLEX_CUDA_ARCH` and `REFLEX_CUDA_ARCHS` are set.
+A fatbin embeds one SASS image per arch, so it is fatter than a single pinned cubin —
+the traded-off binary size is the honest cost of not maintaining one image per GPU
+generation. `reflex doctor` reports the build's `kernel_format` and, for a fatbin,
+whether the detected GPU gets a native (zero-JIT) image or falls back to the embedded
+PTX.
+
+**Measured on a real T4 for this project's dense kernel set: the whole module load is
+~3ms either way** (portable PTX ~3.5ms vs. pinned cubin ~3.1ms), so the driver-side JIT
+tax is negligible for these kernels. The pinned-cubin/fatbin builds are still preferred
+for true zero-JIT and a simpler load path, but the load-phase difference is
+sub-millisecond.
 
 Run `cargo run --bin reflex -- smoke` on a real GPU instance as the very first
 real-hardware step: it proves the AOT pipeline works end to end and reports actual
 process-start-to-first-result wall clock on the simplest possible kernel, before any
 model-architecture work begins.
-
-**Linux build prerequisite for `--features download`/`ipc`/`python`** (`--all-features`
-included): these pull in `hf-hub`, whose `ureq` HTTP client needs `libssl-dev` +
-`pkg-config` on the build host, or `cargo build` fails with `openssl-sys` unable to find
-an OpenSSL installation. Not needed for the default feature-less build. On Ubuntu/Debian:
-```
-sudo apt-get install -y libssl-dev pkg-config
-```
-(Discovered on a fresh ThunderCompute instance during the MVP-release adoption round —
-not needed on the Windows dev machine that round otherwise developed on, since
-`native-tls` uses a different TLS backend there.)
 
 ## MVP order
 

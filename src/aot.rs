@@ -79,7 +79,24 @@ fn ptx_from_embedded_bytes(kernel_bytes: &'static [u8], module_name: &str) -> Re
                 .ok_or_else(|| format!("materialized cubin temp path for module {module_name} is not valid UTF-8: {tmp_path:?}"))?;
             Ok(Ptx::from_file(path_str))
         }
-        other => Err(format!("unknown REFLEX_KERNEL_FORMAT {other:?} (build.rs should only ever emit \"ptx\" or \"cubin\")")),
+        // A fatbin (multi-arch cubin container with an embedded PTX fallback, see
+        // build.rs) is also arbitrary binary, so it takes the same materialize-
+        // to-temp-file-then-`Ptx::from_file` path as a single cubin -- the CUDA
+        // driver's `cuModuleLoad` is format-agnostic, so no separate handling is
+        // needed beyond giving the temp file a distinct extension.
+        "fatbin" => {
+            let hash = fnv1a_hash(kernel_bytes);
+            let tmp_path = std::env::temp_dir().join(format!("reflex-engine-kernel-{module_name}-{hash:016x}.fatbin"));
+            std::fs::write(&tmp_path, kernel_bytes)
+                .map_err(|e| format!("failed to materialize embedded fatbin for module {module_name} at {tmp_path:?}: {e}"))?;
+            let path_str = tmp_path
+                .to_str()
+                .ok_or_else(|| format!("materialized fatbin temp path for module {module_name} is not valid UTF-8: {tmp_path:?}"))?;
+            Ok(Ptx::from_file(path_str))
+        }
+        other => Err(format!(
+            "unknown REFLEX_KERNEL_FORMAT {other:?} (build.rs should only ever emit \"ptx\", \"cubin\", or \"fatbin\")"
+        )),
     }
 }
 

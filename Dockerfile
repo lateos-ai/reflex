@@ -43,6 +43,11 @@ COPY . .
 # zero-runtime-JIT cubin path instead.
 ARG REFLEX_CUDA_ARCH=""
 
+# Multi-arch fatbin build (comma-separated sm_XX list with an embedded PTX fallback
+# for newer GPUs) -- mutually exclusive with REFLEX_CUDA_ARCH. See build.rs and
+# README's "AOT PTX/fatbin packaging" for the three-mode tradeoff.
+ARG REFLEX_CUDA_ARCHS=""
+
 # Empty by default: no optional Cargo features enabled, matching this image's original
 # footprint exactly. Set --build-arg REFLEX_FEATURES=ipc to additionally enable `reflex
 # stdio`/`reflex uds` (see Cargo.toml's [features] table) -- needed for the AWS
@@ -51,7 +56,10 @@ ARG REFLEX_CUDA_ARCH=""
 ARG REFLEX_FEATURES=""
 RUN set -- --release --bin reflex; \
     if [ -n "$REFLEX_FEATURES" ]; then set -- "$@" --features "$REFLEX_FEATURES"; fi; \
-    if [ -n "$REFLEX_CUDA_ARCH" ]; then \
+    if [ -n "$REFLEX_CUDA_ARCHS" ]; then \
+        unset REFLEX_CUDA_ARCH; \
+        REFLEX_CUDA_ARCHS=$REFLEX_CUDA_ARCHS cargo build "$@"; \
+    elif [ -n "$REFLEX_CUDA_ARCH" ]; then \
         REFLEX_CUDA_ARCH=$REFLEX_CUDA_ARCH cargo build "$@"; \
     else \
         cargo build "$@"; \

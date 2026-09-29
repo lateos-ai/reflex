@@ -1326,3 +1326,45 @@ handle; one thread, joined, no pool). The remaining `model_load_ms` is dominated
 per-tensor weight loop (~124ms) and the lazy `token_embd` raw-byte copy (~102ms), both
 memory/GPU-bound rather than host setup, so further load-path wins need a different idea
 (re-rank against the new ~237ms floor).
+
+## Multi-arch fatbin packaging (`REFLEX_CUDA_ARCHS`) and the explicit core-vs-optional feature split
+
+**Decision (fatbin)**: add a third AOT output mode to `build.rs`, selected by the
+plural `REFLEX_CUDA_ARCHS=sm_XX,sm_YY,...`, that compiles each kernel once via
+`nvcc -fatbin` with one `-gencode arch=compute_XX,code=sm_XX` per listed arch plus a
+trailing `-gencode arch=compute_<highest>,code=compute_<highest>` (embedded PTX
+fallback for any GPU newer than the highest listed arch). `REFLEX_CUDA_ARCHS` is
+mutually exclusive with the existing singular `REFLEX_CUDA_ARCH`; setting both is a
+`build.rs` panic.
+
+**Why (fatbin)**: the single-arch cubin mode (`REFLEX_CUDA_ARCH`) has zero driver-side
+JIT but hard-fails on any other GPU — the Runpod `AMPERE_16` pool is documented as
+mixed `sm_86`/`sm_89`, forcing the "pin to RTX A4500" SKU workaround. A fatbin covering
+the pool's archs would let one undistinguished image schedule anywhere in it correctly,
+while still giving zero-JIT on every listed arch. The loader needs no change:
+`Ptx::from_file` → `cuModuleLoad` is format-agnostic (confirmed against cudarc 0.11.9's
+`driver/safe/ptx.rs` and `src/aot.rs`'s own cubin precedent), so `aot.rs` just adds a
+`"fatbin"` arm reusing the cubin temp-file path. `src/diagnostics.rs` gains
+`COMPILED_ARCHS` + `fatbin_native_for_device` because a GPU *not* in the list must be a
+non-fatal "will JIT from embedded PTX" report, not the hard error single-arch mode
+correctly raises (that mode has no fallback). `reflex doctor` surfaces
+native-vs-fallback for fatbin builds.
+
+**Decision (features)**: make the core-vs-optional dependency boundary explicit —
+`default = []` in `Cargo.toml` (previously implicit), and a README "Build features"
+table documenting that only `download` (Linux `libssl-dev`+`pkg-config`) and `python`
+(a Python interpreter) add host build dependencies the feature-less core build doesn't.
+`--all-features` is documented as a developer matrix-testing convenience, not a release
+build; the deploy Dockerfiles keep building explicit minimal feature sets as they
+already did.
+
+**Not done here, and why**: real-hardware verification of the fatbin path (a working
+multi-arch `.fatbin` actually loading/launching on a real CUDA-toolkit GPU) — this was
+implemented and CI/`REFLEX_SKIP_CUDA=1` checked only, since no `nvcc`/GPU is available on
+the machine that wrote it; it reuses this repo's existing real-hardware-verification
+bar. Also not fixed: the `python` feature does not currently compile at all
+(`--all-features` fails with `Send` not implemented for `PyModel`, because
+`WeightLoadPipeline` holds a `*mut u8` pinned-host pointer that isn't `Send`) — a
+pre-existing incompatibility between the pyo3 `#[pyclass]` `Send` bound and the current
+`Model` shape, documented here and left untouched rather than papered over with an
+`unsafe impl Send`.

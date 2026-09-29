@@ -51,13 +51,25 @@ hf-hub = { version = "0.3", optional = true }
 nvml-wrapper = { version = "0.13", optional = true }
 
 [features]
+# Explicit (rather than relying on Cargo's implicit "no default key = no default
+# features" behavior) so the core build's footprint is a documented contract, not
+# an accident. `cargo build --release` and `cargo build --release
+# --no-default-features` are equivalent today: neither pulls in any optional
+# dependency. See README's "Build features" section for the full core-vs-optional
+# split and each feature's extra host build requirement.
+default = []
 # `ipc`'s own wire protocol (src/ipc.rs) needs serde too, so it just pulls in
 # `json-output` rather than declaring `dep:serde`/`dep:serde_json` a second
 # time -- cargo unifies the shared deps, no duplication/conflict from having
 # both features on at once.
 ipc = ["json-output"]
+# Requires a Python 3.8+ interpreter on the build host (pyo3-build-config
+# probes for it; abi3 avoids a per-version matrix but not Python discovery).
 python = ["dep:pyo3"]
+# Requires libssl-dev + pkg-config on the build HOST at Linux build time
+# (hf-hub -> ureq -> openssl-sys on Linux; native-tls on Windows, no extra dep).
 download = ["dep:hf-hub"]
+# Pure-Rust + dlopen(libnvidia-ml) at runtime -- no extra host build dependency.
 nvml = ["dep:nvml-wrapper"]
 # --json output on generate/system1/bench/smoke/check/doctor (see
 # src/cli_output.rs) -- deliberately its own feature rather than reusing `ipc`,

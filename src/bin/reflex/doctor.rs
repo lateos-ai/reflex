@@ -113,24 +113,52 @@ pub fn run(args: Vec<String>) {
     };
 
     let arch_display = if COMPILED_ARCH.is_empty() {
-        "portable-ptx"
+        "portable-ptx".to_string()
     } else {
-        COMPILED_ARCH
+        COMPILED_ARCH.to_string()
     };
     match &device {
         Some(device) => match diagnostics::check_kernel_compute_capability(device) {
-            Ok(()) => checks.push(Check {
-                name: "compute_capability",
-                status: Status::Pass,
-                detail: format!(
-                    "kernel_format={KERNEL_FORMAT} compiled_arch={arch_display} matches detected GPU"
-                ),
-            }),
             Err(e) => checks.push(Check {
                 name: "compute_capability",
                 status: Status::Fail,
                 detail: e,
             }),
+            Ok(()) => {
+                // A fatbin build embeds a PTX fallback, so there's no hard mismatch
+                // to fail on -- but the native-vs-fallback distinction is still worth
+                // surfacing (a fallback means the driver JITs, i.e. slower first load
+                // than a native zero-JIT image in the fatbin would be).
+                let (status, detail) = if KERNEL_FORMAT == "fatbin" {
+                    match diagnostics::fatbin_native_for_device(device) {
+                        Ok(true) => (
+                            Status::Pass,
+                            format!(
+                                "kernel_format={KERNEL_FORMAT} compiled_archs={} native (zero-JIT) match for detected GPU",
+                                diagnostics::COMPILED_ARCHS
+                            ),
+                        ),
+                        Ok(false) => (
+                            Status::Warn,
+                            format!(
+                                "kernel_format={KERNEL_FORMAT} compiled_archs={} does not include the detected GPU -- will fall back to the embedded PTX and be driver-JIT'd",
+                                diagnostics::COMPILED_ARCHS
+                            ),
+                        ),
+                        Err(e) => (Status::Fail, e),
+                    }
+                } else {
+                    (
+                        Status::Pass,
+                        format!("kernel_format={KERNEL_FORMAT} compiled_arch={arch_display} matches detected GPU"),
+                    )
+                };
+                checks.push(Check {
+                    name: "compute_capability",
+                    status,
+                    detail,
+                });
+            }
         },
         None => checks.push(Check {
             name: "compute_capability",
