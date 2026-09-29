@@ -46,104 +46,14 @@
 //! `Model::system1_evaluate_hybrid`'s doc comment for why); dense/MoE and
 //! MLA support both single- and multi-token candidates.
 
+#[cfg(not(feature = "json-output"))]
+use crate::phase::json_output_unavailable;
+use crate::phase::{energy_suffix, print_phase_report};
 use reflex_engine::diagnostics;
 use reflex_engine::energy;
 use reflex_engine::gguf::GgufFile;
 use reflex_engine::model::{Model, System1Candidate};
 use std::time::Instant;
-
-fn energy_suffix(measurement: Option<&energy::EnergyMeasurement>) -> String {
-    match measurement {
-        Some(m) => format!(
-            " joules={:.3} energy_method={}",
-            m.joules,
-            m.method.as_str()
-        ),
-        None => String::new(),
-    }
-}
-
-/// Per-phase energy is the *delta* between two cumulative
-/// [`energy::EnergyMeasurement`] readings (`measure()` returns cumulative
-/// joules since `start()`, and the underlying counter/accumulator is
-/// monotonic). `None` if either reading is unavailable. See the identical
-/// helper in `generate.rs`.
-fn phase_energy_delta(
-    after: &Option<energy::EnergyMeasurement>,
-    before: &Option<energy::EnergyMeasurement>,
-) -> Option<energy::EnergyMeasurement> {
-    match (after, before) {
-        (Some(a), Some(b)) => Some(energy::EnergyMeasurement {
-            joules: a.joules - b.joules,
-            method: a.method,
-        }),
-        _ => None,
-    }
-}
-
-/// Prints one `REFLEX_PHASE_OK` line (or its `--json` form) for a single
-/// phase. Purely additive: the aggregate `REFLEX_SYSTEM1_OK` line and its
-/// existing fields are unchanged. See the identical helper in `generate.rs`.
-fn print_phase_ok(
-    json: bool,
-    phase: &'static str,
-    duration_ms: f64,
-    energy: Option<&energy::EnergyMeasurement>,
-) {
-    if !json {
-        let suffix = match energy {
-            Some(m) => format!(
-                " energy_joules={:.3} energy_method={}",
-                m.joules,
-                m.method.as_str()
-            ),
-            None => String::new(),
-        };
-        println!("REFLEX_PHASE_OK phase={phase} duration_ms={duration_ms:.3}{suffix}");
-        return;
-    }
-    #[cfg(feature = "json-output")]
-    reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::PhaseTimingJson {
-        schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
-        phase,
-        duration_ms,
-        energy_joules: energy.map(|m| m.joules),
-        energy_method: energy.map(|m| m.method.as_str()),
-    });
-    #[cfg(not(feature = "json-output"))]
-    json_output_unavailable();
-}
-
-/// Emits the four bracketed cold-start phases' ms + joules, given the
-/// cumulative energy readings captured at each boundary (in order). See the
-/// identical helper in `generate.rs`.
-#[allow(clippy::too_many_arguments)]
-fn print_phase_report(
-    json: bool,
-    gguf_open_ms: f64,
-    cuda_init_ms: f64,
-    model_load_ms: f64,
-    prompt_eval_ms: f64,
-    e_gguf_open: &Option<energy::EnergyMeasurement>,
-    e_cuda_init: &Option<energy::EnergyMeasurement>,
-    e_model_load: &Option<energy::EnergyMeasurement>,
-    e_prompt_eval: &Option<energy::EnergyMeasurement>,
-) {
-    print_phase_ok(json, "gguf_open", gguf_open_ms, e_gguf_open.as_ref());
-    let cuda = phase_energy_delta(e_cuda_init, e_gguf_open);
-    print_phase_ok(json, "cuda_init", cuda_init_ms, cuda.as_ref());
-    let load = phase_energy_delta(e_model_load, e_cuda_init);
-    print_phase_ok(json, "model_load", model_load_ms, load.as_ref());
-    let eval = phase_energy_delta(e_prompt_eval, e_model_load);
-    print_phase_ok(json, "prompt_eval", prompt_eval_ms, eval.as_ref());
-}
-
-// Only called from a `#[cfg(not(feature = "json-output"))]` arm below --
-// `#[allow(dead_code)]` since a build *with* that feature never reaches it.
-#[allow(dead_code)]
-fn json_output_unavailable() -> ! {
-    panic!("--json requires this binary to be built with `cargo build --features json-output`");
-}
 
 fn print_lora_ok(json: bool, path: &str, tensors_applied: usize) {
     if !json {

@@ -3158,6 +3158,9 @@ nvml,json-output,download`, HEAD `676fcb6`, driven over SSM with source/GGUF via
 Not yet done: the same per-phase treatment for `smoke`/`bench`/`doctor` (they already
 emit a total `joules`), and no energy figure is quoted in the benchmark tables until the
 `polled_power` path is exercised -- the T4 always took the coarse counter branch.
+**Resolved by M4 (below)**: `smoke`/`bench` now emit per-phase lines, `doctor` documents
+why it has none, `polled_power` is forced and exercised on real hardware, and the README
+benchmark table now carries measured joules.
 
 ### Operational packaging: scripted Runpod deploy + landed runtime slimming (2026-09-29)
 
@@ -3202,3 +3205,93 @@ pre-existing issue surfaced and was fixed: `cargo fmt --check` was failing at HE
 `src/bin/reflex/{bench,doctor,generate,smoke,system1}.rs` from the M1/M2 commits; `cargo
 fmt` was applied (formatting-only, semantics verified unchanged by clippy/tests) to get
 the required gate green.
+
+### Energy-to-First-Result, item 4: published per-phase energy + exercised `polled_power` (real-hardware-verified 2026-09-29)
+
+Item 4 (M4) of the energy/observability plan -- the payoff milestone. Instrumentation and
+docs only: no engine/model/forward-pass change, so no numerics are touched.
+
+**Deliverable A -- the per-phase energy surface is complete.** The four helpers M1 had
+duplicated in `generate.rs`/`system1.rs` (`energy_suffix`, `phase_energy_delta`,
+`print_phase_ok`, `print_phase_report`) moved to a new shared `src/bin/reflex/phase.rs`
+(`mod phase;` in `main.rs`), so the follow-up would not add a third and fourth copy -- the
+whole point of the shared module. Then:
+- `smoke.rs` emits three additive `REFLEX_PHASE_OK` lines -- `cuda_init`, `kernel_load`,
+  `kernel_launch` -- snapshotted at its existing device-init / `aot::load_kernel` /
+  post-`synchronize` boundaries. The aggregate `REFLEX_SMOKE_OK` line and its fields are
+  unchanged.
+- `bench.rs` emits its real model-load sequence `gguf_open`/`cuda_init`/`model_load`
+  (three phases, not four: bench has no single `prompt_eval` -- its warm loops run per
+  prompt-length bucket and keep the separate `REFLEX_BENCH_ENERGY_OK` line). All existing
+  `REFLEX_BENCH_*` output is untouched.
+- `doctor.rs`: **no phase.** It runs no timed execution phase and emits no total `joules`
+  at all -- only an NVML availability probe. The module doc comment says so explicitly,
+  rather than inventing a phase over a set of sub-millisecond boolean checks.
+Purely additive: no versioned object changed shape, so `SCHEMA_VERSION` stays `1.0.0`.
+
+**Deliverable B -- `polled_power` forced and exercised on real hardware.** Every prior
+verification took `nvmlDeviceGetTotalEnergyConsumption`. `REFLEX_NVML_FORCE_POLLED=1`
+(`energy::force_polled_requested`, default-off; truthy = anything but unset/`0`/`false`/
+`no`/`off`) makes `EnergySampler::start` and `probe_availability` skip the counter branch
+and use `poll_power` even when the counter is present. The default preference order is
+unchanged. `reflex doctor`'s `nvml_energy` check reports the method it would actually use,
+appending `(forced by REFLEX_NVML_FORCE_POLLED; ...)` under the override.
+
+**Deliverable C -- published numbers + harness.** `scripts/bench_cold_start_phases.sh` and
+`..._system1.sh` gained a `p50 joules` column (per phase from the `REFLEX_PHASE_OK
+energy_joules` field, total from the aggregate `joules=`), plus a `gguf open` row the
+tables lacked; both still reuse `bench_cold_common.sh`'s single `/usr/bin/time -v` loop and
+its never-discard-raw-logs convention. The README's energy paragraph
+("not yet published") and ms-only phase table were rewritten with the measured numbers
+below.
+
+**Deliverable D -- deferred, with a note.** `bench`/`check`/`doctor` result structs still
+omit `schema_version`. Extending it is additive but changes those shapes and bumps
+`SCHEMA_VERSION` for no measurement benefit, so it is recorded as a mechanical follow-up in
+`cli_output.rs`'s versioning doc and README's contract section, not silently half-applied.
+
+**Verification -- real hardware, 2026-09-29** (`g4dn.xlarge`/Tesla T4, driver 595.91.07 /
+CUDA 13.2, `REFLEX_CUDA_ARCH=sm_75 cargo build --release --features
+nvml,json-output,download`, working tree = HEAD `9bf78f4` + M4 changes, driven over SSM
+with the source tarball + `tiny-qwen3moe.gguf` via the `reflex-gpu-verify-1790613486` S3
+bucket). `reflex doctor`: 4/4 pass, `method=total_energy_counter`; with the override,
+`method=polled_power (forced by REFLEX_NVML_FORCE_POLLED; the total-energy counter would
+otherwise be preferred)`.
+
+`reflex system1` on dense `Qwen3-0.6B-Q4_K_M`, `scripts/bench_cold_start_phases_system1.sh`,
+n=10, p50 (ms / J):
+
+| phase | `total_energy_counter` | `polled_power` (forced) |
+|---|---|---|
+| gguf open + metadata parse | 64.2 / 0.000 | 61.6 / 0.957 |
+| cuda init | 142.3 / 3.662 | 187.9 / 7.129 |
+| model load | 235.1 / 9.613 | 267.1 / 11.888 |
+| scoring pass | 39.2 / 0.000 | 40.4 / 1.450 |
+| total (`process_start_to_result_ms`) | 485.4 / 20.324 | 556.5 / 21.433 |
+
+`reflex generate` (same model, `scripts/bench_cold_start_phases.sh`), total p50: 755.8 ms /
+32.16 J (counter), 836.3 ms / 35.28 J (forced-polled). `reflex smoke` (counter):
+`cuda_init 165.604ms/7.307J`, `kernel_load 3.963ms/0.000J`, `kernel_launch
+14.643ms/0.000J`, aggregate `joules=7.307`; forced-polled `kernel_launch 13.397ms/0.601J`
+-- a short phase made non-zero exactly as the fallback is supposed to.
+
+**Findings (both disclosed in the README, not smoothed over).** (1) The counter
+granularity caveat reproduces at n=10: the ~64ms gguf parse and the ~39ms scoring pass
+both read p50 `0.000J` under `total_energy_counter`, and the phase joules do not sum to
+the total. (2) Forcing `polled_power` is **not free**: on this 4-vCPU instance the polling
+thread costs wall-clock (cuda init 142→188ms, model load 235→267ms) and polled totals read
+~5--15% higher than counter mode -- part real extra time, part the counter's coarse
+undercount. Both are carried in the README caveats.
+
+One operational gotcha fixed to run the harness: the phase scripts had never been executed
+on Linux before, and the Windows-created tarball carried CRLF line endings + no exec bit
+(`bench_cold_common.sh: Permission denied`, and `set: pipefail-: invalid option` from the
+`\r`); the runner normalizes with `sed -i 's/\r$//'` + `chmod +x`. The tracked scripts are
+LF in git (`core.autocrlf=true` is checkout-side only), so this was a transfer artifact,
+not a repo bug -- the committed files are clean.
+
+**Gates**: `REFLEX_SKIP_CUDA=1 cargo fmt --check`; `cargo clippy --all-targets --
+-D warnings` (default and `--features nvml,json-output`); `cargo test` (85 passed / 12
+ignored) and `cargo test --features json-output` (87 passed). Golden `token_id=12095` /
+`" Paris"` reproduced on the real T4, confirming the output-layer change is
+forward-pass-neutral.

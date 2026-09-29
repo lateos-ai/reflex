@@ -20,6 +20,7 @@ mod bench;
 mod check;
 mod doctor;
 mod generate;
+mod phase;
 mod smoke;
 mod system1;
 

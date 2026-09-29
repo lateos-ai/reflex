@@ -18,7 +18,24 @@
 //! `--json` (needs `cargo build --features json-output`) prints each result
 //! as one line of JSON instead of the plain `REFLEX_*_OK key=value` text --
 //! see `reflex_engine::cli_output`'s doc comment for the exact shapes.
+//!
+//! **Additive per-phase energy for the load sequence.** `bench`'s *timed*
+//! metric deliberately excludes process/GGUF-load cost (that is the whole
+//! point of a warm-latency microbenchmark), but the load sequence a bench run
+//! still performs before its first timed pass -- `gguf_open`, `cuda_init`,
+//! `model_load` -- is the same set of real cold-start phases
+//! `generate`/`system1` report, so it now emits the same additive
+//! `REFLEX_PHASE_OK phase=<name> duration_ms=<ms> energy_joules=<j>
+//! energy_method=<m>` lines (three phases, not four: bench has no single
+//! `prompt_eval` phase -- its warm loops run per prompt-length bucket, are
+//! already bracketed by the existing `REFLEX_BENCH_ENERGY_OK` line, and stay
+//! unchanged). The latency samples and every existing `REFLEX_BENCH_*` field
+//! are untouched; see `src/energy.rs`'s doc comment for the per-phase
+//! (delta-from-cumulative) semantics and the counter-vs-polled caveat.
 
+#[cfg(not(feature = "json-output"))]
+use crate::phase::json_output_unavailable;
+use crate::phase::{phase_energy_delta, print_phase_ok};
 use reflex_engine::diagnostics;
 use reflex_engine::energy;
 use reflex_engine::gguf::GgufFile;
@@ -40,13 +57,6 @@ fn build_prompt(word_count: usize) -> String {
 fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
     let idx = ((sorted_ms.len() as f64 - 1.0) * p).round() as usize;
     sorted_ms[idx.min(sorted_ms.len() - 1)]
-}
-
-// Only called from a `#[cfg(not(feature = "json-output"))]` arm below --
-// `#[allow(dead_code)]` since a build *with* that feature never reaches it.
-#[allow(dead_code)]
-fn json_output_unavailable() -> ! {
-    panic!("--json requires this binary to be built with `cargo build --features json-output`");
 }
 
 fn print_lora_ok(json: bool, path: &str, tensors_applied: usize) {
@@ -111,6 +121,8 @@ fn print_stats(
 }
 
 pub fn run(args: Vec<String>) {
+    let t0 = Instant::now();
+    let sampler = energy::EnergySampler::start(0);
     let mut gguf_path: Option<String> = None;
     let mut warmup: usize = 5;
     let mut iters: usize = 50;
@@ -148,7 +160,11 @@ pub fn run(args: Vec<String>) {
 
     let file =
         GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
+    let gguf_open_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let e_gguf_open = sampler.measure();
     let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
+    let cuda_init_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms;
+    let e_cuda_init = sampler.measure();
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }
@@ -158,6 +174,8 @@ pub fn run(args: Vec<String>) {
     let vram_before = diagnostics::probe(&device).ok();
     let device_for_vram = device.clone();
     let mut model = Model::load(device, &file).expect("failed to load model");
+    let model_load_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms - cuda_init_ms;
+    let e_model_load = sampler.measure();
     if let Some(before) = vram_before {
         if let Ok(after) = diagnostics::probe(&device_for_vram) {
             let free_before_load_mib = before.vram_free_bytes / (1024 * 1024);
@@ -182,6 +200,15 @@ pub fn run(args: Vec<String>) {
             }
         }
     }
+
+    // Additive load-phase energy, same three phases `generate`/`system1`
+    // report for the identical load sequence -- emitted before the warm-loop
+    // measurements below. See this file's module doc comment and `crate::phase`.
+    print_phase_ok(json, "gguf_open", gguf_open_ms, e_gguf_open.as_ref());
+    let bench_cuda = phase_energy_delta(&e_cuda_init, &e_gguf_open);
+    print_phase_ok(json, "cuda_init", cuda_init_ms, bench_cuda.as_ref());
+    let bench_load = phase_energy_delta(&e_model_load, &e_cuda_init);
+    print_phase_ok(json, "model_load", model_load_ms, bench_load.as_ref());
 
     if let Some(lora_path) = &lora_path {
         let applied = model

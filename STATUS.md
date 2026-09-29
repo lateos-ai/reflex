@@ -844,6 +844,28 @@ no local GPU); see HISTORY.md's "Operational packaging" entry. One pre-existing
 issue fixed to get the gate green: `cargo fmt` applied to `src/bin/reflex/*.rs`
 (formatting-only; M1/M2 had landed them unformatted).
 
+## Energy-to-First-Result, item 4: published energy + polled_power (done 2026-09-29)
+
+Instrumentation/docs only, no engine change. Real-T4-verified (`g4dn.xlarge`, driver
+595.91.07 / CUDA 13.2, `sm_75` cubin, `--features nvml,json-output,download`).
+
+- Per-phase `REFLEX_PHASE_OK` energy now covers `smoke` (cuda_init/kernel_load/
+  kernel_launch) and `bench` (gguf_open/cuda_init/model_load) as well as
+  `generate`/`system1`; the duplicated helpers moved to a shared
+  `src/bin/reflex/phase.rs`. `doctor` has no timed phase and documents why it emits none.
+  Additive: `SCHEMA_VERSION` stays `1.0.0`.
+- `REFLEX_NVML_FORCE_POLLED=1` forces the previously-never-exercised `polled_power`
+  integration path; `reflex doctor` reports the method it would actually use. Measured
+  `reflex system1` p50 (n=10, `Qwen3-0.6B-Q4_K_M`): total **485.4ms / 20.324J** counter
+  vs. **556.5ms / 21.433J** forced-polled. Short phases (gguf parse ~64ms, scoring ~39ms)
+  read `0.000J` in counter mode but `0.957J` / `1.450J` polled -- the fallback's whole
+  point. Forcing polled costs wall-clock on a 4-vCPU host (cuda init 142→188ms); disclosed.
+- `scripts/bench_cold_start_phases{,_system1}.sh` gained a `p50 joules` column and a
+  `gguf open` row, still reusing `bench_cold_common.sh` / never-discarding raw logs. The
+  README's energy paragraph and phase table now quote measured joules. Extending
+  `schema_version` to `bench`/`check`/`doctor` result structs is documented as deferred.
+- Gates: `REFLEX_SKIP_CUDA=1` fmt/clippy (default + nvml,json-output)/test all green.
+
 ## Known debt / limitations
 
 - ~~**`src/ffi.rs`'s `extern "C"` functions dereference raw pointers without being

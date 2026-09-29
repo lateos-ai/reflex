@@ -225,20 +225,23 @@ the benchmarks below treat it as one.
 first generated token) — a real, underexplored gap. Existing energy benchmarks measure
 warm/steady-state joules-per-token, not full-lifecycle cold-start cost.
 
-**Energy instrumentation exists; energy *numbers* are not yet published.** `src/energy.rs`
-samples GPU power via NVML (`nvml-wrapper`, `dlopen`'d at runtime behind the optional
-`nvml` Cargo feature — never linked at build time), preferring the Volta+ monotonic
-`nvmlDeviceGetTotalEnergyConsumption` counter and falling back to polling
+**Energy instrumentation *and* measured energy numbers (real T4; see the phase table
+below).** `src/energy.rs` samples GPU energy via NVML (`nvml-wrapper`, `dlopen`'d at runtime
+behind the optional `nvml` Cargo feature — never linked at build time), preferring the
+Volta+ monotonic `nvmlDeviceGetTotalEnergyConsumption` counter and falling back to polling
 `nvmlDeviceGetPowerUsage` and integrating `power_mw * dt_s`. `generate`/`system1`/`smoke`/
-`bench`/`doctor` emit total `joules` when it is available (`--features nvml` on a machine
-that exposes NVML), and `generate`/`system1` now also emit per-phase `REFLEX_PHASE_OK`
-joules lines. **But none of it has been real-hardware-verified yet, so no energy figure is
-quoted in the benchmark tables below** — every published number remains latency (and, in
-`reflex bench`, VRAM residency). Two caveats carried openly: NVML has no per-process energy
-API, so the figure is **device-wide** (accurate on a dedicated/rented instance, an overcount
-on a shared GPU); and in `total_energy_counter` mode the hardware counter updates coarsely,
-so *short-phase* deltas (e.g. a ~39ms prefill) can read as zero or lumpy — the
-`polled_power` fallback integrates continuously and does not have that limitation.
+`bench` emit per-phase `REFLEX_PHASE_OK` joules lines plus a total `joules` when available
+(`--features nvml` on a machine that exposes NVML); `doctor` reports the method a real run
+would actually use. These are now real-hardware-verified on a dedicated Tesla T4
+(`g4dn.xlarge`): the cold-start phase table below carries a p50 **joules** column, and the
+`polled_power` fallback — previously never exercised on real hardware, because that T4
+always had the counter — is forceable with `REFLEX_NVML_FORCE_POLLED=1` and shown below
+turning short-phase deltas non-zero. Two caveats are carried openly and were both observed:
+NVML has no per-process energy API, so every figure is **device-wide** (accurate on a
+dedicated/rented instance, an overcount on a shared GPU); and `total_energy_counter` mode
+updates coarsely, so short phases (e.g. the ~39 ms scoring pass) legitimately read `0.000 J`
+there — reported as-is, not smoothed over. The `polled_power` fallback integrates
+continuously and does not have that granularity limit.
 
 **Target models**: Qwen and DeepSeek families.
 
@@ -311,27 +314,63 @@ aggregate even for `system1` (both observed on a real T4: sub-50ms phases read `
 and a phase sum matched the aggregate in some runs but was one counter-tick short in
 others).
 
-Current numbers, real `Tesla T4` (dedicated AWS EC2 `g4dn.xlarge`),
-`Qwen3-0.6B-Q4_K_M.gguf`, `reflex system1`, `n=10`:
+The same additive treatment covers the other subcommands with a real phase boundary:
+`reflex smoke` emits `cuda_init` / `kernel_load` / `kernel_launch`, and `reflex bench`
+emits its model-load sequence (`gguf_open` / `cuda_init` / `model_load`) ahead of its
+existing per-bucket `REFLEX_BENCH_ENERGY_OK` line. `reflex doctor` emits **no** phase line
+and no total joules — it runs no timed execution phase, only cheap boolean checks, so it
+reports the energy *method* a real run would use (`nvml_energy` check) instead of inventing
+a phase to measure.
 
-| phase | p50 |
-|---|---|
-| gguf open + metadata parse | ~37 ms |
-| process launch (external − internal) | ~130 ms |
-| CUDA init (`CudaDevice::new`) | ~140 ms |
-| model load (kernel module load + weight dequant/upload; tokenizer and cuBLAS init overlapped on a worker thread) | ~237 ms |
-| scoring pass (single forward pass) | ~39 ms |
-| **total** (`process_start_to_result_ms`) | **~456 ms** |
+**Current numbers, real `Tesla T4` (dedicated AWS EC2 `g4dn.xlarge`), `Qwen3-0.6B-Q4_K_M.gguf`,
+`reflex system1`, `n=10`** (`REFLEX_CUDA_ARCH=sm_75`, driver 595.91.07 / CUDA 13.2;
+`scripts/bench_cold_start_phases_system1.sh`, which now also aggregates the
+`REFLEX_PHASE_OK` `energy_joules` fields; raw per-run logs kept under `bench-results/`):
 
-On this dedicated instance the spread was unusually tight (p95 within ~1% of p50 at the
-point in the optimization sequence where the full p50/p95 table was captured), unlike
-the shared-rented-instance variance discussed below.
+| phase | p50 ms | p95 ms | p50 joules (`total_energy_counter`) |
+|---|---|---|---|
+| process launch (external − internal) | 112.1 | 125.3 | n/a (pre-`main`) |
+| gguf open + metadata parse | 64.2 | 67.0 | 0.000 |
+| CUDA init (`CudaDevice::new`) | 142.3 | 144.0 | 3.662 |
+| model load (kernel module load + weight dequant/upload; tokenizer and cuBLAS init overlapped on a worker thread) | 235.1 | 244.4 | 9.613 |
+| scoring pass (single forward pass) | 39.2 | 39.5 | 0.000 |
+| **total** (`process_start_to_result_ms`) | **485.4** | **494.0** | **20.324** |
 
-That ~456ms is down from **3502.8ms** in this table's previous revision — but that
+The joules column is exactly as measured, not cleaned up: the ~39 ms scoring pass and the
+~64 ms GGUF parse both round to `0.000 J` at the counter's granularity, and the per-phase
+joules need not add to the total (counter quantization can place a phase's joules in the
+previous boundary's snapshot). That is the device-wide/counter caveat in practice.
+
+Forcing the `polled_power` fallback (`REFLEX_NVML_FORCE_POLLED=1`, same `n=10`) makes those
+short phases measurable — the reason the fallback exists:
+
+| phase | p50 ms | p50 joules (`polled_power`, forced) |
+|---|---|---|
+| gguf open + metadata parse | 61.6 | 0.957 |
+| CUDA init | 187.9 | 7.129 |
+| model load | 267.1 | 11.888 |
+| scoring pass | 40.4 | 1.450 |
+| **total** | **556.5** | **21.433** |
+
+This T4 would normally take the counter branch (`reflex doctor` reports
+`method=total_energy_counter`), so the polled path is forced here only to exercise it. Two
+honest costs of that path: the polling thread adds wall-clock on this small 4-vCPU instance
+(CUDA init 142→188 ms, model load 235→267 ms), and the polled totals run slightly higher
+than counter mode — partly that extra time, partly the counter's coarse undercount. Both are
+real and disclosed rather than hidden. `scripts/bench_cold_start_phases.sh` (the `generate`
+variant) reports the same columns for the first-token metric (`total` p50: 755.8 ms /
+32.16 J counter; 836.3 ms / 35.28 J forced-polled). The other benchmark tables above stay
+latency-only because only Reflex emits NVML energy — llama.cpp/vLLM/Jev have no comparable
+joules figure to put in a column.
+
+On this dedicated instance the spread was tight (p95 within ~1–4% of p50 per phase in the
+table above), unlike the shared-rented-instance variance discussed below.
+
+That ~485ms is down from **3502.8ms** in this table's previous revision — but that
 older figure was a *different measurement* (`reflex generate`, `Q8_0`, rented `NVIDIA
 L40`), so it is not a like-for-like multiple and shouldn't be quoted as one. On this same
 T4/`Q4_K_M`/`system1` setup the starting point was **~1248.6ms** (mean of `n=5`, before
-the warm-latency perf plan) and it is **~456ms** (p50 of `n=10`) now — roughly a 2.7x
+the warm-latency perf plan) and it is **~485ms** (p50 of `n=10`) now — roughly a 2.6x
 improvement, delivered first by that plan's items 2–6 (warp-per-row `gemv`, lazy
 `lm_head`, phase instrumentation, pipelined model load, lazy `token_embd` dequant), then
 by a cold-load overlap round (a fast non-cryptographic tokenizer hasher, and the
@@ -345,7 +384,7 @@ What this breakdown shows now: **CUDA init is small and stable** (~140ms — thi
 *entire* dense kernel-module load (rmsnorm, rope, silu, gemv, gemv_gather, attention,
 attention_prefill, elementwise, dequant) measures **~3ms** in pinned-cubin mode (and
 ~3.5ms in portable PTX) — no JIT tax hiding there. **Model load is now ~237ms of the
-~456ms total (~52%)**, dominated by two memory-bound pieces: the per-tensor weight
+~485ms total (~49%)**, dominated by two memory-bound pieces: the per-tensor weight
 dequant/upload loop (~124ms) and the `token_embd` raw-byte copy (~102ms, mmap page-fault
 cost rather than compute). Tokenizer construction (~100ms) and cuBLAS handle init
 (~81ms) — the two remaining host/driver setup costs the item-6 profiling surfaced — are
@@ -588,8 +627,13 @@ objects also carry a **`schema_version`** field so a consumer can detect a shape
 - The four versioned objects are `generate`'s `REFLEX_GENERATE_OK` result, `system1`'s
   `REFLEX_SYSTEM1_OK` result, `smoke`'s `REFLEX_SMOKE_OK` result, and each additive
   `REFLEX_PHASE_OK` phase object. Per-item lines (`REFLEX_SYSTEM1_CANDIDATE_OK`,
-  `REFLEX_LORA_OK`, `REFLEX_DOCTOR_CHECK`) and the other subcommands' result structs do
-  not carry it yet.
+  `REFLEX_LORA_OK`, `REFLEX_DOCTOR_CHECK`) and the other subcommands' result structs
+  (`bench`'s `REFLEX_BENCH_*`, `check`'s `REFLEX_CHECK`, `doctor`'s
+  `REFLEX_DOCTOR_OK`/`_FAIL`) still do not carry it. Extending `schema_version` to those
+  structs is an additive change that was deliberately **deferred** (M4, 2026-09-29): it
+  touches `bench`/`check`/`doctor`'s output shapes and the `SCHEMA_VERSION` constant for no
+  measurement benefit, and every one of them already ignores-unknown-fields safely. It
+  remains a mechanical follow-up, not a contract gap.
 - **Additive / forward-compatible**: a *minor* bump only adds fields, so a reader that
   ignores unknown fields keeps working; a *major* bump signals that an existing field
   changed meaning or was removed.

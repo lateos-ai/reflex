@@ -23,6 +23,13 @@
 //! keep working across a minor bump. See README's "`--json` output contract"
 //! section.
 //!
+//! Extending `schema_version` to the `bench`/`check`/`doctor` result structs
+//! was deliberately deferred (M4, 2026-09-29): it would bump
+//! [`SCHEMA_VERSION`] and change those shapes for no measurement benefit, and
+//! they already serialize cleanly for a reader that ignores unknown fields.
+//! Still an additive, mechanical follow-up, documented in the README rather
+//! than silently half-applied.
+//!
 //! **Scope boundary**: only the stdout success-path contract lines
 //! (`REFLEX_*_OK`/`REFLEX_CHECK`/`REFLEX_DOCTOR_CHECK`) get a JSON form.
 //! `check.rs`'s `REFLEX_CHECK_FAIL` diagnostics (stderr, varying fields per

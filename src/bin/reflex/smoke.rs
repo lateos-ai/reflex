@@ -14,6 +14,7 @@
 //! why a graceful return costs several extra seconds of CUDA-context-
 //! teardown wall-clock time on GPU-virtualized rented instances.
 
+use crate::phase::{energy_suffix, phase_energy_delta, print_phase_ok};
 use cudarc::driver::{LaunchAsync, LaunchConfig};
 use reflex_engine::{aot, diagnostics, energy};
 use std::time::Instant;
@@ -30,6 +31,8 @@ pub fn run(args: Vec<String>) {
     // skew this subcommand's whole reason for existing: the smallest possible
     // process-start-to-first-kernel-result measurement.
     let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
+    let cuda_init_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let e_cuda_init = sampler.measure();
     let kernel = aot::load_kernel(
         &device,
         include_bytes!(env!("REFLEX_KERNEL_SMOKE")),
@@ -37,6 +40,8 @@ pub fn run(args: Vec<String>) {
         "axpy_f32",
     )
     .expect("failed to load AOT smoke kernel");
+    let kernel_load_ms = t0.elapsed().as_secs_f64() * 1000.0 - cuda_init_ms;
+    let e_kernel_load = sampler.measure();
 
     let n = 1024usize;
     let x = device.htod_copy(vec![1.0f32; n]).unwrap();
@@ -54,12 +59,27 @@ pub fn run(args: Vec<String>) {
 
     let elapsed = t0.elapsed();
     let energy_measurement = sampler.measure();
+    let kernel_launch_ms = elapsed.as_secs_f64() * 1000.0 - cuda_init_ms - kernel_load_ms;
 
     let result = device.dtoh_sync_copy(&out).unwrap();
     assert!(
         (result[0] - 5.0).abs() < 1e-5,
         "wrong result: {}",
         result[0]
+    );
+
+    // Additive per-phase energy, same shape as `generate`/`system1`'s
+    // `REFLEX_PHASE_OK` lines (see `crate::phase`). The aggregate
+    // `REFLEX_SMOKE_OK` line and its fields are unchanged.
+    print_phase_ok(json, "cuda_init", cuda_init_ms, e_cuda_init.as_ref());
+    let kernel_load = phase_energy_delta(&e_kernel_load, &e_cuda_init);
+    print_phase_ok(json, "kernel_load", kernel_load_ms, kernel_load.as_ref());
+    let kernel_launch = phase_energy_delta(&energy_measurement, &e_kernel_load);
+    print_phase_ok(
+        json,
+        "kernel_launch",
+        kernel_launch_ms,
+        kernel_launch.as_ref(),
     );
 
     let process_start_to_first_result_ms = elapsed.as_secs_f64() * 1000.0;
@@ -82,15 +102,7 @@ pub fn run(args: Vec<String>) {
             );
         }
     } else {
-        let energy_suffix = match &energy_measurement {
-            Some(m) => format!(
-                " joules={:.3} energy_method={}",
-                m.joules,
-                m.method.as_str()
-            ),
-            None => String::new(),
-        };
-        println!("REFLEX_SMOKE_OK process_start_to_first_result_ms={process_start_to_first_result_ms:.3}{energy_suffix}");
+        println!("REFLEX_SMOKE_OK process_start_to_first_result_ms={process_start_to_first_result_ms:.3}{}", energy_suffix(energy_measurement.as_ref()));
     }
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");

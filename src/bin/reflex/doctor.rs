@@ -10,6 +10,18 @@
 //! No GGUF/model loading -- hardware/toolchain check only, same scope class
 //! as `reflex smoke`.
 //!
+//! **No per-phase energy here, deliberately.** `doctor` runs no timed
+//! execution phase and does not even emit a total `joules` figure -- it only
+//! *probes* whether energy sampling would work (`energy::probe_availability`,
+//! surfaced as the `nvml_energy` check reporting the method a real run would
+//! use). There is therefore no phase boundary to bracket and no
+//! `REFLEX_PHASE_OK`/`PhaseTimingJson` output to add, unlike `smoke` (whose
+//! CUDA-init / kernel-load / kernel-launch boundaries are real timed phases)
+//! and `bench` (which loads a model and reports its load phases additively).
+//! Inventing a "phase" for a set of independent, sub-millisecond boolean
+//! checks would be exactly the kind of fabricated measurement this project's
+//! energy work avoids.
+//!
 //! Usage: `reflex doctor [--json]`
 //!
 //! Exit codes (mirroring `reflex check`'s 0/1/2 contract, and using
@@ -193,7 +205,14 @@ pub fn run(args: Vec<String>) {
         Ok(method) => checks.push(Check {
             name: "nvml_energy",
             status: Status::Pass,
-            detail: format!("method={}", method.as_str()),
+            detail: if energy::force_polled_requested() {
+                format!(
+                    "method={} (forced by REFLEX_NVML_FORCE_POLLED; the total-energy counter would otherwise be preferred)",
+                    method.as_str()
+                )
+            } else {
+                format!("method={}", method.as_str())
+            },
         }),
         Err(reason) => checks.push(Check {
             name: "nvml_energy",

@@ -39,6 +39,17 @@
 //! `reflex` subcommand calls `reflex_engine::fast_exit` when done, which
 //! kills every thread the process owns for free.
 //!
+//! The fallback is normally reached only when the counter is unsupported. To
+//! exercise it on hardware that *does* have the counter (needed because the
+//! polled path had never actually run before M4 -- every real-hardware
+//! verification had taken the counter branch), set
+//! **`REFLEX_NVML_FORCE_POLLED=1`**: that makes [`EnergySampler::start`]/
+//! [`probe_availability`] skip the counter branch and use polling even when a
+//! counter is available. It is default-off and does **not** change the normal
+//! preference order (counter first, polled only as a fallback) -- see
+//! [`force_polled_requested`]. `reflex doctor`'s `nvml_energy` check reports
+//! whichever method would actually be used, including under this override.
+//!
 //! Any NVML failure (library missing, driver too old, no permission,
 //! unsupported GPU) degrades gracefully to "no measurement available" --
 //! never a panic.
@@ -134,6 +145,24 @@ fn explain_nvml_error(e: &nvml_wrapper::error::NvmlError) -> String {
     }
 }
 
+/// Whether `REFLEX_NVML_FORCE_POLLED` asks this process to skip the
+/// total-energy-counter branch and use [`poll_power`] even when the counter is
+/// available. Default-off (unset, or `0`/`false`/`no`/`off`, case-insensitive)
+/// leaves the normal preference order -- counter first, polled only as a
+/// fallback -- completely unchanged. Exists so the fallback path can be
+/// exercised on real hardware that does have the counter (see this module's
+/// doc comment and README's energy section); `reflex doctor` reads it too so
+/// its `nvml_energy` check reports what a real run would actually use.
+pub fn force_polled_requested() -> bool {
+    match std::env::var("REFLEX_NVML_FORCE_POLLED") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
 #[cfg(feature = "nvml")]
 fn poll_power(joules: Arc<Mutex<f64>>, device_index: u32) {
     let poll_ms: u64 = std::env::var("REFLEX_NVML_POLL_MS")
@@ -191,23 +220,25 @@ impl EnergySampler {
             Ok(d) => d,
             Err(_) => return Inner::Unavailable,
         };
-        match device.total_energy_consumption() {
-            Ok(start_mj) => Inner::Counter {
-                nvml: Box::new(nvml),
-                device_index,
-                start_mj,
-            },
-            Err(_) => {
-                // This handshake's `nvml`/`device` are dropped here; the
-                // polling thread does its own fresh `Nvml::init()` instead
-                // of borrowing these, so `Inner` never has to name a
-                // borrowed `Device<'_>`'s lifetime.
-                let joules = Arc::new(Mutex::new(0.0));
-                let joules_thread = joules.clone();
-                std::thread::spawn(move || poll_power(joules_thread, device_index));
-                Inner::Polled { joules }
+        // Prefer the precise hardware counter unless the fallback was
+        // explicitly forced (see `force_polled_requested`).
+        if !force_polled_requested() {
+            if let Ok(start_mj) = device.total_energy_consumption() {
+                return Inner::Counter {
+                    nvml: Box::new(nvml),
+                    device_index,
+                    start_mj,
+                };
             }
         }
+        // This handshake's `nvml`/`device` are dropped here; the polling
+        // thread does its own fresh `Nvml::init()` instead of borrowing
+        // these, so `Inner` never has to name a borrowed `Device<'_>`'s
+        // lifetime.
+        let joules = Arc::new(Mutex::new(0.0));
+        let joules_thread = joules.clone();
+        std::thread::spawn(move || poll_power(joules_thread, device_index));
+        Inner::Polled { joules }
     }
 
     /// Snapshot at the checkpoint a subcommand wants to report (e.g. "first
@@ -260,7 +291,7 @@ pub fn probe_availability(device_ordinal: usize) -> Result<EnergyMethod, String>
         let device = nvml
             .device_by_index(device_ordinal as u32)
             .map_err(|e| explain_nvml_error(&e))?;
-        if device.total_energy_consumption().is_ok() {
+        if !force_polled_requested() && device.total_energy_consumption().is_ok() {
             return Ok(EnergyMethod::TotalEnergyCounter);
         }
         device
