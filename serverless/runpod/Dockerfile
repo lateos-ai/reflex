@@ -31,6 +31,13 @@
 # not a custom command line -- see this directory's README for the exact Runpod
 # endpoint configuration this expects.
 
+# Global build arg -- declared before the first FROM so it can be used in a FROM
+# line. Defaults to the full CUDA `-runtime-` base this deployment has always
+# shipped with; scripts/deploy_runpod.sh can opt into the measured slim variant
+# (base + libcublas-12-4) with --slim. See the runtime stage below and the root
+# README's "Container image size is part of cold start here".
+ARG REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -63,7 +70,26 @@ RUN set -- --release --bin reflex --features ipc; \
 # against a separate plain-Rust builder base image.
 RUN cd sidecar/openai-adapter && cargo build --release
 
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+FROM ${REFLEX_RUNTIME_BASE} AS runtime
+
+# Opt-in runtime slimming, default no-op. On a genuinely cold Runpod worker the
+# image pull precedes everything, and the standard `-runtime-` base is mostly
+# libraries this engine never loads (NCCL, cuFFT, cuSPARSE, cuSOLVER, NPP,
+# nvJPEG from the cuda-libraries-12-4 meta-package). Reflex links only the CUDA
+# driver API + cuBLAS, so with
+#   --build-arg REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-base-ubuntu22.04 \
+#   --build-arg REFLEX_RUNTIME_SLIM=1
+# only libcublas-12-4 is installed on the smaller base. Measured: 3.78GB full
+# base -> 1.28GB slim (cuBLAS 553MB of the remainder). Build/push is driven by
+# scripts/deploy_runpod.sh's --slim flag; the default is unchanged so existing
+# deployments do not silently switch base images.
+ARG REFLEX_RUNTIME_SLIM=""
+RUN if [ -n "$REFLEX_RUNTIME_SLIM" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends libcublas-12-4 \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 COPY --from=builder /build/target/release/reflex /usr/local/bin/reflex
 COPY --from=builder /build/sidecar/openai-adapter/target/release/reflex-openai-adapter /usr/local/bin/reflex-openai-adapter
 

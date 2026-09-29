@@ -18,6 +18,13 @@
 # only supported invocation (same build-context requirement every other Dockerfile in
 # this project already has).
 
+# Global build arg -- declared before the first FROM so it can be used in a FROM
+# line. Defaults to the full CUDA `-runtime-` base (unchanged); the slim variant
+# is opt-in via a base-image override plus REFLEX_RUNTIME_SLIM=1. See the
+# runtime stage below and the root README's "Container image size is part of
+# cold start here".
+ARG REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -49,7 +56,22 @@ RUN set -- --release --bin reflex --features ipc; \
 # against a separate plain-Rust builder base image.
 RUN cd sidecar/openai-adapter && cargo build --release
 
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+FROM ${REFLEX_RUNTIME_BASE} AS runtime
+
+# Opt-in runtime slimming, default no-op. Modal's own container init installs
+# the Python interpreter this file's app.py needs, so the only CUDA runtime
+# library these binaries actually link is cuBLAS; when REFLEX_RUNTIME_SLIM is
+# set (with a base-image override to nvidia/cuda:12.4.1-base-ubuntu22.04) just
+# libcublas-12-4 is installed. Measured: 3.78GB full base -> 1.28GB slim (cuBLAS
+# 553MB of the remainder). See the root README's "Container image size is part
+# of cold start here". Default base unchanged.
+ARG REFLEX_RUNTIME_SLIM=""
+RUN if [ -n "$REFLEX_RUNTIME_SLIM" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends libcublas-12-4 \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 COPY --from=builder /build/target/release/reflex /usr/local/bin/reflex
 COPY --from=builder /build/sidecar/openai-adapter/target/release/reflex-openai-adapter /usr/local/bin/reflex-openai-adapter
 

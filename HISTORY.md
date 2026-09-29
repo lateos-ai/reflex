@@ -3158,3 +3158,47 @@ nvml,json-output,download`, HEAD `676fcb6`, driven over SSM with source/GGUF via
 Not yet done: the same per-phase treatment for `smoke`/`bench`/`doctor` (they already
 emit a total `joules`), and no energy figure is quoted in the benchmark tables until the
 `polled_power` path is exercised -- the T4 always took the coarse counter branch.
+
+### Operational packaging: scripted Runpod deploy + landed runtime slimming (2026-09-29)
+
+Item 3 of the energy/observability plan ("Energy-to-First-Result") -- the operational
+milestone; deliberately no engine/model changes.
+
+**`scripts/deploy_runpod.sh`** scripts the deployment `serverless/runpod/README.md`
+already documents by hand, reusing its verified findings instead of re-deriving them:
+build/push `serverless/runpod/Dockerfile`, create a Serverless *template* (REST) and a
+load-balancing *endpoint* (GraphQL `saveEndpoint` with `type: "LB"` -- the only API field
+that expresses the endpoint type), pin the exact RTX A4500 SKU with a REST `gpuTypeIds`
+PATCH (the GraphQL create path can only name the mixed-architecture `AMPERE_16` pool),
+then benchmark. It supports `--endpoint-id` (reuse), `--teardown` (delete after),
+`--dry-run`, and refuses endpoint steps without `RUNPOD_API_KEY`. It touches no `src/`.
+
+**New `scripts/bench_cold_runpod.sh`** reuses `bench_cold_common.sh`'s `/usr/bin/time -v`
+loop through a new default-off `BENCH_PREPARE_CMD` hook (untimed, runs before each timed
+run) that forces the endpoint back to zero workers between runs, so runs 2..N are
+genuinely cold rather than hitting a warm worker; the timed command is a single `curl`
+POST to the worker's `/v1/chat/completions`, with `--retry` covering the gateway `502`
+the README documents. Existing `bench_cold_common.sh` callers are unaffected (hook unset
+= no-op).
+
+**Landed the measured runtime-image slimming** (previously only a README finding). All
+five deploy Dockerfiles now take a global `REFLEX_RUNTIME_BASE` (defaulting to the full
+`-runtime-` base) plus `REFLEX_RUNTIME_SLIM`; leaving both unset reproduces the shipped
+image exactly, so no existing deployment's base changes. `deploy_runpod.sh --slim` tags
+the variant `:runtime`. Re-measured on the built images (Docker Desktop, containerd image
+store; the ~397MB model is baked into both): `docker images` 4.57GB -> 2.06GB, on-disk
+rootfs (`du -sxh /`) 2.6GB -> 1.2GB, `/usr/local/cuda-12.4` 1.9GB -> 675MB; the
+`libcublas-12-4` layer is 553MB (`libcublasLt.so.12.4.5.8` 442MB + `libcublas.so.12.4.5.8`
+110MB). The README's earlier 3.78GB/1.28GB pair compared different accounting methods
+(model-free `docker images` for full, model-inclusive layer sum for slim); the README was
+corrected to an apples-to-apples table.
+
+**Verification**: `REFLEX_SKIP_CUDA=1 cargo fmt --check`, `cargo clippy --all-targets --
+-D warnings`, `cargo test` (85 passed / 12 ignored / 0 failed). The image build was
+verified locally (both variants, `sm_86`, `--check` clean in both modes). Real Runpod API
+calls and GPU execution were *not* re-run in this session (no Runpod credentials, no local
+NVIDIA GPU), so the scripts' platform paths remain build/lint-verified only. One
+pre-existing issue surfaced and was fixed: `cargo fmt --check` was failing at HEAD on
+`src/bin/reflex/{bench,doctor,generate,smoke,system1}.rs` from the M1/M2 commits; `cargo
+fmt` was applied (formatting-only, semantics verified unchanged by clippy/tests) to get
+the required gate green.

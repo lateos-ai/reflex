@@ -1368,3 +1368,39 @@ bar. Also not fixed: the `python` feature does not currently compile at all
 pre-existing incompatibility between the pyo3 `#[pyclass]` `Send` bound and the current
 `Model` shape, documented here and left untouched rather than papered over with an
 `unsafe impl Send`.
+
+## Runtime-image slimming is opt-in (`REFLEX_RUNTIME_BASE` + `REFLEX_RUNTIME_SLIM`), defaults unchanged (2026-09-29)
+
+**Context**: the root README's "Container image size is part of cold start here" section
+recorded a measured finding -- the full CUDA `-runtime-` base is mostly libraries this
+engine never loads (Reflex links only the driver API + cuBLAS), and `base` + `libcublas`
+is much smaller -- but explicitly "not yet landed". Landing it risks silently changing an
+already-deployed image's base image, which is the kind of default change this project
+deliberately avoids.
+
+**Decision**: add the slim runtime as an *opt-in* build-arg variant on every deploy
+Dockerfile, mirroring the multi-arch fatbin work's "add capability, don't change
+defaults" rule. A global `ARG REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-runtime-ubuntu22.04`
+(declared before the first `FROM` so it can be used in the runtime `FROM`) plus
+`ARG REFLEX_RUNTIME_SLIM=""`; the latter installs `libcublas-12-4` only when non-empty.
+Both unset reproduce the previously-shipped image exactly. `scripts/deploy_runpod.sh
+--slim` drives it and tags the result `:runtime`.
+
+**Why build-args, not a second Dockerfile**: a near-duplicate Dockerfile per deploy target
+would drift from the original; the build-arg form keeps one source of truth per target and
+makes the default provably unchanged (the `RUN` is a no-op when unset, and `--check`
+passes with default args). The cost is the pre-`FROM` global ARG wording, documented at
+each site.
+
+**Endpoint-creation API choice (same session)**: the load-balancing endpoint *type*
+(`type: "LB"`) exists only on the GraphQL `saveEndpoint` mutation, while the exact GPU
+*SKU* is expressible on the REST endpoint input (`gpuTypeIds`) but the type is not. So
+`scripts/deploy_runpod.sh` deliberately combines both: REST for the template +
+post-create configuration (SKU pin, flashboot), GraphQL for endpoint creation. This mirrors
+the README's documented "create the endpoint, then pin the SKU with a control-plane call"
+sequence and the mixed-architecture `AMPERE_16` hazard that makes the pin mandatory.
+
+**Not verified here**: the live API calls (no Runpod credentials on the writing machine)
+and GPU execution of the slim image (no local NVIDIA GPU). The image build itself was
+verified locally for both variants; the slimming's original real-hardware verification is
+recorded in the README. A live deploy using the script is the remaining step.

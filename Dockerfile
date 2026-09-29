@@ -24,6 +24,17 @@
 # here is a build-time/runtime library version mismatch, not something this
 # Dockerfile can catch for you.
 
+# Global build args -- declared before the first FROM so they can be used in a
+# FROM line (Docker only allows that for ARGs declared before the first FROM).
+#
+# REFLEX_RUNTIME_BASE selects the runtime stage's base image. Its default is the
+# full CUDA `-runtime-` base this image has always shipped with, so existing
+# builds are byte-for-byte unchanged. Override it (together with
+# REFLEX_RUNTIME_SLIM=1, declared in the runtime stage below) for the measured
+# `base` + libcublas-12-4 variant -- see the runtime stage's comment and
+# README's "Container image size is part of cold start here".
+ARG REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -65,6 +76,28 @@ RUN set -- --release --bin reflex; \
         cargo build "$@"; \
     fi
 
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+FROM ${REFLEX_RUNTIME_BASE} AS runtime
+
+# Runtime-base selection, opt-in only. The default base (set at the top of this
+# file) is the full CUDA `-runtime-` image, which carries the entire
+# cuda-libraries-12-4 meta-package (NCCL, cuFFT, cuSPARSE, cuSOLVER, NPP,
+# nvJPEG...) -- libraries this engine never loads. Reflex links only the CUDA
+# driver API + cuBLAS (Cargo.toml's cudarc features are
+# driver/cublas/cuda-12000/f16), so everything else is dead weight that only
+# adds image-pull bytes to a genuine cold start.
+#
+# Passing REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-base-ubuntu22.04 together with
+# REFLEX_RUNTIME_SLIM=1 (any non-empty value) installs just libcublas-12-4 on
+# that smaller base. Measured, verified-working: full `-runtime-` base image
+# 3.78GB -> `base` + libcublas-12-4 1.28GB (cuBLAS itself is 553MB of what
+# remains). Defaults are deliberately left unchanged so no already-deployed
+# image's base silently moves out from under it.
+ARG REFLEX_RUNTIME_SLIM=""
+RUN if [ -n "$REFLEX_RUNTIME_SLIM" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends libcublas-12-4 \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 COPY --from=builder /build/target/release/reflex /usr/local/bin/reflex
 ENTRYPOINT ["/usr/local/bin/reflex", "generate"]

@@ -29,6 +29,14 @@
 # The CUDA major/minor version in both stages must stay consistent with Cargo.toml's
 # pinned `cudarc` feature ("cuda-12000"), same rule as the root Dockerfile.
 
+# Global build args -- declared before the first FROM so they can be used in a
+# FROM line. REFLEX_RUNTIME_BASE defaults to the full CUDA `-runtime-` base this
+# image has always shipped with (unchanged); override it with
+# REFLEX_RUNTIME_SLIM=1 for the measured `base` + libcublas-12-4 variant. See
+# the runtime stage below and README's "Container image size is part of cold
+# start here".
+ARG REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -64,7 +72,22 @@ RUN set -- --release --bin reflex --features ipc; \
 # stage. This crate itself needs no CUDA toolkit, only the toolchain.
 RUN cd sidecar/openai-adapter && cargo build --release
 
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+FROM ${REFLEX_RUNTIME_BASE} AS runtime
+
+# Opt-in runtime slimming (default no-op): the full `-runtime-` base carries the
+# whole cuda-libraries-12-4 meta-package, but these two binaries link only the
+# CUDA driver API + cuBLAS. With REFLEX_RUNTIME_BASE set to
+# nvidia/cuda:12.4.1-base-ubuntu22.04 and REFLEX_RUNTIME_SLIM=1, this installs
+# libcublas-12-4 alone. Measured: 3.78GB full base -> 1.28GB slim (cuBLAS 553MB
+# of the remainder). See README's "Container image size is part of cold start
+# here". Defaults unchanged so no existing deployment's base moves silently.
+ARG REFLEX_RUNTIME_SLIM=""
+RUN if [ -n "$REFLEX_RUNTIME_SLIM" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends libcublas-12-4 \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 COPY --from=builder /build/target/release/reflex /usr/local/bin/reflex
 COPY --from=builder /build/sidecar/openai-adapter/target/release/reflex-openai-adapter /usr/local/bin/reflex-openai-adapter
 ENTRYPOINT ["/usr/local/bin/reflex-openai-adapter"]

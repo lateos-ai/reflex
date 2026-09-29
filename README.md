@@ -667,19 +667,50 @@ type that requires a Python SDK handler). Two details that matter there:
 ### Container image size is part of cold start here
 
 On a genuinely cold worker, image pull precedes everything else, and the standard
-CUDA `-runtime-` base image is mostly libraries this engine never loads. Measured
-locally: the current image is **3.78GB**, of which the `reflex` binary is **2.42MB** —
-the bulk is the `cuda-libraries-12-4` meta-package, which ships NCCL, cuFFT, cuSPARSE,
-cuSOLVER, NPP and nvJPEG. Reflex links only the CUDA **driver API** plus **cuBLAS**
-(`Cargo.toml`'s `cudarc` features are `driver`/`cublas`/`cuda-12000`/`f16`); none of
-those other libraries are referenced anywhere in `src/`.
+CUDA `-runtime-` base image is mostly libraries this engine never loads. Reflex
+links only the CUDA **driver API** plus **cuBLAS** (`Cargo.toml`'s `cudarc`
+features are `driver`/`cublas`/`cuda-12000`/`f16`); none of the
+`cuda-libraries-12-4` meta-package's NCCL, cuFFT, cuSPARSE, cuSOLVER, NPP or
+nvJPEG are referenced anywhere in `src/`.
 
-Building instead on the `base` image plus `libcublas-12-4` alone produced a
-**verified-working 1.28GB image containing both binaries** (vs. 3.78GB for the
-standard image carrying only `reflex`) — a ~66% reduction, with cuBLAS itself
-accounting for 553MB of what remains. **This slimming is a measured finding, not yet
-landed in the repo's Dockerfiles**; the images under `sidecar/openai-adapter/` and
-`serverless/runpod/` still build on the full `-runtime-` base.
+That slimming is now **landed as an opt-in runtime variant** across the deploy
+Dockerfiles (`Dockerfile`, `sidecar/openai-adapter/`, `serverless/runpod/`,
+`.runpod/`, `.modal/`), following the same "add capability, don't change
+defaults" rule the multi-arch fatbin work used. Pass
+
+```
+--build-arg REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-base-ubuntu22.04 \
+--build-arg REFLEX_RUNTIME_SLIM=1
+```
+
+and only `libcublas-12-4` is installed on the smaller base; leaving both unset
+reproduces the previously-shipped image byte-for-byte, so no existing
+deployment's base moves out from under it. `scripts/deploy_runpod.sh --slim`
+builds and tags this variant `:runtime`. See `scripts/deploy_runpod.sh --help`.
+
+Re-measured on the landed images (Docker Desktop, containerd image store; the
+same ~397MB Qwen3-0.6B Q4_K_M model is baked into both, so it is a fixed cost in
+each):
+
+| | full `-runtime-` base | `base` + `libcublas-12-4` |
+|---|---|---|
+| `docker images` reported size | 4.57GB | 2.06GB |
+| on-disk rootfs (`du -sxh /`) | 2.6GB | 1.2GB |
+| `/usr/local/cuda-12.4` (CUDA userspace tree) | 1.9GB | 675MB |
+
+The `libcublas-12-4` layer alone is **553MB** (confirmed from the BuildKit step
+size) — `libcublasLt.so.12.4.5.8` is 442MB and `libcublas.so.12.4.5.8` 110MB of
+the 527MB of cuBLAS shared objects. The CUDA-library tree shrinks by ~1.2GB,
+which is the part that tracks the actual dead weight; the whole-image percentage
+is smaller only because the constant model is a larger share of the slim image.
+The finding this section previously recorded as "not yet landed" (**3.78GB** vs
+**1.28GB**) was the first measurement and used two different accounting methods
+(`docker images` of the model-free root image for the full figure, an
+already-model-inclusive layer sum for the slim one); the table above is the
+apples-to-apples re-measurement of the landed variant. The variant re-builds
+clean locally; the original finding reported it verified-working on real
+hardware, and a fresh end-to-end GPU run of the landed image is worth doing
+before leaning on it.
 
 **`serverless/runpod/` has since been deployed against a real Runpod account and works
 end-to-end** — see [Why serverless is the fit](#why-serverless-is-the-fit) above and

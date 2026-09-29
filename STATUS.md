@@ -824,6 +824,26 @@ in kind (e.g. item 1's f16 weight residency, which halves weight bytes but carri
 numerics-methodology decision), not more load-path threading. Only an interleaved-A/B
 measurement will say whether anything left is worth it.
 
+## Energy-to-First-Result, item 3: operational packaging (done 2026-09-29)
+
+No engine/model changes. `scripts/deploy_runpod.sh` now scripts the
+`serverless/runpod/` deployment end to end: build/push the image, create the
+load-balancing template + endpoint via Runpod's REST/GraphQL APIs, pin the RTX
+A4500 SKU, then benchmark via the new `scripts/bench_cold_runpod.sh` (which reuses
+`bench_cold_common.sh`'s `/usr/bin/time -v` loop through a new default-off
+`BENCH_PREPARE_CMD` hook that forces scale-to-zero between runs). `--slim` builds
+and tags the runtime-slimmed image `:runtime`. The long-documented
+`base`+`libcublas-12-4` slimming is now an opt-in build-arg variant across all
+five deploy Dockerfiles (defaults unchanged; `--check` clean in both modes):
+re-measured `docker images` 4.57GB -> 2.06GB, on-disk rootfs 2.6GB -> 1.2GB,
+`/usr/local/cuda-12.4` 1.9GB -> 675MB (the `libcublas-12-4` layer is 553MB).
+Verified with `REFLEX_SKIP_CUDA=1` `cargo fmt --check` / `clippy --all-targets
+-- -D warnings` / `test` (85 passed / 12 ignored). The Runpod API paths and GPU
+execution of the slim image were **not** re-run this session (no credentials /
+no local GPU); see HISTORY.md's "Operational packaging" entry. One pre-existing
+issue fixed to get the gate green: `cargo fmt` applied to `src/bin/reflex/*.rs`
+(formatting-only; M1/M2 had landed them unformatted).
+
 ## Known debt / limitations
 
 - ~~**`src/ffi.rs`'s `extern "C"` functions dereference raw pointers without being

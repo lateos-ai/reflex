@@ -32,6 +32,31 @@ Runpod Serverless has two distinct endpoint types, and they are not interchangea
 **Use a load-balancing endpoint.** A queue-based endpoint is the wrong fit here and would add
 unnecessary Python glue code for no benefit.
 
+## Scripted deployment (`scripts/deploy_runpod.sh`)
+
+The manual steps above are scripted in
+[`scripts/deploy_runpod.sh`](../../scripts/deploy_runpod.sh), which builds
+`serverless/runpod/Dockerfile`, pushes the image, creates the (load-balancing) template +
+endpoint, pins the RTX A4500 SKU, and then drives the cold-start benchmark through
+[`scripts/bench_cold_runpod.sh`](../../scripts/bench_cold_runpod.sh) — itself a thin wrapper
+over `bench_cold_common.sh`'s `/usr/bin/time -v` loop. It encodes the verified findings in
+this directory rather than re-deriving them:
+
+- Endpoint creation goes through the GraphQL `saveEndpoint` mutation, the only Runpod API
+  that exposes the load-balancing `type: "LB"` field.
+- The exact SKU is pinned immediately after creation with a REST `gpuTypeIds` PATCH, because
+  the GraphQL create path can only name a *pool* (`gpuIds: "AMPERE_16"`), and that pool is
+  mixed-architecture (see "GPU selection" below).
+- The benchmark retries Runpod's documented first-cold-request `502` and, before each timed
+  run, forces a genuine scale-from-zero (`workersMax` 0 → wait out `idleTimeout` → 1), so
+  runs 2..N don't silently measure a warm worker.
+
+`--slim` additionally builds the runtime-slimmed image (`base` + `libcublas-12-4`, tagged
+`:runtime`) described in the root README's "Container image size is part of cold start
+here"; like every other default here, the full `-runtime-` base stays the default and the
+slim variant is opt-in. `--teardown` deletes the endpoint and template after benchmarking.
+Run `scripts/deploy_runpod.sh --help` for the full flag/environment reference.
+
 ## Runpod endpoint configuration
 
 When creating the Serverless endpoint in Runpod's console/API:
@@ -105,9 +130,10 @@ This deployment bakes the model directly into the image (`COPY serverless/runpod
 /models/model.gguf` in the Dockerfile, `GGUF_PATH` defaulted to that path) rather than using a
 Runpod Network Volume. Deliberate, not just simpler: a runtime download would add
 HuggingFace-fetch latency directly into the cold-start number this deployment exists to
-measure, corrupting the benchmark. Qwen3-0.6B-Q4_K_M is ~379MB, small enough that baking it in
-costs a proportionally small amount of image size (~1.66GB with a slim base, more with the
-current full `-runtime-` base — see the size discussion in the root README).
+measure, corrupting the benchmark. Qwen3-0.6B-Q4_K_M is ~379MB, small enough that baking it
+in costs a proportionally small amount of image size (1.2GB on-disk rootfs with the slim
+`base` + cuBLAS runtime variant, vs. 2.6GB on the full `-runtime-` base — see the size
+discussion in the root README).
 
 A Network Volume remains the better choice if you need to swap models without rebuilding the
 image, or the model is too large to comfortably bake in — same

@@ -39,6 +39,14 @@
 # they don't proxy external HTTP to a configured port. reflex-openai-adapter binds
 # 127.0.0.1:8000 (its own code default) for handler.py's exclusive, in-container use.
 
+# Global build arg -- declared before the first FROM so it can be used in a FROM
+# line. Defaults to the full CUDA `-runtime-` base (unchanged); pass
+# --build-arg REFLEX_RUNTIME_SLIM=1 with
+# --build-arg REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-base-ubuntu22.04 for the
+# measured slim variant. See the runtime stage below and the root README's
+# "Container image size is part of cold start here".
+ARG REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -70,7 +78,19 @@ RUN set -- --release --bin reflex --features ipc; \
 # against a separate plain-Rust builder base image.
 RUN cd sidecar/openai-adapter && cargo build --release
 
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+FROM ${REFLEX_RUNTIME_BASE} AS runtime
+
+# Opt-in runtime slimming, default no-op: installs only libcublas-12-4 when
+# REFLEX_RUNTIME_SLIM is non-empty (paired with a base-image override). Measured
+# 3.78GB full `-runtime-` base -> 1.28GB slim, cuBLAS 553MB of the remainder --
+# see the root README's "Container image size is part of cold start here". The
+# default base is unchanged so existing Hub builds are unaffected.
+ARG REFLEX_RUNTIME_SLIM=""
+RUN if [ -n "$REFLEX_RUNTIME_SLIM" ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends libcublas-12-4 \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # The only new runtime dependencies this whole addition introduces: a Python
 # interpreter and the runpod SDK, needed solely to speak Runpod's queue job
