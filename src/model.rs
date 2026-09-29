@@ -217,7 +217,7 @@ impl LazyTokenEmbedding {
 
     /// Test-only accessor (mirrors `Self::lm_head_argmax`'s `#[cfg(test)]`
     /// convention) -- no non-test caller needs the vocab size on its own,
-    /// only `Self::row`/`Self::dequantize_all` internally.
+    /// only `Self::row` internally.
     #[cfg(test)]
     fn vocab_size(&self) -> usize {
         self.vocab_size
@@ -247,22 +247,6 @@ impl LazyTokenEmbedding {
         Ok(std::cell::Ref::map(self.cache.borrow(), |m| {
             m.get(&token_id).expect("just inserted above").as_slice()
         }))
-    }
-
-    /// Dequantizes every row at once, delegating straight to
-    /// `dequant::dequantize` on the full raw buffer -- the exact same call
-    /// the pre-lazy eager load path used to make, so this can never
-    /// disagree with it. Used only by the rare full-vocab callers
-    /// ([`Model::lm_head_resident`]'s `TiedLazy` upload, and
-    /// `load_hybrid`/`load_mla`'s eager tied-embedding `LmHead::Resident`
-    /// upload) -- never `system1_evaluate`'s candidate-gather path, which is
-    /// what this laziness targets.
-    fn dequantize_all(&self) -> Result<Vec<f32>, String> {
-        dequant::dequantize(
-            self.ggml_type,
-            &self.raw,
-            (self.vocab_size * self.hidden_size) as u64,
-        )
     }
 }
 
@@ -1663,6 +1647,16 @@ pub struct Model {
     /// dequantizing it twice (see [`LmHead::TiedLazy`]/
     /// `Model::lm_head_resident`/`Model::gemv_gather_lm_head`).
     token_embd: LazyTokenEmbedding,
+    /// Kept alive past load solely so [`Self::lm_head_resident`] can
+    /// dequantize a tied `token_embd`/`lm_head` on-device on first use
+    /// (`dequantize_tensor_to_device`, the same on-device path every other
+    /// weight tensor uses) instead of falling back to a slow host-side
+    /// dequant loop. `RefCell` because `lm_head_resident` takes `&self`; safe
+    /// without further synchronization for the same reason `LmHead::TiedLazy`'s
+    /// `OnceLock` is -- this project never runs more than one request at a
+    /// time (see CLAUDE.md's Non-goals).
+    dequant_kernels: DequantKernels,
+    dequant_pipeline: RefCell<WeightLoadPipeline>,
     output_norm: Weight,
     lm_head: LmHead,
     tokenizer: Tokenizer,
@@ -2165,6 +2159,8 @@ impl Model {
             layers,
             expert_used_count,
             token_embd,
+            dequant_kernels,
+            dequant_pipeline: RefCell::new(pipeline),
             output_norm,
             lm_head,
             tokenizer,
@@ -2442,10 +2438,14 @@ impl Model {
                 })
             }
             None => {
-                let full = token_embd.dequantize_all()?;
-                let data = device
-                    .htod_sync_copy(&full)
-                    .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
+                let data = dequantize_tensor_to_device(
+                    &mut pipeline,
+                    &dequant_kernels,
+                    token_embd.ggml_type,
+                    &token_embd.raw,
+                    token_embd_info.element_count(),
+                )
+                .map_err(|e| format!("load weight 'token_embd.weight': {e}"))?;
                 LmHead::Resident(Weight {
                     data,
                     shape: token_embd_info.shape.clone(),
@@ -2475,6 +2475,8 @@ impl Model {
             layers: Vec::new(),
             expert_used_count: None,
             token_embd,
+            dequant_kernels,
+            dequant_pipeline: RefCell::new(pipeline),
             output_norm,
             lm_head,
             tokenizer,
@@ -2713,10 +2715,14 @@ impl Model {
                 })
             }
             None => {
-                let full = token_embd.dequantize_all()?;
-                let data = device
-                    .htod_sync_copy(&full)
-                    .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
+                let data = dequantize_tensor_to_device(
+                    &mut pipeline,
+                    &dequant_kernels,
+                    token_embd.ggml_type,
+                    &token_embd.raw,
+                    token_embd_info.element_count(),
+                )
+                .map_err(|e| format!("load weight 'token_embd.weight': {e}"))?;
                 LmHead::Resident(Weight {
                     data,
                     shape: token_embd_info.shape.clone(),
@@ -2757,6 +2763,8 @@ impl Model {
             layers: Vec::new(),
             expert_used_count: None,
             token_embd,
+            dequant_kernels,
+            dequant_pipeline: RefCell::new(pipeline),
             output_norm,
             lm_head,
             tokenizer,
@@ -5436,16 +5444,22 @@ impl Model {
             .map_err(|e| format!("logits dtoh: {e}"))
     }
 
-    /// Forces the LM head fully device-resident, uploading `token_embd`'s
-    /// already-dequantized host bytes if it hasn't been already (see
+    /// Forces the LM head fully device-resident, on-device-dequantizing
+    /// `token_embd`'s raw quantized bytes if it hasn't been already (see
     /// [`LmHead`]'s doc comment) -- needed by [`Self::lm_head_logits`], which
     /// (unlike [`Self::gemv_gather_lm_head`]) genuinely needs every vocab
-    /// row. A no-op past the first call (`Resident`, or a `TiedLazy` some
-    /// earlier call already forced): `OnceLock::get`/`set` rather than the
-    /// still-unstable `get_or_try_init`, safe without a race check because
-    /// this project never runs more than one request at a time (`batch_size`
-    /// is a permanent constraint, see CLAUDE.md's Non-goals) -- there is
-    /// never a second caller to race against.
+    /// row. Uses the same on-device `dequantize_tensor_to_device` path (and
+    /// the `dequant_kernels`/`dequant_pipeline` kept alive on `Model` for
+    /// exactly this) every other weight tensor's dequant goes through,
+    /// instead of a slow single-threaded host dequant loop -- see
+    /// HISTORY.md's "Lazy `token_embd` dequant (item 6)" for why the host
+    /// path this replaced was a real, measured regression. A no-op past the
+    /// first call (`Resident`, or a `TiedLazy` some earlier call already
+    /// forced): `OnceLock::get`/`set` rather than the still-unstable
+    /// `get_or_try_init`, safe without a race check because this project
+    /// never runs more than one request at a time (`batch_size` is a
+    /// permanent constraint, see CLAUDE.md's Non-goals) -- there is never a
+    /// second caller to race against.
     fn lm_head_resident(&self) -> Result<&Weight, String> {
         match &self.lm_head {
             LmHead::Resident(w) => Ok(w),
@@ -5453,11 +5467,16 @@ impl Model {
                 if let Some(w) = cell.get() {
                     return Ok(w);
                 }
-                let full = self.token_embd.dequantize_all()?;
-                let data = self
-                    .device
-                    .htod_sync_copy(&full)
-                    .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
+                let element_count =
+                    self.token_embd.vocab_size as u64 * self.token_embd.hidden_size as u64;
+                let data = dequantize_tensor_to_device(
+                    &mut self.dequant_pipeline.borrow_mut(),
+                    &self.dequant_kernels,
+                    self.token_embd.ggml_type,
+                    &self.token_embd.raw,
+                    element_count,
+                )
+                .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
                 let _ = cell.set(Weight {
                     data,
                     shape: shape.clone(),

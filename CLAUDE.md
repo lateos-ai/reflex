@@ -74,9 +74,19 @@ hardcoded architecture-string check). Every weight tensor is dequantized once
 once as a `CudaSlice<f32>` inside `Weight` — **do not** reintroduce per-call
 `htod_sync_copy` of weight buffers inside `gemv`/`gemv_expert`/`rmsnorm`; that was a real
 regression (see README's "Phase 2, round 1" section) that made the engine ~4.3x slower
-than llama.cpp until fixed. Only the token embedding table stays host-resident (needed
-for the host-side embedding-lookup gather); its dequantized bytes are reused for
-`lm_head` when the two are tied, instead of dequantizing twice.
+than llama.cpp until fixed. Only the token embedding table's *raw quantized* bytes stay
+host-resident (`LazyTokenEmbedding`, needed for the host-side embedding-lookup gather);
+individual rows are dequantized lazily and cached on first use (see HISTORY.md's "Lazy
+`token_embd` dequant (item 6)"). If the full vocab table is ever needed device-resident
+(a tied `lm_head`'s first full-vocab-logits call, or `load_hybrid`/`load_mla`'s eager
+tied case — see `Model::lm_head_resident`), it goes through the same on-device
+`dequantize_tensor_to_device` path every other weight tensor uses, **not** a host-side
+dequant loop — a single-threaded host loop over the whole vocab table used to sit on
+this path and was a real, measured ~548ms/~63%-of-`model_load_ms` cost (still eagerly
+paid by `load_hybrid`/`load_mla`'s tied case, and, after item 6 made dense/MoE's copy
+lazy, silently relocated into `prompt_eval_ms` on `generate`/`check`'s first call
+instead of removed — a net regression documented in item 6's own numbers); don't
+reintroduce it.
 
 That per-tensor load loop runs through `WeightLoadPipeline`, which double-buffers each
 tensor's raw quantized bytes through pinned host memory and uploads them on a forked
@@ -85,8 +95,8 @@ copy stream so tensor N+1's H2D transfer overlaps tensor N's dequant kernel — 
 staging buffers per-tensor allocations: both were measured, and the reasons each
 alternative is wrong (a host/device race in one case, a cross-stream dependency that
 serializes the pipeline in the other) are written up in HISTORY.md's "Pipelined model
-load (item 5)" entry. Note the pipeline is only ~14% of `model_load_ms`; the dominant
-cold-load cost is the host-side `token_embd` dequant above, at ~63%.
+load (item 5)" entry. `Model` keeps its `dequant_kernels`/`dequant_pipeline` alive past
+load specifically so `lm_head_resident` can reuse this same on-device path lazily.
 
 `forward_prompt` runs: embedding lookup (host-side gather, `batch_size` always 1) → each
 layer via `forward_layer` (dispatches to `forward_layer_dense` or `forward_layer_moe`,
