@@ -714,9 +714,11 @@ changes, so this is a timing-only plan, verified by the existing phase-breakdown
 harness + golden-token regression rather than new numerics methodology. **Item 1 (the
 rope dedup) is done and real-hardware-verified** (see HISTORY.md's "Rope-module dedup"
 entry) — and its measured result reframes the AOT half of this plan; that reframing is
-folded into items #2 and the sequencing note below. Two decision items are also flagged
-inline (a hasher dependency and a load-time worker thread); each needs its own
-DECISIONS.md entry and a deliberate call before the corresponding code is written.
+folded into items #2 and the sequencing note below. The hasher decision item is now also
+**made and implemented** (vendored inline FxHasher, not the `rustc-hash` crate — see
+DECISIONS.md's hasher entry and item #1 of the tokenizer list below, which measured far
+smaller than estimated); the load-time worker-thread item is still a pending DECISIONS.md
+call before any code is written.
 
 **AOT module load (~83ms)** — root cause is one `cuModuleLoad` per kernel module
 (~10–20 sequential driver round-trips; dense loads rmsnorm, rope×2, silu, gemv,
@@ -751,19 +753,29 @@ gemv_gather, attention, attention_prefill, elementwise, dequant), each via
 
 **Tokenizer construction (~107ms)** — `Tokenizer::from_gguf` (`src/tokenizer.rs:79`)
 on Qwen3-0.6B (vocab 151,936; merges ~150k) clones 151k `String`s into `tokens`,
-clones them *again* into `token_to_id` (SipHash each), and builds `merge_rank` with
-~300k allocations (two `String`s per `(String,String)` key, SipHash each). SipHash is
-the dominant compute; the double vocab clone is the dominant alloc. Ranked:
+clones them *again* into `token_to_id`, and builds `merge_rank` with ~300k allocations
+(two `String`s per `(String,String)` key). Item #1's measurement below settled which of
+these dominates: **allocation/copying, not hashing.** Ranked:
 
-1. **Swap SipHash → a fast hasher (biggest per-line win, tiny risk).** Replace the
-   two maps' hasher with `FxHasher` (vend ~50 lines from `rustc-hash`, or add the
-   `rustc-hash` dep). Typical 3–5x on `HashMap<String>`. **Decision item:** a new
-   dependency; DOS-resistance is irrelevant (these maps never face untrusted input —
-   same reasoning `aot.rs`'s existing `fnv1a_hash` already relies on).
-2. **Remove the duplicate vocab copy.** `token_to_id` is the inverse of `tokens`,
-   stored as a second full clone. Intern tokens once (single contiguous arena;
-   `token_to_id` keyed by `&str`/index into it) so only one copy exists. More
-   invasive; pair with #1 for the combined win.
+1. ~~**Swap SipHash → a fast hasher.**~~ — **done, real-hardware-verified 2026-09-28,
+   but far smaller than estimated.** Vendored the classic FxHash algorithm inline in
+   `src/tokenizer.rs` (~50 lines; no new dependency — the `rustc-hash` crate was the
+   alternative, rejected per this project's no-new-dep convention) as the hasher for
+   `token_to_id`/`merge_rank` only; see DECISIONS.md's hasher entry. Strict change-only
+   A/B (`src/tokenizer.rs` alone), AWS EC2 `g4dn.xlarge`/T4 `sm_75` cubin, interleaved
+   n=10: golden tokens byte-identical (dense `12095`/`" Paris"`, hybrid `279`/
+   `" the"`, MLA `94216`/`" NavLink"`, MoE deterministic), `model_load_ms` p50
+   **415.568→411.627ms (-3.9ms)**, total p50 **632.712→629.671ms (-3.0ms)** —
+   consistent across all 10 pairs (mean per-pair ~5.2ms) but ~1% of load, not the
+   ~60-80ms this item estimated. **The finding**: SipHash was *not* the dominant cost;
+   tokenizer construction is allocation/copy-dominated, so this was the smallest lever,
+   not the biggest.
+2. **Remove the duplicate vocab copy — now the likely large lever.** `token_to_id` is
+   the inverse of `tokens`, stored as a second full clone; `from_gguf` also allocates
+   ~300k `String`s for `merge_rank`'s two-string-per-key build. Intern tokens once
+   (single contiguous arena; `token_to_id` keyed by `&str`/index into it) so only one
+   copy exists. More invasive, but item #1's A/B says this — not hashing — is where the
+   tokenizer's real cost sits.
 3. **Cheaper `merge_rank` key** — either a single `String` key (`left + " " + right`,
    one alloc vs. two) or resolve to token-id pairs in a second pass
    (`HashMap<(u32,u32),usize>`, zero string allocs). The id-keyed variant changes
@@ -779,20 +791,22 @@ the dominant compute; the double vocab clone is the dominant alloc. Ranked:
    `fast_exit`, never accepts a request); a one-shot, joined-at-load tokenizer thread
    is the same shape. Record explicitly, don't assume.
 
-**Sequencing (revised after the item-#1 measurement)**: the AOT half of this plan has
-already paid for itself with the finding that per-call `cuModuleLoad`
-overhead is ~1ms, not ~8ms — so the module-coalescing idea (old item #2) is
-deprioritized, and the tokenizer is now the dominant remaining lever. Next: the fast
-hasher (zero-risk, biggest tokenizer win), then the tokenizer arena/merge-key reduction
-(host-only, gated by existing `tokenizer.rs` unit tests + byte-exact encode), then the
-tokenizer-thread overlap last, pending its DECISIONS.md call, all measured interleaved
-A/B (n=10) on a real T4 exactly like item #1 was. Only *then*, if load time still
-matters, add a sub-phase timer around `load_dequant_kernels` to find where the ~83ms AOT
-load actually goes before reconsidering single-module coalescing. Realistic serial
-reduction, revised down from the original ~160-190ms: the tokenizer is worth up to
-~60-80ms serial (hasher+arena) or ~107ms via overlap, the AOT half now only ~1-20ms —
-call it ~60-110ms off `model_load_ms`, toward ~520-560ms total on the same T4 setup,
-and only the interleaved-A/B measurement will say.
+**Sequencing (revised again after the tokenizer-hasher measurement)**: both
+"zero-risk biggest wins" the plan led with have now measured *small* — the AOT
+rope-dedup freed one `cuModuleLoad` for ~1ms (not ~8ms, deprioritizing module
+coalescing), and the fast hasher saved ~3-4ms of `model_load_ms` (not ~60-80ms),
+showing tokenizer construction is allocation-dominated, not hash-dominated. Next: the
+tokenizer arena/duplicate-vocab-copy reduction (item #2 above — the likely real serial
+lever, host-only, gated by existing `tokenizer.rs` unit tests + byte-exact encode),
+re-measured with the same interleaved n=10 A/B; then the tokenizer-thread overlap
+(item #4, still worth its full ~107ms of serial-path removal regardless of how small
+the serial cost itself gets), pending its already-written DECISIONS.md call. The AOT
+half is down to the leftover instrumentation question (a sub-phase timer around
+`load_dequant_kernels` to find where the ~83ms actually goes) if load time still
+matters after the tokenizer work. Honest revised expectation: the hasher moved total
+cold start ~4ms; the arena work's upside is the open question, and the thread overlap
+remains the only item with a large, size-independent ceiling — only an interleaved-A/B
+measurement will say.
 
 ## Known debt / limitations
 

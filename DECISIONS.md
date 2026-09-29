@@ -1134,38 +1134,64 @@ for the full readout, including why the LoRA-adapted run collapsing to immediate
 EOS is expected given the fixture's deliberately large synthetic delta magnitudes,
 not a bug).
 
-## Tokenizer map hasher: adopt a small non-cryptographic hasher (planned, not started)
+## Tokenizer map hasher: vendored inline FxHasher (implemented, real-hardware-verified 2026-09-28)
 
 **Decision**: replace `std::collections::HashMap`'s default SipHash hasher with a
-fixed, small, non-cryptographic hasher (`FxHasher`, either vendored ~50 lines or the
-tiny `rustc-hash` crate) for `Tokenizer`'s two maps (`token_to_id`,
-`merge_rank`) — and only those two maps, not a crate-wide hasher-policy change.
+fixed, small, non-cryptographic hasher for `Tokenizer`'s two maps (`token_to_id`,
+`merge_rank`) — and only those two maps, not a crate-wide hasher-policy change. The
+hasher is **vendored inline in `src/tokenizer.rs`** (the classic Firefox/rustc `FxHash`
+algorithm, ~50 lines), **not** the `rustc-hash` crate: this matches the project's
+no-new-default-dependency convention and the existing in-repo precedent of
+`aot.rs`'s inline `fnv1a_hash`, keeps the crate's default dependency footprint at
+cudarc/half/memmap2/rand, and avoids pinning another crate for what is self-contained,
+testable, ~50 lines of arithmetic.
 
 **Why**: the item-5/item-6 phase-breakdown profiling made tokenizer construction a
 measured, named cost (~107ms of `model_load_ms`, ~26% of the 410.3ms p50 on dense
-`Qwen3-0.6B`). Its dominant compute is hashing: ~151k token strings into `token_to_id`
-and ~150k `(String,String)` merge keys into `merge_rank`, every one SipHash — the std
-default, designed for HashDoS resistance on untrusted input, typically 3–5x slower
-than a non-cryptographic hasher the same operation doesn't need. These maps never see
-untrusted input — keys come from a model file the user already chose to load, in the
-same trust boundary as the weights themselves — so HashDoS resistance buys nothing
-here. This exact reasoning already has in-repo precedent: `aot.rs`'s `fnv1a_hash`
-(FNV-1a) exists precisely because a content-hash of embedded kernel bytes needs speed
-and has no DOS surface. A hasher swap is also the lowest-risk part of this plan: no
-ownership/allocation changes, no algorithm changes, byte-exact encode output is
-unchanged because hashing affects only table insertion/lookup, never iteration order
-in these lookups (encode resolves each symbol via a direct `get`, never enumerates the
-map).
+`Qwen3-0.6B`). The plan's hypothesis was that its dominant compute is hashing: ~151k
+token strings into `token_to_id` and ~150k `(String,String)` merge keys into
+`merge_rank`, every one SipHash — the std default, designed for HashDoS resistance on
+untrusted input, typically 3–5x slower than a non-cryptographic hasher the same
+operation doesn't need. These maps never see untrusted input — keys come from a model
+file the user already chose to load, in the same trust boundary as the weights — so
+HashDoS resistance buys nothing here. A hasher swap is also the lowest-risk part of
+this plan: no ownership/allocation changes, no algorithm changes, byte-exact encode
+output is unchanged because hashing affects only table insertion/lookup, never
+iteration order in these lookups (encode resolves each symbol via a direct `get`,
+never enumerates the map).
 
-**How to apply**: introduce the hasher at the two `HashMap` types in
-`src/tokenizer.rs` (`merge_rank`/`token_to_id`), keep the change scoped there, and
-note the dependency (or vendored-copy) choice in `Cargo.toml`. Do it first among the
-tokenizer items, paired with the rope-dedup AOT item as the two zero-risk changes, and
-measure with `scripts/bench_cold_start_phases_system1.sh` (n=10) plus the existing
-`tokenizer.rs` unit tests (`test_gpt2_encode_decode_round_trips_real_strings_...`,
-SentencePiece tests) unchanged as the regression gate. Revisit the `crate-policy`
-question only if some other map later shows up as hot on this path; don't grow a
-crate-wide hashing convention from a two-map fix.
+**Measured outcome, real hardware (AWS EC2 `g4dn.xlarge`/Tesla T4, `sm_75` cubin,
+strict change-only A/B of `src/tokenizer.rs` alone, interleaved n=10)**: golden tokens
+byte-identical on both arms (dense `12095`/`" Paris"`, hybrid `279`/`" the"`, synthetic
+MLA `94216`/`" NavLink"`, MoE deterministic `[45729,22560,23860,16773,8275]`). The
+timing win is **real but much smaller than the plan estimated**: `model_load_ms` p50
+**415.568ms → 411.627ms (-3.9ms)**, total `process_start_to_result_ms` p50
+**632.712ms → 629.671ms (-3.0ms)**. The win is consistent, not noise — every one of the
+10 paired before/after runs improved (mean per-pair delta ~5.2ms on `model_load_ms`),
+and `prompt_eval_ms` is untouched (39.023 → 39.048ms, within noise) — but it is ~1% of
+`model_load_ms`, far below the ~60-80ms the hasher item's own plan estimated.
+
+**The finding that reframes the tokenizer half of the plan**: the same way the AOT
+rope-dedup's ~1ms-not-~8ms measurement reframed the AOT half, this says SipHash was
+**not** the dominant cost of `Tokenizer::from_gguf`. The ~107ms "tokenizer
+construction" is dominated by *allocation/copying* — parsing and cloning the ~151k
+`tokens` strings, cloning them a second time into `token_to_id`, and the ~150k
+two-`String`-per-key `merge_rank` builds — not by hashing them. The plan's item
+ranking therefore inverts: the fast hasher is the *smallest* lever, not the biggest
+(the duplicate-vocab-copy/arena item is the likely large one), and the load-time
+worker-thread item (#4) keeps its full ~107ms value regardless, since it removes the
+whole construction from the serial path rather than shrinking it.
+
+**How to apply**: the hasher change is scoped to the two `HashMap` type aliases in
+`src/tokenizer.rs` (`FxHashMap`/`FxBuildHasher` there); no `Cargo.toml` change. Land
+it (zero-risk, correctness-neutral, strictly a small consistent win), but do **not**
+rely on the hasher to deliver a large tokenizer win — re-rank the remaining tokenizer
+items against a fresh measurement (the arena/duplicate-copy work is the one to
+evaluate next), and measure any successor with the same interleaved A/B + golden-token
+regression gate used here (`scripts/bench_cold_start_phases_system1.sh`, n=10, plus the
+`tokenizer.rs` unit tests). Revisit the `crate-policy` question only if some other map
+later shows up as hot on this path; don't grow a crate-wide hashing convention from a
+two-map fix.
 
 ## Tokenizer construction on a load-time worker thread (planned, not started)
 

@@ -2918,3 +2918,58 @@ fixture shipped to the instance; the code path is byte-for-byte the same
 
 **Verdict**: land it. Correctness-neutral (golden token identical), and it converts the
 documented item-6 regression on the tied-model `generate`/`check` path into a large win.
+
+### Tokenizer fast-hasher (tokenizer item #1), real-hardware-verified, 2026-09-28
+
+The tokenizer half of the "tokenizer + AOT module load" plan (STATUS.md's matching
+"Planned next work" section): replace `std::collections::HashMap`'s default SipHash with
+a small non-cryptographic hasher for `Tokenizer`'s two build-time bulk maps
+(`token_to_id`, `merge_rank`). Per DECISIONS.md's hasher entry, the hasher is the classic
+Firefox/rustc FxHash algorithm **vendored inline** in `src/tokenizer.rs` (~50 lines: the
+`FxHasher` struct, its `Hasher` impl, and `FxHashMap`/`FxBuildHasher` type aliases)
+rather than the `rustc-hash` crate — this project's no-new-default-dependency convention,
+matching `aot.rs`'s inline `fnv1a_hash` precedent. No `Cargo.toml` change; no
+ownership/algorithm change, so encode output is unaffected (these maps are only ever read
+by direct `get`, never iterated).
+
+**Verification -- strict change-only A/B**, same recipe as the rope-dedup and tied-dequant
+entries above: `before` = committed HEAD (`ad36d45`), `after` = HEAD with *only*
+`src/tokenizer.rs` overwritten by the working copy (confirmed on the instance with
+`diff -rq`: exactly that one file differs). `g4dn.xlarge`/T4, pinned `sm_75` cubin,
+`REFLEX_CUDA_ARCH=sm_75 cargo build --release --features download,json-output` on both
+arms (both RC=0), interleaved before/after n=10 `reflex system1` with
+`--candidate " True" --candidate " False"`.
+
+**Correctness -- passes.** Golden tokens byte-identical on both arms: dense `12095`/
+`" Paris"`, hybrid `279`/`" the"`, synthetic MLA `94216`/`" NavLink"`, and the MoE
+5-token sequence `[45729,22560,23860,16773,8275]` identical across two runs on each arm.
+
+**Timing -- a real but far smaller win than the plan estimated, n=10 interleaved:**
+
+| metric (p50) | before (HEAD) | after (+hasher) | delta |
+|---|---|---|---|
+| `model_load_ms` | 415.568 ms | 411.627 ms | -3.9 ms |
+| `prompt_eval_ms` | 39.023 ms | 39.048 ms | +0.025 ms (noise, untouched) |
+| `process_start_to_result_ms` | 632.712 ms | 629.671 ms | -3.0 ms |
+
+The delta is consistent, not noise -- all 10 paired before/after runs improved on
+`model_load_ms` (mean per-pair delta ~5.2 ms; p95 423.138 -> 415.345), and
+`prompt_eval_ms` is flat as expected (the change touches only load-time table
+construction). But ~4 ms is ~1% of `model_load_ms`, versus the plan's ~60-80 ms
+back-of-envelope for the hasher.
+
+**The finding that reframes the tokenizer half**: the way the rope-dedup's
+~1 ms-not-~8 ms result reframed the AOT half, this says **SipHash was not the dominant
+cost of `Tokenizer::from_gguf`**. The ~107 ms tokenizer construction is dominated by
+allocation/copying -- parsing and cloning the ~151k `tokens` strings, the second full
+clone into `token_to_id`, and the ~300k `String` allocations in `merge_rank`'s
+two-string-per-key build -- not by hashing them. Item #1's own ranking ("SipHash is the
+dominant compute") is therefore wrong; the fast hasher is the *smallest* lever, and the
+duplicate-vocab-copy/arena item is the one to evaluate next. The load-time worker-thread
+item keeps its full ~107 ms value regardless (it removes the whole construction from the
+serial path rather than shrinking it).
+
+**Verdict**: land it -- zero-risk, correctness-neutral (golden tokens identical), and a
+small consistent win. But re-rank the remaining tokenizer items: the hasher does not
+deliver the tokenizer win the plan hoped for, and the arena/duplicate-copy item is where
+the real serial cost now appears to sit. See STATUS.md's updated ranking/sequencing.
