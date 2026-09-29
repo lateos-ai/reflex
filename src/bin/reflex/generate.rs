@@ -20,6 +20,14 @@
 //! `scripts/bench_cold_start_phases.sh` runs this N times and reports
 //! per-phase p50/p95 across runs.
 //!
+//! Each phase is additionally emitted as its own additive `REFLEX_PHASE_OK
+//! phase=<name> duration_ms=<ms> energy_joules=<j> energy_method=<m>` line,
+//! printed *before* the aggregate `REFLEX_GENERATE_OK` line (the `energy_*`
+//! fields appear only when a measurement is available) -- the existing
+//! aggregate line and its fields are unchanged. See `src/energy.rs`'s doc
+//! comment for the per-phase (delta-from-cumulative) semantics and the
+//! counter-vs-polled granularity caveat.
+//!
 //! Exits via `reflex_engine::fast_exit` after printing the result instead
 //! of returning from `run` normally -- see that function's doc comment for
 //! why a graceful return costs several extra seconds of CUDA-context-
@@ -76,6 +84,81 @@ fn energy_suffix(measurement: Option<&energy::EnergyMeasurement>) -> String {
         Some(m) => format!(" joules={:.3} energy_method={}", m.joules, m.method.as_str()),
         None => String::new(),
     }
+}
+
+/// Per-phase energy is the *delta* between two cumulative
+/// [`energy::EnergyMeasurement`] readings (`measure()` returns cumulative
+/// joules since `start()`, and the underlying counter/accumulator is
+/// monotonic). `None` if either reading is unavailable.
+fn phase_energy_delta(
+    after: &Option<energy::EnergyMeasurement>,
+    before: &Option<energy::EnergyMeasurement>,
+) -> Option<energy::EnergyMeasurement> {
+    match (after, before) {
+        (Some(a), Some(b)) => Some(energy::EnergyMeasurement {
+            joules: a.joules - b.joules,
+            method: a.method,
+        }),
+        _ => None,
+    }
+}
+
+/// Prints one `REFLEX_PHASE_OK` line (or its `--json` form) for a single
+/// phase. Purely additive: the aggregate `REFLEX_*_OK` lines and their
+/// existing fields are unchanged.
+fn print_phase_ok(
+    json: bool,
+    phase: &'static str,
+    duration_ms: f64,
+    energy: Option<&energy::EnergyMeasurement>,
+) {
+    if !json {
+        let suffix = match energy {
+            Some(m) => format!(
+                " energy_joules={:.3} energy_method={}",
+                m.joules,
+                m.method.as_str()
+            ),
+            None => String::new(),
+        };
+        println!("REFLEX_PHASE_OK phase={phase} duration_ms={duration_ms:.3}{suffix}");
+        return;
+    }
+    #[cfg(feature = "json-output")]
+    reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::PhaseTimingJson {
+        phase,
+        duration_ms,
+        energy_joules: energy.map(|m| m.joules),
+        energy_method: energy.map(|m| m.method.as_str()),
+    });
+    #[cfg(not(feature = "json-output"))]
+    json_output_unavailable();
+}
+
+/// Emits the four bracketed cold-start phases' ms + joules, given the
+/// cumulative energy readings captured at each boundary (in order). The
+/// per-phase energy is each boundary's delta from the previous one; the
+/// `gguf_open` phase is the first cumulative reading measured from
+/// `EnergySampler::start`.
+#[allow(clippy::too_many_arguments)]
+fn print_phase_report(
+    json: bool,
+    gguf_open_ms: f64,
+    cuda_init_ms: f64,
+    model_load_ms: f64,
+    prompt_eval_ms: f64,
+    e_gguf_open: &Option<energy::EnergyMeasurement>,
+    e_cuda_init: &Option<energy::EnergyMeasurement>,
+    e_model_load: &Option<energy::EnergyMeasurement>,
+    e_prompt_eval: &Option<energy::EnergyMeasurement>,
+) {
+    print_phase_ok(json, "gguf_open", gguf_open_ms, e_gguf_open.as_ref());
+    let cuda = phase_energy_delta(e_cuda_init, e_gguf_open);
+    print_phase_ok(json, "cuda_init", cuda_init_ms, cuda.as_ref());
+    let load = phase_energy_delta(e_model_load, e_cuda_init);
+    print_phase_ok(json, "model_load", model_load_ms, load.as_ref());
+    let eval = phase_energy_delta(e_prompt_eval, e_model_load);
+    print_phase_ok(json, "prompt_eval", prompt_eval_ms, eval.as_ref());
 }
 
 // Only called from a `#[cfg(not(feature = "json-output"))]` arm below --
@@ -251,13 +334,16 @@ pub fn run(args: Vec<String>) {
     let file =
         GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
     let gguf_open_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let e_gguf_open = sampler.measure();
     let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
     let cuda_init_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms;
+    let e_cuda_init = sampler.measure();
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }
     let mut model = Model::load(device, &file).expect("failed to load model");
     let model_load_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms - cuda_init_ms;
+    let e_model_load = sampler.measure();
     let model_ready_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     if let Some(lora_path) = &lora_path {
@@ -299,6 +385,17 @@ pub fn run(args: Vec<String>) {
         let energy_measurement = sampler.measure();
         let prompt_eval_ms = elapsed.as_secs_f64() * 1000.0 - model_ready_ms;
         let process_start_to_first_token_ms = elapsed.as_secs_f64() * 1000.0;
+        print_phase_report(
+            json,
+            gguf_open_ms,
+            cuda_init_ms,
+            model_load_ms,
+            prompt_eval_ms,
+            &e_gguf_open,
+            &e_cuda_init,
+            &e_model_load,
+            &energy_measurement,
+        );
         if json {
             #[cfg(feature = "json-output")]
             reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::GenerateResultJson {
@@ -331,6 +428,7 @@ pub fn run(args: Vec<String>) {
         .map(|path| kv_io::import_kv(path).expect("failed to import KV cache"));
 
     let mut first_token_ms: Option<f64> = None;
+    let mut first_token_energy: Option<energy::EnergyMeasurement> = None;
     let (tokens, text) = model
         .generate(
             &prompt,
@@ -339,6 +437,7 @@ pub fn run(args: Vec<String>) {
             &sampling,
             |_logits| {
                 first_token_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+                first_token_energy = sampler.measure();
             },
             |_id, _text| {},
         )
@@ -346,6 +445,18 @@ pub fn run(args: Vec<String>) {
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let energy_measurement = sampler.measure();
     let prompt_eval_ms = first_token_ms.unwrap_or(total_ms) - model_ready_ms;
+
+    print_phase_report(
+        json,
+        gguf_open_ms,
+        cuda_init_ms,
+        model_load_ms,
+        prompt_eval_ms,
+        &e_gguf_open,
+        &e_cuda_init,
+        &e_model_load,
+        &first_token_energy,
+    );
 
     if json {
         #[cfg(feature = "json-output")]

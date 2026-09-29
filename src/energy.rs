@@ -42,6 +42,15 @@
 //! Any NVML failure (library missing, driver too old, no permission,
 //! unsupported GPU) degrades gracefully to "no measurement available" --
 //! never a panic.
+//!
+//! **Per-phase deltas**: `measure()` returns *cumulative* joules since
+//! `start()`, so a caller wanting per-phase energy (see `generate.rs`/
+//! `system1.rs`'s `REFLEX_PHASE_OK` lines) snapshots it at each phase
+//! boundary and subtracts the previous snapshot. Granularity follows the
+//! mode: `PolledPower` integrates continuously so short-phase deltas are
+//! meaningful; `TotalEnergyCounter` is a hardware counter the driver updates
+//! coarsely, so a very short phase's delta can read as zero or lumpy -- a
+//! property of NVML's counter, not of this module's arithmetic.
 
 use std::time::Instant;
 

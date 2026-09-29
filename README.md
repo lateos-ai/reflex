@@ -225,12 +225,20 @@ the benchmarks below treat it as one.
 first generated token) — a real, underexplored gap. Existing energy benchmarks measure
 warm/steady-state joules-per-token, not full-lifecycle cold-start cost.
 
-**Stated plainly: energy is not yet measured.** There is no NVML/`nvidia-smi` power
-sampling anywhere in this repo — every number published here is latency (and, in
-`reflex bench`, VRAM residency). Joules-to-first-token remains the *aim* this project
-is organized around, not a result it can currently report. Building that
-instrumentation is outstanding work, and until it exists this section should be read as
-a statement of intent rather than a claim.
+**Energy instrumentation exists; energy *numbers* are not yet published.** `src/energy.rs`
+samples GPU power via NVML (`nvml-wrapper`, `dlopen`'d at runtime behind the optional
+`nvml` Cargo feature — never linked at build time), preferring the Volta+ monotonic
+`nvmlDeviceGetTotalEnergyConsumption` counter and falling back to polling
+`nvmlDeviceGetPowerUsage` and integrating `power_mw * dt_s`. `generate`/`system1`/`smoke`/
+`bench`/`doctor` emit total `joules` when it is available (`--features nvml` on a machine
+that exposes NVML), and `generate`/`system1` now also emit per-phase `REFLEX_PHASE_OK`
+joules lines. **But none of it has been real-hardware-verified yet, so no energy figure is
+quoted in the benchmark tables below** — every published number remains latency (and, in
+`reflex bench`, VRAM residency). Two caveats carried openly: NVML has no per-process energy
+API, so the figure is **device-wide** (accurate on a dedicated/rented instance, an overcount
+on a shared GPU); and in `total_energy_counter` mode the hardware counter updates coarsely,
+so *short-phase* deltas (e.g. a ~39ms prefill) can read as zero or lumpy — the
+`polled_power` fallback integrates continuously and does not have that limitation.
 
 **Target models**: Qwen and DeepSeek families.
 
@@ -287,6 +295,15 @@ report p50/p95 per phase instead of one sample. "Process launch" (OS
 `exec`/dynamic-linking/CRT init before `main()` runs) isn't something the process can
 report about itself — it's derived as external wall clock minus the internal total,
 the same gap this page's other benchmark numbers already rely on.
+
+Each of those phases also gets an **additive** `REFLEX_PHASE_OK phase=<name>
+duration_ms=<ms> energy_joules=<j> energy_method=<m>` line (one per phase, printed
+*before* the aggregate result line; the `energy_*` fields are present only when a
+measurement is available), with the same fields in the `--json` form. The existing
+`REFLEX_GENERATE_OK`/`REFLEX_SYSTEM1_OK` lines and their fields are unchanged. The
+per-phase `energy_joules` is the delta between consecutive cumulative readings, so its
+precision follows the mode caveat above (coarse in `total_energy_counter` mode for very
+short phases; continuous in `polled_power` mode).
 
 Current numbers, real `Tesla T4` (dedicated AWS EC2 `g4dn.xlarge`),
 `Qwen3-0.6B-Q4_K_M.gguf`, `reflex system1`, `n=10`:

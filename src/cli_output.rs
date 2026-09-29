@@ -120,6 +120,24 @@ pub struct SmokeResultJson {
     pub energy_method: Option<&'static str>,
 }
 
+/// `REFLEX_PHASE_OK` -- one per named execution phase (`gguf_open`,
+/// `cuda_init`, `model_load`, `prompt_eval`), printed *before* the aggregate
+/// `REFLEX_GENERATE_OK`/`REFLEX_SYSTEM1_OK` line. `energy_joules` is the
+/// delta across just this phase (not cumulative) and is `None` when no
+/// energy measurement is available (no `nvml` feature, or NVML unavailable on
+/// this machine). See `src/energy.rs`'s doc comment for the
+/// `total_energy_counter`-vs-`polled_power` granularity caveat that makes
+/// short-phase deltas coarse in counter mode.
+#[derive(Serialize)]
+pub struct PhaseTimingJson {
+    pub phase: &'static str,
+    pub duration_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub energy_joules: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub energy_method: Option<&'static str>,
+}
+
 /// `REFLEX_BENCH_VRAM_OK`.
 #[derive(Serialize)]
 pub struct BenchVramJson {
