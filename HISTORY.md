@@ -2973,3 +2973,60 @@ serial path rather than shrinking it).
 small consistent win. But re-rank the remaining tokenizer items: the hasher does not
 deliver the tokenizer win the plan hoped for, and the arena/duplicate-copy item is where
 the real serial cost now appears to sit. See STATUS.md's updated ranking/sequencing.
+
+### Tokenizer load-time worker thread (tokenizer item #4), real-hardware-verified, 2026-09-28
+
+The last tokenizer item of the "tokenizer + AOT module load" plan, and the one that
+touches the threading boundary: build the `Tokenizer` on a single one-shot background
+thread inside each of the three `Model` load sites, so its ~100ms of allocation/hashing
+overlaps the GPU-bound weight load instead of sitting after it on the serial path. The
+Non-goals call is argued in DECISIONS.md's worker-thread entry (same shape as
+`energy.rs`'s poll thread: one internal thread, joined before the caller sees the
+`Model`, never reused, never accepting a second unit of work).
+
+**Implementation — `std::thread::scope`, not `std::thread::spawn`**: the load functions
+take `file: &GgufFile`, so a `'static` spawn would have needed an `Arc<GgufFile>` at ~12
+call sites (or a metadata snapshot, which is exactly the clone the thread exists to
+overlap). Instead each of `load`/`load_hybrid`/`load_mla` became a thin wrapper that
+spawns `Tokenizer::from_gguf(file)` on a scoped thread and passes the
+`ScopedJoinHandle<Result<Tokenizer, String>>` into a new private `*_inner` body, which
+joins it at the point the old code called `Tokenizer::from_gguf` (a thread panic maps to
+an ordinary `Err`). `GgufFile` is immutable after parse (mmap + owned metadata, all
+`Send + Sync`), so main body and tokenizer thread only share immutable reads — no new
+locking, no shared mutable state.
+
+**Verification -- strict change-only A/B**, same recipe as the entries above: `before` =
+committed HEAD (`88a1f32`, which already includes the fast hasher), `after` = HEAD with
+*only* `src/model.rs` overwritten by the working copy (`diff -rq` on the instance shows
+exactly that one file differs). `g4dn.xlarge`/T4, pinned `sm_75` cubin,
+`REFLEX_CUDA_ARCH=sm_75 cargo build --release --features download,json-output` on both
+arms (both RC=0), interleaved before/after n=10 `reflex system1`.
+
+**Correctness -- passes.** Golden tokens byte-identical on both arms: dense `12095`/
+`" Paris"`, hybrid `279`/`" the"`, synthetic MLA `94216`/`" NavLink"`, and the MoE
+5-token sequence `[45729,22560,23860,16773,8275]` identical across two runs on each arm.
+
+**Timing -- a large, clean win, n=10 interleaved:**
+
+| metric (p50) | before (HEAD) | after (+worker thread) | delta |
+|---|---|---|---|
+| `model_load_ms` | 408.942 ms | 307.554 ms | **-101.4 ms (-24.8%)** |
+| `prompt_eval_ms` | 39.027 ms | 39.328 ms | +0.3 ms (noise) |
+| `process_start_to_result_ms` | 627.148 ms | 523.686 ms | **-103.5 ms (-16.5%)** |
+
+The ~101 ms removed from `model_load_ms` is the entire tokenizer construction moved off
+the serial path -- the item's design goal exactly, and by far the largest cold-load win
+since item-6's lazy `token_embd` dequant. `prompt_eval_ms` is flat, as expected for a
+load-path-only change.
+
+**The finding that follows**: this largely subsumes the fast-hasher item (#1) at the
+end-to-end level. Once the tokenizer's construction is hidden behind the GPU load,
+whether it takes 107 ms or 103 ms no longer changes cold start at all, so the remaining
+*serial* tokenizer micro-optimizations (arena/duplicate-vocab-copy, cheaper merge key)
+are now lower-value than their own measurements suggested -- they would only matter if
+the tokenizer exceeded the overlap window, which the measurement says it does not.
+
+**Verdict**: land it -- correctness-neutral (golden tokens identical), the biggest
+remaining cold-start win, and it buys a new ~308 ms `model_load_ms` floor to re-rank any
+further load-path work against. See STATUS.md's updated sequencing and DECISIONS.md's
+updated worker-thread entry.

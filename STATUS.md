@@ -781,32 +781,36 @@ these dominates: **allocation/copying, not hashing.** Ranked:
    (`HashMap<(u32,u32),usize>`, zero string allocs). The id-keyed variant changes
    merge-lookup code and needs care; the single-string key is trivial. Rejected:
    deferring `merge_rank` to first `encode` — `encode` always runs, so no net save.
-4. **Overlap with weight load (largest E2E win, but a threading decision).**
-   `Tokenizer::from_gguf` only needs `file` (already mmap'd), not the device or
-   weights. Build it on a single background thread started right after GGUF open,
-   concurrent with kernel-load + weight-load, `join()` before `Model::load` returns —
-   ~107ms off the serial path entirely. **Decision item:** a real worker thread, so it
-   must be squared with the Non-goals. Precedent exists — `energy.rs`'s background
-   poll thread is justified as a non-exception (single internal thread, discarded via
-   `fast_exit`, never accepts a request); a one-shot, joined-at-load tokenizer thread
-   is the same shape. Record explicitly, don't assume.
+4. ~~**Overlap with weight load.**~~ — **done, real-hardware-verified 2026-09-28; the
+   largest remaining cold-start win.** Each load site (`Model::load`/`load_hybrid`/
+   `load_mla`) is now a thin `std::thread::scope` wrapper that spawns
+   `Tokenizer::from_gguf(file)` on one scoped thread and hands the join handle to a new
+   private `*_inner` body, which joins it before returning the `Model` — exactly one
+   thread, joined, never reused (see DECISIONS.md's updated worker-thread entry for the
+   Non-goals justification and the scoped-thread implementation note). Strict
+   change-only A/B (`src/model.rs` alone vs HEAD `88a1f32`), AWS EC2 `g4dn.xlarge`/T4
+   `sm_75` cubin, interleaved n=10: golden tokens byte-identical (dense/hybrid/MLA/MoE),
+   `model_load_ms` p50 **408.942→307.554ms (-101.4ms, -24.8%)**, total p50
+   **627.148→523.686ms (-103.5ms, -16.5%)**, `prompt_eval_ms` flat. This is the full
+   ~100ms tokenizer construction off the serial path — the whole point of the item.
+   **Side effect**: it largely subsumes item #1 (hasher) at the E2E level — once the
+   tokenizer is hidden behind the GPU load, whether it takes 107ms or 103ms stops
+   mattering, so the remaining serial micro-optimizations (item #2/#3) are now
+   lower-value than their own measurements suggested.
 
-**Sequencing (revised again after the tokenizer-hasher measurement)**: both
-"zero-risk biggest wins" the plan led with have now measured *small* — the AOT
-rope-dedup freed one `cuModuleLoad` for ~1ms (not ~8ms, deprioritizing module
-coalescing), and the fast hasher saved ~3-4ms of `model_load_ms` (not ~60-80ms),
-showing tokenizer construction is allocation-dominated, not hash-dominated. Next: the
-tokenizer arena/duplicate-vocab-copy reduction (item #2 above — the likely real serial
-lever, host-only, gated by existing `tokenizer.rs` unit tests + byte-exact encode),
-re-measured with the same interleaved n=10 A/B; then the tokenizer-thread overlap
-(item #4, still worth its full ~107ms of serial-path removal regardless of how small
-the serial cost itself gets), pending its already-written DECISIONS.md call. The AOT
-half is down to the leftover instrumentation question (a sub-phase timer around
-`load_dequant_kernels` to find where the ~83ms actually goes) if load time still
-matters after the tokenizer work. Honest revised expectation: the hasher moved total
-cold start ~4ms; the arena work's upside is the open question, and the thread overlap
-remains the only item with a large, size-independent ceiling — only an interleaved-A/B
-measurement will say.
+**Sequencing (revised after the worker-thread measurement)**: the plan's two
+"zero-risk" AOT/hasher items both measured small (rope dedup ~1ms; hasher ~4ms), but the
+worker-thread item (#4) just delivered the full ~101ms it promised — by far the biggest
+cold-load win since item-6 lazy `token_embd` dequant. The remaining tokenizer items are
+now optional rather than a next lever: since the tokenizer construction is off the
+serial path entirely, the arena/duplicate-vocab-copy reduction (item #2) and the cheaper
+merge key (#3) only pay off if they shorten a tokenizer that would otherwise *exceed*
+the GPU-load overlap window, which the measurement says it doesn't. The AOT half is down
+to the leftover instrumentation question (a sub-phase timer around `load_dequant_kernels`
+to find where the ~83ms actually goes) if load time still matters. Next cold-load work
+should be re-ranked against the new ~308ms `model_load_ms` floor rather than the old
+~410ms one; only an interleaved-A/B measurement will say whether anything left is worth
+it.
 
 ## Known debt / limitations
 

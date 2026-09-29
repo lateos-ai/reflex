@@ -1193,14 +1193,14 @@ regression gate used here (`scripts/bench_cold_start_phases_system1.sh`, n=10, p
 later shows up as hot on this path; don't grow a crate-wide hashing convention from a
 two-map fix.
 
-## Tokenizer construction on a load-time worker thread (planned, not started)
+## Tokenizer construction on a load-time worker thread (implemented, real-hardware-verified 2026-09-28)
 
 **Decision**: build the `Tokenizer` on a single one-shot background thread inside
-`Model::load` (dense/MoE, hybrid, and MLA — all three `load*` sites), started right
-after `GgufFile::open` and `join()`-ed before `Model::load` returns, so its ~107ms of
-CPU hashing/allocation overlaps the GPU-bound weight-load pipeline instead of sitting
-after it on the serial path. Exactly one extra thread, spawned per load, joined before
-the caller sees the `Model`, never reused and never accepting a second unit of work.
+`Model::load` (dense/MoE, hybrid, and MLA — all three `load*` sites), started at the top
+of each load body and `join()`-ed before the `Model` is returned, so its CPU
+hashing/allocation overlaps the GPU-bound weight-load pipeline instead of sitting after
+it on the serial path. Exactly one extra thread, spawned per load, joined before the
+caller sees the `Model`, never reused and never accepting a second unit of work.
 
 **Why**: `Tokenizer::from_gguf` needs only `file` (already mmap'd/opened by then) and
 reads pure host metadata — no dependency on the device, the loaded weights, or the
@@ -1217,17 +1217,36 @@ shape — it exists only to make one load faster and is gone before any request 
 The `batch_size`-1/no-thread-pool constraints govern *concurrent request handling*,
 not whether a single load may use an internal helper thread once and join it.
 
-**How to apply**: guard the proposal by not generalizing it — a plain
-`std::thread::spawn` + a moved `file`-derived snapshot handed back via a channel (or
-an `Arc<GgufFile>`), `join()` before the `Ok(Model { .. })` at each load site, so the
-`Tokenizer` field is still fully constructed before the caller can `encode`. Because
-`Tokenizer::from_gguf` is host-only and `GgufFile`'s mmap is `Send + Sync`-safe read
-under a single writer-thread hand-off, no shared mutable state is introduced. Failure
-propagation is a `join()` + `?` on the returned `Result<String>` — a tokenizer error
-surfaces exactly as it does today, just after the join. Keep `REFLEX_SKIP_CUDA=1`
-builds unaffected (the thread is unrelated to CUDA). Same measurement bar as the
-hasher item (phase-breakdown n=10 + tokenizer unit tests), and because this is a
-timing-only change with zero numerics impact, the golden-token check is a regression
-assert, not new first-principles verification. This is the one load-path item that
-touches the threading boundary, so it lands *last* in the plan and only after this
-entry is read as agreed, not assumed.
+**Implementation note — scoped threads, not `std::thread::spawn`**: the load functions
+take `file: &GgufFile`, so the thread needs a borrow that does not outlive it rather
+than a `'static` `Arc<GgufFile>`. `std::thread::scope` gives exactly that: each
+`load`/`load_hybrid`/`load_mla` is now a thin wrapper that spawns
+`Tokenizer::from_gguf(file)` on a scoped thread and hands the
+`ScopedJoinHandle<Result<Tokenizer, String>>` to a new private `*_inner` body, which
+joins it at its end (surfacing a thread panic as an ordinary `Err` via `map_err`). No
+`Arc` and no metadata snapshot/copy is needed — `GgufFile` is immutable after parse
+(`Mmap` + owned metadata, all `Send + Sync`), so the main load body and the tokenizer
+thread only ever share immutable reads. Failure propagation is unchanged: a tokenizer
+error surfaces after the join, exactly as before. `REFLEX_SKIP_CUDA=1` builds are
+unaffected (the thread is unrelated to CUDA).
+
+**Measured outcome, real hardware (AWS EC2 `g4dn.xlarge`/Tesla T4, `sm_75` cubin,
+strict change-only A/B of `src/model.rs` alone against HEAD `88a1f32`, interleaved
+n=10)**: golden tokens byte-identical on both arms (dense `12095`/`" Paris"`, hybrid
+`279`/`" the"`, synthetic MLA `94216`/`" NavLink"`, MoE deterministic
+`[45729,22560,23860,16773,8275]`). `model_load_ms` p50 **408.942ms → 307.554ms
+(-101.4ms, -24.8%)**, total `process_start_to_result_ms` p50 **627.148ms → 523.686ms
+(-103.5ms, -16.5%)**; `prompt_eval_ms` is flat (39.027 → 39.328ms, noise). This is the
+full ~100ms tokenizer construction moved off the serial path — the item's whole design
+goal. It also means the earlier hasher item (#1) is now almost entirely subsumed at the
+E2E level: whether the tokenizer takes 107ms or 103ms no longer matters once it is
+hidden behind the GPU load, so further *serial* tokenizer micro-optimization
+(arena/merge-key) has much less value than its own measurement suggested; only
+shortening the overlap window would make it matter again.
+
+**How to apply**: don't generalize this — keep it exactly one scoped thread spawned and
+joined inside a single load, never a pool and never a background thread that outlives
+the call. If a future load-path item wants concurrency too, reuse this same
+`thread::scope` wrapper/inner shape rather than adding a second mechanism. Because this
+is a timing-only change with zero numerics impact, the golden-token check was a
+regression assert, not new first-principles verification.
