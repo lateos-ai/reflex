@@ -65,6 +65,7 @@ use cudarc::driver::{
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::thread::ScopedJoinHandle;
 
 /// Prefill result: encoded prompt ids, the final position's hidden state,
 /// the filled per-layer K/V caches (separate K and V buffers), and the next
@@ -1950,6 +1951,28 @@ impl Model {
             return Self::load_mla(device, file);
         }
 
+        Self::load_dense(device, file)
+    }
+
+    /// Wrapper around [`Self::load_dense_inner`]: builds the `Tokenizer` on a
+    /// one-shot scoped background thread so its ~107ms of allocation/hashing
+    /// overlaps the GPU-bound weight load instead of sitting after it on the
+    /// serial path. Exactly one thread, joined before the `Model` is returned,
+    /// never reused and never accepting a second unit of work -- see
+    /// DECISIONS.md's "Tokenizer construction on a load-time worker thread"
+    /// entry for why this is not a violation of the Non-goals threading rule.
+    fn load_dense(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
+        std::thread::scope(|scope| {
+            let tokenizer = scope.spawn(|| Tokenizer::from_gguf(file));
+            Self::load_dense_inner(device, file, tokenizer)
+        })
+    }
+
+    fn load_dense_inner<'scope>(
+        device: Arc<CudaDevice>,
+        file: &GgufFile,
+        tokenizer: ScopedJoinHandle<'scope, Result<Tokenizer, String>>,
+    ) -> Result<Self, String> {
         let (cfg, block_count, moe) = parse_model_config(file)?;
         let expert_used_count = moe.map(|m| m.expert_used_count);
 
@@ -2134,7 +2157,9 @@ impl Model {
             },
         };
 
-        let tokenizer = Tokenizer::from_gguf(file)?;
+        let tokenizer = tokenizer
+            .join()
+            .map_err(|_| "tokenizer construction thread panicked".to_string())??;
 
         Ok(Model {
             device,
@@ -2173,6 +2198,17 @@ impl Model {
     /// `nextn_predict_layers` absent/zero). See `HybridModel`'s doc comment
     /// for what's shared with the dense/MoE path.
     fn load_hybrid(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
+        std::thread::scope(|scope| {
+            let tokenizer = scope.spawn(|| Tokenizer::from_gguf(file));
+            Self::load_hybrid_inner(device, file, tokenizer)
+        })
+    }
+
+    fn load_hybrid_inner<'scope>(
+        device: Arc<CudaDevice>,
+        file: &GgufFile,
+        tokenizer: ScopedJoinHandle<'scope, Result<Tokenizer, String>>,
+    ) -> Result<Self, String> {
         let architecture = "qwen35";
         let key = |suffix: &str| format!("{architecture}.{suffix}");
 
@@ -2447,7 +2483,9 @@ impl Model {
             }
         };
 
-        let tokenizer = Tokenizer::from_gguf(file)?;
+        let tokenizer = tokenizer
+            .join()
+            .map_err(|_| "tokenizer construction thread panicked".to_string())??;
 
         Ok(Model {
             device,
@@ -2493,6 +2531,17 @@ impl Model {
     /// unused garbage (matching the `hybrid` path's own convention) --
     /// `forward_prompt` branches on `self.mla` before touching them.
     fn load_mla(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
+        std::thread::scope(|scope| {
+            let tokenizer = scope.spawn(|| Tokenizer::from_gguf(file));
+            Self::load_mla_inner(device, file, tokenizer)
+        })
+    }
+
+    fn load_mla_inner<'scope>(
+        device: Arc<CudaDevice>,
+        file: &GgufFile,
+        tokenizer: ScopedJoinHandle<'scope, Result<Tokenizer, String>>,
+    ) -> Result<Self, String> {
         let (mla_cfg, block_count, leading_dense) = parse_mla_config(file)?;
 
         // Created once per load, like every AOT kernel handle below -- see
@@ -2719,7 +2768,9 @@ impl Model {
             }
         };
 
-        let tokenizer = Tokenizer::from_gguf(file)?;
+        let tokenizer = tokenizer
+            .join()
+            .map_err(|_| "tokenizer construction thread panicked".to_string())??;
 
         let dummy_cfg = LayerConfig {
             hidden_size: mla_cfg.hidden_size,
