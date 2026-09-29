@@ -1972,18 +1972,15 @@ impl Model {
             "rmsnorm",
             "rmsnorm_kernel",
         )?;
-        let rope_k = aot::load_kernel(
+        let mut rope_fns = aot::load_kernel_module(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ROPE")),
             "rope",
-            "rope_kernel",
-        )?;
-        let rope_batch_k = aot::load_kernel(
-            &device,
-            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
-            "rope_batch",
-            "rope_batch_kernel",
-        )?;
+            &["rope_kernel", "rope_batch_kernel"],
+        )?
+        .into_iter();
+        let rope_k = rope_fns.next().ok_or("missing rope_kernel")?;
+        let rope_batch_k = rope_fns.next().ok_or("missing rope_batch_kernel")?;
         let silu_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")),
@@ -2270,18 +2267,15 @@ impl Model {
             "rmsnorm",
             "rmsnorm_kernel",
         )?;
-        let rope_k = aot::load_kernel(
+        let mut rope_fns = aot::load_kernel_module(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ROPE")),
             "rope",
-            "rope_kernel",
-        )?;
-        let rope_batch_k = aot::load_kernel(
-            &device,
-            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
-            "rope_batch",
-            "rope_batch_kernel",
-        )?;
+            &["rope_kernel", "rope_batch_kernel"],
+        )?
+        .into_iter();
+        let rope_k = rope_fns.next().ok_or("missing rope_kernel")?;
+        let rope_batch_k = rope_fns.next().ok_or("missing rope_batch_kernel")?;
         let silu_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")),
@@ -2520,18 +2514,15 @@ impl Model {
             "rmsnorm",
             "rmsnorm_kernel",
         )?;
-        let rope_k = aot::load_kernel(
+        let mut rope_fns = aot::load_kernel_module(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ROPE")),
             "rope",
-            "rope_kernel",
-        )?;
-        let rope_batch_k = aot::load_kernel(
-            &device,
-            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
-            "rope_batch",
-            "rope_batch_kernel",
-        )?;
+            &["rope_kernel", "rope_batch_kernel"],
+        )?
+        .into_iter();
+        let rope_k = rope_fns.next().ok_or("missing rope_kernel")?;
+        let rope_batch_k = rope_fns.next().ok_or("missing rope_batch_kernel")?;
         let silu_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")),
@@ -2608,30 +2599,28 @@ impl Model {
             "mla_attention_prefill",
             "mla_attention_prefill_kernel",
         )?;
-        let rope_norm_k = aot::load_kernel(
+        let mut rope_norm_fns = aot::load_kernel_module(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ROPE")),
             "rope_norm",
-            "rope_norm_kernel",
-        )?;
-        let rope_norm_yarn_k = aot::load_kernel(
-            &device,
-            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
-            "rope_norm_yarn",
-            "rope_norm_yarn_kernel",
-        )?;
-        let rope_norm_batch_k = aot::load_kernel(
-            &device,
-            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
-            "rope_norm_batch",
-            "rope_norm_batch_kernel",
-        )?;
-        let rope_norm_yarn_batch_k = aot::load_kernel(
-            &device,
-            include_bytes!(env!("REFLEX_KERNEL_ROPE")),
-            "rope_norm_yarn_batch",
-            "rope_norm_yarn_batch_kernel",
-        )?;
+            &[
+                "rope_norm_kernel",
+                "rope_norm_yarn_kernel",
+                "rope_norm_batch_kernel",
+                "rope_norm_yarn_batch_kernel",
+            ],
+        )?
+        .into_iter();
+        let rope_norm_k = rope_norm_fns.next().ok_or("missing rope_norm_kernel")?;
+        let rope_norm_yarn_k = rope_norm_fns
+            .next()
+            .ok_or("missing rope_norm_yarn_kernel")?;
+        let rope_norm_batch_k = rope_norm_fns
+            .next()
+            .ok_or("missing rope_norm_batch_kernel")?;
+        let rope_norm_yarn_batch_k = rope_norm_fns
+            .next()
+            .ok_or("missing rope_norm_yarn_batch_kernel")?;
         let gemv_per_head_batch_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_GEMV_PER_HEAD_BATCH")),
