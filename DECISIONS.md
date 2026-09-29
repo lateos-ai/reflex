@@ -1249,7 +1249,9 @@ joined inside a single load, never a pool and never a background thread that out
 the call. If a future load-path item wants concurrency too, reuse this same
 `thread::scope` wrapper/inner shape rather than adding a second mechanism. Because this
 is a timing-only change with zero numerics impact, the golden-token check was a
-regression assert, not new first-principles verification.
+regression assert, not new first-principles verification. As of the cuBLAS-overlap entry
+below, this same worker thread also builds the cuBLAS handle (the helper is now
+`load_background_init`); the one-thread guarantee is unchanged.
 
 ## AOT module loads are ~3ms; the "~83ms" is cuBLAS init (measured 2026-09-28)
 
@@ -1287,3 +1289,40 @@ avoid cuBLAS on the `system1`/decode path where the custom kernels already do th
 but that is a real design decision with its own numerics/verification question, not a
 follow-on patch — treat it as a new item, with its own DECISIONS entry and strict A/B,
 before any code is written.
+
+## cuBLAS handle init overlapped on the load-time worker thread (implemented, real-hardware-verified 2026-09-28)
+
+**Decision**: move `CudaBlas::new` + `cublasSetMathMode` off the serial load path by
+building them on the same one-shot scoped worker thread the tokenizer already uses, run
+*after* the tokenizer on that thread, and move the handle back once the thread is joined
+(both `Tokenizer` and `CudaBlas` are `Send`; cudarc 0.11.9 declares `unsafe impl Send for
+CudaBlas`). Still exactly one extra thread per load, never a pool.
+
+**Why**: the AOT-diagnostic entry above established that the plan's "~83ms AOT module
+load" was really `CudaBlas::new` + `cublasSetMathMode` (~80.9ms) — the largest single
+remaining cold-load cost once the tokenizer was overlapped. cuBLAS handle creation is
+pure host/driver setup that needs no loaded weights, so it can run concurrently with the
+GPU-bound weight loop exactly like the tokenizer. `CudaBlas::new` itself calls
+`device.bind_to_thread()` (cudarc 0.11.9 `cublas/safe.rs:29`), which sets the primary
+context current on whichever thread runs it, so no extra context plumbing is needed.
+Running tokenizer (~103ms) then cuBLAS (~81ms) sequentially on the *same* thread keeps
+the load at one extra thread and still fits inside the weight loop's ~226ms, so both are
+fully hidden.
+
+**Measured outcome, real hardware** (AWS EC2 `g4dn.xlarge`/T4, `sm_75` cubin, strict
+change-only A/B of `src/model.rs` alone against HEAD `99cb544`, interleaved n=10): golden
+tokens byte-identical on both arms (dense `12095`/`" Paris"`, hybrid `279`/`" the"`,
+synthetic MLA `94216`/`" NavLink"`, MoE deterministic `[45729,22560,23860,16773,8275]`).
+`model_load_ms` p50 **316.310ms → 236.590ms (-79.7ms, -25.2%)** (means 315.2 → 237.1ms),
+total `process_start_to_result_ms` p50 **536.124ms → 456.440ms (-79.7ms, -14.9%)**;
+`prompt_eval_ms` flat (39.818 → 39.793). The full ~80ms cuBLAS cost is hidden, as
+predicted, on the first try — the `bind_to_thread` cross-thread concern did not
+materialize (golden tokens byte-identical).
+
+**How to apply**: this is the last of the measured host/driver setup costs on the load
+path. Don't add a second background thread/mechanism for the next such item — extend the
+existing `load_background_init` helper (it now carries both the tokenizer and the cuBLAS
+handle; one thread, joined, no pool). The remaining `model_load_ms` is dominated by the
+per-tensor weight loop (~124ms) and the lazy `token_embd` raw-byte copy (~102ms), both
+memory/GPU-bound rather than host setup, so further load-path wins need a different idea
+(re-rank against the new ~237ms floor).

@@ -741,16 +741,22 @@ profiling) measured every dense `cuModuleLoad` directly. Ranked/updated:
    warmup spike (the first module costs the same as the rest), and the 20-function
    `dequant` module is the largest single one at only ~1ms. There is nothing left to
    coalesce, and portable PTX pays no meaningful driver-JIT tax on these kernels either.
-3. **The real ~81ms is `CudaBlas::new` + `cublasSetMathMode`.** A load-region marker
-   pass on the same build found, per run (3 runs, very tight): `parse_model_config`
-   ~0.01ms; **`CudaBlas::new` + `cublasSetMathMode` ~80.9ms**; all kernel loads +
-   `WeightLoadPipeline::new` ~3.2ms; the per-tensor weight loop ~123.8ms; `token_embd`
-   construction ~102.1ms; `output_norm`/`lm_head` ~0.1ms; and the tokenizer-thread join
-   ~0.01ms (fully hidden). The plan's "AOT kernel module load 83.09ms" was a
-   timer-boundary mistake — that timer evidently started before `CudaBlas::new` and ran
-   through the kernel loads, so it captured cuBLAS handle init, not the module loads.
-   **This ~81ms cuBLAS init is now the largest single remaining cold-load cost after
-   the tokenizer overlap.**
+3. **The real ~81ms is `CudaBlas::new` + `cublasSetMathMode` — now overlapped too.**
+   A load-region marker pass on the same build found, per run (3 runs, very tight):
+   `parse_model_config` ~0.01ms; **`CudaBlas::new` + `cublasSetMathMode` ~80.9ms**; all
+   kernel loads + `WeightLoadPipeline::new` ~3.2ms; the per-tensor weight loop ~123.8ms;
+   `token_embd` construction ~102.1ms; `output_norm`/`lm_head` ~0.1ms; and the
+   tokenizer-thread join ~0.01ms (fully hidden). The plan's "AOT kernel module load
+   83.09ms" was a timer-boundary mistake — that timer evidently started before
+   `CudaBlas::new` and ran through the kernel loads, so it captured cuBLAS handle init,
+   not the module loads. **Done and real-hardware-verified 2026-09-28**: `CudaBlas::new`
+   + `cublasSetMathMode` moved onto the same one-thread background init helper as the
+   tokenizer (run after it), strict change-only A/B (`src/model.rs` alone vs HEAD
+   `99cb544`), T4 `sm_75` cubin, interleaved n=10 — golden tokens byte-identical,
+   `model_load_ms` p50 **316.310→236.590ms (-79.7ms, -25.2%)**, total p50
+   **536.124→456.440ms (-79.7ms, -14.9%)**, `prompt_eval_ms` flat. See DECISIONS.md's
+   cuBLAS-overlap entry; the load path now has no remaining measured host/driver setup
+   cost above the weight loop (~124ms) and `token_embd` copy (~102ms).
 4. **Rejected:** parallel/threaded `cuModuleLoad` — moot now (module loads are ~3ms).
 
 **Tokenizer construction (~107ms)** — `Tokenizer::from_gguf` (`src/tokenizer.rs:79`)
@@ -801,19 +807,21 @@ these dominates: **allocation/copying, not hashing.** Ranked:
    lower-value than their own measurements suggested.
 
 **Sequencing (revised after the 2026-09-28 measurements)**: the plan's two "zero-risk"
-AOT/hasher items both measured small (rope dedup ~1ms; hasher ~4ms), but the worker-thread
-item (#4) delivered the full ~101ms it promised — by far the biggest cold-load win since
-item-6 lazy `token_embd` dequant. The remaining *serial* tokenizer items are now optional
-rather than a next lever: with tokenizer construction off the serial path entirely, the
-arena/duplicate-vocab-copy reduction (item #2) and cheaper merge key (#3) only pay off if
-the tokenizer would otherwise *exceed* the GPU-load overlap window, which the measurement
-says it doesn't. The AOT instrumentation question is now answered: the `.cu` module loads
-are ~3ms and the "~83ms" was `cuBLAS` handle init (~81ms). **The new top cold-load lever
-is that `CudaBlas::new` cost** — overlapping or eliminating cuBLAS init is the obvious next
-target (~81ms, comparable to the tokenizer win), but it needs its own decision (can the
-handle be created on a background thread like the tokenizer was, or can `system1`/decode
-avoid cuBLAS entirely?) and a strict A/B before any code. Next cold-load work should be
-re-ranked against the new ~308ms `model_load_ms` floor; only an interleaved-A/B
+AOT/hasher items both measured small (rope dedup ~1ms; hasher ~4ms), but the two
+overlap items delivered: the worker-thread tokenizer overlap ~101ms, then the
+same-thread cuBLAS-init overlap a further ~80ms — together the biggest cold-load wins
+since item-6 lazy `token_embd` dequant. The remaining *serial* tokenizer items are now
+optional rather than a next lever: with tokenizer construction off the serial path
+entirely, the arena/duplicate-vocab-copy reduction (item #2) and cheaper merge key (#3)
+only pay off if the tokenizer would otherwise *exceed* the GPU-load overlap window, which
+the measurement says it doesn't. The AOT instrumentation question is answered and the
+cuBLAS lever is now banked: `.cu` module loads are ~3ms and the "~83ms" was cuBLAS handle
+init (~81ms), which is now overlapped. `model_load_ms` is down to ~237ms, dominated by
+the memory/GPU-bound per-tensor weight loop (~124ms) and lazy `token_embd` raw-byte copy
+(~102ms) — no remaining *host setup* cost above those. **Next cold-start work should be
+re-ranked against the new ~237ms floor**: the obvious remaining candidates are different
+in kind (e.g. item 1's f16 weight residency, which halves weight bytes but carries a
+numerics-methodology decision), not more load-path threading. Only an interleaved-A/B
 measurement will say whether anything left is worth it.
 
 ## Known debt / limitations

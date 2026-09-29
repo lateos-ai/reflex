@@ -3067,3 +3067,48 @@ the next candidate -- but overlapping or avoiding cuBLAS is a real design decisi
 numerics/verification question, flagged as a new item rather than a follow-on patch. See
 DECISIONS.md's new entry and STATUS.md's updated "Planned next work" section. No code
 changed: the instrumentation was throwaway and the working tree was reverted.
+
+### cuBLAS-init overlap (the ~81ms the AOT label was actually measuring), 2026-09-28
+
+The follow-up the AOT-diagnostic entry above pointed at: overlap `CudaBlas::new` +
+`cublasSetMathMode` (~80.9ms, the largest remaining host/driver setup cost) on the
+load-time worker thread. Both `Tokenizer` and `CudaBlas` are `Send` (cudarc 0.11.9
+declares `unsafe impl Send for CudaBlas`), and `CudaBlas::new` calls
+`device.bind_to_thread()` itself, so no extra context plumbing was needed. To keep the
+Non-goals "one extra thread" guarantee, the tokenizer and cuBLAS handle are built
+sequentially on the *same* scoped thread (new shared helper `load_background_init`),
+joined (returning `(Tokenizer, CudaBlas)`) before the `Model` is returned. The in-body
+`CudaBlas::new`/`cublasSetMathMode` blocks in all three `load_*` bodies were removed.
+
+**Verification -- strict change-only A/B**, same recipe as the entries above: `before` =
+committed HEAD (`99cb544`), `after` = HEAD with *only* `src/model.rs` overwritten by the
+working copy (`diff -rq` on the instance shows exactly that one file differs).
+`g4dn.xlarge`/T4, pinned `sm_75` cubin, `REFLEX_CUDA_ARCH=sm_75 cargo build --release
+--features download,json-output` on both arms (both RC=0), interleaved before/after n=10
+`reflex system1`.
+
+**Correctness -- passes.** Golden tokens byte-identical on both arms: dense `12095`/
+`" Paris"`, hybrid `279`/`" the"`, synthetic MLA `94216`/`" NavLink"`, and the MoE
+5-token sequence `[45729,22560,23860,16773,8275]` identical across two runs on each arm.
+This also confirms the one real risk of the design -- creating the cuBLAS handle on a
+different thread than the one that later uses it -- is not a problem under cudarc's
+`bind_to_thread`.
+
+**Timing -- the full ~80ms, first try, n=10 interleaved:**
+
+| metric (p50) | before (HEAD) | after (+cuBLAS overlap) | delta |
+|---|---|---|---|
+| `model_load_ms` | 316.310 ms | 236.590 ms | **-79.7 ms (-25.2%)** |
+| `prompt_eval_ms` | 39.818 ms | 39.793 ms | flat |
+| `process_start_to_result_ms` | 536.124 ms | 456.440 ms | **-79.7 ms (-14.9%)** |
+
+Means: `model_load_ms` 315.2 -> 237.1ms, total 535.0 -> 457.0ms. `prompt_eval_ms` is
+flat, as expected for a load-path-only change.
+
+**Verdict**: land it. Correctness-neutral (golden tokens identical) and it banks the full
+cuBLAS-init cost. With the tokenizer overlap this is ~181ms of host/driver setup removed
+from the serial load path in two same-shaped changes. `model_load_ms` is now ~237ms,
+dominated by the memory/GPU-bound weight loop (~124ms) and lazy `token_embd` raw-byte
+copy (~102ms); there is no remaining measured *host setup* cost to overlap, so further
+cold-load work is a different kind of change (see STATUS.md's updated sequencing). See
+DECISIONS.md's cuBLAS-overlap entry.
