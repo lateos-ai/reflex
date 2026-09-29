@@ -1133,3 +1133,75 @@ regressions in the pre-existing MoE test suite (see HISTORY.md's matching entry
 for the full readout, including why the LoRA-adapted run collapsing to immediate
 EOS is expected given the fixture's deliberately large synthetic delta magnitudes,
 not a bug).
+
+## Tokenizer map hasher: adopt a small non-cryptographic hasher (planned, not started)
+
+**Decision**: replace `std::collections::HashMap`'s default SipHash hasher with a
+fixed, small, non-cryptographic hasher (`FxHasher`, either vendored ~50 lines or the
+tiny `rustc-hash` crate) for `Tokenizer`'s two maps (`token_to_id`,
+`merge_rank`) — and only those two maps, not a crate-wide hasher-policy change.
+
+**Why**: the item-5/item-6 phase-breakdown profiling made tokenizer construction a
+measured, named cost (~107ms of `model_load_ms`, ~26% of the 410.3ms p50 on dense
+`Qwen3-0.6B`). Its dominant compute is hashing: ~151k token strings into `token_to_id`
+and ~150k `(String,String)` merge keys into `merge_rank`, every one SipHash — the std
+default, designed for HashDoS resistance on untrusted input, typically 3–5x slower
+than a non-cryptographic hasher the same operation doesn't need. These maps never see
+untrusted input — keys come from a model file the user already chose to load, in the
+same trust boundary as the weights themselves — so HashDoS resistance buys nothing
+here. This exact reasoning already has in-repo precedent: `aot.rs`'s `fnv1a_hash`
+(FNV-1a) exists precisely because a content-hash of embedded kernel bytes needs speed
+and has no DOS surface. A hasher swap is also the lowest-risk part of this plan: no
+ownership/allocation changes, no algorithm changes, byte-exact encode output is
+unchanged because hashing affects only table insertion/lookup, never iteration order
+in these lookups (encode resolves each symbol via a direct `get`, never enumerates the
+map).
+
+**How to apply**: introduce the hasher at the two `HashMap` types in
+`src/tokenizer.rs` (`merge_rank`/`token_to_id`), keep the change scoped there, and
+note the dependency (or vendored-copy) choice in `Cargo.toml`. Do it first among the
+tokenizer items, paired with the rope-dedup AOT item as the two zero-risk changes, and
+measure with `scripts/bench_cold_start_phases_system1.sh` (n=10) plus the existing
+`tokenizer.rs` unit tests (`test_gpt2_encode_decode_round_trips_real_strings_...`,
+SentencePiece tests) unchanged as the regression gate. Revisit the `crate-policy`
+question only if some other map later shows up as hot on this path; don't grow a
+crate-wide hashing convention from a two-map fix.
+
+## Tokenizer construction on a load-time worker thread (planned, not started)
+
+**Decision**: build the `Tokenizer` on a single one-shot background thread inside
+`Model::load` (dense/MoE, hybrid, and MLA — all three `load*` sites), started right
+after `GgufFile::open` and `join()`-ed before `Model::load` returns, so its ~107ms of
+CPU hashing/allocation overlaps the GPU-bound weight-load pipeline instead of sitting
+after it on the serial path. Exactly one extra thread, spawned per load, joined before
+the caller sees the `Model`, never reused and never accepting a second unit of work.
+
+**Why**: `Tokenizer::from_gguf` needs only `file` (already mmap'd/opened by then) and
+reads pure host metadata — no dependency on the device, the loaded weights, or the
+dequant pipeline, which is what gives it runnable-in-parallel status. The
+piece-by-piece hasher/arena work above shrinks the *serial* cost; this item removes it
+from the serial path *entirely* (the weight-load pipeline is the genuinely independent
+concurrent side). The one thing that stopped this being proposed bluntly is the
+project's permanent Non-goals (no thread pool, one job at a time, strictly
+sequential). It goes ahead on the strength of in-repo precedent: `energy.rs`'s NVML
+poll thread is already a deliberate, documented non-exception (a single internal
+thread that measures but never *serves*, is torn down with the process via
+`fast_exit`, and accepts no work items). A one-shot tokenizer-build thread is the same
+shape — it exists only to make one load faster and is gone before any request runs.
+The `batch_size`-1/no-thread-pool constraints govern *concurrent request handling*,
+not whether a single load may use an internal helper thread once and join it.
+
+**How to apply**: guard the proposal by not generalizing it — a plain
+`std::thread::spawn` + a moved `file`-derived snapshot handed back via a channel (or
+an `Arc<GgufFile>`), `join()` before the `Ok(Model { .. })` at each load site, so the
+`Tokenizer` field is still fully constructed before the caller can `encode`. Because
+`Tokenizer::from_gguf` is host-only and `GgufFile`'s mmap is `Send + Sync`-safe read
+under a single writer-thread hand-off, no shared mutable state is introduced. Failure
+propagation is a `join()` + `?` on the returned `Result<String>` — a tokenizer error
+surfaces exactly as it does today, just after the join. Keep `REFLEX_SKIP_CUDA=1`
+builds unaffected (the thread is unrelated to CUDA). Same measurement bar as the
+hasher item (phase-breakdown n=10 + tokenizer unit tests), and because this is a
+timing-only change with zero numerics impact, the golden-token check is a regression
+assert, not new first-principles verification. This is the one load-path item that
+touches the threading boundary, so it lands *last* in the plan and only after this
+entry is read as agreed, not assumed.

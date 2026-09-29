@@ -701,6 +701,99 @@ general CFG/regex grammar, where the constraint state lives across streamed toke
 and which CLI/IPC surfaces (`reflex generate`, `stdio`, `uds`, the OpenAI-compatible
 sidecar) expose it.
 
+## Planned next work: tokenizer construction + AOT module load (planned 2026-09-28)
+
+Two costs the item-6 profiling surfaced (README's "Cold-start phase breakdown" calls
+them out as "only became visible as costs once the larger ones were removed") now
+have a plan. Inside `model_load_ms` p50 410.3ms (dense, T4) sit AOT kernel module
+load (~83ms) and tokenizer construction (~107ms), both CPU/driver-side and both
+serialized on the load path in `Model::load` (`src/model.rs`): kernel modules load
+first (lines 1969–2039), the weight loop runs, then `Tokenizer::from_gguf` runs last
+(line 2140). Neither has numerics risk — both are pure "how fast do we get set up"
+changes, so this is a timing-only plan, verified by the existing phase-breakdown
+harness + golden-token regression rather than new numerics methodology. **Item 1 (the
+rope dedup) is done and real-hardware-verified** (see HISTORY.md's "Rope-module dedup"
+entry) — and its measured result reframes the AOT half of this plan; that reframing is
+folded into items #2 and the sequencing note below. Two decision items are also flagged
+inline (a hasher dependency and a load-time worker thread); each needs its own
+DECISIONS.md entry and a deliberate call before the corresponding code is written.
+
+**AOT module load (~83ms)** — root cause is one `cuModuleLoad` per kernel module
+(~10–20 sequential driver round-trips; dense loads rmsnorm, rope×2, silu, gemv,
+gemv_gather, attention, attention_prefill, elementwise, dequant), each via
+`device.load_ptx` in `src/aot.rs` with real fixed per-call driver overhead. Ranked:
+
+1. ~~**Kill the duplicate rope load (free, do first).**~~ — **done, real-hardware-
+   verified 2026-09-28**. `rope.cu` turned out to define **6** kernels, loaded once per
+   kernel: 2 `cuModuleLoad`s on dense/hybrid/MoE and **6** on MLA. Collapsed to
+   `load_kernel_module` (dense/hybrid: one 2-fn load; MLA: a 2-fn + a 4-fn load, 6→2).
+   Strict rope-only A/B (before = HEAD `738ea06`, after = HEAD + rope; clean git
+   worktrees so the pre-existing uncommitted `dequantize_all` removal stays out), AWS
+   EC2 `g4dn.xlarge` T4, pinned `sm_75` cubin, interleaved n=10: golden token
+   byte-identical (`12095`/`" Paris"`), `model_load_ms` p50 429.957→428.733ms,
+   total 649.765→648.790ms — **~1ms, inside noise**. The important result is the
+   reframing, not the win: freeing one `cuModuleLoad` saves ~1ms, not the ~8ms the
+   "~83ms ÷ ~10 modules" back-of-envelope assumed, so the ~83ms AOT load is dominated
+   by first-load/context warmup or `dequant.cu` PTX parse — *not* per-call round-trips.
+2. **Coalesce all `.cu` into a single CUDA module — now deprioritized.** Originally
+   framed as "the main win" ~50-60ms; the item-#1 measurement (per-call overhead ~1ms)
+   drops it to **~15-20ms at best**, which no longer obviously justifies the
+   cross-file `__device__`/`static` collision audit + `.cu` restructure. If still
+   pursued: one `cuModuleLoad` via an umbrella `reflex_kernels.cu` that `#include`s the
+   15 sources (`build.rs` compiles one file → one PTX/cubin), `load_kernel_module`
+   resolving every function name. Works identically in PTX and cubin mode (unlike
+   `nvcc -dlink`, cubin-only); function names/order must stay stable. **The real next
+   question for this half is instrumentation, not coalescing**: add a sub-phase timer
+   around `load_dequant_kernels` (vs. the other module loads) to see where the ~83ms
+   actually goes before spending any effort merging modules.
+3. **Rejected:** parallel/threaded `cuModuleLoad` — driver-call serialization and
+   marginal upside vs. complexity; #2 subsumes the same win.
+
+**Tokenizer construction (~107ms)** — `Tokenizer::from_gguf` (`src/tokenizer.rs:79`)
+on Qwen3-0.6B (vocab 151,936; merges ~150k) clones 151k `String`s into `tokens`,
+clones them *again* into `token_to_id` (SipHash each), and builds `merge_rank` with
+~300k allocations (two `String`s per `(String,String)` key, SipHash each). SipHash is
+the dominant compute; the double vocab clone is the dominant alloc. Ranked:
+
+1. **Swap SipHash → a fast hasher (biggest per-line win, tiny risk).** Replace the
+   two maps' hasher with `FxHasher` (vend ~50 lines from `rustc-hash`, or add the
+   `rustc-hash` dep). Typical 3–5x on `HashMap<String>`. **Decision item:** a new
+   dependency; DOS-resistance is irrelevant (these maps never face untrusted input —
+   same reasoning `aot.rs`'s existing `fnv1a_hash` already relies on).
+2. **Remove the duplicate vocab copy.** `token_to_id` is the inverse of `tokens`,
+   stored as a second full clone. Intern tokens once (single contiguous arena;
+   `token_to_id` keyed by `&str`/index into it) so only one copy exists. More
+   invasive; pair with #1 for the combined win.
+3. **Cheaper `merge_rank` key** — either a single `String` key (`left + " " + right`,
+   one alloc vs. two) or resolve to token-id pairs in a second pass
+   (`HashMap<(u32,u32),usize>`, zero string allocs). The id-keyed variant changes
+   merge-lookup code and needs care; the single-string key is trivial. Rejected:
+   deferring `merge_rank` to first `encode` — `encode` always runs, so no net save.
+4. **Overlap with weight load (largest E2E win, but a threading decision).**
+   `Tokenizer::from_gguf` only needs `file` (already mmap'd), not the device or
+   weights. Build it on a single background thread started right after GGUF open,
+   concurrent with kernel-load + weight-load, `join()` before `Model::load` returns —
+   ~107ms off the serial path entirely. **Decision item:** a real worker thread, so it
+   must be squared with the Non-goals. Precedent exists — `energy.rs`'s background
+   poll thread is justified as a non-exception (single internal thread, discarded via
+   `fast_exit`, never accepts a request); a one-shot, joined-at-load tokenizer thread
+   is the same shape. Record explicitly, don't assume.
+
+**Sequencing (revised after the item-#1 measurement)**: the AOT half of this plan has
+already paid for itself with the finding that per-call `cuModuleLoad`
+overhead is ~1ms, not ~8ms — so the module-coalescing idea (old item #2) is
+deprioritized, and the tokenizer is now the dominant remaining lever. Next: the fast
+hasher (zero-risk, biggest tokenizer win), then the tokenizer arena/merge-key reduction
+(host-only, gated by existing `tokenizer.rs` unit tests + byte-exact encode), then the
+tokenizer-thread overlap last, pending its DECISIONS.md call, all measured interleaved
+A/B (n=10) on a real T4 exactly like item #1 was. Only *then*, if load time still
+matters, add a sub-phase timer around `load_dequant_kernels` to find where the ~83ms AOT
+load actually goes before reconsidering single-module coalescing. Realistic serial
+reduction, revised down from the original ~160-190ms: the tokenizer is worth up to
+~60-80ms serial (hasher+arena) or ~107ms via overlap, the AOT half now only ~1-20ms —
+call it ~60-110ms off `model_load_ms`, toward ~520-560ms total on the same T4 setup,
+and only the interleaved-A/B measurement will say.
+
 ## Known debt / limitations
 
 - ~~**`src/ffi.rs`'s `extern "C"` functions dereference raw pointers without being

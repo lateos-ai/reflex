@@ -2808,3 +2808,113 @@ confirm forward-pass correctness") applies here too: treat `reflex doctor`'s che
 launch` actually launches a kernel, NVML's counter-vs-polled-fallback branch both work
 as designed, and the numbers `--json` emits are sane. Next real-hardware session should
 close this gap before any further claim is made about it in README.md or a benchmark.
+
+### Rope-module dedup (AOT load item #1), real-hardware-verified, 2026-09-28
+
+The first item of the "tokenizer + AOT module load" plan (see STATUS.md's matching
+"Planned next work" section) was implemented and measured on a real AWS EC2
+`g4dn.xlarge` (Tesla T4, `sm_75`, pinned cubin). The change collapses the per-kernel
+`aot::load_kernel` calls for `rope.cu` into `aot::load_kernel_module` calls: `rope.cu`
+defines **6** kernels (`rope_kernel`/`rope_batch_kernel`/`rope_norm_kernel`/
+`rope_norm_yarn_kernel`/`rope_norm_batch_kernel`/`rope_norm_yarn_batch_kernel`), and the
+old code loaded it once per kernel -- 2 `cuModuleLoad`s on the dense/hybrid paths, **6**
+on the MLA path (one per `rope_norm*` kernel, each their own `load_kernel`). Now the
+dense/hybrid/MoE paths load it once (2 fns), and MLA loads it twice (a 2-fn module plus
+a 4-fn `rope_norm` module -- still 6→2). Function names and destructure order match
+`rope.cu`'s `extern "C" __global__` declarations exactly.
+
+**Verification scope, decided up front**: a *strict rope-only* A/B -- `before` = committed
+HEAD (`738ea06`), `after` = HEAD + the rope change *only* (the working tree also carried a
+separate, pre-existing uncommitted `dequantize_all`-removal, deliberately excluded by
+building both arms from clean `git worktree`s at HEAD so the only delta is the rope
+dedup). Built both with `REFLEX_CUDA_ARCH=sm_75 --release --features download,json-output`,
+downloaded the real `unsloth/Qwen3-0.6B-GGUF:Qwen3-0.6B-Q4_K_M.gguf` once, and ran
+interleaved (before/after/before/after, n=10 each) `reflex system1` plus a golden-token
+`reflex generate` on both arms.
+
+**Correctness -- passes.** Golden token byte-identical on both arms:
+`"The capital of France is"` -> `token_id=12095`, `" Paris"`. No `function not found`
+error, confirming every `rope*` function resolves correctly from the merged module load.
+
+**Timing -- a real but below-estimate win, interleaved n=10 on one instance:**
+
+| metric (p50) | before (HEAD) | after (+rope) | delta |
+|---|---|---|---|
+| `model_load_ms` | 429.957 ms | 428.733 ms | -1.2 ms |
+| `process_start_to_result_ms` | 649.765 ms | 648.790 ms | -1.0 ms |
+
+Both inside run-to-run noise (p95 spread ~7 ms per arm). Honest note on the absolute
+numbers: this session's ~430/649 ms is a few percent above the README's 410.3/627.3 ms --
+ordinary session-to-session variance on a fresh rented instance (already documented as
+exceeding intra-session variance), and irrelevant to a within-session interleaved A/B.
+
+**The finding that reframes the rest of the plan**: the "tokenizer + AOT module load"
+plan's back-of-envelope estimate assumed the ~83 ms AOT module load was `N x per-call`
+driver overhead (~8 ms per `cuModuleLoad` over ~17 modules), so single-module coalescing
+(item #2) would recover ~50-60 ms. This measurement contradicts that: **freeing one
+`cuModuleLoad` on dense saves ~1 ms, not ~8 ms**, so the per-call driver overhead is ~1 ms
+and the ~83 ms is dominated by *something else* -- first-module/context warmup, or parsing
+the large `dequant.cu` PTX -- not the per-call round-trips item #2 targets. Item #2's
+expected payoff therefore falls to **~15-20 ms, not ~50-60 ms**, and may not justify its
+collision-audit + `.cu`-restructure risk. The rope dedup's remaining real win is on MLA
+alone (4 freed loads ~ ~4 ms), not re-measured here (no `deepseek2` fixture shipped to the
+instance).
+
+**Verdict**: ship the dedup for correctness/cleanliness (zero numerics drift, strictly
+fewer driver calls), but treat item #1 as a no-op perf-wise on dense, and deprioritize
+item #2 given the measured ~1 ms/call overhead. The leftover instrumentation question --
+where the ~83 ms actually goes (first-load warmup vs. `dequant.cu` PTX parse) -- is the
+real next question for the AOT-load half of that plan, and it needs a sub-phase timer
+around `load_dequant_kernels` rather than more module coalescing.
+
+### Tied `token_embd`/`lm_head` dequant moved on-device: the item-6 regression closed, 2026-09-28
+
+This is the second, *pre-existing* uncommitted change that had been sitting stacked in the
+same `src/model.rs` working copy as the rope dedup above. It was verified separately (its
+own A/B, its own commit) rather than left mixed in, exactly as the rope dedup was.
+
+**What it does**: replaces `LazyTokenEmbedding::dequantize_all` -- a single-threaded host
+loop calling `dequant::dequantize` over the *entire* 151,936 x 1024 `token_embd` table --
+with the existing on-device `dequantize_tensor_to_device` path (the same one every other
+weight tensor uses). `Model` keeps its `dequant_kernels`/`dequant_pipeline` alive past load
+so `lm_head_resident` can reuse them lazily. This touches the three "tied" call sites: the
+dense/MoE `LmHead::TiedLazy` full-vocab upload in `lm_head_resident` (first `generate`/
+`check` call), and `load_hybrid`/`load_mla`'s eager tied-embedding branch.
+
+**Why it matters**: item 6 (`Lazy token_embd` dequant) made dense/MoE's embedding copy
+lazy, but left this host-side full-vocab dequant as the fallback for the tied `lm_head`
+path. The measured consequence was that `generate` on a *tied* model (no separate
+`output.weight`, e.g. `Qwen3-0.6B`) did not get item 6's win -- the ~548 ms host dequant
+was merely *relocated* from `model_load_ms` into `prompt_eval_ms`, plus a ~102 ms added
+copy tax, a documented net **+110 ms regression** on that path. This change removes the
+host loop entirely, so that cost is gone instead of moved.
+
+**Verification -- strict dequant-only A/B**, same recipe as the rope entry above: `before`
+= HEAD (`738ea06`), `after` = HEAD + *only* the dequant change (the rope dedup deliberately
+excluded via a clean `git worktree` + `git apply` of a hunk-filtered patch, so the sole
+delta is this change), `g4dn.xlarge`/T4, pinned `sm_75` cubin, interleaved n=10, `generate`
+on the tied `Qwen3-0.6B-Q4_K_M`.
+
+**Correctness -- passes.** Golden token byte-identical on both arms:
+`"The capital of France is"` -> `token_id=12095`, `" Paris"`.
+
+**Timing -- a large, clear win on the tied-`generate` path, n=10 interleaved:**
+
+| metric (p50) | before (HEAD) | after (on-device) | delta |
+|---|---|---|---|
+| `model_load_ms` | 417.497 ms | 424.381 ms | +6.9 ms (within noise) |
+| `prompt_eval_ms` | 714.284 ms | 287.910 ms | **-426.4 ms** |
+| `process_start_to_first_token_ms` | 1313.509 ms | 894.043 ms | **-419.5 ms (-32%)** |
+
+The ~426 ms saved in `prompt_eval_ms` is the single-threaded host dequant loop being
+replaced by the parallel on-device kernel; `model_load_ms` is unchanged (the change is
+lazy for dense, so it never touched load). Net: `generate` on a tied model goes from
+~1314 ms to ~894 ms -- **the item-6 +110 ms regression is not just closed but turned into
+a ~420 ms net win vs. even the pre-item-6 baseline** (item 5 + item 6's own numbers had
+that path at ~1206-1316 ms). The same mechanism speeds `load_hybrid`/`load_mla`'s eager
+tied case at load time, though that branch wasn't separately re-timed here (no hybrid/MLA
+fixture shipped to the instance; the code path is byte-for-byte the same
+`dequantize_tensor_to_device` call).
+
+**Verdict**: land it. Correctness-neutral (golden token identical), and it converts the
+documented item-6 regression on the tied-model `generate`/`check` path into a large win.
