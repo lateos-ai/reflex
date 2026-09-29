@@ -25,8 +25,64 @@
 
 use crate::gguf::{GgufFile, GgufValue};
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 const WORD_BOUNDARY: char = '\u{2581}'; // '▁', SentencePiece's space marker
+
+/// A small, non-cryptographic hasher (the classic Firefox/rustc `FxHash`
+/// algorithm) used only for [`Tokenizer`]'s two build-time bulk maps
+/// (`token_to_id`, `merge_rank`). `std`'s default SipHash is designed for
+/// HashDoS resistance on untrusted input, which these maps never see -- keys
+/// come from a GGUF file the user already chose to load, in the same trust
+/// boundary as the weights themselves. That is the same "speed, no DOS
+/// surface" reasoning `aot.rs`'s `fnv1a_hash` already relies on. Equality is
+/// still checked on every lookup, so the hash only needs to be consistent,
+/// not strong (and encode only ever does direct `get`s, never iterates, so
+/// byte-exact output is unaffected).
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    const SEED: u64 = 0x517cc1b727220a95;
+    const ROTATE: u32 = 5;
+
+    #[inline]
+    fn add_to_hash(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(Self::ROTATE) ^ word).wrapping_mul(Self::SEED);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut rest = bytes;
+        while rest.len() >= 8 {
+            self.add_to_hash(u64::from_ne_bytes(rest[..8].try_into().unwrap()));
+            rest = &rest[8..];
+        }
+        if rest.len() >= 4 {
+            self.add_to_hash(u32::from_ne_bytes(rest[..4].try_into().unwrap()) as u64);
+            rest = &rest[4..];
+        }
+        if rest.len() >= 2 {
+            self.add_to_hash(u16::from_ne_bytes(rest[..2].try_into().unwrap()) as u64);
+            rest = &rest[2..];
+        }
+        for &b in rest {
+            self.add_to_hash(b as u64);
+        }
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+type FxBuildHasher = BuildHasherDefault<FxHasher>;
+type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 
 fn byte_fallback_token(byte: u8) -> String {
     format!("<0x{byte:02X}>")
@@ -47,8 +103,8 @@ pub struct Tokenizer {
     pub eos_token_id: Option<u32>,
     pub unk_token_id: Option<u32>,
     pub pad_token_id: Option<u32>,
-    token_to_id: HashMap<String, u32>,
-    merge_rank: HashMap<(String, String), usize>,
+    token_to_id: FxHashMap<String, u32>,
+    merge_rank: FxHashMap<(String, String), usize>,
     /// Vocab entries whose `tokenizer.ggml.token_type` is `CONTROL` (3) or
     /// `USER_DEFINED` (4) -- e.g. ChatML's `<|im_start|>`/`<|im_end|>`, or
     /// `<think>`/`</think>`. Sorted longest-first so [`Self::encode`]'s
@@ -93,7 +149,8 @@ impl Tokenizer {
             None => Vec::new(),
         };
 
-        let mut merge_rank = HashMap::with_capacity(merges_raw.len());
+        let mut merge_rank =
+            FxHashMap::with_capacity_and_hasher(merges_raw.len(), FxBuildHasher::default());
         for (rank, entry) in merges_raw.iter().enumerate() {
             let mut parts = entry.split(' ');
             let left = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
@@ -105,7 +162,7 @@ impl Tokenizer {
             merge_rank.insert((left.to_string(), right.to_string()), rank);
         }
 
-        let token_to_id: HashMap<String, u32> = tokens
+        let token_to_id: FxHashMap<String, u32> = tokens
             .iter()
             .enumerate()
             .map(|(i, t)| (t.clone(), i as u32))
@@ -756,7 +813,7 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let token_to_id: HashMap<String, u32> = tokens
+        let token_to_id: FxHashMap<String, u32> = tokens
             .iter()
             .enumerate()
             .map(|(i, t)| (t.clone(), i as u32))
