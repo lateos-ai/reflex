@@ -66,20 +66,28 @@ pub fn run(args: Vec<String>) {
     if json {
         #[cfg(feature = "json-output")]
         {
-            reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::SmokeResultJson {
-                schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
-                process_start_to_first_result_ms,
-                joules: energy_measurement.as_ref().map(|m| m.joules),
-                energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
-            });
+            reflex_engine::cli_output::print_json_line(
+                &reflex_engine::cli_output::SmokeResultJson {
+                    schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
+                    process_start_to_first_result_ms,
+                    joules: energy_measurement.as_ref().map(|m| m.joules),
+                    energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
+                },
+            );
         }
         #[cfg(not(feature = "json-output"))]
         {
-            panic!("--json requires this binary to be built with `cargo build --features json-output`");
+            panic!(
+                "--json requires this binary to be built with `cargo build --features json-output`"
+            );
         }
     } else {
         let energy_suffix = match &energy_measurement {
-            Some(m) => format!(" joules={:.3} energy_method={}", m.joules, m.method.as_str()),
+            Some(m) => format!(
+                " joules={:.3} energy_method={}",
+                m.joules,
+                m.method.as_str()
+            ),
             None => String::new(),
         };
         println!("REFLEX_SMOKE_OK process_start_to_first_result_ms={process_start_to_first_result_ms:.3}{energy_suffix}");

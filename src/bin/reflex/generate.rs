@@ -81,7 +81,11 @@ use std::time::Instant;
 /// this machine) -- see `energy::EnergySampler::measure`'s doc comment.
 fn energy_suffix(measurement: Option<&energy::EnergyMeasurement>) -> String {
     match measurement {
-        Some(m) => format!(" joules={:.3} energy_method={}", m.joules, m.method.as_str()),
+        Some(m) => format!(
+            " joules={:.3} energy_method={}",
+            m.joules,
+            m.method.as_str()
+        ),
         None => String::new(),
     }
 }
@@ -183,7 +187,13 @@ fn print_lora_ok(json: bool, path: &str, tensors_applied: usize) {
     json_output_unavailable();
 }
 
-fn print_kv_export_ok(json: bool, path: &str, kind: &'static str, seq_len: usize, num_layers: usize) {
+fn print_kv_export_ok(
+    json: bool,
+    path: &str,
+    kind: &'static str,
+    seq_len: usize,
+    num_layers: usize,
+) {
     if !json {
         println!("REFLEX_GENERATE_KV_EXPORT_OK path={path:?} kind={kind} seq_len={seq_len} num_layers={num_layers}");
         return;
@@ -362,14 +372,26 @@ pub fn run(args: Vec<String>) {
                     .expect("forward_prompt_capture_kv_hybrid failed");
                 kv_io::export_hybrid_kv(export_path, &cache)
                     .expect("failed to export hybrid KV cache");
-                print_kv_export_ok(json, export_path, "hybrid", cache.seq_len, cache.layers.len());
+                print_kv_export_ok(
+                    json,
+                    export_path,
+                    "hybrid",
+                    cache.seq_len,
+                    cache.layers.len(),
+                );
                 (token_id, text)
             }
             ArchitectureKind::Dense => {
                 let ((token_id, text), cache) = model
                     .forward_prompt_capture_kv(&prompt)
                     .expect("forward_prompt_capture_kv failed");
-                print_kv_export_ok(json, export_path, "dense", cache.seq_len, cache.k_caches.len());
+                print_kv_export_ok(
+                    json,
+                    export_path,
+                    "dense",
+                    cache.seq_len,
+                    cache.k_caches.len(),
+                );
                 kv_io::export_dense_kv(export_path, &cache).expect("failed to export KV cache");
                 (token_id, text)
             }
@@ -377,7 +399,13 @@ pub fn run(args: Vec<String>) {
                 let ((token_id, text), cache) = model
                     .forward_prompt_capture_kv_mla(&prompt)
                     .expect("forward_prompt_capture_kv_mla failed");
-                print_kv_export_ok(json, export_path, "mla", cache.seq_len, cache.kv_caches.len());
+                print_kv_export_ok(
+                    json,
+                    export_path,
+                    "mla",
+                    cache.seq_len,
+                    cache.kv_caches.len(),
+                );
                 kv_io::export_mla_kv(export_path, &cache).expect("failed to export MLA KV cache");
                 (token_id, text)
             }
@@ -399,21 +427,23 @@ pub fn run(args: Vec<String>) {
         );
         if json {
             #[cfg(feature = "json-output")]
-            reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::GenerateResultJson {
-                schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
-                process_start_to_first_token_ms,
-                process_start_to_last_token_ms: None,
-                gguf_open_ms,
-                cuda_init_ms,
-                model_load_ms,
-                prompt_eval_ms,
-                num_generated: None,
-                token_id,
-                token_ids: None,
-                token_text: text,
-                joules: energy_measurement.as_ref().map(|m| m.joules),
-                energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
-            });
+            reflex_engine::cli_output::print_json_line(
+                &reflex_engine::cli_output::GenerateResultJson {
+                    schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
+                    process_start_to_first_token_ms,
+                    process_start_to_last_token_ms: None,
+                    gguf_open_ms,
+                    cuda_init_ms,
+                    model_load_ms,
+                    prompt_eval_ms,
+                    num_generated: None,
+                    token_id,
+                    token_ids: None,
+                    token_text: text,
+                    joules: energy_measurement.as_ref().map(|m| m.joules),
+                    energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
+                },
+            );
             #[cfg(not(feature = "json-output"))]
             json_output_unavailable();
         } else {
@@ -462,21 +492,23 @@ pub fn run(args: Vec<String>) {
 
     if json {
         #[cfg(feature = "json-output")]
-        reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::GenerateResultJson {
-            schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
-            process_start_to_first_token_ms: first_token_ms.unwrap_or(total_ms),
-            process_start_to_last_token_ms: Some(total_ms),
-            gguf_open_ms,
-            cuda_init_ms,
-            model_load_ms,
-            prompt_eval_ms,
-            num_generated: Some(tokens.len()),
-            token_id: tokens[0],
-            token_ids: Some(tokens.clone()),
-            token_text: text,
-            joules: energy_measurement.as_ref().map(|m| m.joules),
-            energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
-        });
+        reflex_engine::cli_output::print_json_line(
+            &reflex_engine::cli_output::GenerateResultJson {
+                schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
+                process_start_to_first_token_ms: first_token_ms.unwrap_or(total_ms),
+                process_start_to_last_token_ms: Some(total_ms),
+                gguf_open_ms,
+                cuda_init_ms,
+                model_load_ms,
+                prompt_eval_ms,
+                num_generated: Some(tokens.len()),
+                token_id: tokens[0],
+                token_ids: Some(tokens.clone()),
+                token_text: text,
+                joules: energy_measurement.as_ref().map(|m| m.joules),
+                energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
+            },
+        );
         #[cfg(not(feature = "json-output"))]
         json_output_unavailable();
     } else {

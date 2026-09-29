@@ -54,7 +54,11 @@ use std::time::Instant;
 
 fn energy_suffix(measurement: Option<&energy::EnergyMeasurement>) -> String {
     match measurement {
-        Some(m) => format!(" joules={:.3} energy_method={}", m.joules, m.method.as_str()),
+        Some(m) => format!(
+            " joules={:.3} energy_method={}",
+            m.joules,
+            m.method.as_str()
+        ),
         None => String::new(),
     }
 }
@@ -233,13 +237,15 @@ pub fn run(args: Vec<String>) {
     {
         if json {
             #[cfg(feature = "json-output")]
-            reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::System1CandidateJson {
-                idx,
-                text: result.text.clone(),
-                token_ids: result.token_ids.clone(),
-                score: result.score,
-                probability,
-            });
+            reflex_engine::cli_output::print_json_line(
+                &reflex_engine::cli_output::System1CandidateJson {
+                    idx,
+                    text: result.text.clone(),
+                    token_ids: result.token_ids.clone(),
+                    score: result.score,
+                    probability,
+                },
+            );
             #[cfg(not(feature = "json-output"))]
             json_output_unavailable();
         } else {

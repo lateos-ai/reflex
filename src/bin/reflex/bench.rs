@@ -166,11 +166,13 @@ pub fn run(args: Vec<String>) {
                 before.vram_free_bytes.saturating_sub(after.vram_free_bytes) / (1024 * 1024);
             if json {
                 #[cfg(feature = "json-output")]
-                reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::BenchVramJson {
-                    model_resident_mib,
-                    free_before_load_mib,
-                    free_after_load_mib,
-                });
+                reflex_engine::cli_output::print_json_line(
+                    &reflex_engine::cli_output::BenchVramJson {
+                        model_resident_mib,
+                        free_before_load_mib,
+                        free_after_load_mib,
+                    },
+                );
                 #[cfg(not(feature = "json-output"))]
                 json_output_unavailable();
             } else {
@@ -220,13 +222,15 @@ pub fn run(args: Vec<String>) {
             let joules_per_forward_pass = m.joules / iters as f64;
             if json {
                 #[cfg(feature = "json-output")]
-                reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::BenchEnergyJson {
-                    prompt_tokens,
-                    iters,
-                    total_joules: m.joules,
-                    joules_per_forward_pass,
-                    energy_method: m.method.as_str(),
-                });
+                reflex_engine::cli_output::print_json_line(
+                    &reflex_engine::cli_output::BenchEnergyJson {
+                        prompt_tokens,
+                        iters,
+                        total_joules: m.joules,
+                        joules_per_forward_pass,
+                        energy_method: m.method.as_str(),
+                    },
+                );
                 #[cfg(not(feature = "json-output"))]
                 json_output_unavailable();
             } else {
@@ -291,14 +295,16 @@ pub fn run(args: Vec<String>) {
             let tokens_per_sec = 1000.0 / ms_per_token;
             if json {
                 #[cfg(feature = "json-output")]
-                reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::BenchThroughputJson {
-                    prompt_tokens,
-                    decode_tokens: DECODE_STEPS,
-                    warmup,
-                    iters,
-                    tokens_per_sec,
-                    ms_per_token,
-                });
+                reflex_engine::cli_output::print_json_line(
+                    &reflex_engine::cli_output::BenchThroughputJson {
+                        prompt_tokens,
+                        decode_tokens: DECODE_STEPS,
+                        warmup,
+                        iters,
+                        tokens_per_sec,
+                        ms_per_token,
+                    },
+                );
                 #[cfg(not(feature = "json-output"))]
                 json_output_unavailable();
             } else {

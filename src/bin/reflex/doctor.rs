@@ -206,9 +206,18 @@ pub fn run(args: Vec<String>) {
         print_check(json, check);
     }
 
-    let checks_passed = checks.iter().filter(|c| matches!(c.status, Status::Pass)).count();
-    let checks_warned = checks.iter().filter(|c| matches!(c.status, Status::Warn)).count();
-    let checks_failed = checks.iter().filter(|c| matches!(c.status, Status::Fail)).count();
+    let checks_passed = checks
+        .iter()
+        .filter(|c| matches!(c.status, Status::Pass))
+        .count();
+    let checks_warned = checks
+        .iter()
+        .filter(|c| matches!(c.status, Status::Warn))
+        .count();
+    let checks_failed = checks
+        .iter()
+        .filter(|c| matches!(c.status, Status::Fail))
+        .count();
     let ok = checks_failed == 0;
 
     if json {
