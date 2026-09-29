@@ -14,6 +14,15 @@ out of the way.
 `Qwen3-0.6B-Q4_K_M`, `reflex system1`, `n=10`. Full phase breakdown
 [below](#cold-start-phase-breakdown).
 
+> **Architectural boundary — read before opening a PR.** Reflex is a **local
+> execution engine for single-tenant agent decisions**. Scaling and HTTP APIs belong
+> in the host orchestrator. This rules out, permanently, not just now: internal
+> request queues/schedulers, continuous batching or PagedAttention-style dynamic KV
+> allocation, multi-tenant LoRA routers, and any in-core HTTP/gRPC server. HTTP, if
+> ever needed, is a *separate* sidecar binary ([`sidecar/openai-adapter`](sidecar/openai-adapter/README.md))
+> over local IPC — never a socket inside this engine. See [Non-goals](#non-goals) for
+> the full list and the rationale.
+
 ### Why serverless is the fit
 
 On a serverless GPU platform (Runpod, and others with the same shape) you are billed
@@ -188,16 +197,34 @@ a statement of intent rather than a claim.
 
 All comparisons are cold-start (process launch to first token/result), same
 ThunderCompute A6000, `n=3`, external wall-clock (`/usr/bin/time -v` — process launch
-to exit, not just Reflex's own internal timer), except the two Jev *warm* rows below,
-which use a different, explicitly-disclosed methodology. Full methodology, disclosed
-caveats, and per-run numbers for every comparison below are in `DECISIONS.md` and
-`HISTORY.md`.
+to exit, not just Reflex's own internal timer), except the TypeSafe Jev *warm* rows
+below, which use a different, explicitly-disclosed methodology. Full methodology,
+disclosed caveats, and per-run numbers for every comparison below are in
+`DECISIONS.md` and `HISTORY.md`.
+
+### Cold-start: local process launch vs. `llama-cli` / `llama-server` / vLLM
+
+These compare a *cold* local process launch (Reflex) against llama.cpp's two front-ends
+and vLLM. Note the AOT truth before reading the "avoids runtime JIT" claim into every
+row: `llama-cli` and `llama-server` are, like Reflex, compiled ahead-of-time by `nvcc` at
+*build* time — neither pays a runtime CUDA JIT tax, so the llama.cpp rows below measure
+*other* cold-start overheads (teardown, GPU discovery), and only the vLLM row actually
+exercises Reflex's no-runtime-JIT bet.
+
+| vs. (cold process launch) | Result | Caveat |
+|---|---|---|
+| **llama.cpp `llama-cli`** | **~1.3–1.4x faster** (4.71–5.05s vs. 6.45–6.56s) | Both AOT-compiled — the win is Reflex's one-line `fast_exit` teardown fix, not JIT; doesn't exercise the JIT-tax claim |
+| **Ollama (bundled `llama-server`)** | Directly competitive when it doesn't stall (~6–7s), but its bundled `llama-server` intermittently hits an internal GPU-discovery-watchdog timeout (~55–62s) | Wraps llama.cpp's AOT runtime — the stall is a GPU-probe/virtualization hang, not JIT; tests packaging/daemon overhead, not the AOT-vs-JIT bet |
+| **vLLM** | **~24–52x faster** (4.71–5.05s vs. 121–244s, depending on `torch.compile` cache state) | **The actual AOT-vs-JIT foil** — vLLM's CUDA graph capture + `torch.compile` warmup at cold start. Installed vLLM has no GGUF support; ran against an HF safetensors checkpoint instead, disclosed |
+
+### Warm-API: Reflex (warm compute) vs. TypeSafe Jev (always-warm managed API)
+
+These compare Reflex's warm-compute side against Jev, an always-warm managed decision API
+— the structural opposite of a cold local process. Different, explicitly-disclosed
+methodology (see `HISTORY.md`).
 
 | vs. | Result | Caveat |
 |---|---|---|
-| **llama.cpp** | **~1.3–1.4x faster** (4.71–5.05s vs. 6.45–6.56s) | Both AOT-compiled — doesn't exercise the JIT-tax claim below |
-| **vLLM** | **~24–52x faster** (4.71–5.05s vs. 121–244s, depending on `torch.compile` cache state) | Installed vLLM has no GGUF support; ran against an HF safetensors checkpoint instead, disclosed |
-| **Ollama** | Directly competitive when it doesn't stall (~6–7s), but its bundled `llama-server` intermittently hits an internal GPU-discovery-watchdog timeout (~55–62s) | Wraps llama.cpp's own runtime — tests packaging/daemon overhead, not the AOT-vs-JIT bet |
 | **TypeSafe Jev**, cold-start-to-decision | Reflex loses, **~33–62x slower** (18.96s vs. Jev's independently measured 307.8–569.6ms) | Different deployment model: Jev is an always-warm managed API; this measures a genuine cold local process launch. Jev's side is now a real measurement (via OpenRouter), not a citation — see HISTORY.md |
 | **TypeSafe Jev**, warm compute-only | **Competitive, within ~1.3–2x** (19.4ms vs. Jev's cited 10–15ms) | Jev's *compute-only* figure is self-reported/published — structurally unmeasurable from outside their infra, still a citation |
 | **TypeSafe Jev**, warm, both over the network (independently measured) | Reflex 118.8–224.9ms (network floor to a live sidecar + 20.9ms compute) vs. Jev 120.6–190ms (measured round-trip) — **roughly 10% apart at p50, Jev's max is actually better** | The fairer comparison: both sides now carry real network transit. Reflex's number is a construction (measured floor + measured compute, not one live decision call); Jev's is a direct measurement. See HISTORY.md's "Making the Jev comparison genuinely apples-to-apples" entry |
