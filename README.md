@@ -303,7 +303,13 @@ measurement is available), with the same fields in the `--json` form. The existi
 `REFLEX_GENERATE_OK`/`REFLEX_SYSTEM1_OK` lines and their fields are unchanged. The
 per-phase `energy_joules` is the delta between consecutive cumulative readings, so its
 precision follows the mode caveat above (coarse in `total_energy_counter` mode for very
-short phases; continuous in `polled_power` mode).
+short phases; continuous in `polled_power` mode). The four phases span process-start
+*through the first token*, so they need not sum to the aggregate `joules` — for
+`generate --max-tokens N>1` the aggregate also covers post-first-token decode, and in
+`total_energy_counter` mode counter quantization can make the sum differ from the
+aggregate even for `system1` (both observed on a real T4: sub-50ms phases read `0.000 J`,
+and a phase sum matched the aggregate in some runs but was one counter-tick short in
+others).
 
 Current numbers, real `Tesla T4` (dedicated AWS EC2 `g4dn.xlarge`),
 `Qwen3-0.6B-Q4_K_M.gguf`, `reflex system1`, `n=10`:

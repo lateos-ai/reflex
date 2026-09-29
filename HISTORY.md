@@ -3112,3 +3112,49 @@ dominated by the memory/GPU-bound weight loop (~124ms) and lazy `token_embd` raw
 copy (~102ms); there is no remaining measured *host setup* cost to overlap, so further
 cold-load work is a different kind of change (see STATUS.md's updated sequencing). See
 DECISIONS.md's cuBLAS-overlap entry.
+
+### Per-phase energy (joules) lines in `generate`/`system1` (real-hardware-verified 2026-09-29)
+
+Item 1 of the energy/observability plan ("Energy-to-First-Result"). `generate` and
+`system1` now emit a `REFLEX_PHASE_OK phase=<name> duration_ms=<ms>
+energy_joules=<j> energy_method=<m>` line per named cold-start phase (`gguf_open`,
+`cuda_init`, `model_load`, `prompt_eval`), printed *before* the existing aggregate
+`REFLEX_GENERATE_OK`/`REFLEX_SYSTEM1_OK` line, plus a matching `PhaseTimingJson` object
+per phase in `--json`. Purely additive: the aggregate lines' fields are unchanged. The
+per-phase figure is the *delta* between consecutive cumulative `EnergySampler::measure()`
+readings, so it inherits NVML's granularity -- continuous in `polled_power` mode, coarse
+in `total_energy_counter` mode.
+
+**Implementation**: `src/cli_output.rs` gains `PhaseTimingJson`; `generate.rs`/
+`system1.rs` gain `phase_energy_delta`/`print_phase_ok`/`print_phase_report` helpers and
+capture a cumulative `measure()` at each existing phase checkpoint (in `generate`'s
+normal path the `prompt_eval` boundary is captured at the first-token callback so it
+aligns with `prompt_eval_ms`). `src/energy.rs`'s doc comment records the
+delta-from-cumulative pattern and the granularity caveat.
+
+**Verification -- real hardware, 2026-09-29** (`g4dn.xlarge`/Tesla T4, driver
+595.91.07 / CUDA 13.2, `REFLEX_CUDA_ARCH=sm_75 cargo build --release --features
+nvml,json-output,download`, HEAD `676fcb6`, driven over SSM with source/GGUF via the
+`reflex-gpu-verify-1790613486` S3 bucket):
+
+- `reflex doctor`: 4/4 checks pass, `nvml_energy ... detail="method=total_energy_counter"`.
+- `reflex smoke`: `REFLEX_SMOKE_OK process_start_to_first_result_ms=180.213 joules=7.085`.
+- `reflex system1` on dense `Qwen3-0.6B-Q4_K_M`, one run: `gguf_open 37.290ms/0.000J`,
+  `cuda_init 147.072ms/3.412J`, `model_load 120.512ms/6.774J`, `prompt_eval
+  21.603ms/0.000J`, aggregate `joules=10.186` -- the four phases sum exactly to the
+  aggregate.
+- `--json`: four `{"phase":...}` objects emitted before the aggregate object, whose
+  field set is unchanged.
+- `reflex generate` on the same dense model still produced the golden `token_id=12095`/
+  `" Paris"` -- i.e. no forward-pass regression from this output-layer change.
+- **The counter-granularity caveat is real, and confirmed on hardware**: sub-50ms phases
+  read `0.000 J`, and one `generate` run's phase sum was one counter-tick short of the
+  aggregate (29.577 vs 36.555) while another matched exactly (36.313 = 36.313) -- an
+  artifact of `nvmlDeviceGetTotalEnergyConsumption`'s coarse update, not the delta
+  arithmetic. The README's energy paragraph was corrected to match reality (its old
+  "no NVML/`nvidia-smi` power sampling anywhere in this repo" claim predated
+  `src/energy.rs` and was simply false).
+
+Not yet done: the same per-phase treatment for `smoke`/`bench`/`doctor` (they already
+emit a total `joules`), and no energy figure is quoted in the benchmark tables until the
+`polled_power` path is exercised -- the T4 always took the coarse counter branch.
