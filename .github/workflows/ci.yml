@@ -31,8 +31,12 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+      # `--features ipc` on build/clippy/test: src/ipc.rs (the `reflex stdio`/`uds`
+      # JSON-line protocol the sidecar, Runpod images and AWS guides all speak) is
+      # compiled only under this feature, so without it its unit tests never run.
+      # `ipc` only adds serde/serde_json -- no OpenSSL or Python host deps.
       - name: Build (nvcc skipped, no GPU on hosted runners)
-        run: cargo build --locked --all-targets
+        run: cargo build --locked --all-targets --features ipc
 
       - name: Feature-matrix build (each optional feature in isolation, nvcc skipped)
         # `python` and `--all-features` are deliberately excluded: the `python`
@@ -47,10 +51,20 @@ jobs:
           done
 
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets --features ipc -- -D warnings
+
+      # Lints the `download` feature (not just type-checks it, as the feature
+      # matrix above does). Ubuntu-only because it needs libssl-dev/pkg-config;
+      # `python` stays out (needs maturin, and currently doesn't compile).
+      - name: Clippy (ipc + download, Ubuntu only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+          cargo clippy --locked --all-targets --features ipc,download -- -D warnings
 
       - name: Test (GPU-hardware tests are #[ignore]d and skipped here)
-        run: cargo test --locked
+        run: cargo test --locked --features ipc
 
   # sidecar/openai-adapter is a deliberately separate Cargo project (own
   # Cargo.toml/Cargo.lock, not a workspace member, no dependency on reflex-engine --
