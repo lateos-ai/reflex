@@ -129,16 +129,18 @@ Also fixed from this same first attempt: `hub.json`'s `category` field was set t
 
 ## Status
 
-**Registered in Runpod's Hub, not yet publicly listed** (checked 2026-09-30 via
-`runpodctl`). `runpodctl hub get lateos-ai/reflex` resolves the listing (id
-`cmuj7rnqr000007jwfsbb4ipc`, `listedRelease` `v0.2.1-runpod-hub`), but the repo appears in
-neither `runpodctl hub list` nor `runpodctl hub search reflex`, and
-`https://www.runpod.io/hub/lateos-ai/reflex` 404s. That is the submitted/registered state
-before Runpod's manual review makes it appear in the catalog.
+**Registered in Runpod's Hub, not yet publicly listed** (re-checked 2026-09-30 via
+`runpodctl`, after re-submitting). `runpodctl hub get lateos-ai/reflex` resolves the
+listing (id `cmuj7rnqr000007jwfsbb4ipc`), and its `listedRelease` is now
+**`v0.2.2-runpod-hub`** with the real hosted `iconUrl` below — so the Hub pipeline did pick
+up the icon fix (release `updatedAt` 2026-09-30 03:21Z, build image
+`registry.runpod.net/lateos-ai-reflex-master-runpod-dockerfile:16370973d`). It still appears
+in neither `runpodctl hub list --limit 100` nor `runpodctl hub search reflex`/`lateos`, and
+`https://www.runpod.io/hub/lateos-ai/reflex` 404s: the listing is registered and
+release-current, pending Runpod's **manual review/approval** before it shows in the public
+catalog.
 
-The portable-PTX fix is released as `v0.2.1-runpod-hub`. `iconUrl` in `hub.json` no longer
-points at a placeholder — it references a real hosted asset (`.runpod/icon.jpg` on
-`master`), and `v0.2.2-runpod-hub` is the release that triggers the Hub's rebuild with the
-fixed icon. Remaining step is Runpod's review/approval; the GPU-selection fields in
-`hub.json`/`tests.json` are kept as advisory intent only (real evidence above shows the Hub
-test scheduler does not honor them).
+`iconUrl` in `hub.json` points at a real hosted asset (`.runpod/icon.jpg` on `master`), not
+the old `TODO:` placeholder. The GPU-selection fields in `hub.json`/`tests.json` are kept as
+advisory intent only (real evidence above shows the Hub test scheduler does not honor them).
+
