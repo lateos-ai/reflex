@@ -528,11 +528,36 @@ generation. `reflex doctor` reports the build's `kernel_format` and, for a fatbi
 whether the detected GPU gets a native (zero-JIT) image or falls back to the embedded
 PTX.
 
-**Measured on a real T4 for this project's dense kernel set: the whole module load is
-~3ms either way** (portable PTX ~3.5ms vs. pinned cubin ~3.1ms), so the driver-side JIT
-tax is negligible for these kernels. The pinned-cubin/fatbin builds are still preferred
-for true zero-JIT and a simpler load path, but the load-phase difference is
-sub-millisecond.
+**Portable PTX is only cheap when the driver's JIT cache is warm.** Measured on a real
+T4 (driver 595.91.07, CUDA 13.2, `Qwen3-0.6B-Q4_K_M`, `reflex system1`, p50 of 10
+interleaved runs, 2026-09-30):
+
+| build | kernel files | `reflex` binary | `model_load_ms` p50 | total p50 |
+|---|---|---|---|---|
+| portable PTX, **no** JIT cache | 0.50 MB | 3.02 MB | **1061** | 1272 |
+| portable PTX, warm JIT cache | 0.50 MB | 3.02 MB | 246 | — |
+| cubin `REFLEX_CUDA_ARCH=sm_75` | 0.39 MB | 2.92 MB | 250 | 473 |
+| fatbin `REFLEX_CUDA_ARCHS=sm_75,sm_80,sm_86,sm_89,sm_90` | 2.10 MB | 4.63 MB | 253 | 475 |
+
+The driver caches JIT output under `~/.nv/ComputeCache`. With that cache warm, PTX loads
+as fast as a cubin (an earlier measurement of ~3 ms module load for either mode was taken
+this way). Without it, every process pays the JIT again: about **+0.8 s per cold start**
+on this kernel set. That is the normal case for a fresh container, a serverless worker, or
+a process run with no `HOME` or with `CUDA_CACHE_DISABLE=1`. So the deploy images default
+to a pinned cubin or a fatbin, and a fatbin costs nothing measurable over a pinned cubin
+at load time (253 vs. 250 ms, within noise) for about 1.7 MB more binary.
+
+Three more things the same run established:
+
+- **A fatbin's PTX fallback only covers *newer* GPUs.** The embedded PTX targets the
+  highest listed arch, so it JITs on a GPU at least that new, but a GPU *older* than every
+  listed arch can't load the kernels at all (`REFLEX_CUDA_ARCHS=sm_80,sm_86` on a T4 fails
+  with `CUDA_ERROR_NO_BINARY_FOR_GPU`). `Model::load` and `reflex doctor` now report that
+  case in plain English up front.
+- **An unlisted GPU with the same major version still loads natively.** CUDA runs an
+  `sm_86` image on `sm_87`/`sm_89`, so `reflex doctor` reports those as native, not JIT.
+- **CUDA 13's `nvcc` can't target `sm_70` or older** (`Unsupported gpu architecture
+  'compute_70'`), so with a CUDA 13 toolkit `sm_75` (T4) is the oldest possible entry.
 
 Run `cargo run --bin reflex -- smoke` on a real GPU instance as the very first
 real-hardware step: it proves the AOT pipeline works end to end and reports actual
@@ -720,9 +745,11 @@ binary at build time — the runtime image never runs `nvcc` and never needs the
 toolkit.
 
 ```
-# Defaults to sm_86 (RTX A6000/3090-class). Pass --build-arg REFLEX_CUDA_ARCH=sm_XX
-# for a different target compute capability, or --build-arg REFLEX_CUDA_ARCH= (empty)
-# for a portable PTX build that JITs to whatever GPU the container actually runs on.
+# With no build-arg the image holds portable PTX, which a fresh container JITs on every
+# start (~0.8 s on a T4, since it has no driver JIT cache yet; see "Core technical
+# bet"). Pin the kernels instead: REFLEX_CUDA_ARCH=sm_XX for one GPU architecture, or
+# REFLEX_CUDA_ARCHS=sm_75,sm_80,sm_86,sm_89,sm_90 for one image that runs natively on
+# several generations (fatbin; it takes precedence if both are set).
 docker build --build-arg REFLEX_CUDA_ARCH=sm_86 -t reflex .
 
 # Needs nvidia-container-toolkit on the host. The default entrypoint is

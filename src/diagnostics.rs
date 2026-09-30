@@ -109,9 +109,26 @@ fn parse_arch(arch: &str) -> Result<(i32, i32), String> {
 /// CUDA driver load/launch failure.
 pub fn check_kernel_compute_capability(device: &Arc<CudaDevice>) -> Result<(), String> {
     if COMPILED_ARCH.is_empty() {
-        // Portable-PTX (everything JITs) or fatbin (embedded PTX fallback covers any
-        // unlisted arch) -- no hard mismatch is possible in either mode, so nothing
-        // to enforce here. Single-arch cubin is the only mode with no fallback.
+        if COMPILED_ARCHS.is_empty() {
+            // Portable PTX: the driver JITs it for whatever GPU is present.
+            return Ok(());
+        }
+        // Fatbin: the embedded PTX only helps GPUs at least as new as its target, so a
+        // GPU older than every listed arch can't load the kernels at all. Catch that
+        // here rather than as CUDA_ERROR_NO_BINARY_FOR_GPU from the first module load.
+        let diag = probe(device)?;
+        let (major, minor) = diag.compute_capability;
+        if let FatbinCoverage::Unsupported { oldest, ptx } =
+            fatbin_coverage(&compiled_archs()?, diag.compute_capability)
+        {
+            return Err(format!(
+                "this binary's fatbin kernels cover REFLEX_CUDA_ARCHS={COMPILED_ARCHS} (native images, the \
+                 oldest sm_{}{}) plus PTX for compute_{}{}, but the detected GPU ({}) has compute capability \
+                 {major}.{minor}, which none of them can run on -- rebuild with sm_{major}{minor} in \
+                 REFLEX_CUDA_ARCHS, or omit it for a portable PTX build.",
+                oldest.0, oldest.1, ptx.0, ptx.1, diag.name
+            ));
+        }
         return Ok(());
     }
     let (compiled_major, compiled_minor) = parse_arch(COMPILED_ARCH)?;
@@ -128,25 +145,67 @@ pub fn check_kernel_compute_capability(device: &Arc<CudaDevice>) -> Result<(), S
     Ok(())
 }
 
-/// For a fatbin (multi-arch cubin) build: reports whether the detected GPU's compute
-/// capability is covered by a native zero-JIT image among `REFLEX_CUDA_ARCHS`
-/// (`Ok(true)`), or will instead fall back to the fatbin's embedded forward-compatible
-/// PTX and be driver-JIT'd (`Ok(false)`). Only meaningful in fatbin mode -- a
-/// portable-PTX build always JITs and a single-arch cubin build is already enforced
-/// as an exact match by [`check_kernel_compute_capability`].
-pub fn fatbin_native_for_device(device: &Arc<CudaDevice>) -> Result<bool, String> {
-    let diag = probe(device)?;
-    let (major, minor) = diag.compute_capability;
-    for arch in COMPILED_ARCHS
+/// How a fatbin build's kernels load on a GPU of a given compute capability. `build.rs`
+/// embeds one plain `sm_XY` SASS image per `REFLEX_CUDA_ARCHS` entry plus PTX for the
+/// highest entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FatbinCoverage {
+    /// A SASS image loads with zero JIT: an exact match, or -- per CUDA's binary
+    /// compatibility rule -- an image with the same major version and an equal or lower
+    /// minor (an `sm_86` image runs on `sm_87`/`sm_89`). `image` is the one the driver
+    /// picks: the highest compatible.
+    Native { image: (i32, i32) },
+    /// No compatible SASS image, but the GPU is at least as new as the embedded PTX's
+    /// target, so the driver JIT-compiles that PTX at load time.
+    PtxJit { ptx: (i32, i32) },
+    /// No compatible SASS image and the GPU is older than the PTX target: the kernels
+    /// cannot load on this GPU at all.
+    Unsupported { oldest: (i32, i32), ptx: (i32, i32) },
+}
+
+/// Pure coverage decision behind [`fatbin_coverage_for_device`] and the fatbin arm of
+/// [`check_kernel_compute_capability`]. `compiled` must be non-empty (see
+/// [`compiled_archs`]).
+pub fn fatbin_coverage(compiled: &[(i32, i32)], device: (i32, i32)) -> FatbinCoverage {
+    let native = compiled
+        .iter()
+        .filter(|&&(major, minor)| major == device.0 && minor <= device.1)
+        .max();
+    if let Some(&image) = native {
+        return FatbinCoverage::Native { image };
+    }
+    let ptx = compiled.iter().max().copied().unwrap_or((0, 0));
+    if device >= ptx {
+        FatbinCoverage::PtxJit { ptx }
+    } else {
+        FatbinCoverage::Unsupported {
+            oldest: compiled.iter().min().copied().unwrap_or((0, 0)),
+            ptx,
+        }
+    }
+}
+
+/// `REFLEX_CUDA_ARCHS` parsed into `(major, minor)` pairs. Errs if it's empty, i.e. this
+/// isn't a fatbin build.
+pub fn compiled_archs() -> Result<Vec<(i32, i32)>, String> {
+    let archs = COMPILED_ARCHS
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-    {
-        if parse_arch(arch)? == (major, minor) {
-            return Ok(true);
-        }
+        .map(parse_arch)
+        .collect::<Result<Vec<_>, _>>()?;
+    if archs.is_empty() {
+        return Err("not a fatbin build: REFLEX_CUDA_ARCHS was empty at build time".to_string());
     }
-    Ok(false)
+    Ok(archs)
+}
+
+/// [`fatbin_coverage`] for the detected GPU. Only meaningful in fatbin mode -- a
+/// portable-PTX build always JITs and a single-arch cubin build is already enforced as
+/// an exact match by [`check_kernel_compute_capability`].
+pub fn fatbin_coverage_for_device(device: &Arc<CudaDevice>) -> Result<FatbinCoverage, String> {
+    let diag = probe(device)?;
+    Ok(fatbin_coverage(&compiled_archs()?, diag.compute_capability))
 }
 
 fn explain_driver_error(ordinal: usize, e: &DriverError) -> String {
@@ -178,7 +237,61 @@ fn explain_driver_error(ordinal: usize, e: &DriverError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_arch;
+    use super::{fatbin_coverage, parse_arch, FatbinCoverage};
+
+    /// The default multi-arch list the README suggests.
+    const DEFAULT_LIST: [(i32, i32); 5] = [(7, 5), (8, 0), (8, 6), (8, 9), (9, 0)];
+
+    #[test]
+    fn fatbin_exact_arch_is_native() {
+        assert_eq!(
+            fatbin_coverage(&DEFAULT_LIST, (7, 5)),
+            FatbinCoverage::Native { image: (7, 5) }
+        );
+    }
+
+    #[test]
+    fn fatbin_same_major_lower_minor_image_is_native() {
+        // sm_87 (Jetson Orin) isn't listed; the sm_86 image runs on it with no JIT.
+        assert_eq!(
+            fatbin_coverage(&DEFAULT_LIST, (8, 7)),
+            FatbinCoverage::Native { image: (8, 6) }
+        );
+        // Ada (sm_89) on a list without sm_89 still gets the sm_86 image, not PTX.
+        assert_eq!(
+            fatbin_coverage(&[(8, 0), (8, 6)], (8, 9)),
+            FatbinCoverage::Native { image: (8, 6) }
+        );
+    }
+
+    #[test]
+    fn fatbin_newer_gpu_jits_the_embedded_ptx() {
+        assert_eq!(
+            fatbin_coverage(&DEFAULT_LIST, (12, 0)),
+            FatbinCoverage::PtxJit { ptx: (9, 0) }
+        );
+    }
+
+    #[test]
+    fn fatbin_older_gpu_is_unsupported_not_ptx_fallback() {
+        // Measured on a real T4 (sm_75) with REFLEX_CUDA_ARCHS=sm_80,sm_86: the module
+        // load fails with CUDA_ERROR_NO_BINARY_FOR_GPU; compute_86 PTX can't run on 7.5.
+        assert_eq!(
+            fatbin_coverage(&[(8, 0), (8, 6)], (7, 5)),
+            FatbinCoverage::Unsupported {
+                oldest: (8, 0),
+                ptx: (8, 6)
+            }
+        );
+        // Same major but only a *higher* minor listed: SASS isn't backward compatible.
+        assert_eq!(
+            fatbin_coverage(&[(8, 6), (9, 0)], (8, 0)),
+            FatbinCoverage::Unsupported {
+                oldest: (8, 6),
+                ptx: (9, 0)
+            }
+        );
+    }
 
     #[test]
     fn parse_arch_sm_prefix() {

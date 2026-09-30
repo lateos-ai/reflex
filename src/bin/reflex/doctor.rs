@@ -137,25 +137,34 @@ pub fn run(args: Vec<String>) {
                 detail: e,
             }),
             Ok(()) => {
-                // A fatbin build embeds a PTX fallback, so there's no hard mismatch
-                // to fail on -- but the native-vs-fallback distinction is still worth
-                // surfacing (a fallback means the driver JITs, i.e. slower first load
-                // than a native zero-JIT image in the fatbin would be).
+                // In a fatbin build a GPU with no usable image already failed above
+                // (check_kernel_compute_capability). Here the kernels will load; what's
+                // worth surfacing is whether natively or through a driver JIT of the
+                // embedded PTX, which costs every cold start that lacks a warm driver
+                // JIT cache.
                 let (status, detail) = if KERNEL_FORMAT == "fatbin" {
-                    match diagnostics::fatbin_native_for_device(device) {
-                        Ok(true) => (
+                    let archs = diagnostics::COMPILED_ARCHS;
+                    match diagnostics::fatbin_coverage_for_device(device) {
+                        Ok(diagnostics::FatbinCoverage::Native { image }) => (
                             Status::Pass,
                             format!(
-                                "kernel_format={KERNEL_FORMAT} compiled_archs={} native (zero-JIT) match for detected GPU",
-                                diagnostics::COMPILED_ARCHS
+                                "kernel_format={KERNEL_FORMAT} compiled_archs={archs} native (zero-JIT) image sm_{}{} for detected GPU",
+                                image.0, image.1
                             ),
                         ),
-                        Ok(false) => (
+                        Ok(diagnostics::FatbinCoverage::PtxJit { ptx }) => (
                             Status::Warn,
                             format!(
-                                "kernel_format={KERNEL_FORMAT} compiled_archs={} does not include the detected GPU -- will fall back to the embedded PTX and be driver-JIT'd",
-                                diagnostics::COMPILED_ARCHS
+                                "kernel_format={KERNEL_FORMAT} compiled_archs={archs} has no native image for the detected GPU -- \
+                                 the driver will JIT the embedded compute_{}{} PTX at load, which adds a large one-time cost to \
+                                 every cold start without a warm driver JIT cache (~0.8 s measured on a T4); add this GPU's arch \
+                                 to REFLEX_CUDA_ARCHS to avoid it",
+                                ptx.0, ptx.1
                             ),
+                        ),
+                        Ok(diagnostics::FatbinCoverage::Unsupported { .. }) => (
+                            Status::Fail,
+                            format!("kernel_format={KERNEL_FORMAT} compiled_archs={archs} cannot run on the detected GPU"),
                         ),
                         Err(e) => (Status::Fail, e),
                     }

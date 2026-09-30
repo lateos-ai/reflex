@@ -48,15 +48,16 @@ WORKDIR /build
 COPY . .
 
 # Empty by default: unset builds the portable PTX kernels (driver JITs to whatever
-# GPU the container actually runs on -- the safer default for a distributed image,
-# since it isn't pinned to one compute capability the way a cubin build is). Set
-# --build-arg REFLEX_CUDA_ARCH=sm_86 (or your target) for the true
-# zero-runtime-JIT cubin path instead.
+# GPU the container actually runs on, so the image isn't pinned to one compute
+# capability). The cost: a fresh container has no driver JIT cache, so every cold
+# start pays the JIT again (~0.8 s measured on a T4). Set --build-arg
+# REFLEX_CUDA_ARCH=sm_86 (or your target) for the zero-runtime-JIT cubin path, or
+# REFLEX_CUDA_ARCHS below for several GPU generations.
 ARG REFLEX_CUDA_ARCH=""
 
 # Multi-arch fatbin build (comma-separated sm_XX list with an embedded PTX fallback
-# for newer GPUs) -- mutually exclusive with REFLEX_CUDA_ARCH. See build.rs and
-# README's "AOT PTX/fatbin packaging" for the three-mode tradeoff.
+# for newer GPUs) -- takes precedence over REFLEX_CUDA_ARCH. See build.rs and
+# README's "Core technical bet" for the three-mode tradeoff and measurements.
 ARG REFLEX_CUDA_ARCHS=""
 
 # Empty by default: no optional Cargo features enabled, matching this image's original
