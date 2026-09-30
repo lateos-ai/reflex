@@ -274,7 +274,7 @@ pub fn run(args: Vec<String>) {
             ArchitectureKind::Hybrid => {
                 let ((token_id, text), cache) = model
                     .forward_prompt_capture_kv_hybrid(&prompt)
-                    .expect("forward_prompt_capture_kv_hybrid failed");
+                    .unwrap_or_else(|e| crate::fail("forward_prompt_capture_kv_hybrid failed", e));
                 kv_io::export_hybrid_kv(export_path, &cache)
                     .expect("failed to export hybrid KV cache");
                 print_kv_export_ok(
@@ -289,7 +289,7 @@ pub fn run(args: Vec<String>) {
             ArchitectureKind::Dense => {
                 let ((token_id, text), cache) = model
                     .forward_prompt_capture_kv(&prompt)
-                    .expect("forward_prompt_capture_kv failed");
+                    .unwrap_or_else(|e| crate::fail("forward_prompt_capture_kv failed", e));
                 print_kv_export_ok(
                     json,
                     export_path,
@@ -303,7 +303,7 @@ pub fn run(args: Vec<String>) {
             ArchitectureKind::Mla => {
                 let ((token_id, text), cache) = model
                     .forward_prompt_capture_kv_mla(&prompt)
-                    .expect("forward_prompt_capture_kv_mla failed");
+                    .unwrap_or_else(|e| crate::fail("forward_prompt_capture_kv_mla failed", e));
                 print_kv_export_ok(
                     json,
                     export_path,
@@ -360,9 +360,9 @@ pub fn run(args: Vec<String>) {
         reflex_engine::fast_exit(0);
     }
 
-    let imported = import_kv
-        .as_ref()
-        .map(|path| kv_io::import_kv(path).expect("failed to import KV cache"));
+    let imported = import_kv.as_ref().map(|path| {
+        kv_io::import_kv(path).unwrap_or_else(|e| crate::fail("failed to import KV cache", e))
+    });
 
     let mut first_token_ms: Option<f64> = None;
     let mut first_token_energy: Option<energy::EnergyMeasurement> = None;
@@ -378,7 +378,7 @@ pub fn run(args: Vec<String>) {
             },
             |_id, _text| {},
         )
-        .expect("generate failed");
+        .unwrap_or_else(|e| crate::fail("generate failed", e));
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let energy_measurement = sampler.measure();
     let prompt_eval_ms = first_token_ms.unwrap_or(total_ms) - model_ready_ms;

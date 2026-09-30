@@ -5124,6 +5124,7 @@ impl Model {
             return Err("encode produced no tokens".to_string());
         }
 
+        crate::limits::check_positions(start_pos, ids.len(), extra_headroom)?;
         let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
         // Preallocated up front (Phase 2 round 2 sized this to exactly the
         // prompt's token count; round 2 of Phase 3 sizes it for the whole
@@ -5217,6 +5218,7 @@ impl Model {
             return Err("encode produced no tokens".to_string());
         }
         let rows = ids.len();
+        crate::limits::check_positions(start_pos, rows, extra_headroom)?;
 
         let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
         let total_len = start_pos + rows + extra_headroom;
@@ -7347,6 +7349,7 @@ impl Model {
         rows: usize,
         extra_headroom: usize,
     ) -> Result<Vec<HybridLayerState>, String> {
+        crate::limits::check_positions(start_pos, rows, extra_headroom)?;
         if let Some(cache) = imported {
             if cache.attn_num_kv_heads != h.attn_cfg.num_kv_heads
                 || cache.attn_head_dim != h.attn_cfg.head_dim
@@ -7869,6 +7872,7 @@ impl Model {
         rows: usize,
         extra_headroom: usize,
     ) -> Result<Vec<CudaSlice<f32>>, String> {
+        crate::limits::check_positions(start_pos, rows, extra_headroom)?;
         let qk_dim = m.cfg.kv_lora_rank + m.cfg.qk_rope_head_dim;
         let total_len = start_pos + rows + extra_headroom;
         let mut kv_caches: Vec<CudaSlice<f32>> = (0..m.layers.len())

@@ -581,6 +581,18 @@ Each addition counts as done only after an independent-implementation comparison
 (llama.cpp, or a host CPU reference) on real generated tokens — see `DECISIONS.md`'s
 "Cross-check new architecture work..." and "Extending architecture coverage..." entries.
 
+### Context-length limit (all architectures)
+
+A single sequence can hold at most **11,264 positions** in total: any imported KV cache
+(`--import-kv`) + the encoded prompt + `--max-tokens` (or System1's longest candidate).
+This is an engine limit, not the model's: all four attention kernels keep one `f32`
+softmax score per position in shared memory, within the default 48 KiB per-block budget
+(`(49152 − 4096) / 4`; see `src/limits.rs`). Requests over it are rejected before any GPU
+allocation with an error starting `context length exceeded:` — from `reflex generate`/
+`system1`, the IPC `error` field, the C FFI's `reflex_last_error()`, and as an HTTP `400`
+with code `context_length_exceeded` from the OpenAI sidecar. Qwen3 models advertise 32K+
+context, so long-context prompts hit this well before the model's own limit.
+
 ## Non-goals
 
 These are permanent constraints on this engine, not just current-MVP scope — the whole

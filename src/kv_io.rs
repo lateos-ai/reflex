@@ -257,6 +257,7 @@ fn open_and_check_magic(path: &str) -> Result<std::fs::File, String> {
 fn read_dense_body(f: &mut std::fs::File) -> Result<DenseKvCache, String> {
     let num_layers = read_u32(f)? as usize;
     let seq_len = read_u32(f)? as usize;
+    crate::limits::check_positions(seq_len, 0, 0)?;
     let num_kv_heads = read_u32(f)? as usize;
     let head_dim = read_u32(f)? as usize;
     let per_layer_len = seq_len * num_kv_heads * head_dim;
@@ -280,6 +281,7 @@ fn read_dense_body(f: &mut std::fs::File) -> Result<DenseKvCache, String> {
 fn read_hybrid_body(f: &mut std::fs::File) -> Result<HybridKvCache, String> {
     let num_layers = read_u32(f)? as usize;
     let seq_len = read_u32(f)? as usize;
+    crate::limits::check_positions(seq_len, 0, 0)?;
     let attn_num_kv_heads = read_u32(f)? as usize;
     let attn_head_dim = read_u32(f)? as usize;
     let gdn_conv_state_len = read_u32(f)? as usize;
@@ -327,6 +329,7 @@ fn read_hybrid_body(f: &mut std::fs::File) -> Result<HybridKvCache, String> {
 fn read_mla_body(f: &mut std::fs::File) -> Result<MlaKvCache, String> {
     let num_layers = read_u32(f)? as usize;
     let seq_len = read_u32(f)? as usize;
+    crate::limits::check_positions(seq_len, 0, 0)?;
     let qk_dim = read_u32(f)? as usize;
     let per_layer_len = seq_len * qk_dim;
 
@@ -410,6 +413,36 @@ mod tests {
         assert_eq!(reimported.k_caches, cache.k_caches);
         assert_eq!(reimported.v_caches, cache.v_caches);
         assert_eq!(via_import_kv.k_caches, cache.k_caches);
+    }
+
+    #[test]
+    fn import_rejects_cache_longer_than_attention_limit() {
+        let seq_len = crate::limits::ATTN_MAX_POSITIONS + 1;
+        let cache = DenseKvCache {
+            seq_len,
+            num_kv_heads: 1,
+            head_dim: 1,
+            k_caches: vec![vec![0.0; seq_len]],
+            v_caches: vec![vec![0.0; seq_len]],
+        };
+
+        let path = std::env::temp_dir().join(format!(
+            "reflex_kv_io_test_too_long_{}.bin",
+            std::process::id()
+        ));
+        let path_str = path.to_str().unwrap();
+
+        export_dense_kv(path_str, &cache).expect("export failed");
+        let result = import_kv(path_str);
+        std::fs::remove_file(&path).ok();
+        let Err(err) = result else {
+            panic!("oversized import must fail");
+        };
+
+        assert!(
+            err.starts_with(crate::limits::CONTEXT_LENGTH_EXCEEDED_PREFIX),
+            "{err}"
+        );
     }
 
     #[test]

@@ -136,7 +136,7 @@ pub fn run(args: Vec<String>) {
         .collect();
     let response = model
         .system1_evaluate(&prompt, &candidates, temperature)
-        .expect("system1_evaluate failed");
+        .unwrap_or_else(|e| crate::fail("system1_evaluate failed", e));
     let prompt_eval_ms = t0.elapsed().as_secs_f64() * 1000.0 - model_ready_ms;
 
     for (idx, (result, &probability)) in response

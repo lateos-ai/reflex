@@ -19,6 +19,7 @@ pub mod hf;
 #[cfg(feature = "ipc")]
 pub mod ipc;
 pub mod kv_io;
+pub mod limits;
 pub mod lora;
 pub mod model;
 pub mod moe;

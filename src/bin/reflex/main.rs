@@ -43,6 +43,15 @@ const USAGE: &str = "usage: reflex <subcommand> [args...]\n\
      \n\
      run `reflex <subcommand>` with no further arguments to see that subcommand's own usage.";
 
+/// Reports a runtime error as a single `error: <context>: <message>` line on
+/// stderr and exits with status 1 -- for engine errors a user can act on (e.g.
+/// the attention context-length limit, `reflex_engine::limits`), which
+/// `.expect()` would otherwise dump as a panic with a Debug-quoted string.
+pub(crate) fn fail(context: &str, err: String) -> ! {
+    eprintln!("error: {context}: {err}");
+    reflex_engine::fast_exit(1)
+}
+
 fn main() {
     let mut args = std::env::args();
     let _program = args.next();

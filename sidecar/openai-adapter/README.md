@@ -186,6 +186,14 @@ supports it. `temperature` omitted or `<= 0` selects greedy argmax, mirroring
     still correctly reports `"stop"`), and out of scope for this change (core
     engine decode/generate-loop behavior, not chat-template rendering) — a
     follow-up for whoever next touches `Model::generate`'s stop handling.
+- **Context is capped at 11,264 positions per request** (prompt tokens +
+  `max_tokens`) by the core engine's attention kernels, well below the 32K+ context
+  Qwen3 models advertise — see the root README's "Context-length limit" section. A
+  request over it gets `400` with an OpenAI-style body (`"type":
+  "invalid_request_error"`, `"code": "context_length_exceeded"`), in both streaming and
+  non-streaming mode: for `stream: true` the adapter waits for the engine's first event
+  before sending SSE headers, so any error raised before the first token gets a real
+  HTTP status instead of an empty `200` stream. Other engine errors stay `500`.
 - **No function/tool calling, no `logprobs`, no `n > 1`, no multimodal content
   parts.** A `messages[i].content` that isn't a plain string (e.g. an image/text
   content-parts array) is rejected with a `400`.

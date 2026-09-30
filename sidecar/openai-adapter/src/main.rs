@@ -330,14 +330,65 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelsResponse>
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    error_response_with(status, message, "reflex_adapter_error", None)
+}
+
+fn error_response_with(
+    status: StatusCode,
+    message: impl Into<String>,
+    error_type: &str,
+    code: Option<&str>,
+) -> Response {
     let body = serde_json::json!({
         "error": {
             "message": message.into(),
-            "type": "reflex_adapter_error",
-            "code": Value::Null,
+            "type": error_type,
+            "code": code,
         }
     });
     (status, Json(body)).into_response()
+}
+
+/// Stable prefix of the engine's context-length error
+/// (`reflex_engine::limits::CONTEXT_LENGTH_EXCEEDED_PREFIX` -- mirrored here, not
+/// imported, since this crate deliberately doesn't depend on `reflex-engine`).
+const CONTEXT_LENGTH_EXCEEDED_PREFIX: &str = "context length exceeded";
+
+/// Maps an engine-side error message (an IPC `final` event with `ok: false`) to
+/// the HTTP status and OpenAI-style error `type`/`code` the client should see.
+/// Requests over the engine's attention context-length limit are the client's
+/// to fix, so they get `400`/`context_length_exceeded`, as OpenAI returns;
+/// everything else stays a `500`.
+fn classify_engine_error(msg: &str) -> (StatusCode, &'static str, Option<&'static str>) {
+    if msg.starts_with(CONTEXT_LENGTH_EXCEEDED_PREFIX) {
+        (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            Some("context_length_exceeded"),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reflex_adapter_error",
+            None,
+        )
+    }
+}
+
+fn engine_error_response(msg: &str) -> Response {
+    let (status, error_type, code) = classify_engine_error(msg);
+    error_response_with(status, msg, error_type, code)
+}
+
+/// `Some(message)` if `v` is the engine's terminal `final` event reporting failure.
+fn engine_error_message(v: &Value) -> Option<&str> {
+    let is_final = v.get("event").and_then(Value::as_str) == Some("final");
+    let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    (is_final && !ok).then(|| {
+        v.get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown reflex error")
+    })
 }
 
 async fn chat_completions(
@@ -390,12 +441,20 @@ async fn chat_completions(
         }
     };
 
-    let rx = state.client.request(line).await;
+    let mut rx = state.client.request(line).await;
     let chat_id = state.next_chat_id();
     let created = now_unix();
 
     if stream {
-        let sse_stream = build_sse_stream(rx, chat_id, created, model_label, max_tokens);
+        // Wait for the engine's first event before committing to a `200` SSE
+        // response, so an error raised before any token is produced (e.g. the
+        // prompt is over the engine's context-length limit) still reaches the
+        // client as a real HTTP status instead of an empty stream.
+        let first = rx.recv().await;
+        if let Some(msg) = first.as_ref().and_then(engine_error_message) {
+            return engine_error_response(msg);
+        }
+        let sse_stream = build_sse_stream(first, rx, chat_id, created, model_label, max_tokens);
         Sse::new(sse_stream)
             .keep_alive(KeepAlive::default())
             .into_response()
@@ -417,13 +476,8 @@ async fn non_streaming_response(
         if event != "final" {
             continue; // shouldn't happen for a non-streaming IPC request, but ignore rather than choke on it
         }
-        let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
-        if !ok {
-            let msg = v
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown reflex error");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, msg);
+        if let Some(msg) = engine_error_message(&v) {
+            return engine_error_response(msg);
         }
         let text = v
             .get("text")
@@ -463,7 +517,10 @@ async fn non_streaming_response(
     )
 }
 
+/// `first` is the engine event `chat_completions` already received (to rule out
+/// an up-front error) before starting the stream; it's replayed ahead of `rx`.
 fn build_sse_stream(
+    first: Option<Value>,
     mut rx: tokio::sync::mpsc::Receiver<Value>,
     chat_id: String,
     created: u64,
@@ -485,7 +542,11 @@ fn build_sse_stream(
         yield Ok(Event::default().data(serde_json::to_string(&role_chunk).unwrap()));
 
         let mut completion_tokens = 0usize;
-        while let Some(v) = rx.recv().await {
+        let mut pending = first;
+        while let Some(v) = match pending.take() {
+            Some(v) => Some(v),
+            None => rx.recv().await,
+        } {
             let event = v.get("event").and_then(Value::as_str).unwrap_or("");
             if event == "token" {
                 completion_tokens += 1;
@@ -534,5 +595,45 @@ fn build_sse_stream(
             }
         }
         yield Ok(Event::default().data("[DONE]"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_length_error_maps_to_400_context_length_exceeded() {
+        let msg = "context length exceeded: request needs 12000 positions (imported KV 0 +                    prompt 11999 + generation headroom 1), but this engine's attention kernels                    support at most 11264 positions per sequence.";
+        assert_eq!(
+            classify_engine_error(msg),
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("context_length_exceeded")
+            )
+        );
+    }
+
+    #[test]
+    fn other_engine_errors_stay_500() {
+        assert_eq!(
+            classify_engine_error("attn launch: CUDA_ERROR_OUT_OF_MEMORY"),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "reflex_adapter_error",
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn engine_error_message_only_matches_failed_final_events() {
+        let failed = serde_json::json!({"event": "final", "ok": false, "error": "boom"});
+        let succeeded = serde_json::json!({"event": "final", "ok": true, "text": "hi"});
+        let token = serde_json::json!({"event": "token", "text": "hi"});
+        assert_eq!(engine_error_message(&failed), Some("boom"));
+        assert_eq!(engine_error_message(&succeeded), None);
+        assert_eq!(engine_error_message(&token), None);
     }
 }
