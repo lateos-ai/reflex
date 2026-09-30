@@ -5,7 +5,7 @@
 > ahead-of-time by `nvcc` at build time (`build.rs`) — never at runtime via NVRTC — so
 > there is no JIT tax on cold start. `batch_size` is always 1; no in-engine HTTP server,
 > queue, or continuous batching (see "Non-goals" in README.md). Full context: README.md,
-> CLAUDE.md, HISTORY.md.
+> docs/DEVELOPMENT.md, HISTORY.md.
 
 This file gives an agent the literal commands to run Reflex on each supported platform.
 Every command below is real and has been executed against real GPU hardware at least
@@ -37,9 +37,9 @@ cargo run --release --bin reflex -- generate <path-to-gguf> "prompt"
 
 `REFLEX_CUDA_ARCH=sm_86 cargo build --release` pins a cubin to one GPU instead of
 portable PTX. `REFLEX_SKIP_CUDA=1 cargo build` skips kernel compilation for editing on a
-machine with no CUDA toolkit (no subcommand actually runs on this build). See root
-`CLAUDE.md`'s "Build / run / test commands" for the full command reference (`system1`,
-`bench`, `check`, `stdio`/`uds` IPC modes, LoRA, KV export/import, etc.).
+machine with no CUDA toolkit (no subcommand actually runs on this build). Run `reflex` with no
+arguments for the subcommand list (`system1`, `bench`, `check`, `stdio`/`uds` IPC modes,
+etc.) and `reflex <subcommand>` for its usage; `docs/DEVELOPMENT.md` covers building and testing.
 
 ## Docker (any host with `nvidia-container-toolkit`)
 

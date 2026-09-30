@@ -1,6 +1,6 @@
 //! Owns exactly one managed `reflex stdio <gguf>` child process and serializes every
 //! HTTP-originated request into it one at a time, matching the core engine's
-//! permanent `batch_size == 1`/strictly-sequential contract (see root CLAUDE.md/
+//! permanent `batch_size == 1`/strictly-sequential contract (see root
 //! README.md's Non-goals) even though this sidecar's HTTP side happily accepts
 //! concurrent connections. A single background worker task is the only thing that
 //! ever touches the child's stdin/stdout; every request handler talks to it through

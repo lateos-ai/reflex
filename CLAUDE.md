@@ -20,6 +20,12 @@ Full narrative context, MVP milestone write-ups, and benchmark numbers live in
 overview) — read it before starting new architecture or perf work; it's kept current
 as the project's log, not just a pitch doc.
 
+`CLAUDE.md`, `HISTORY.md`, `STATUS.md` and `DECISIONS.md` are stripped from the public
+branch, so **public files (code comments, READMEs, docs, scripts) must never point at
+them**. Point at `docs/DEVELOPMENT.md` instead: the public contributor doc that mirrors
+this file's Non-goals, core technical bet, build/test, model-loading and test-fixture
+sections. When you change one of those sections here, update it there too.
+
 ## Build / run / test commands
 
 This crate requires the CUDA toolkit (`nvcc` on `PATH` or `CUDA_PATH`/`CUDA_HOME`) and

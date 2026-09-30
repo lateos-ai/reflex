@@ -179,8 +179,8 @@ fn main() {
         // its place instead -- `include_bytes!` (unlike the old design's runtime
         // `Ptx::from_file`) needs *some* file to exist at compile time, but its
         // contents are never a real kernel in this mode, so no inference binary
-        // can actually load/launch kernels here (type-check only, per CLAUDE.md's
-        // "REFLEX_SKIP_CUDA=1 cargo build" doc).
+        // can actually load/launch kernels here (type-check only, per docs/DEVELOPMENT.md's
+        // "Working without CUDA" section).
         if let Some(nvcc) = &nvcc {
             let mut cmd = Command::new(nvcc);
             cmd.arg(mode_flag).arg(&path).arg("-o").arg(&out_file);

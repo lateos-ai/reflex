@@ -4,7 +4,7 @@
 //! served at both `/healthz` and `/ping` (identical handler -- `/ping` exists because
 //! Runpod Serverless load-balancing endpoints hard-poll that exact path, confirmed
 //! against a real deployment) -- see this crate's README for usage, scope, and known
-//! limitations, and the root CLAUDE.md/README.md's Non-goals section for why this
+//! limitations, and the root README.md's Non-goals section for why this
 //! lives in its own crate/process rather than inside the core engine.
 //!
 //! Usage: `reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host
@@ -255,7 +255,7 @@ impl Opts {
 
 /// Reads `<arch>.context_length` from the GGUF's own metadata (the same
 /// arch-prefixed-key convention the core engine's `parse_model_config` uses, per the
-/// root CLAUDE.md) via the standalone `gguf_meta` reader -- best-effort: returns
+/// root docs/DEVELOPMENT.md) via the standalone `gguf_meta` reader -- best-effort: returns
 /// `None` rather than failing startup if the architecture or key is missing, since
 /// `context_length` is an informational extra for `/v1/models`, not required for the
 /// adapter to function.

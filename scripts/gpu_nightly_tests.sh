@@ -14,8 +14,8 @@
 #   HYBRID_GGUF    optional  Qwen3.5 hybrid GGUF, e.g. Qwen3.5-0.8B-Q4_K_M.gguf
 #   IQ_GGUF        optional  a GGUF containing IQ-family tensors
 #   MLA_REAL_GGUF  optional  the real DeepSeek-V2-Lite GGUF (~17 GB; see STATUS.md)
-#   test-data/*.gguf         optional synthetic fixtures (see CLAUDE.md "Known
-#                            test-fixture limitation"); tests needing them SKIP if absent
+#   test-data/*.gguf         optional synthetic fixtures (see docs/DEVELOPMENT.md "Known
+#                            test-fixture limitations"); tests needing them SKIP if absent
 #   CARGO_TEST_FLAGS         default "--release --features ipc"
 #   LOG_DIR                  default bench-results/gpu-tests-<timestamp>
 #   GITHUB_STEP_SUMMARY      if set, the table is appended there too

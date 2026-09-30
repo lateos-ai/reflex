@@ -5,7 +5,7 @@
 //! dependency (the GPU kernel is a separate, later step) -- get the math
 //! right on host first, the same sequencing every foundational kernel in
 //! this repo started with. Kept here as the oracle the GPU kernel is
-//! diffed against while debugging (see CLAUDE.md's `reference/` note);
+//! diffed against while debugging (see docs/DEVELOPMENT.md's `reference/` note);
 //! not compiled as part of this crate.
 //!
 //! Port provenance (fetched 2026-09-15, upstream `ggml-org/llama.cpp`):

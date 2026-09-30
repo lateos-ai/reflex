@@ -204,7 +204,7 @@ struct Weight {
 /// decoding the whole `[vocab_size, hidden_size]` matrix at load time.
 /// `forward_prompt`'s embedding lookup is a host-side gather that reads only
 /// a handful of rows per token in the prompt/generation loop (`batch_size`
-/// is always 1, see CLAUDE.md's Non-goals), yet the eager version decoded
+/// is always 1, see docs/DEVELOPMENT.md's Non-goals), yet the eager version decoded
 /// every row unconditionally -- ~548ms, ~63% of `model_load_ms` for
 /// Qwen3-0.6B-Q4_K_M on a T4, the single largest piece of cold-start time in
 /// the whole engine (see HISTORY.md's "Pipelined model load (item 5)" entry,
@@ -233,7 +233,7 @@ struct LazyTokenEmbedding {
     /// longer prompt, or the same token recurring across a generation loop)
     /// reuses the cached decode instead of redoing it. `RefCell`, not a
     /// `Mutex`: this project never runs more than one request at a time
-    /// (`batch_size` is a permanent constraint, see CLAUDE.md's Non-goals),
+    /// (`batch_size` is a permanent constraint, see docs/DEVELOPMENT.md's Non-goals),
     /// so there is never a concurrent borrower -- the same reasoning
     /// `LmHead::TiedLazy`'s `OnceLock::get`/`set` already relies on.
     cache: RefCell<HashMap<u32, Vec<f32>>>,
@@ -1860,7 +1860,7 @@ pub struct Model {
     /// dequant loop. `RefCell` because `lm_head_resident` takes `&self`; safe
     /// without further synchronization for the same reason `LmHead::TiedLazy`'s
     /// `OnceLock` is -- this project never runs more than one request at a
-    /// time (see CLAUDE.md's Non-goals).
+    /// time (see docs/DEVELOPMENT.md's Non-goals).
     dequant_kernels: DequantKernels,
     dequant_pipeline: RefCell<WeightLoadPipeline>,
     output_norm: Weight,
@@ -3476,7 +3476,7 @@ impl Model {
 
     /// In-place: `t` is already device-resident. `position` is a plain
     /// scalar kernel argument rather than an uploaded device array --
-    /// `batch_size` is a permanent project constraint (CLAUDE.md's
+    /// `batch_size` is a permanent project constraint (docs/DEVELOPMENT.md's
     /// Non-goals), so there is never more than one token's position to pass,
     /// and the previous per-call device allocation+upload for it was pure
     /// overhead (Phase 2 round 2).
@@ -5749,7 +5749,7 @@ impl Model {
     /// forced): `OnceLock::get`/`set` rather than the still-unstable
     /// `get_or_try_init`, safe without a race check because this project
     /// never runs more than one request at a time (`batch_size` is a
-    /// permanent constraint, see CLAUDE.md's Non-goals) -- there is never a
+    /// permanent constraint, see docs/DEVELOPMENT.md's Non-goals) -- there is never a
     /// second caller to race against.
     fn lm_head_resident(&self) -> Result<&Weight, String> {
         match &self.lm_head {
@@ -7056,7 +7056,7 @@ impl Model {
     /// per-head calls: looping `Self::gemv_per_head`/`Self::gemv_view` `rows` times
     /// would mean `rows * n_head` kernel launches for absorption alone (plus as many
     /// device-to-device copies), the same order of magnitude as the exact
-    /// per-call-overhead regression CLAUDE.md documents for Phase 2 round 1 -- e.g.
+    /// per-call-overhead regression docs/DEVELOPMENT.md's model-loading section documents -- e.g.
     /// ~14k launches per layer at a 449-row prefill with 16 heads, ~28k counting
     /// decompression too. [`Self::gemv_per_head_batch`] does both in one launch each
     /// instead. The three small `Self::mla_extract_batch`/`Self::mla_concat_qcur_batch`/
@@ -8606,7 +8606,7 @@ mod mla_batching_tests {
     /// `MlaFfn::Moe`'s grouped-GEMM path or `rope_norm_yarn_batch_kernel` -- see
     /// `prefill_mla_batched_matches_sequential_real_moe_checkpoint` below for that,
     /// which only the real `deepseek-ai/DeepSeek-V2-Lite` checkpoint can exercise (see
-    /// CLAUDE.md's "Known test-fixture limitation"). Run with `cargo test --release
+    /// docs/DEVELOPMENT.md's "Known test-fixture limitations"). Run with `cargo test --release
     /// -- --ignored prefill_mla_batched_matches_sequential`.
     #[test]
     #[ignore]
@@ -8675,8 +8675,8 @@ mod mla_batching_tests {
     /// `Model::forward_mla_moe_ffn_batched`'s grouped-GEMM routed-expert path or its
     /// batched shared-expert seeding -- both new this round, and both only reachable
     /// through a real `deepseek2` file's routed-MoE layers (no small synthetic
-    /// `deepseek2` MoE fixture exists, see CLAUDE.md's "Known test-fixture
-    /// limitation"). Same cross-check shape as the fixture-based test (byte-exact-ish
+    /// `deepseek2` MoE fixture exists, see docs/DEVELOPMENT.md's "Known test-fixture
+    /// limitations"). Same cross-check shape as the fixture-based test (byte-exact-ish
     /// hidden state plus matching greedy-argmax token), but reads its GGUF path from
     /// `REFLEX_TEST_GGUF` (the same convention `prefill_dense_batched_matches_sequential_prefill`
     /// uses) instead of the hardcoded fixture constant, so it can point at the real
@@ -8820,7 +8820,7 @@ mod system1_tests {
     /// handful of rows (including the model's own real argmax id) must
     /// agree with the corresponding entries of a full-vocab GEMV to float
     /// rounding. Real GGUF fixtures live outside this repo (`.gguf` is
-    /// gitignored, per CLAUDE.md's "Known test-fixture limitation"), so this
+    /// gitignored, per docs/DEVELOPMENT.md's "Known test-fixture limitations"), so this
     /// is `#[ignore]`d by default and reads its model path from
     /// `REFLEX_TEST_GGUF` rather than guessing a local path -- run with:
     /// `REFLEX_TEST_GGUF=<path> cargo test --release -- --ignored gemv_gather_matches_full_vocab_gemv`

@@ -7,13 +7,13 @@ fast local decision gate. See the main [README](../README.md)'s
 for the underlying command and what `score`/`probability`/`entropy` mean.
 
 These are shell scripts, not Rust code — this project is CLI-first (see
-CLAUDE.md's Non-goals), and `reflex system1`'s stdout is already a stable,
+[docs/DEVELOPMENT.md](../docs/DEVELOPMENT.md#non-goals)'s Non-goals), and `reflex system1`'s stdout is already a stable,
 parseable `KEY=value` contract (see `scripts/bench_cold_system1_vs_jev.sh` for
 another script that relies on it).
 
 **Requirements**: a release build (`cargo build --release --bin reflex` from
 the repo root) and a real GPU with a local dense/MoE Qwen3 GGUF — there is no
-CPU fallback for `system1` (see CLAUDE.md).
+CPU fallback for `system1` (see [docs/DEVELOPMENT.md](../docs/DEVELOPMENT.md#no-cpu-fallback)).
 
 | Script | Pattern |
 |---|---|

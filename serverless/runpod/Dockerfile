@@ -10,7 +10,7 @@
 # defaults to sm_86 here, not sm_75 -- Runpod's cheapest serverless tier is Ampere
 # (compute capability 8.6), not the T4 (7.5) the AWS deployment guides target. Do not
 # reuse a sm_75 image on Runpod or vice versa -- a pinned cubin build only runs on the
-# compute capability it was built for (see root CLAUDE.md's "Core technical bet").
+# compute capability it was built for (see docs/DEVELOPMENT.md's "Core technical bet").
 #
 # CRITICAL, verified against the live Runpod catalog (not assumed): the cheapest
 # serverless pool `AMPERE_16` is **mixed-architecture despite its name**. It contains

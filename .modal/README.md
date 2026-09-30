@@ -82,7 +82,7 @@ roughly two orders of magnitude shorter.
 
 - No changes to `serverless/runpod/`, `.runpod/`, `sidecar/openai-adapter/`, or any core
   engine file. This is a fourth, independent, purely additive deployment path.
-- No new engine capability, no batching, no protocol redesign -- see root `CLAUDE.md`'s
+- No new engine capability, no batching, no protocol redesign -- see [`docs/DEVELOPMENT.md`](../docs/DEVELOPMENT.md)'s
   non-goals.
 - The Phase 3 head-to-head comparison lives in
   [`docs/modal-phase3-comparison.md`](../docs/modal-phase3-comparison.md), not here.

@@ -1,7 +1,7 @@
 //! GPU energy measurement via NVML, bracketing the same process-start-to-
 //! result interval every subcommand's `Instant`-based wall-clock timing
 //! already measures -- validates this project's core "cold-start energy"
-//! thesis (see CLAUDE.md), currently otherwise completely unmeasured
+//! thesis (see docs/DEVELOPMENT.md), currently otherwise completely unmeasured
 //! anywhere in this codebase (only wall-clock ms).
 //!
 //! Unconditional module (like `diagnostics.rs`): every call site
@@ -34,7 +34,7 @@
 //! project measures). **This is not a Non-goals violation**: it is a single
 //! internal measurement thread, analogous to a stopwatch, that never
 //! accepts a work item and never serves a request -- not the
-//! `batch_size`/thread-pool concurrency model CLAUDE.md's Non-goals section
+//! `batch_size`/thread-pool concurrency model docs/DEVELOPMENT.md's Non-goals section
 //! governs. It never needs a join/shutdown handshake either: every one-shot
 //! `reflex` subcommand calls `reflex_engine::fast_exit` when done, which
 //! kills every thread the process owns for free.

@@ -1,7 +1,7 @@
 // GPT-NeoX-style (half-rotation) rotary position embedding, applied in place
 // over row-major (num_heads, head_dim) `t` for a single token's position
 // (this MVP forwards exactly one token per call -- batch_size is a permanent
-// project constraint, see CLAUDE.md's Non-goals -- so `position` is a plain
+// project constraint, see docs/DEVELOPMENT.md's Non-goals -- so `position` is a plain
 // scalar rather than a per-token device array). Only the first rotary_dim
 // elements of each head are rotated; any remaining head_dim - rotary_dim
 // elements are left untouched. For i in [0, rotary_dim/2), pairs (x1, x2) =

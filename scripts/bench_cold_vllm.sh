@@ -9,7 +9,7 @@
 # WHY vLLM (not just another llama.cpp-style engine): llama.cpp is, like
 # Reflex, AOT-compiled via nvcc — it never JIT-compiles CUDA
 # kernels, so it doesn't actually test this project's core AOT-vs-JIT
-# cold-start bet (see CLAUDE.md). vLLM's CUDA graph capture / historically
+# cold-start bet (see docs/DEVELOPMENT.md). vLLM's CUDA graph capture / historically
 # JIT-driven kernel compilation is a real, well-documented warmup cost and
 # a much better foil for that specific claim.
 #

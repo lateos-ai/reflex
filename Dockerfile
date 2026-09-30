@@ -1,5 +1,5 @@
 # Multi-stage build. The builder stage has the full CUDA devel toolkit (nvcc) to
-# compile this project's AOT kernels (see build.rs/CLAUDE.md's core technical bet);
+# compile this project's AOT kernels (see build.rs/docs/DEVELOPMENT.md's core technical bet);
 # the runtime stage only needs the CUDA *runtime* libraries, since every kernel byte
 # is embedded directly into the compiled binary at build time (see src/aot.rs's
 # module doc comment for why -- the previous design, loading kernels from a

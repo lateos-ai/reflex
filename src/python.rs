@@ -2,7 +2,7 @@
 //! --features python`), feature-gated. Calls `crate::model::Model`/
 //! `system1_evaluate` directly, not through `src/ffi.rs`'s C ABI -- there is no
 //! reason to pay a second serialization/indirection layer when PyO3 can hold a
-//! `Model` natively in the same process. See CLAUDE.md/README.md's Non-goals: this
+//! `Model` natively in the same process. See README.md's Non-goals: this
 //! is an in-process embedding surface, not a network server -- a Python process
 //! holding a `PyModel` still only ever runs one request at a time (nothing here
 //! spawns a thread or a request queue; the underlying `Model` methods already only
@@ -22,7 +22,7 @@ fn to_py_err(e: String) -> PyErr {
 
 /// A loaded model, held for the Python object's whole lifetime. `PyModel(path)`
 /// loads a GGUF file from `path` onto GPU 0 (the only device index this engine's
-/// Python/FFI/CLI surfaces ever target -- see CLAUDE.md's Non-goals).
+/// Python/FFI/CLI surfaces ever target -- see docs/DEVELOPMENT.md's Non-goals).
 #[pyclass]
 struct PyModel {
     inner: Model,

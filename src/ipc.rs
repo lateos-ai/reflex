@@ -1,5 +1,5 @@
 //! Local, non-network IPC protocol shared by the `reflex stdio`/`reflex uds`
-//! subcommands (`src/bin/reflex/stdio.rs`/`uds.rs`) -- see CLAUDE.md/README.md's
+//! subcommands (`src/bin/reflex/stdio.rs`/`uds.rs`) -- see README.md's
 //! Non-goals: no HTTP/gRPC server, ever; this is the sequential, non-thread-pool
 //! local-ergonomics surface that stands in for one. One line of JSON in; one or
 //! more lines of JSON out (see `stream` below), one request fully processed before

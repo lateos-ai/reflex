@@ -69,7 +69,7 @@ first-response after long idle periods is not.
 - **Pick one GPU instance family up front.** This guide uses `g4dn.xlarge` (NVIDIA T4,
   compute capability `sm_75`) throughout, matched to a `REFLEX_CUDA_ARCH=sm_75` build —
   the zero-driver-JIT cubin path this project's own architecture is built around (see
-  the root [CLAUDE.md](../CLAUDE.md)'s "Core technical bet"). **Do not** put both
+  [DEVELOPMENT.md](DEVELOPMENT.md#core-technical-bet)'s "Core technical bet"). **Do not** put both
   `g4dn.xlarge` and `g5.xlarge` (A10G, `sm_86`) in one mixed-instances-policy ASG with a
   pinned cubin build — a `sm_75` cubin will not run on an A10G or vice versa. If you
   deliberately want a multi-family Spot fleet for capacity diversification, build with
@@ -80,7 +80,7 @@ first-response after long idle periods is not.
 ### Model sizing for a T4 (`g4dn.xlarge`, 16GB VRAM)
 
 Reflex dequantizes every weight tensor once and holds it GPU-resident as `f32` (see the
-root [CLAUDE.md](../CLAUDE.md)'s model-loading section) — VRAM need is therefore
+[DEVELOPMENT.md](DEVELOPMENT.md#model-loading-weights-stay-on-the-gpu)'s model-loading section) — VRAM need is therefore
 `total_params × 4 bytes`, regardless of the source GGUF's quant level, and for MoE,
 regardless of how many experts are actually "active" per token (every expert is
 dequantized and resident, since routing happens per-token at runtime). Real-hardware-

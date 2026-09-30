@@ -488,7 +488,7 @@ the cold per-process total above:
 A resident process's steady-state request is **~80x faster** than this project's own
 cold-start design — expected and not a criticism of the architecture (a resident,
 always-on server is exactly the `batch_size`-1/no-thread-pool serving-platform shape this
-project's Non-goals deliberately reject; see root `CLAUDE.md`). What's genuinely useful
+project's Non-goals deliberately reject; see [Non-goals](#non-goals)). What's genuinely useful
 here: the gap between a resident process's *first* request (708.96ms) and its *second*
 (16.35ms) shows that even a fully warm, already-loaded model still pays a real one-time
 cost the first time it actually runs its compute kernels — a cost `model_load_ms` doesn't

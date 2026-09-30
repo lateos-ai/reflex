@@ -2,7 +2,7 @@
 
 An OpenAI-compatible `POST /v1/chat/completions` HTTP sidecar in front of the Reflex
 core engine. This is the escape-hatch pattern the root project's `README.md`/
-`CLAUDE.md` Non-goals sections describe and defer: **the core `reflex` engine never
+`docs/DEVELOPMENT.md` Non-goals sections describe and defer: **the core `reflex` engine never
 grows a network socket or a thread pool** — this crate is a separate process, in its
 own Cargo project, that translates real HTTP traffic (OpenRouter, the OpenAI Python/
 JS SDKs, curl, anything that speaks the OpenAI Chat Completions API) into calls

@@ -14,7 +14,7 @@
 //! dense/MoE's separate K/V pair or hybrid's per-layer Attn/Gdn split), the
 //! last of the three cache shapes this project's architectures produce. The
 //! engine stays ignorant of where the file lives (NVMe, S3-backed FUSE,
-//! tmpfs) -- see CLAUDE.md's Non-goals.
+//! tmpfs) -- see docs/DEVELOPMENT.md's Non-goals.
 //!
 //! File format is a flat, home-grown binary layout, not a stable public
 //! spec: magic + version-gated, so the version-1 dense/MoE-only layout
