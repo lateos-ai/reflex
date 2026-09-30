@@ -34,6 +34,10 @@
 # Optional:
 #   PORT         - TCP port the adapter listens on and the ALB target group forwards
 #                  to (default 8000)
+#   ADAPTER_ARGS - extra reflex-openai-adapter flags, space-separated, e.g.
+#                  "--max-tokens-cap 1024 --request-timeout-secs 55". Unset = the
+#                  adapter's own request-limit defaults (see its README's "Request
+#                  limits"), which already apply without this.
 #   HF_TOKEN     - bearer token for gated/private HF repos (leave unset for public
 #                  repos; see docs/aws-deployment-warm.md for why this must come from
 #                  SSM/Secrets Manager into the environment, never plaintext in
@@ -49,6 +53,8 @@ efs_id="${EFS_ID:?usage: ECR_IMAGE=... EFS_ID=fs-... MODEL_REPO=... MODEL_FILE=.
 model_repo="${MODEL_REPO:?usage: ECR_IMAGE=... EFS_ID=fs-... MODEL_REPO=... MODEL_FILE=... $0}"
 model_file="${MODEL_FILE:?usage: ECR_IMAGE=... EFS_ID=fs-... MODEL_REPO=... MODEL_FILE=... $0}"
 port="${PORT:-8000}"
+# Word-split on purpose: one flag/value per word (no values containing spaces).
+read -r -a adapter_args <<<"${ADAPTER_ARGS:-}"
 hf_token="${HF_TOKEN:-}"
 
 cache_dir="/mnt/reflex-cache"
@@ -127,7 +133,7 @@ docker run -d \
   -p "${port}:${port}" \
   -v "$models_dir:/models:ro" \
   "$ecr_image" \
-  "/models/$model_file" --host 0.0.0.0 --port "$port"
+  "/models/$model_file" --host 0.0.0.0 --port "$port" "${adapter_args[@]}"
 
 echo "[bootstrap] waiting for http://127.0.0.1:$port/healthz..."
 # Require exactly HTTP 200, not just "no error" -- the sidecar returns 204 (not an

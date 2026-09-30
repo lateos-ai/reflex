@@ -11,15 +11,16 @@
 //! <addr>] [--port <port>] [--lora <adapter.gguf>] [--model-name <name>]
 //! [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>]
 //! [--owned-by <name>] [--pricing-prompt <str>] [--pricing-completion <str>]
-//! [--region <str>]`
+//! [--region <str>] [--max-tokens-cap <n>] [--max-prompt-bytes <n>]
+//! [--max-queue-depth <n>] [--request-timeout-secs <n>]`
 
 mod chat_template;
 mod gguf_meta;
 mod openai;
 mod reflex_client;
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -37,11 +38,13 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::Instant;
 
 struct AppState {
     client: ReflexClient,
     model_label: String,
     default_max_tokens: usize,
+    limits: RequestLimits,
     request_counter: AtomicU64,
     chat_template: Option<ChatTemplate>,
     model_info: ModelInfo,
@@ -51,6 +54,54 @@ impl AppState {
     fn next_chat_id(&self) -> String {
         let n = self.request_counter.fetch_add(1, Ordering::Relaxed);
         format!("chatcmpl-reflex-{n:x}")
+    }
+}
+
+/// Per-request guards against one caller monopolizing the single, strictly
+/// sequential engine behind this sidecar -- see the README's "Request limits".
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RequestLimits {
+    /// Largest `max_tokens` a request may ask for; above it -> `400` (rejected, never
+    /// silently clamped). The real protection against a long job blocking everyone.
+    max_tokens_cap: usize,
+    /// Largest rendered prompt, in bytes (this sidecar has no tokenizer, so bytes are
+    /// the honest unit); above it -> `400`.
+    max_prompt_bytes: usize,
+    /// Most jobs queued or running in the engine at once; above it -> `429`.
+    max_queue_depth: usize,
+    /// How long the HTTP response waits for the engine. On expiry the client gets a
+    /// `504` (or an error event mid-stream), but the engine job keeps running to
+    /// completion -- there is no cancel operation.
+    request_timeout: Duration,
+}
+
+impl Default for RequestLimits {
+    fn default() -> Self {
+        RequestLimits {
+            max_tokens_cap: 2048,
+            max_prompt_bytes: 262_144,
+            max_queue_depth: 16,
+            request_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+impl RequestLimits {
+    /// Request-body cap handed to axum's `DefaultBodyLimit`, derived from
+    /// `max_prompt_bytes`: the JSON body carries the messages plus role/field
+    /// overhead and string escaping, so it gets twice the prompt budget plus 64 KiB.
+    /// Bodies over it are rejected with `413` before being parsed at all.
+    fn body_limit_bytes(&self) -> usize {
+        self.max_prompt_bytes
+            .saturating_mul(2)
+            .saturating_add(64 * 1024)
+    }
+}
+
+fn parse_positive(flag: &str, raw: &str) -> Result<usize, String> {
+    match raw.parse::<usize>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(format!("{flag}: expected a positive integer, got {raw}")),
     }
 }
 
@@ -68,6 +119,7 @@ struct Opts {
     pricing_prompt: String,
     pricing_completion: String,
     region: Option<String>,
+    limits: RequestLimits,
 }
 
 impl Opts {
@@ -85,6 +137,7 @@ impl Opts {
         let mut pricing_prompt = "0".to_string();
         let mut pricing_completion = "0".to_string();
         let mut region: Option<String> = None;
+        let mut limits = RequestLimits::default();
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -135,6 +188,25 @@ impl Opts {
                 "--region" => {
                     region = Some(args.next().ok_or("--region requires a value")?);
                 }
+                "--max-tokens-cap" => {
+                    let raw = args.next().ok_or("--max-tokens-cap requires a number")?;
+                    limits.max_tokens_cap = parse_positive("--max-tokens-cap", &raw)?;
+                }
+                "--max-prompt-bytes" => {
+                    let raw = args.next().ok_or("--max-prompt-bytes requires a number")?;
+                    limits.max_prompt_bytes = parse_positive("--max-prompt-bytes", &raw)?;
+                }
+                "--max-queue-depth" => {
+                    let raw = args.next().ok_or("--max-queue-depth requires a number")?;
+                    limits.max_queue_depth = parse_positive("--max-queue-depth", &raw)?;
+                }
+                "--request-timeout-secs" => {
+                    let raw = args
+                        .next()
+                        .ok_or("--request-timeout-secs requires a number")?;
+                    limits.request_timeout =
+                        Duration::from_secs(parse_positive("--request-timeout-secs", &raw)? as u64);
+                }
                 _ if gguf_path.is_none() => gguf_path = Some(arg),
                 other => return Err(format!("unexpected argument: {other}")),
             }
@@ -145,13 +217,21 @@ impl Opts {
              [--port <port>] [--lora <adapter.gguf>] [--model-name <name>] \
              [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>] \
              [--owned-by <name>] [--pricing-prompt <str>] [--pricing-completion <str>] \
-             [--region <str>]",
+             [--region <str>] [--max-tokens-cap <n>] [--max-prompt-bytes <n>] \
+             [--max-queue-depth <n>] [--request-timeout-secs <n>]",
         )?;
 
         if no_chat_template && chat_template_file.is_some() {
             return Err(
                 "--no-chat-template and --chat-template-file are mutually exclusive".to_string(),
             );
+        }
+        if default_max_tokens > limits.max_tokens_cap {
+            return Err(format!(
+                "--default-max-tokens ({default_max_tokens}) exceeds --max-tokens-cap ({}); \
+                 every request that omits max_tokens would be rejected",
+                limits.max_tokens_cap
+            ));
         }
 
         Ok(Opts {
@@ -168,6 +248,7 @@ impl Opts {
             pricing_prompt,
             pricing_completion,
             region,
+            limits,
         })
     }
 }
@@ -206,16 +287,20 @@ async fn main() {
         "[adapter] launching `{} stdio {}`...",
         opts.reflex_bin, opts.gguf_path
     );
-    let client =
-        match ReflexClient::spawn(&opts.reflex_bin, &opts.gguf_path, opts.lora_path.as_deref())
-            .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[adapter] failed to launch reflex: {e:#}");
-                std::process::exit(1);
-            }
-        };
+    let client = match ReflexClient::spawn(
+        &opts.reflex_bin,
+        &opts.gguf_path,
+        opts.lora_path.as_deref(),
+        opts.limits.max_queue_depth,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[adapter] failed to launch reflex: {e:#}");
+            std::process::exit(1);
+        }
+    };
 
     // Loaded/render-tested once at boot, not per-request -- see
     // `chat_template::build`'s doc comment for the fallback rules.
@@ -243,6 +328,7 @@ async fn main() {
         client,
         model_label,
         default_max_tokens: opts.default_max_tokens,
+        limits: opts.limits,
         request_counter: AtomicU64::new(0),
         chat_template,
         model_info,
@@ -270,8 +356,12 @@ async fn main() {
         });
     }
 
+    let body_limit = opts.limits.body_limit_bytes();
     let app = Router::new()
-        .route("/v1/chat/completions", post(chat_completions))
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions).layer(DefaultBodyLimit::max(body_limit)),
+        )
         .route("/v1/models", get(list_models))
         .route("/healthz", get(healthz))
         // Alias of /healthz, same handler: Runpod Serverless load-balancing endpoints
@@ -339,14 +429,90 @@ fn error_response_with(
     error_type: &str,
     code: Option<&str>,
 ) -> Response {
-    let body = serde_json::json!({
+    (status, Json(error_body(message, error_type, code))).into_response()
+}
+
+fn error_body(message: impl Into<String>, error_type: &str, code: Option<&str>) -> Value {
+    serde_json::json!({
         "error": {
             "message": message.into(),
             "type": error_type,
             "code": code,
         }
-    });
-    (status, Json(body)).into_response()
+    })
+}
+
+/// `400` for a request that breaks one of the configured [`RequestLimits`].
+fn limit_exceeded_response(message: String, code: &str) -> Response {
+    error_response_with(
+        StatusCode::BAD_REQUEST,
+        message,
+        "invalid_request_error",
+        Some(code),
+    )
+}
+
+/// The `400` rejection for a request over the size limits, if any (queue depth is
+/// checked separately, at enqueue time). `prompt_bytes` is the rendered prompt's
+/// length.
+fn request_limit_violation(
+    limits: &RequestLimits,
+    prompt_bytes: usize,
+    max_tokens: usize,
+) -> Option<Response> {
+    if prompt_bytes > limits.max_prompt_bytes {
+        return Some(limit_exceeded_response(
+            format!(
+                "rendered prompt is {prompt_bytes} bytes, over this server's limit of {} bytes \
+                 (--max-prompt-bytes)",
+                limits.max_prompt_bytes
+            ),
+            "context_length_exceeded",
+        ));
+    }
+    if max_tokens > limits.max_tokens_cap {
+        return Some(limit_exceeded_response(
+            format!(
+                "max_tokens is {max_tokens}, over this server's limit of {} (--max-tokens-cap)",
+                limits.max_tokens_cap
+            ),
+            "max_tokens_exceeded",
+        ));
+    }
+    None
+}
+
+fn queue_full_response(max_in_flight: usize) -> Response {
+    let mut response = error_response_with(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "server busy: {max_in_flight} requests are already queued or running \
+             (--max-queue-depth); retry shortly"
+        ),
+        "rate_limit_error",
+        Some("queue_full"),
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+    response
+}
+
+fn timeout_message(timeout: Duration) -> String {
+    format!(
+        "reflex did not finish within {}s (--request-timeout-secs); the job may still \
+         be running in the engine",
+        timeout.as_secs()
+    )
+}
+
+fn timeout_response(timeout: Duration) -> Response {
+    error_response_with(
+        StatusCode::GATEWAY_TIMEOUT,
+        timeout_message(timeout),
+        "timeout_error",
+        Some("request_timeout"),
+    )
 }
 
 /// Stable prefix of the engine's context-length error
@@ -397,7 +563,8 @@ async fn chat_completions(
 ) -> Response {
     let Json(req) = match body {
         Ok(j) => j,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, e.to_string()),
+        // The rejection's own status: 400/422 for bad JSON, 413 over the body limit.
+        Err(e) => return error_response(e.status(), e.body_text()),
     };
 
     let messages = match extract_text_messages(&req.messages) {
@@ -418,6 +585,9 @@ async fn chat_completions(
         None => build_prompt(&messages),
     };
     let max_tokens = req.max_tokens.unwrap_or(state.default_max_tokens).max(1);
+    if let Some(response) = request_limit_violation(&state.limits, prompt.len(), max_tokens) {
+        return response;
+    }
     let sampling = build_sampling(&req);
     let stream = req.stream;
     let model_label = req
@@ -441,25 +611,49 @@ async fn chat_completions(
         }
     };
 
-    let mut rx = state.client.request(line).await;
+    let mut rx = match state.client.request(line).await {
+        Ok(rx) => rx,
+        Err(full) => return queue_full_response(full.max_in_flight),
+    };
     let chat_id = state.next_chat_id();
     let created = now_unix();
+    // Dropping `rx` on timeout is safe: the worker keeps draining the job's output
+    // (see `reflex_client::ReflexClient::request`).
+    let timeout = state.limits.request_timeout;
+    let deadline = Instant::now() + timeout;
 
     if stream {
         // Wait for the engine's first event before committing to a `200` SSE
         // response, so an error raised before any token is produced (e.g. the
         // prompt is over the engine's context-length limit) still reaches the
         // client as a real HTTP status instead of an empty stream.
-        let first = rx.recv().await;
+        let first = match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(first) => first,
+            Err(_) => return timeout_response(timeout),
+        };
         if let Some(msg) = first.as_ref().and_then(engine_error_message) {
             return engine_error_response(msg);
         }
-        let sse_stream = build_sse_stream(first, rx, chat_id, created, model_label, max_tokens);
+        let sse_stream = build_sse_stream(
+            first,
+            rx,
+            chat_id,
+            created,
+            model_label,
+            max_tokens,
+            deadline,
+            timeout,
+        );
         Sse::new(sse_stream)
             .keep_alive(KeepAlive::default())
             .into_response()
     } else {
-        non_streaming_response(rx, chat_id, created, model_label, prompt, max_tokens).await
+        let response =
+            non_streaming_response(rx, chat_id, created, model_label, prompt, max_tokens);
+        match tokio::time::timeout_at(deadline, response).await {
+            Ok(response) => response,
+            Err(_) => timeout_response(timeout),
+        }
     }
 }
 
@@ -519,6 +713,9 @@ async fn non_streaming_response(
 
 /// `first` is the engine event `chat_completions` already received (to rule out
 /// an up-front error) before starting the stream; it's replayed ahead of `rx`.
+/// Past `deadline` the stream sends one OpenAI-style `{"error": ...}` event and
+/// ends (headers are already sent, so a status code is no longer possible).
+#[allow(clippy::too_many_arguments)]
 fn build_sse_stream(
     first: Option<Value>,
     mut rx: tokio::sync::mpsc::Receiver<Value>,
@@ -526,6 +723,8 @@ fn build_sse_stream(
     created: u64,
     model_label: String,
     requested_max_tokens: usize,
+    deadline: Instant,
+    timeout: Duration,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
         let role_chunk = ChatCompletionChunk {
@@ -543,10 +742,24 @@ fn build_sse_stream(
 
         let mut completion_tokens = 0usize;
         let mut pending = first;
-        while let Some(v) = match pending.take() {
-            Some(v) => Some(v),
-            None => rx.recv().await,
-        } {
+        loop {
+            let v = match pending.take() {
+                Some(v) => v,
+                None => match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(v)) => v,
+                    Ok(None) => break,
+                    Err(_) => {
+                        eprintln!("[adapter] stream timed out after {}s", timeout.as_secs());
+                        let body = error_body(
+                            timeout_message(timeout),
+                            "timeout_error",
+                            Some("request_timeout"),
+                        );
+                        yield Ok(Event::default().data(body.to_string()));
+                        break;
+                    }
+                },
+            };
             let event = v.get("event").and_then(Value::as_str).unwrap_or("");
             if event == "token" {
                 completion_tokens += 1;
@@ -601,6 +814,119 @@ fn build_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(extra: &[&str]) -> Result<Opts, String> {
+        let mut args = vec!["model.gguf".to_string()];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        Opts::parse(args)
+    }
+
+    async fn error_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn request_limit_flags_default_and_parse() {
+        assert_eq!(parse(&[]).unwrap().limits, RequestLimits::default());
+        let o = parse(&[
+            "--max-tokens-cap",
+            "512",
+            "--max-prompt-bytes",
+            "1000",
+            "--max-queue-depth",
+            "4",
+            "--request-timeout-secs",
+            "30",
+        ])
+        .unwrap();
+        assert_eq!(
+            o.limits,
+            RequestLimits {
+                max_tokens_cap: 512,
+                max_prompt_bytes: 1000,
+                max_queue_depth: 4,
+                request_timeout: Duration::from_secs(30),
+            }
+        );
+    }
+
+    #[test]
+    fn request_limit_flags_reject_zero_garbage_and_missing_values() {
+        for flag in [
+            "--max-tokens-cap",
+            "--max-prompt-bytes",
+            "--max-queue-depth",
+            "--request-timeout-secs",
+        ] {
+            assert!(parse(&[flag, "0"]).is_err(), "{flag} 0");
+            assert!(parse(&[flag, "-3"]).is_err(), "{flag} -3");
+            assert!(parse(&[flag, "lots"]).is_err(), "{flag} lots");
+            assert!(parse(&[flag]).is_err(), "{flag} with no value");
+        }
+    }
+
+    #[test]
+    fn default_max_tokens_above_cap_is_a_startup_error() {
+        let err = parse(&["--default-max-tokens", "600", "--max-tokens-cap", "512"])
+            .err()
+            .unwrap();
+        assert!(err.contains("--max-tokens-cap"), "{err}");
+        assert!(parse(&["--default-max-tokens", "512", "--max-tokens-cap", "512"]).is_ok());
+    }
+
+    #[test]
+    fn body_limit_covers_a_max_size_prompt() {
+        let limits = RequestLimits::default();
+        assert!(limits.body_limit_bytes() > limits.max_prompt_bytes);
+        let huge = RequestLimits {
+            max_prompt_bytes: usize::MAX,
+            ..limits
+        };
+        assert_eq!(huge.body_limit_bytes(), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn requests_at_the_limits_pass_and_one_over_gets_openai_shaped_400() {
+        let limits = RequestLimits {
+            max_tokens_cap: 100,
+            max_prompt_bytes: 1000,
+            ..RequestLimits::default()
+        };
+        assert!(request_limit_violation(&limits, 1000, 100).is_none());
+
+        let response = request_limit_violation(&limits, 1001, 100).unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = error_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+
+        let response = request_limit_violation(&limits, 1000, 101).unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = error_json(response).await;
+        assert_eq!(body["error"]["code"], "max_tokens_exceeded");
+        assert!(body["error"]["message"].as_str().unwrap().contains("101"));
+    }
+
+    #[tokio::test]
+    async fn queue_full_is_429_with_retry_after() {
+        let response = queue_full_response(16);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        let body = error_json(response).await;
+        assert_eq!(body["error"]["code"], "queue_full");
+    }
+
+    #[tokio::test]
+    async fn timeout_is_504_openai_shaped() {
+        let response = timeout_response(Duration::from_secs(300));
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = error_json(response).await;
+        assert_eq!(body["error"]["code"], "request_timeout");
+        assert!(body["error"]["message"].as_str().unwrap().contains("300s"));
+    }
 
     #[test]
     fn context_length_error_maps_to_400_context_length_exceeded() {

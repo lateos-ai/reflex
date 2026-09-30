@@ -107,4 +107,9 @@ ENV GGUF_PATH=/models/model.gguf
 # endpoints; override by setting a PORT environment variable on the endpoint if a
 # different port is exposed.
 ENV PORT=80
-ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/reflex-openai-adapter \"$GGUF_PATH\" --host 0.0.0.0 --port \"$PORT\""]
+# Extra reflex-openai-adapter flags, space-separated (e.g. "--max-tokens-cap 1024").
+# Empty = the adapter's own request-limit defaults (max_tokens <= 2048, 16 queued
+# jobs, 300 s timeout -- see sidecar/openai-adapter/README.md's "Request limits").
+# Deliberately unquoted below so it word-splits into separate arguments.
+ENV ADAPTER_ARGS=""
+ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/reflex-openai-adapter \"$GGUF_PATH\" --host 0.0.0.0 --port \"$PORT\" $ADAPTER_ARGS"]

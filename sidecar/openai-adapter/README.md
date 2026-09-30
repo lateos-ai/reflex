@@ -49,7 +49,8 @@ reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host <addr>]
   [--port <port>] [--lora <adapter.gguf>] [--model-name <name>]
   [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>]
   [--owned-by <name>] [--pricing-prompt <str>] [--pricing-completion <str>]
-  [--region <str>]
+  [--region <str>] [--max-tokens-cap <n>] [--max-prompt-bytes <n>]
+  [--max-queue-depth <n>] [--request-timeout-secs <n>]
 ```
 
 - `--lora <adapter.gguf>` is forwarded straight through to `reflex stdio`'s own
@@ -57,6 +58,7 @@ reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host <addr>]
 - `--model-name` sets the `model` field returned in responses when a request doesn't
   specify one of its own; defaults to the GGUF file's stem.
 - `--default-max-tokens` (default `256`) is used when a request omits `max_tokens`.
+  It must not exceed `--max-tokens-cap` (a startup error otherwise).
 - `--no-chat-template` forces the old generic role-labeled flattening
   (`"System: ...\nUser: ...\nAssistant:"`) even when the loaded GGUF ships its own
   `tokenizer.chat_template`. Useful as an A/B-comparison switch and as an escape
@@ -68,6 +70,26 @@ reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host <addr>]
   <str>` (default `"0"` each), `--region <str>` (no default) populate the
   `GET /v1/models` metadata described below. None of these affect inference; they're
   informational fields a caller (or an OpenRouter provider-listing application) reads.
+
+#### Request limits
+
+The engine behind this sidecar runs one job at a time, so without limits a single
+request (say, `max_tokens: 100000`) would block every other caller. Each limit has a
+default and a flag; every rejection is an OpenAI-shaped `{"error": {"message",
+"type", "code"}}` body:
+
+| Flag | Default | Over the limit |
+|---|---|---|
+| `--max-tokens-cap <n>` | `2048` | `400`, code `max_tokens_exceeded`. Rejected, never silently clamped. |
+| `--max-prompt-bytes <n>` | `262144` | `400`, code `context_length_exceeded`. Measured on the rendered prompt, in bytes, since the sidecar has no tokenizer. Request bodies over `2 × this + 64 KiB` are refused with `413` before parsing. |
+| `--max-queue-depth <n>` | `16` | `429`, code `queue_full`, `Retry-After: 1`. Counts jobs queued *or running* in the engine. |
+| `--request-timeout-secs <n>` | `300` | `504`, code `request_timeout` (or, mid-stream, one `data: {"error": ...}` event before `[DONE]`). |
+
+The timeout only frees the *client*: the engine has no cancel operation, so a
+timed-out job keeps running to completion (the sidecar drains its output so the next
+job starts cleanly) and still counts toward `--max-queue-depth` until it finishes. A
+job whose client gave up while it was still *queued* is skipped entirely.
+`--max-tokens-cap` is the real protection; the timeout is a backstop.
 
 At startup the adapter tries to load and render-test the GGUF's own
 `tokenizer.chat_template` metadata once (or `--chat-template-file`'s contents, if
@@ -204,9 +226,10 @@ supports it. `temperature` omitted or `<= 0` selects greedy argmax, mirroring
 - **`finish_reason` is a heuristic**: `"length"` if the number of generated tokens
   reached the `max_tokens` actually requested, `"stop"` otherwise — the IPC protocol
   has no explicit stop-reason field to report an exact EOS-vs-length distinction.
-- **No auth, no rate-limiting, no TLS.** This is a local translation shim, not a
-  production-hardened gateway — put a real reverse proxy in front of it if either is
-  needed. Consistent with this being local sidecar tooling, not a serving platform
+- **No auth, no per-client rate-limiting, no TLS.** This is a local translation shim,
+  not a production-hardened gateway — put a real reverse proxy in front of it if any
+  of those is needed. It does bound each request and the shared queue (see "Request
+  limits" above), but not per caller. Consistent with this being local sidecar tooling, not a serving platform
   (see the root README's Non-goals section).
 - **One managed `reflex` process, not auto-restarted -- but the sidecar now fails
   fast and observably instead of degrading silently.** This crate deliberately does

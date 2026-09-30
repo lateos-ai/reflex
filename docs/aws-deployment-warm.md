@@ -183,6 +183,9 @@ export EFS_ID=fs-0123456789abcdef0
 export MODEL_REPO=Qwen/Qwen3-0.6B-GGUF
 export MODEL_FILE=Qwen3-0.6B-Q8_0.gguf
 export PORT=8000
+# Optional: tune the adapter's request limits (defaults apply without this). Keep
+# --request-timeout-secs under the ALB idle timeout -- see "Known limitations".
+# export ADAPTER_ARGS="--max-tokens-cap 1024 --request-timeout-secs 55"
 # export HF_TOKEN populated from SSM here if the repo is gated
 curl -fsSL https://raw.githubusercontent.com/YOUR_ORG/reflex/main/scripts/aws_ec2_bootstrap_warm.sh -o /tmp/bootstrap.sh
 bash /tmp/bootstrap.sh
@@ -408,6 +411,16 @@ public endpoint.
   always-on On-Demand baseline, not the only capacity, but not a guarantee.
 - The WAF shared-secret header is abuse deterrence, not real per-user
   authentication/billing/rate-limiting.
+- The sidecar bounds every request by default (`max_tokens` ≤ 2048, rendered prompt
+  ≤ 256 KiB, ≤ 16 jobs queued or running → `429` beyond that, 300 s response
+  timeout; see the sidecar README's "Request limits"). Those limits are per
+  instance, not per caller. Tune them with `ADAPTER_ARGS` in the user-data.
+- The ALB's default idle timeout is **60 s**, shorter than the sidecar's default
+  300 s `--request-timeout-secs`. A non-streaming request that runs past 60 s
+  without sending bytes gets the ALB's own `504` first, and the engine keeps working
+  on it regardless. Either raise the ALB's `idle_timeout.timeout_seconds` to at least
+  the sidecar timeout, or set `--request-timeout-secs` below the ALB's value (as in
+  the step 5 example). Streaming requests are unaffected once tokens are flowing.
 - `ALBRequestCountPerTarget`'s request-completion attribution is an imperfect signal
   for long-lived SSE streams (see step 8).
 - `usage.prompt_tokens` in the sidecar's responses remains a whitespace-word-count
