@@ -8,7 +8,7 @@ GPU, 2026-09-27.**
 
 ## What this is
 
-- **`Dockerfile`**: same builder recipe as `serverless/runpod/Dockerfile` (compile
+- **`Dockerfile`**: same builder recipe as the root `Dockerfile`'s `adapter` target (compile
   `reflex --features ipc` and `sidecar/openai-adapter` in one `nvidia/cuda:12.4.1-devel`
   stage, copy both binaries plus the baked-in model into a `nvidia/cuda:12.4.1-runtime`
   stage). The only real difference: `REFLEX_CUDA_ARCH` defaults to `sm_89` (Ada

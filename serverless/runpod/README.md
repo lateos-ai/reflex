@@ -36,7 +36,7 @@ unnecessary Python glue code for no benefit.
 
 The manual steps above are scripted in
 [`scripts/deploy_runpod.sh`](../../scripts/deploy_runpod.sh), which builds
-`serverless/runpod/Dockerfile`, pushes the image, creates the (load-balancing) template +
+the root [`Dockerfile`](../../Dockerfile)'s `runpod-lb` target, pushes the image, creates the (load-balancing) template +
 endpoint, pins the RTX A4500 SKU, and then drives the cold-start benchmark through
 [`scripts/bench_cold_runpod.sh`](../../scripts/bench_cold_runpod.sh) — itself a thin wrapper
 over `bench_cold_common.sh`'s `/usr/bin/time -v` loop. It encodes the verified findings in
@@ -51,10 +51,9 @@ this directory rather than re-deriving them:
   run, forces a genuine scale-from-zero (`workersMax` 0 → wait out `idleTimeout` → 1), so
   runs 2..N don't silently measure a warm worker.
 
-`--slim` additionally builds the runtime-slimmed image (`base` + `libcublas-12-4`, tagged
-`:runtime`) described in the root README's "Container image size is part of cold start
-here"; like every other default here, the full `-runtime-` base stays the default and the
-slim variant is opt-in. `--teardown` deletes the endpoint and template after benchmarking.
+The image always uses the slimmed runtime (`base` + `libcublas-12-4`) described in the root
+README's "Container image size is part of cold start here"; `--slim`, which used to opt into
+it, is still accepted and does nothing. `--teardown` deletes the endpoint and template after benchmarking.
 Run `scripts/deploy_runpod.sh --help` for the full flag/environment reference.
 
 ## Runpod endpoint configuration
@@ -62,7 +61,9 @@ Run `scripts/deploy_runpod.sh --help` for the full flag/environment reference.
 When creating the Serverless endpoint in Runpod's console/API:
 
 - **Endpoint type**: Load Balancing.
-- **Container image**: the image built from this directory's `Dockerfile`.
+- **Container image**: the root `Dockerfile`'s `runpod-lb` target
+  (`docker build --target runpod-lb -t reflex-runpod .` from the repo root, with
+  `model.gguf` placed in this directory first).
 - **Exposed HTTP port**: matches this image's `PORT` environment variable (default `80` — set
   both consistently if you override it; Runpod requires the exposed port to be explicitly
   declared in the endpoint's container configuration, not just implied by the `Dockerfile`).

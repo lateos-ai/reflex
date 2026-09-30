@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# scripts/deploy_runpod.sh — build/push the serverless/runpod image and drive a
+# scripts/deploy_runpod.sh — build/push the Runpod load-balancing image (the root
+# Dockerfile's `runpod-lb` target) and drive a
 # real Runpod Serverless **load-balancing** endpoint through the existing
 # cold-start benchmark harness (scripts/bench_cold_runpod.sh, which in turn uses
 # bench_cold_common.sh's /usr/bin/time -v loop).
 #
 # SCOPE: operational packaging only. This touches no engine code and no model
-# code — it builds the same serverless/runpod/Dockerfile the README describes,
+# code — it builds the root Dockerfile's `runpod-lb` target the README describes,
 # pushes it, configures an endpoint, then measures it. It is the scripted form
 # of the manual deployment serverless/runpod/README.md documents, and it follows
 # that README's verified findings rather than re-deriving them:
@@ -19,8 +20,11 @@
 #     (Ampere sm_86 alongside Ada sm_89) despite its name — so the SKU is pinned
 #     right after creation with a REST PATCH of `gpuTypeIds`, exactly the
 #     "create, then pin the SKU with a control-plane call" sequence the README
-#     documents. Skipping this makes the endpoint fail nondeterministically
-#     depending on which card a worker lands on.
+#     documents. With a single-arch cubin (REFLEX_CUDA_ARCH=sm_86), skipping this
+#     makes the endpoint fail nondeterministically depending on which card a
+#     worker lands on. The image now defaults to a multi-arch fatbin that also runs
+#     natively on the Ada cards, but the pin stays until that is confirmed on a real
+#     Ada worker.
 #   * Health check is `/ping` (the adapter serves it as an alias of /healthz),
 #     because Runpod's gateway polls the hardcoded `/ping` regardless of the
 #     documented HEALTH_CHECK_PATH override.
@@ -29,11 +33,10 @@
 #     methodology (docs/serverless-cost-comparison.md disabled it on both
 #     engines so it can't confound the number).
 #
-# IMAGE VARIANT (Deliverable B): `--slim` builds the measured runtime-slimmed
-# image (`base` + libcublas-12-4; measured `docker images` 4.57GB -> 2.06GB, and
-# a 1.2GB on-disk rootfs vs 2.6GB) and tags it `:runtime`; the default variant
-# and tag are unchanged, so this never silently moves an existing deployment's
-# base image. See README's "Container image size is part of cold start here".
+# IMAGE: the runtime is always the slim `base` + libcublas-12-4 variant (it used
+# to be opt-in via `--slim`; measured `docker images` 4.57GB -> 2.06GB). `--slim`
+# is still accepted and does nothing. Kernels default to the Dockerfile's fatbin;
+# set REFLEX_CUDA_ARCH to build a single-arch cubin instead.
 #
 # Cost warning: this creates real, billable Runpod resources. Use `--teardown`
 # (or delete the endpoint in the console) when finished. Per the README, do not
@@ -44,7 +47,7 @@
 #   RUNPOD_API_KEY=... scripts/deploy_runpod.sh [flags]
 #
 # Flags:
-#   --slim             build the slim `:runtime` image variant (default: full image, :latest)
+#   --slim             no-op, kept for compatibility (the slim runtime is now the default)
 #   --no-build         skip `docker build` (use an image already built/pushed)
 #   --no-push          skip `docker push` (local image only)
 #   --no-endpoint      build/push only; never touch the Runpod API
@@ -57,8 +60,8 @@
 #
 # Environment overrides (defaults in parentheses):
 #   REFLEX_REGISTRY_IMAGE (ghcr.io/lateos-ai/reflex-runpod)
-#   REFLEX_IMAGE_TAG      (latest, or runtime with --slim)
-#   REFLEX_CUDA_ARCH      (sm_86)
+#   REFLEX_IMAGE_TAG      (latest)
+#   REFLEX_CUDA_ARCH      ("" = the Dockerfile's multi-arch fatbin; e.g. sm_86 for one cubin)
 #   REFLEX_ENDPOINT_NAME  (reflex-runpod)
 #   REFLEX_GPU_POOL       (AMPERE_16)
 #   REFLEX_GPU_TYPE_ID    (NVIDIA RTX A4500)
@@ -76,7 +79,7 @@ set -euo pipefail
 
 RUNPOD_API_KEY="${RUNPOD_API_KEY:-}"
 REFLEX_REGISTRY_IMAGE="${REFLEX_REGISTRY_IMAGE:-ghcr.io/lateos-ai/reflex-runpod}"
-REFLEX_CUDA_ARCH="${REFLEX_CUDA_ARCH:-sm_86}"
+REFLEX_CUDA_ARCH="${REFLEX_CUDA_ARCH:-}"
 REFLEX_ENDPOINT_NAME="${REFLEX_ENDPOINT_NAME:-reflex-runpod}"
 REFLEX_GPU_POOL="${REFLEX_GPU_POOL:-AMPERE_16}"
 REFLEX_GPU_TYPE_ID="${REFLEX_GPU_TYPE_ID:-NVIDIA RTX A4500}"
@@ -204,26 +207,20 @@ if (( DO_ENDPOINT && DO_BENCH )); then
 fi
 
 # --- image reference / build args -----------------------------------------
-if [[ -n "${REFLEX_IMAGE_TAG:-}" ]]; then
-  image_tag="$REFLEX_IMAGE_TAG"
-elif (( SLIM )); then
-  image_tag="runtime"
-else
-  image_tag="latest"
-fi
+image_tag="${REFLEX_IMAGE_TAG:-latest}"
 image_ref="${REFLEX_REGISTRY_IMAGE}:${image_tag}"
-
-build_args=(--build-arg "REFLEX_CUDA_ARCH=${REFLEX_CUDA_ARCH}")
 if (( SLIM )); then
-  build_args+=(
-    --build-arg "REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-base-ubuntu22.04"
-    --build-arg "REFLEX_RUNTIME_SLIM=1"
-  )
+  echo "note: --slim is now the default runtime and has no effect" >&2
+fi
+
+build_args=(--target runpod-lb)
+if [[ -n "$REFLEX_CUDA_ARCH" ]]; then
+  build_args+=(--build-arg "REFLEX_CUDA_ARCH=${REFLEX_CUDA_ARCH}")
 fi
 
 # --- build / push ----------------------------------------------------------
 if (( DO_BUILD )); then
-  run docker build -f serverless/runpod/Dockerfile "${build_args[@]}" -t "$image_ref" "$repo_root"
+  run docker build -f "$repo_root/Dockerfile" "${build_args[@]}" -t "$image_ref" "$repo_root"
 fi
 if (( DO_PUSH )); then
   run docker push "$image_ref"
@@ -243,7 +240,7 @@ if [[ -z "$ENDPOINT_ID" ]]; then
 import json, sys
 name, image, disk_gb, auth = sys.argv[1:5]
 # GGUF_PATH is baked into the image at /models/model.gguf by
-# serverless/runpod/Dockerfile; PORT must be declared both here and as the
+# the root Dockerfile's runpod-lb target; PORT must be declared both here and as the
 # exposed port the endpoint's container configuration declares (Runpod does not
 # infer it from the Dockerfile). The adapter serves the three-state health
 # check at both /healthz and /ping.

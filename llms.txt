@@ -44,7 +44,7 @@ etc.) and `reflex <subcommand>` for its usage; `docs/DEVELOPMENT.md` covers buil
 ## Docker (any host with `nvidia-container-toolkit`)
 
 ```
-docker build --build-arg REFLEX_CUDA_ARCH=sm_86 -t reflex .   # pin to your GPU's arch; omit the arg for portable PTX
+docker build -t reflex .   # multi-arch fatbin; --build-arg REFLEX_CUDA_ARCH=sm_XX pins one GPU arch
 docker run --rm --gpus all -v /path/to/models:/models \
   reflex /models/Qwen3-0.6B-Q4_K_M.gguf "Once upon a time"
 ```
@@ -76,9 +76,9 @@ Serverless **Load-Balancing** endpoint (not queue-based; the existing
 [`scripts/deploy_runpod.sh`](scripts/deploy_runpod.sh) automates the whole path: it builds
 and pushes the image, creates the load-balancing template + endpoint, pins the `sm_86`
 SKU, and runs the cold-start benchmark (`scripts/bench_cold_runpod.sh`) against it.
-(`--slim` builds the measured `base` + `libcublas-12-4` runtime variant tagged `:runtime`;
-defaults are unchanged — see the README's image-size section.) To do it by hand, build and
-push the image from this directory's `Dockerfile`, then create the endpoint (console, API,
+The image uses the slim `base` + `libcublas-12-4` runtime and multi-arch fatbin kernels by
+default (see the README's image-size section). To do it by hand, build and push the root
+`Dockerfile`'s `runpod-lb` target (`docker build --target runpod-lb .`), then create the endpoint (console, API,
 or `runpod-mcp`'s `create-endpoint` / `runpodctl`) with:
 - Endpoint type: Load Balancing
 - `GGUF_PATH` env var (model is baked into the image at build time), `PORT` if not `80`

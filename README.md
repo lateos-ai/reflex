@@ -745,12 +745,15 @@ binary at build time — the runtime image never runs `nvcc` and never needs the
 toolkit.
 
 ```
-# With no build-arg the image holds portable PTX, which a fresh container JITs on every
-# start (~0.8 s on a T4, since it has no driver JIT cache yet; see "Core technical
-# bet"). Pin the kernels instead: REFLEX_CUDA_ARCH=sm_XX for one GPU architecture, or
-# REFLEX_CUDA_ARCHS=sm_75,sm_80,sm_86,sm_89,sm_90 for one image that runs natively on
-# several generations (fatbin; it takes precedence if both are set).
-docker build --build-arg REFLEX_CUDA_ARCH=sm_86 -t reflex .
+# With no build-arg the kernels are a multi-arch fatbin (native on T4 through H100,
+# Ada included). --build-arg REFLEX_CUDA_ARCH=sm_XX builds a single cubin for one GPU
+# instead (it wins over the fatbin list). --build-arg REFLEX_CUDA_ARCHS= (empty) gives
+# portable PTX, which a fresh container JITs on every start (~0.8 s on a T4; see
+# "Core technical bet").
+docker build -t reflex .
+
+# The same Dockerfile also builds the OpenAI-compatible sidecar image and the Runpod
+# load-balancing image: --target adapter / --target runpod-lb (see the Dockerfile header).
 
 # Needs nvidia-container-toolkit on the host. The default entrypoint is
 # `reflex generate`, so pass just the GGUF path and prompt:
@@ -815,44 +818,38 @@ features are `driver`/`cublas`/`cuda-12000`/`f16`); none of the
 `cuda-libraries-12-4` meta-package's NCCL, cuFFT, cuSPARSE, cuSOLVER, NPP or
 nvJPEG are referenced anywhere in `src/`.
 
-That slimming is now **landed as an opt-in runtime variant** across the deploy
-Dockerfiles (`Dockerfile`, `sidecar/openai-adapter/`, `serverless/runpod/`,
-`.runpod/`, `.modal/`), following the same "add capability, don't change
-defaults" rule the multi-arch fatbin work used. Pass
+Every image built from this repo now uses CUDA's `base` image plus `libcublas-12-4` (for
+`libcublas.so.12` and `libcublasLt.so.12`) as its runtime, and all but the Modal image
+come from one multi-target root `Dockerfile` (`--target reflex`, the default, `adapter`,
+`runpod-lb`; `.runpod/Dockerfile` must stay separate for Runpod's Hub pipeline and
+mirrors it). Kernels default to the multi-arch fatbin (see
+[Core technical bet](#core-technical-bet)).
 
-```
---build-arg REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-base-ubuntu22.04 \
---build-arg REFLEX_RUNTIME_SLIM=1
-```
+Measured on a dedicated AWS `g4dn.xlarge` (Tesla T4, Docker 29.8.1, BuildKit),
+2026-09-30, each image built with its own defaults before and after:
 
-and only `libcublas-12-4` is installed on the smaller base; leaving both unset
-reproduces the previously-shipped image byte-for-byte, so no existing
-deployment's base moves out from under it. `scripts/deploy_runpod.sh --slim`
-builds and tags this variant `:runtime`. See `scripts/deploy_runpod.sh --help`.
+| image | before (`-runtime-` base) | after (`base` + cuBLAS) | change |
+|---|---|---|---|
+| `reflex` (root, default target) | 3.78 GB | 1.27 GB | −66% |
+| `adapter` (was `sidecar/openai-adapter/Dockerfile`) | 3.78 GB | 1.28 GB | −66% |
+| `runpod-lb` (was `serverless/runpod/Dockerfile`; model baked in) | 4.57 GB | 2.06 GB | −55% |
+| `.runpod/Dockerfile` (Hub; model + Python baked in) | 4.87 GB | 2.37 GB | −51% |
 
-Re-measured on the landed images (Docker Desktop, containerd image store; the
-same ~397MB Qwen3-0.6B Q4_K_M model is baked into both, so it is a fixed cost in
-each):
+The slim images contain no CUDA library besides cuBLAS and `libcudart` (no NCCL, cuFFT,
+cuSPARSE, cuSOLVER or NPP). `ldd` can't confirm cuBLAS is found, because `cudarc` loads it
+with `dlopen` at runtime, so the check that matters is a real run: `reflex generate`
+(which uses cuBLAS for batched prefill) returns the same tokens from the fatbin,
+single-arch `sm_75` and portable-PTX variants, and the `adapter`, `runpod-lb` and Hub
+images each answered a real `/v1/chat/completions` request (the Hub one through
+`handler.py --test_input`).
 
-| | full `-runtime-` base | `base` + `libcublas-12-4` |
+The kernel default matters as much as the size. In a fresh container, the old root
+image's portable-PTX kernels pay the driver JIT on every start; the new fatbin doesn't:
+
+| `reflex system1`, fresh container each run (3 runs) | model load | total |
 |---|---|---|
-| `docker images` reported size | 4.57GB | 2.06GB |
-| on-disk rootfs (`du -sxh /`) | 2.6GB | 1.2GB |
-| `/usr/local/cuda-12.4` (CUDA userspace tree) | 1.9GB | 675MB |
-
-The `libcublas-12-4` layer alone is **553MB** (confirmed from the BuildKit step
-size) — `libcublasLt.so.12.4.5.8` is 442MB and `libcublas.so.12.4.5.8` 110MB of
-the 527MB of cuBLAS shared objects. The CUDA-library tree shrinks by ~1.2GB,
-which is the part that tracks the actual dead weight; the whole-image percentage
-is smaller only because the constant model is a larger share of the slim image.
-The finding this section previously recorded as "not yet landed" (**3.78GB** vs
-**1.28GB**) was the first measurement and used two different accounting methods
-(`docker images` of the model-free root image for the full figure, an
-already-model-inclusive layer sum for the slim one); the table above is the
-apples-to-apples re-measurement of the landed variant. The variant re-builds
-clean locally; the original finding reported it verified-working on real
-hardware, and a fresh end-to-end GPU run of the landed image is worth doing
-before leaning on it.
+| old root image (portable PTX) | 1021–1072 ms | 1218–1308 ms |
+| new root image (fatbin) | 232–234 ms | 435–441 ms |
 
 **`serverless/runpod/` has since been deployed against a real Runpod account and works
 end-to-end** — see [Why serverless is the fit](#why-serverless-is-the-fit) above and
@@ -860,7 +857,9 @@ end-to-end** — see [Why serverless is the fit](#why-serverless-is-the-fit) abo
 platform's actual (undocumented) health-check behavior, and a gateway quirk found along
 the way. The one thing still unconfirmed is the exact dollar amount billed for those test
 invocations — Runpod's billing API hadn't reconciled the relevant hour yet at time of
-writing; the per-second rate itself is confirmed from the live catalog.
+writing; the per-second rate itself is confirmed from the live catalog. That deployment
+used the earlier image (full `-runtime-` base, `sm_86` cubin); the slim fatbin `runpod-lb`
+image above has not been redeployed to Runpod yet.
 
 ## Kubernetes
 

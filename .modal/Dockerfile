@@ -1,14 +1,14 @@
-# Packages the same reflex + reflex-openai-adapter combination as
-# serverless/runpod/Dockerfile and sidecar/openai-adapter/Dockerfile, this time for
+# Packages the same reflex + reflex-openai-adapter combination as the root
+# Dockerfile's `adapter`/`runpod-lb` targets, this time for
 # deployment as a Modal Server (see app.py, which uses `Image.from_dockerfile` against
 # this file rather than modal.Image's Python builder methods -- reusing this exact,
 # already-proven build recipe instead of re-deriving an equivalent one keeps all three
 # deployments' build behavior in lockstep).
 #
 # REFLEX_CUDA_ARCH defaults to sm_89 here (Ada Lovelace) -- unlike
-# serverless/runpod/Dockerfile's sm_86 default and .runpod/Dockerfile's portable-PTX
-# default, both driven by *mixed-architecture GPU pools* neither deployment can fully
-# pin. Modal's `gpu="L4"` parameter in app.py requests one exact SKU (NVIDIA L4, Ada,
+# the root Dockerfile's and .runpod/Dockerfile's multi-arch fatbin default, which
+# exists for *mixed-architecture GPU pools* those deployments can't fully pin.
+# Modal's `gpu="L4"` parameter in app.py requests one exact SKU (NVIDIA L4, Ada,
 # compute capability 8.9) with no pool-mixing hazard, so there is no reason to give up
 # the zero-driver-JIT cold-start advantage a pinned cubin gets. If app.py's GPU choice
 # ever changes to a different architecture, this default must change with it.
@@ -52,7 +52,7 @@ RUN set -- --release --bin reflex --features ipc; \
     fi
 
 # Built in this same devel image deliberately -- see
-# sidecar/openai-adapter/Dockerfile's comment on avoiding a glibc-version skew
+# the root Dockerfile's comment on avoiding a glibc-version skew
 # against a separate plain-Rust builder base image.
 RUN cd sidecar/openai-adapter && cargo build --release
 
@@ -75,7 +75,7 @@ RUN if [ -n "$REFLEX_RUNTIME_SLIM" ]; then \
 COPY --from=builder /build/target/release/reflex /usr/local/bin/reflex
 COPY --from=builder /build/sidecar/openai-adapter/target/release/reflex-openai-adapter /usr/local/bin/reflex-openai-adapter
 
-# Same file, same rationale as serverless/runpod/Dockerfile: baked in at build time so
+# Same file, same rationale as the root Dockerfile's runpod-lb target: baked in at build time so
 # a runtime HuggingFace download never pollutes the cold-start number this deployment
 # exists to measure. Not duplicated under .modal/ -- one baked model artifact shared
 # by both deployments that already bake one in.

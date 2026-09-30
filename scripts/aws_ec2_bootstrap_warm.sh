@@ -5,7 +5,7 @@
 # scale-to-zero/local-UDS-only pattern in docs/aws-deployment.md), not a replacement
 # for it — the two patterns coexist. This script differs from that one in exactly the
 # ways the two deployment patterns differ:
-#   - runs the combined reflex+adapter image (sidecar/openai-adapter/Dockerfile) with
+#   - runs the combined reflex+adapter image (root Dockerfile, --target adapter) with
 #     `reflex-openai-adapter` as the entrypoint, bound to a real TCP port, instead of
 #     bare `reflex uds` bound to a local-only Unix Domain Socket;
 #   - readiness is polled over HTTP (`/healthz`) instead of waiting for a socket file
@@ -26,7 +26,7 @@
 #
 # Required environment variables (set via the Launch Template's user-data):
 #   ECR_IMAGE    - full ECR image URI for the *combined* image built from
-#                  sidecar/openai-adapter/Dockerfile, e.g.
+#                  the root Dockerfile's `adapter` target, e.g.
 #                  123456789012.dkr.ecr.us-east-1.amazonaws.com/reflex-openai-adapter:latest
 #   EFS_ID       - EFS filesystem id, e.g. fs-0123456789abcdef0
 #   MODEL_REPO   - Hugging Face repo id, e.g. Qwen/Qwen3-0.6B-GGUF

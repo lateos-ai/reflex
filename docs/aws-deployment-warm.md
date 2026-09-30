@@ -23,7 +23,7 @@ Internet
        -> Target Group (HTTP:8000, health check "/healthz")
             -> Auto Scaling Group: min=1/max=2, g4dn.xlarge, On-Demand baseline +
                Spot burst (mixed-instances-policy, OnDemandBaseCapacity=1)
-                 each instance: sidecar/openai-adapter/Dockerfile's combined image,
+                 each instance: the root Dockerfile's `adapter` image,
                  reflex-openai-adapter bound 0.0.0.0:8000, spawning
                  reflex stdio <gguf> as a child in the same container
 ```
@@ -84,12 +84,11 @@ What it does *not* buy you:
 Unlike the sibling guide (which uses the root `Dockerfile` unchanged), this pattern
 needs both `reflex` (with the `ipc` feature, for `reflex stdio`) and
 `reflex-openai-adapter` in one image, since the adapter spawns `reflex stdio` as a
-literal child process. Build from the repo root using
-[`sidecar/openai-adapter/Dockerfile`](../sidecar/openai-adapter/Dockerfile) (build
-context = repo root):
+literal child process. Build the root [`Dockerfile`](../Dockerfile)'s `adapter`
+target (build context = repo root):
 
 ```bash
-docker build -f sidecar/openai-adapter/Dockerfile \
+docker build --target adapter \
   --build-arg REFLEX_CUDA_ARCH=sm_75 \
   -t reflex-openai-adapter:latest .
 
