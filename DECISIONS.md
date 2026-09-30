@@ -255,6 +255,64 @@ caching strategy (compressed latent KV), not an incremental extension of GQA, so
 carries the most implementation risk and should be tackled once the rest of the harness
 is trustworthy. (Read llama.cpp PR #11446 before attempting it.)
 
+## Extending architecture coverage: explicit whitelist + per-arch RoPE type (Llama/Mistral, then `qwen35moe`)
+
+**Decision**: after the four-MVP-family set (dense Qwen3 → Qwen3-MoE → Qwen3.5 hybrid →
+MLA), the next architecture additions are **Llama/Mistral dense GQA first**, then
+**`qwen35moe`**, and both are done under two rules:
+
+1. **The dense-path architecture gate stays an explicit whitelist**, never "anything
+   that structurally parses". `parse_model_config` accepts dense `qwen3`, `llama`,
+   `mistral`, `mixtral`, plus (as before) any file reporting a nonzero
+   `<arch>.expert_count`; every other architecture string is still a clear hard error.
+   Silently running an unrecognized family through the Qwen3-shaped dense path would
+   turn a metadata mismatch into plausible-looking-but-wrong output.
+2. **RoPE convention is a per-architecture property derived from one auditable
+   mapping**, `rope_type_for(architecture)`, confirmed against llama.cpp's
+   `llama_model_rope_type` — `Neox` (half-split pairs `(i, i + rotary_dim/2)`,
+   `rope_kernel`) for Qwen3/Qwen3.5, `Norm` (consecutive pairs `(2i, 2i+1)`,
+   `rope_norm_kernel`, already shipped for MLA) for Llama/Mistral/Mixtral. RoPE
+   scaling types other than `none` (e.g. Llama-3.1's `linear`/`yarn` long-context
+   variants) are rejected with a clear error rather than run with wrong frequencies.
+   `rope.dimension_count` is read explicitly (full rotation for these families), not
+   assumed equal to `head_dim`.
+
+**Why**: Llama/Mistral are the cheapest real addition because everything *except* the
+RoPE convention already exists generically in the dense/MoE path — GQA
+(`attention.head_count_kv`), RMSNorm, SwiGLU `ffn_gate`/`ffn_up`/`ffn_down`, the
+SentencePiece tokenizer (`tokenizer.ggml.model == "llama"`), tied-vs-untied
+`output.weight`, and even optional QK-Norm. The MLA work had already proven (the hard
+way, via a silently-corrupted-output bug) that RoPE convention is *not*
+architecture-independent — see this file's MLA RoPE entry and the "don't assume RoPE
+convention is architecture-independent" rule stated there; this decision turns that
+lesson into a single enforced mapping. The whitelist rule exists for the same reason
+the family ordering does: a wrong metadata assumption elsewhere in the pipeline should
+surface as a rejection, not as wrong tokens.
+
+`qwen35moe` is deliberately *second*, not first, even though both halves exist in
+isolation today (the `qwen35` hybrid mixer, and routed-MoE + shared-expert FFN from
+`qwen3moe`/MLA): it combines two mechanisms in one layer, and no small real
+`qwen35moe` checkpoint exists to verify against, so its blocker is a **synthetic
+fixture** (the same hand-built-HF-checkpoint-through-`convert_hf_to_gguf.py` pattern
+as `tiny-qwen3moe.gguf`/`deepseek-tiny-mla.gguf`), not new kernel math.
+
+**How to apply**: breadth is llama.cpp's axis, not this engine's (see the Non-goals
+framing) — add a family only when a concrete target model pulls it, and budget each
+addition as *fixture + independent-implementation verification* first, forward-pass
+code second. Every addition must clear the bar in the "Cross-check new architecture
+work against an independent ground truth" entry above: real generated tokens compared
+against a fresh llama.cpp build (or a host reference), never "it runs and looks
+plausible". The Llama/Mistral path was verified this way before being declared done
+(HISTORY.md's "Llama/Mistral dense-GQA support (2026-09-30)" entry): `reflex
+check`/`generate` matched a fresh CUDA `llama-simple` build byte-exact on
+TinyLlama-1.1B-Chat, and a secondary finding — real Mistral-7B GGUFs report
+`general.architecture = "llama"`, because llama.cpp has no bare `mistral` arch string
+(only the separate `mistral3`/`mistral4`) — means the `llama` arm carries Mistral-7B; the
+`mistral`/`mixtral` arms are defensive aliases. Running a 7B model end-to-end additionally
+needs >15GB (every weight is `f32`-resident), so the byte-exact check was done on the
+smaller `llama`-arch model; the conventions that differ from Qwen3 (Norm RoPE, GQA,
+SwiGLU) are scale-invariant and were exercised there.
+
 ## Naive (ungrouped) per-expert MoE dispatch, not grouped/batched
 
 **Decision**: Qwen3-MoE's FFN dispatches one `gemv_expert` call per selected expert

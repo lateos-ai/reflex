@@ -880,6 +880,37 @@ Instrumentation/docs only, no engine change. Real-T4-verified (`g4dn.xlarge`, dr
   `schema_version` to `bench`/`check`/`doctor` result structs is documented as deferred.
 - Gates: `REFLEX_SKIP_CUDA=1` fmt/clippy (default + nvml,json-output)/test all green.
 
+## Planned next work: extending architecture coverage (queued 2026-09-30)
+
+Breadth on demand, not a roadmap axis (see README's "Future architecture additions" and
+DECISIONS.md's "Extending architecture coverage..."). Next in order:
+
+1. **Llama / Mistral dense GQA** — *implementation landed, real-hardware-verified against
+   llama.cpp on `llama`-arch (TinyLlama-1.1B)*: `parse_model_config` now whitelists
+   `llama` (plus `mistral`/`mixtral` aliases), reads `rope.dimension_count`, rejects
+   non-`none` RoPE scaling, and derives per-arch RoPE convention (`RopeType::Neox` for
+   Qwen3/Qwen3.5, `RopeType::Norm` for the Llama family) from an auditable `rope_type_for`
+   mapping confirmed against llama.cpp's `llama_model_rope_type`. The dense path loads
+   `rope_norm_kernel`/`rope_norm_batch_kernel` from the existing `rope.cu` module and
+   `rope()`/`rope_batch()` dispatch on that type. No new CUDA kernel. On a g4dn.xlarge
+   (Tesla T4, sm_75), `reflex check`/`generate` matched a fresh CUDA `llama-simple` build
+   **byte-exact** on TinyLlama-1.1B-Chat (Q4_K_M) for two prompts (both include GQA:
+   TinyLlama has 4 KV heads) — see HISTORY.md for the exact token ids. **Finding**: real
+   Mistral-7B GGUFs report `general.architecture = "llama"` — llama.cpp has no bare
+   `mistral` arch (its newer `mistral3`/`mistral4` are separate architectures outside this
+   scope), so the verified `llama` path *is* Mistral-7B support. An end-to-end 7B run
+   additionally needs more than the T4's 15GB because the engine holds every weight `f32`
+   (~29GB for 7B) — the documented f16-residency limitation, not a correctness gap; the
+   scale-invariant conventions (Norm RoPE, GQA, SwiGLU, SPM tokenizer) are covered by the
+   TinyLlama match.
+2. **`qwen35moe`** — *planned*: add a routed-MoE + shared-expert FFN to the Qwen3.5 hybrid
+   layer weights (reusing `moe::route_top_k`/`route_top_k_with_norm` and MLA's
+   shared-expert math), plus a synthetic fixture (no small real `qwen35moe` checkpoint
+   exists) built the same way as `tiny-qwen3moe.gguf`.
+
+Both still require the project's independent-implementation verification bar before
+being called fully done.
+
 ## Known debt / limitations
 
 - ~~**`src/ffi.rs`'s `extern "C"` functions dereference raw pointers without being

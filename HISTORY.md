@@ -3405,3 +3405,84 @@ and key pair were torn down at the end of the session.
 **Gates**: docs/harness only -- `REFLEX_SKIP_CUDA=1 cargo fmt --check`, `cargo clippy
 --all-targets -- -D warnings`, `cargo test` all unchanged/clean (no Rust source touched).
 
+### Llama/Mistral dense-GQA support (2026-09-30)
+
+The fifth architecture family, added per DECISIONS.md's "Extending architecture coverage:
+explicit whitelist + per-arch RoPE type" entry and README's "Future architecture
+additions". Small change by design: the dense forward path (GQA, RMSNorm, SwiGLU, the
+SentencePiece tokenizer, tied-vs-untied `output.weight`, optional QK-Norm) was already
+generic, so the only real delta was the RoPE convention.
+
+**What changed** (all in `src/model.rs`; no new `.cu`):
+
+- New `enum RopeType { Neox, Norm }` + `rope_type_for(architecture)`, confirmed against
+  llama.cpp's `llama_model_rope_type`: `qwen3`/`qwen3moe` → `Neox` (half-split,
+  `rope_kernel`); `llama` (and the `mistral`/`mixtral` aliases) → `Norm` (consecutive
+  pair, `rope_norm_kernel`).
+- `parse_model_config` now whitelists dense `qwen3`/`llama`/`mistral`/`mixtral` (plus the
+  pre-existing "any nonzero `<arch>.expert_count`" MoE rule); reads
+  `{arch}.rope.dimension_count` (was hardcoded to `head_dim`); and rejects
+  `{arch}.rope.scaling.type` other than `none` with a clear error (Llama-3.1's
+  `linear`/`yarn` long-context variants are out of scope).
+- The dense path now extracts `rope_norm_kernel`/`rope_norm_batch_kernel` from the same
+  `REFLEX_KERNEL_ROPE` module it already loaded; `Model::rope`/`rope_batch` take a
+  `RopeType` and dispatch to the matching kernel (fields are `Option`, `None` for
+  hybrid/MLA, which never use them). Added a host-only `rope_type_tests` mapping test.
+
+**Verification** -- `g4dn.xlarge` / **Tesla T4 (sm_75)**, driver 595.91.07 / CUDA 13.2,
+instance `reflex-gpu-verify` driven over SSM with source (`reflex-src/`) and models via
+the `reflex-gpu-verify-1790613486` S3 bucket. Reflex built with
+`REFLEX_CUDA_ARCH=sm_75 cargo build --release --bin reflex`; comparison reference was a
+fresh `ggml-org/llama.cpp` built `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75
+-DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release`, using `llama-simple` (greedy,
+`llama_sampler_init_greedy`; prompt passed positionally). Model:
+`TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF` Q4_K_M.
+
+| prompt | reflex `token_ids` | reflex text | llama.cpp `llama-simple` stdout | match |
+|---|---|---|---|---|
+| `The capital of France is` | `[3681,29889,13,13,29906,29889,350,29889]` | `" Paris.\n\n2. B."` | `<s> The capital of France is Paris.\n\n2. B.` | **byte-exact** |
+| `Once upon a time` | `[29892,727,471,263,4123,6114,4257,365]` | `", there was a young woman named L"` | `<s> Once upon a time, there was a young woman named L` | **byte-exact** |
+
+(`llama-simple` prints the prompt's pieces before the continuation and adds a trailing
+newline; the generated continuation is byte-identical to reflex's `token_text` in both
+cases.) TinyLlama has **4 KV heads** (GQA), 22 layers, SPM tokenizer, no separate
+`output.weight`, so this one match exercises GQA + Norm RoPE + RMSNorm + SwiGLU + the
+SentencePiece tokenizer together -- none of which the Qwen3-only path had ever run under
+the Norm convention before.
+
+**Mistral-7B: a finding and a limitation, both disclosed.**
+
+1. *Finding*: `TheBloke/Mistral-7B-v0.1-GGUF` (Q4_K_M, downloaded for this run) reports
+   `general.architecture = "llama"`, not `"mistral"`. llama.cpp has **no bare `mistral`
+   arch string** -- its `llama-arch.cpp` name table has only the separate, newer
+   `mistral3`/`mistral4` (different architectures, out of scope). So Mistral-7B *is* the
+   `llama` path, which the TinyLlama match already verifies; the `mistral`/`mixtral` arms
+   in this change are defensive aliases only.
+2. *Limitation*: an end-to-end 7B run additionally **OOMs on the T4's 15 GB** --
+   `failed to load model: "load weight 'blk.17.ffn_up.weight': alloc dequant output:
+   DriverError(CUDA_ERROR_OUT_OF_MEMORY)"` at layer 17/32 -- because the engine holds
+   every weight `f32` (~29 GB for 7B). This is the already-documented f16-residency
+   limitation (see `docs/pitch.md` / STATUS.md), not an architecture-support gap:
+   `llama-simple` ran the same 7B file on the same GPU because it keeps weights
+   quantized. Verifying a 7B `llama`-arch model end-to-end would need a >30 GB GPU; the
+   scale-invariant conventions are already covered at 1.1B.
+
+**Gates**: `REFLEX_SKIP_CUDA=1 cargo fmt --check`; `cargo clippy --all-targets --
+-D warnings`; `cargo test` (86 passed / 12 ignored -- +1 for `rope_type_tests`). The T4
+instance was left running (kept alive for a possible larger-GPU follow-up); see STATUS.md
+for teardown state.
+
+### Larger-GPU follow-up: Mistral-7B end-to-end (2026-09-30)
+
+**Decision (2026-09-30): accepted the TinyLlama `llama`-arch match as sufficient; no
+separate 7B run.** Rationale: Mistral-7B GGUFs are `general.architecture = "llama"` (see
+the finding above), i.e. the *exact* code path the byte-exact TinyLlama match already
+exercised, and every convention that differs from Qwen3 (Norm RoPE, GQA, SwiGLU, SPM
+tokenizer) is scale-invariant -- model size only changes tensor dimensions the pipeline
+handles uniformly. Spending a >30 GB GPU session (e.g. `g6e.xlarge`/L40S) to re-confirm
+the same path at 7B was judged not worth the cost. The T4 (`reflex-gpu-verify`) instance
+was stopped at the end of the session; the `mistral-7b-v0.1.Q4_K_M.gguf` left in
+`/root/models/` on its EBS is inert while stopped. If a 7B-transformer end-to-end check is
+ever wanted for another reason, the recipe above (fresh CUDA `llama-simple` + `reflex
+check`, same prompt) applies unchanged.
+

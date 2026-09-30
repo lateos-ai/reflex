@@ -120,6 +120,43 @@ fn f32_meta(file: &GgufFile, key: &str) -> Option<f32> {
     file.metadata.get(key).and_then(GgufValue::as_f32)
 }
 
+/// Which rotary-embedding convention a model's attention RoPE must use.
+/// `Neox` is llama.cpp's `LLAMA_ROPE_TYPE_NEOX` -- half-split pairs `(i, i +
+/// rotary_dim/2)` -- implemented by `rope_kernel`/`rope_batch_kernel`, used by
+/// Qwen3/Qwen3.5. `Norm` is `LLAMA_ROPE_TYPE_NORM` -- consecutive pairs
+/// `(2i, 2i+1)` -- implemented by `rope_norm_kernel`/`rope_norm_batch_kernel`,
+/// used by Llama/Mistral (and DeepSeek-V2/V3 MLA, handled on `MlaModel`).
+/// **Confirmed per-architecture against llama.cpp's `llama_model_rope_type`,
+/// never assumed** -- the MLA work found this is a real, easy-to-miss
+/// per-architecture difference that silently corrupts output when wrong (see
+/// DECISIONS.md's MLA RoPE entry).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopeType {
+    Neox,
+    Norm,
+}
+
+/// Maps a GGUF `general.architecture` string to its RoPE convention for the
+/// dense/MoE path. `qwen3`/`qwen3moe` (and any other architecture reaching
+/// [`parse_model_config`] today) use the half-split Neox convention this
+/// project has always applied; `llama` (and the `mistral`/`mixtral` aliases)
+/// use the consecutive-pair Norm convention (`llama_model_rope_type` maps the
+/// Llama family, including Mistral, to `LLAMA_ROPE_TYPE_NORM`). Kept a pure
+/// function of the architecture string so the mapping is auditable in one
+/// place.
+///
+/// Note: real Mistral-7B GGUFs report `general.architecture = "llama"`, not
+/// `"mistral"` -- llama.cpp has no bare `mistral` arch string (its newer
+/// `mistral3`/`mistral4` are separate architectures outside this scope), so
+/// the `mistral`/`mixtral` arms are defensive aliases; `llama` is the arm that
+/// actually carries Mistral-7B.
+fn rope_type_for(architecture: &str) -> RopeType {
+    match architecture {
+        "llama" | "mistral" | "mixtral" => RopeType::Norm,
+        _ => RopeType::Neox,
+    }
+}
+
 /// Static shape/hyperparameter config for one dense Qwen3 transformer layer,
 /// read from the GGUF file's `qwen3.*` metadata.
 #[derive(Clone)]
@@ -140,6 +177,9 @@ pub struct LayerConfig {
     pub ffn_hidden_size: usize,
     pub rope_base: f32,
     pub rmsnorm_eps: f32,
+    /// Which RoPE convention this model's attention uses (see [`RopeType`]).
+    /// `Neox` for Qwen3/Qwen3.5, `Norm` for Llama/Mistral.
+    pub rope_type: RopeType,
 }
 
 /// A weight tensor, dequantized to `f32` once at load time and uploaded to
@@ -962,10 +1002,31 @@ pub fn parse_model_config(
         None => None,
     };
 
-    if architecture != "qwen3" && moe.is_none() {
+    if architecture != "qwen3"
+        && !matches!(architecture, "llama" | "mistral" | "mixtral")
+        && moe.is_none()
+    {
         return Err(format!(
-            "unsupported architecture '{architecture}': only dense 'qwen3' and MoE architectures reporting a nonzero '{architecture}.expert_count' are in scope for this MVP"
+            "unsupported architecture '{architecture}': only dense 'qwen3'/'llama'/'mistral' and MoE architectures reporting a nonzero '{architecture}.expert_count' are in scope for this MVP"
         ));
+    }
+
+    // RoPE scaling types other than "none" (e.g. Llama-3.1's "linear"/"yarn"
+    // long-context variants) change the per-dimension rotation frequencies;
+    // this path implements only the unscaled convention, so reject rather than
+    // silently run wrong frequencies (same rejection posture as MLA's YaRN/
+    // qwen35moe/MTP handling). `deepseek2`'s "yarn" is handled separately on
+    // the MLA path, never here.
+    if let Some(scaling) = file
+        .metadata
+        .get(&format!("{architecture}.rope.scaling.type"))
+        .and_then(GgufValue::as_str)
+    {
+        if scaling != "none" {
+            return Err(format!(
+                "{architecture}.rope.scaling.type = {scaling:?} is not supported by this MVP (only unscaled RoPE, i.e. no scaling or \"none\", is implemented)"
+            ));
+        }
     }
 
     let block_count = u64_meta(file, &format!("{architecture}.block_count"))
@@ -987,6 +1048,13 @@ pub fn parse_model_config(
     let head_dim = u64_meta(file, &format!("{architecture}.attention.key_length"))
         .map(|n| n as usize)
         .unwrap_or(hidden_size / num_q_heads);
+    // Number of leading head dims RoPE rotates. Full (`head_dim`) for
+    // Qwen3/Llama/Mistral; read explicitly so a partial-rotation file isn't
+    // silently run with the wrong count. Falls back to full rotation when the
+    // key is absent (all of the above, plus the Mixtral-style fixture).
+    let rotary_dim = u64_meta(file, &format!("{architecture}.rope.dimension_count"))
+        .map(|n| n as usize)
+        .unwrap_or(head_dim);
 
     let ffn_gate_weight_name = if moe.is_some() {
         "blk.0.ffn_gate_exps.weight"
@@ -1019,10 +1087,11 @@ pub fn parse_model_config(
             num_q_heads,
             num_kv_heads,
             head_dim,
-            rotary_dim: head_dim,
+            rotary_dim,
             ffn_hidden_size,
             rope_base,
             rmsnorm_eps,
+            rope_type: rope_type_for(architecture),
         },
         block_count,
         moe,
@@ -1598,6 +1667,15 @@ pub struct Model {
     /// one launch, each at its own absolute position, instead of one
     /// `rope_k` launch per row.
     rope_batch_k: AotKernel,
+    /// `rope_norm_kernel` (`kernels_cuda/rope.cu`) -- the consecutive-pair
+    /// ([`RopeType::Norm`]) rotation Llama/Mistral need, loaded from the same
+    /// `REFLEX_KERNEL_ROPE` module as `rope_k` (unlike `MlaModel`'s separate
+    /// copy). `None` for models that never use the Norm convention (hybrid,
+    /// MLA), so no module lookup is paid where it isn't used.
+    rope_norm_k: Option<AotKernel>,
+    /// Batched-prefill variant of `rope_norm_k` (`rope_norm_batch_kernel`,
+    /// `kernels_cuda/rope.cu`).
+    rope_norm_batch_k: Option<AotKernel>,
     silu_k: AotKernel,
     gemv_k: AotKernel,
     /// Gathers only caller-chosen output rows of a GEMV instead of every row
@@ -2006,11 +2084,18 @@ impl Model {
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ROPE")),
             "rope",
-            &["rope_kernel", "rope_batch_kernel"],
+            &[
+                "rope_kernel",
+                "rope_batch_kernel",
+                "rope_norm_kernel",
+                "rope_norm_batch_kernel",
+            ],
         )?
         .into_iter();
         let rope_k = rope_fns.next().ok_or("missing rope_kernel")?;
         let rope_batch_k = rope_fns.next().ok_or("missing rope_batch_kernel")?;
+        let rope_norm_k = rope_fns.next().ok_or("missing rope_norm_kernel")?;
+        let rope_norm_batch_k = rope_fns.next().ok_or("missing rope_norm_batch_kernel")?;
         let silu_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")),
@@ -2174,6 +2259,8 @@ impl Model {
             rmsnorm_k,
             rope_k,
             rope_batch_k,
+            rope_norm_k: Some(rope_norm_k),
+            rope_norm_batch_k: Some(rope_norm_batch_k),
             silu_k,
             gemv_k,
             gemv_gather_k,
@@ -2259,6 +2346,7 @@ impl Model {
             ffn_hidden_size,
             rope_base,
             rmsnorm_eps,
+            rope_type: RopeType::Neox,
         };
 
         let d_state = u64_meta(file, &key("ssm.state_size"))
@@ -2488,6 +2576,8 @@ impl Model {
             rmsnorm_k,
             rope_k,
             rope_batch_k,
+            rope_norm_k: None,
+            rope_norm_batch_k: None,
             silu_k,
             gemv_k,
             gemv_gather_k,
@@ -2764,6 +2854,7 @@ impl Model {
             ffn_hidden_size: 1,
             rope_base: mla_cfg.rope_base,
             rmsnorm_eps: mla_cfg.rmsnorm_eps,
+            rope_type: RopeType::Neox,
         };
 
         Ok(Model {
@@ -2772,6 +2863,8 @@ impl Model {
             rmsnorm_k,
             rope_k,
             rope_batch_k,
+            rope_norm_k: None,
+            rope_norm_batch_k: None,
             silu_k,
             gemv_k,
             gemv_gather_k,
@@ -3235,6 +3328,7 @@ impl Model {
     /// Non-goals), so there is never more than one token's position to pass,
     /// and the previous per-call device allocation+upload for it was pure
     /// overhead (Phase 2 round 2).
+    #[allow(clippy::too_many_arguments)]
     fn rope(
         &self,
         t: &mut CudaSlice<f32>,
@@ -3243,6 +3337,7 @@ impl Model {
         rotary_dim: usize,
         position: usize,
         base: f32,
+        rope_type: RopeType,
     ) -> Result<(), String> {
         let half_rotary = rotary_dim / 2;
         let total_pairs = (num_heads * half_rotary) as u32;
@@ -3254,8 +3349,15 @@ impl Model {
             shared_mem_bytes: 0,
         };
 
+        let kernel = match rope_type {
+            RopeType::Neox => &self.rope_k,
+            RopeType::Norm => self
+                .rope_norm_k
+                .as_ref()
+                .ok_or("rope_norm_kernel not loaded for this model")?,
+        };
         unsafe {
-            self.rope_k
+            kernel
                 .function
                 .clone()
                 .launch(
@@ -3288,6 +3390,7 @@ impl Model {
         rotary_dim: usize,
         rows: usize,
         base: f32,
+        rope_type: RopeType,
     ) -> Result<(), String> {
         let half_rotary = rotary_dim / 2;
         let total_pairs = (rows * num_heads * half_rotary) as u32;
@@ -3299,8 +3402,15 @@ impl Model {
             shared_mem_bytes: 0,
         };
 
+        let kernel = match rope_type {
+            RopeType::Neox => &self.rope_batch_k,
+            RopeType::Norm => self
+                .rope_norm_batch_k
+                .as_ref()
+                .ok_or("rope_norm_batch_kernel not loaded for this model")?,
+        };
         unsafe {
-            self.rope_batch_k
+            kernel
                 .function
                 .clone()
                 .launch(
@@ -4169,6 +4279,7 @@ impl Model {
             cfg.rotary_dim,
             position,
             cfg.rope_base,
+            cfg.rope_type,
         )?;
         self.rope(
             &mut k,
@@ -4177,6 +4288,7 @@ impl Model {
             cfg.rotary_dim,
             position,
             cfg.rope_base,
+            cfg.rope_type,
         )?;
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
@@ -4412,6 +4524,7 @@ impl Model {
             cfg.rotary_dim,
             rows,
             cfg.rope_base,
+            cfg.rope_type,
         )?;
         self.rope_batch(
             &mut k,
@@ -4421,6 +4534,7 @@ impl Model {
             cfg.rotary_dim,
             rows,
             cfg.rope_base,
+            cfg.rope_type,
         )?;
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
@@ -6003,6 +6117,7 @@ impl Model {
             cfg.rotary_dim,
             position,
             cfg.rope_base,
+            cfg.rope_type,
         )?;
         self.rope(
             &mut k,
@@ -6011,6 +6126,7 @@ impl Model {
             cfg.rotary_dim,
             position,
             cfg.rope_base,
+            cfg.rope_type,
         )?;
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
@@ -6157,6 +6273,7 @@ impl Model {
             cfg.rotary_dim,
             rows,
             cfg.rope_base,
+            cfg.rope_type,
         )?;
         self.rope_batch(
             &mut k,
@@ -6166,6 +6283,7 @@ impl Model {
             cfg.rotary_dim,
             rows,
             cfg.rope_base,
+            cfg.rope_type,
         )?;
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
@@ -7681,6 +7799,26 @@ impl Model {
             kv_caches,
         };
         Ok(((generated[0], text), cache))
+    }
+}
+
+#[cfg(test)]
+mod rope_type_tests {
+    use super::*;
+
+    /// Locks in the per-architecture RoPE-convention mapping so a future
+    /// architecture addition can't silently inherit the wrong convention.
+    /// `llama`/`mistral`/`mixtral` are the consecutive-pair NORM case
+    /// (`llama.cpp`'s `llama_model_rope_type`); Qwen3 and the pre-existing
+    /// MoE fixtures use the half-split NEOX case.
+    #[test]
+    fn rope_type_mapping_matches_llama_cpp() {
+        for arch in ["llama", "mistral", "mixtral"] {
+            assert_eq!(rope_type_for(arch), RopeType::Norm, "{arch}");
+        }
+        for arch in ["qwen3", "qwen3moe", "some_other_moe"] {
+            assert_eq!(rope_type_for(arch), RopeType::Neox, "{arch}");
+        }
     }
 }
 

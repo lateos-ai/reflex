@@ -551,6 +551,32 @@ current state, `HISTORY.md` for the full verification write-up of each):
 4. **DeepSeek-V2/V3 MLA** — deliberately last; a genuinely different (compressed
    latent-KV) caching strategy, not an incremental GQA extension.
 
+### Future architecture additions (breadth on demand, not a roadmap axis)
+
+The four families above cover the architectural *mechanisms* — dense attention, sparse
+MoE, hybrid linear attention, latent-KV attention. Further coverage is added only when a
+concrete target model pulls it, never chased for its own sake: broad model support is
+llama.cpp's axis, not this engine's (see [Non-goals](#non-goals) — the same reason
+throughput and serving features are out of scope). The next two candidates, in order:
+
+- **Llama / Mistral (dense GQA)** — *implemented and verified byte-exact against llama.cpp
+  on TinyLlama-1.1B* (see `STATUS.md`). The cheapest addition, because GQA, RMSNorm,
+  SwiGLU, the SentencePiece tokenizer, and the device-resident dense/MoE forward path
+  already exist generically; the real delta is the RoPE convention
+  (`LLAMA_ROPE_TYPE_NORM`'s consecutive-pair rotation, reusing the `rope_norm_kernel` the
+  MLA path already ships) plus an explicit architecture whitelist. Mistral-7B GGUFs report
+  `general.architecture = "llama"` (llama.cpp has no bare `mistral` arch), so this path
+  covers Mistral-7B too — though running a 7B model needs >15GB because every weight is
+  held `f32`.
+- **`qwen35moe`** — combines the Qwen3.5 hybrid mixer with a routed-MoE + shared-expert
+  FFN. Both halves exist in isolation (the `qwen35` hybrid path, and MoE routing +
+  MLA's shared-expert tail), so this is integration plus a synthetic fixture, not new
+  math.
+
+Each addition counts as done only after an independent-implementation comparison
+(llama.cpp, or a host CPU reference) on real generated tokens — see `DECISIONS.md`'s
+"Cross-check new architecture work..." and "Extending architecture coverage..." entries.
+
 ## Non-goals
 
 These are permanent constraints on this engine, not just current-MVP scope — the whole
