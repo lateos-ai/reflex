@@ -119,3 +119,19 @@ jobs:
 
       - name: Compile-check handler.py (syntax only)
         run: python -m py_compile .runpod/handler.py
+
+  # scripts/bench_compare.py gates the GPU nightly's perf check (gpu-nightly.yml);
+  # its parser/threshold logic is pure Python and tested here against the sample
+  # bench logs in bench/testdata/, so a broken compare script is caught on every
+  # push rather than only once a nightly GPU run happens.
+  bench-compare-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Unit-test bench_compare.py
+        run: python -m unittest discover -s bench -v

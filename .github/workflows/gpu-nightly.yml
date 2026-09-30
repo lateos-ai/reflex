@@ -1,0 +1,191 @@
+name: GPU nightly
+
+# Real-GPU correctness + cold-start regression check. GitHub-hosted runners have no
+# NVIDIA GPU (see ci.yml), so this starts an ephemeral self-hosted runner on an EC2
+# g4dn.xlarge (Tesla T4), runs every #[ignore]d GPU test plus the cold-start phase
+# bench against bench/baseline-t4.json, then terminates the instance -- even on
+# failure or cancellation. Setup, secrets, cost and how to update the baseline:
+# docs/gpu-ci.md.
+#
+# Deliberately NO pull_request trigger: this repo is public, and a self-hosted runner
+# must never execute code from a fork PR. Only schedule and manual dispatch.
+#
+# Off until enabled: set the repository variable GPU_NIGHTLY_ENABLED=true (after the
+# secrets/variables in docs/gpu-ci.md exist). Otherwise every job is skipped.
+
+on:
+  schedule:
+    - cron: "17 7 * * *" # 07:17 UTC daily, off the top of the hour
+  workflow_dispatch:
+    inputs:
+      threshold_pct:
+        description: "Fail if total cold-start p50 regresses by more than this percent"
+        default: "15"
+      bench_runs:
+        description: "Cold-start bench runs (n)"
+        default: "10"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-nightly
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.GPU_NIGHTLY_AWS_REGION || 'us-east-1' }}
+  DENSE_REPO: unsloth/Qwen3-0.6B-GGUF
+  DENSE_FILE: Qwen3-0.6B-Q4_K_M.gguf
+  HYBRID_REPO: unsloth/Qwen3.5-0.8B-GGUF
+  HYBRID_FILE: Qwen3.5-0.8B-Q4_K_M.gguf
+
+jobs:
+  start-runner:
+    if: vars.GPU_NIGHTLY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.start.outputs.label }}
+      instance-id: ${{ steps.start.outputs.ec2-instance-id }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.GPU_NIGHTLY_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.GPU_NIGHTLY_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # AWS Deep Learning Base AMI with a single CUDA toolkit: NVIDIA driver + nvcc
+      # preinstalled (the base-oss-nvidia-driver variant has no nvcc). Resolved fresh
+      # each run so it tracks AWS's patched image.
+      - name: Resolve GPU AMI
+        id: ami
+        run: |
+          ami=$(aws ssm get-parameter \
+            --name /aws/service/deeplearning/ami/x86_64/base-with-single-cuda-ubuntu-22.04/latest/ami-id \
+            --query Parameter.Value --output text)
+          echo "id=$ami" >> "$GITHUB_OUTPUT"
+
+      - name: Start EC2 runner
+        id: start
+        uses: machulav/ec2-github-runner@v2
+        with:
+          mode: start
+          github-token: ${{ secrets.GPU_NIGHTLY_GH_PAT }}
+          ec2-image-id: ${{ steps.ami.outputs.id }}
+          ec2-instance-type: ${{ vars.GPU_NIGHTLY_INSTANCE_TYPE || 'g4dn.xlarge' }}
+          subnet-id: ${{ vars.GPU_NIGHTLY_SUBNET_ID }}
+          security-group-id: ${{ vars.GPU_NIGHTLY_SECURITY_GROUP_ID }}
+          # Empty = On-Demand. "spot" is cheaper, but us-east-1 g4dn Spot capacity has
+          # been exhausted in every AZ before (docs/gpu-ci.md).
+          market-type: ${{ vars.GPU_NIGHTLY_MARKET_TYPE }}
+          # A fresh GPU DLAMI boot plus runner install can take close to the
+          # action's 5-minute default.
+          startup-timeout-minutes: 10
+          aws-resource-tags: >
+            [{"Key": "Name", "Value": "reflex-gpu-nightly"},
+             {"Key": "GitHubRun", "Value": "${{ github.run_id }}"}]
+
+  gpu-tests-and-bench:
+    needs: start-runner
+    runs-on: ${{ needs.start-runner.outputs.label }}
+    timeout-minutes: 90
+    env:
+      REFLEX_CUDA_ARCH: sm_75 # Tesla T4; change with GPU_NIGHTLY_INSTANCE_TYPE
+      MODELS_DIR: ${{ github.workspace }}/../reflex-models
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends build-essential pkg-config time python3
+          nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Models (cached across runs)
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MODELS_DIR }}
+          key: gguf-${{ env.DENSE_FILE }}-${{ env.HYBRID_FILE }}-v1
+
+      - name: Download models on cache miss
+        run: |
+          mkdir -p "$MODELS_DIR"
+          for spec in "$DENSE_REPO/$DENSE_FILE" "$HYBRID_REPO/$HYBRID_FILE"; do
+            file="$MODELS_DIR/$(basename "$spec")"
+            [ -s "$file" ] || curl -fSL --retry 3 -o "$file" \
+              "https://huggingface.co/${spec%/*}/resolve/main/${spec##*/}"
+          done
+          ls -la "$MODELS_DIR"
+
+      # Optional: a tarball of the synthetic test-data/*.gguf fixtures (not in git).
+      # Without it those tests are reported as SKIP, not dropped silently.
+      - name: Fixtures (optional)
+        env:
+          FIXTURES_URL: ${{ secrets.GPU_NIGHTLY_FIXTURES_URL }}
+        run: |
+          mkdir -p test-data
+          if [ -n "$FIXTURES_URL" ]; then
+            curl -fsSL --retry 3 "$FIXTURES_URL" | tar xz -C test-data
+            ls -la test-data
+          else
+            echo "GPU_NIGHTLY_FIXTURES_URL not set; fixture tests will SKIP"
+          fi
+
+      - name: Build
+        run: cargo build --release --locked --features ipc,nvml --bin reflex
+
+      - name: GPU tests
+        id: tests
+        env:
+          DENSE_GGUF: ${{ env.MODELS_DIR }}/${{ env.DENSE_FILE }}
+          HYBRID_GGUF: ${{ env.MODELS_DIR }}/${{ env.HYBRID_FILE }}
+          CARGO_TEST_FLAGS: --release --locked --features ipc
+          LOG_DIR: bench-results/gpu-tests
+        run: bash scripts/gpu_nightly_tests.sh
+
+      # Runs even if a test failed: a perf regression is worth seeing either way.
+      - name: Cold-start bench
+        if: always() && steps.tests.outcome != 'skipped'
+        run: |
+          set -o pipefail
+          mkdir -p bench-results
+          bash scripts/bench_cold_start_phases_system1.sh \
+            "$MODELS_DIR/$DENSE_FILE" "${{ inputs.bench_runs || '10' }}" | tee bench-results/bench-output.txt
+
+      - name: Compare against baseline
+        if: always() && hashFiles('bench-results/bench-output.txt') != ''
+        run: |
+          python3 scripts/bench_compare.py bench-results/bench-output.txt \
+            --baseline bench/baseline-t4.json \
+            --threshold-pct "${{ inputs.threshold_pct || '15' }}" \
+            --summary-file "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload raw logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-nightly-${{ github.run_id }}
+          path: bench-results/
+          retention-days: 30
+
+  stop-runner:
+    # Always terminate the instance once it was started, whatever happened above.
+    needs: [start-runner, gpu-tests-and-bench]
+    if: always() && needs.start-runner.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.GPU_NIGHTLY_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.GPU_NIGHTLY_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Stop EC2 runner
+        uses: machulav/ec2-github-runner@v2
+        with:
+          mode: stop
+          github-token: ${{ secrets.GPU_NIGHTLY_GH_PAT }}
+          label: ${{ needs.start-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-runner.outputs.instance-id }}

@@ -1,0 +1,23 @@
+| run | wall clock | peak RSS | user time | sys time |
+|---|---|---|---|---|
+| 1 | 0:00.60 | 612 MB | 0.31s | 0.29s |
+| 2 | 0:00.61 | 612 MB | 0.31s | 0.29s |
+| 3 | 0:00.59 | 612 MB | 0.31s | 0.29s |
+| 4 | 0:00.60 | 612 MB | 0.31s | 0.29s |
+| 5 | 0:00.61 | 612 MB | 0.31s | 0.29s |
+| 6 | 0:00.59 | 612 MB | 0.31s | 0.29s |
+| 7 | 0:00.60 | 612 MB | 0.31s | 0.29s |
+| 8 | 0:00.61 | 612 MB | 0.31s | 0.29s |
+| 9 | 0:00.59 | 612 MB | 0.31s | 0.29s |
+| 10 | 0:00.60 | 612 MB | 0.31s | 0.29s |
+
+Cold-start phase breakdown (reflex system1), n=10 runs, Qwen3-0.6B-Q4_K_M.gguf:
+
+| phase | p50 | p95 | p50 joules |
+|---|---|---|---|
+| process launch (external − internal) | 111.000 ms | 126.000 ms | n/a (pre-main) |
+| gguf open (mmap + metadata parse) | 64.000 ms | 66.500 ms | 0.000 J |
+| cuda init | 142.800 ms | 144.900 ms | 3.662 J |
+| model load | 333.000 ms | 351.000 ms | 9.613 J |
+| prompt eval (scoring pass) | 39.400 ms | 39.800 ms | 0.000 J |
+| total (process_start_to_result_ms) | 582.500 ms | 595.000 ms | 20.324 J |
