@@ -5114,7 +5114,7 @@ impl Model {
 
         let mut ids = self.tokenizer.encode(prompt)?;
         if start_pos == 0 {
-            if let Some(bos) = self.tokenizer.bos_token_id {
+            if let Some(bos) = self.tokenizer.prompt_bos() {
                 if ids.first() != Some(&bos) {
                     ids.insert(0, bos);
                 }
@@ -5207,7 +5207,7 @@ impl Model {
 
         let mut ids = self.tokenizer.encode(prompt)?;
         if start_pos == 0 {
-            if let Some(bos) = self.tokenizer.bos_token_id {
+            if let Some(bos) = self.tokenizer.prompt_bos() {
                 if ids.first() != Some(&bos) {
                     ids.insert(0, bos);
                 }
@@ -7430,7 +7430,7 @@ impl Model {
 
         let mut ids = self.tokenizer.encode(prompt)?;
         if start_pos == 0 {
-            if let Some(bos) = self.tokenizer.bos_token_id {
+            if let Some(bos) = self.tokenizer.prompt_bos() {
                 if ids.first() != Some(&bos) {
                     ids.insert(0, bos);
                 }
@@ -7473,7 +7473,7 @@ impl Model {
 
         let mut ids = self.tokenizer.encode(prompt)?;
         if start_pos == 0 {
-            if let Some(bos) = self.tokenizer.bos_token_id {
+            if let Some(bos) = self.tokenizer.prompt_bos() {
                 if ids.first() != Some(&bos) {
                     ids.insert(0, bos);
                 }
@@ -7921,7 +7921,7 @@ impl Model {
 
         let mut ids = self.tokenizer.encode(prompt)?;
         if start_pos == 0 {
-            if let Some(bos) = self.tokenizer.bos_token_id {
+            if let Some(bos) = self.tokenizer.prompt_bos() {
                 if ids.first() != Some(&bos) {
                     ids.insert(0, bos);
                 }
@@ -7964,7 +7964,7 @@ impl Model {
 
         let mut ids = self.tokenizer.encode(prompt)?;
         if start_pos == 0 {
-            if let Some(bos) = self.tokenizer.bos_token_id {
+            if let Some(bos) = self.tokenizer.prompt_bos() {
                 if ids.first() != Some(&bos) {
                     ids.insert(0, bos);
                 }

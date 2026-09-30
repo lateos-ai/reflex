@@ -925,6 +925,18 @@ Both additions cleared the project's independent-implementation verification bar
 
 ## Known debt / limitations
 
+- **`tokenizer.ggml.add_bos_token` now honored — GPU re-check of MLA golden tokens
+  pending (2026-09-30).** Every prompt path used to prepend `bos_token_id` whenever
+  it existed. llama.cpp's `llama_vocab::load` respects `add_bos_token`, and a real
+  Qwen3.8-27B GGUF (`qwen35`, `bos_token_id=248044`, `add_bos_token=false`) would have
+  diverged. `Tokenizer::prompt_bos` now gates the BOS on the key, and falls back to
+  the old behavior when the key is absent. The Qwen3-0.6B, Qwen3.5-0.8B,
+  tiny-qwen35moe, tiny-qwen3moe and TinyLlama fixtures are unaffected (no BOS id, or
+  no key). **`deepseek-tiny-mla.gguf` is affected** (`bos_token_id=151643`,
+  `add_bos_token=false`), so its recorded golden tokens (`26447`/`" subtle"`) were
+  produced with the extra BOS. Re-run it against `llama-simple` on the next GPU
+  session. Host-only unit test: `tokenizer::tests::test_tokenizer_honors_add_bos_token`.
+
 - ~~**`src/ffi.rs`'s `extern "C"` functions dereference raw pointers without being
   `unsafe fn`**~~ — **closed**: found by `cargo clippy --all-targets` while adding CI
   (see HISTORY.md's CI entry) — 12 `clippy::not_unsafe_ptr_arg_deref` errors (a

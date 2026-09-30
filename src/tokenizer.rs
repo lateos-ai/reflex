@@ -100,6 +100,14 @@ pub struct Tokenizer {
     pub scores: Vec<f32>,
     pub token_type: Vec<i32>,
     pub bos_token_id: Option<u32>,
+    /// `tokenizer.ggml.add_bos_token` -- whether a prompt gets `bos_token_id`
+    /// prepended. llama.cpp's `llama_vocab::load` honors this key when present
+    /// (e.g. real Qwen3.8-27B GGUFs define `bos_token_id = 248044` but set
+    /// `add_bos_token = false`, so prepending it anyway diverges from
+    /// llama.cpp). When the key is absent this falls back to "prepend if a BOS
+    /// id exists", the behavior every earlier golden token was recorded under.
+    /// Read via [`Self::prompt_bos`], not directly.
+    pub add_bos: bool,
     pub eos_token_id: Option<u32>,
     pub unk_token_id: Option<u32>,
     pub pad_token_id: Option<u32>,
@@ -170,6 +178,10 @@ impl Tokenizer {
 
         let bos_token_id =
             u64_meta(&file.metadata, "tokenizer.ggml.bos_token_id").map(|v| v as u32);
+        let add_bos = match file.metadata.get("tokenizer.ggml.add_bos_token") {
+            Some(GgufValue::Bool(b)) => *b,
+            _ => bos_token_id.is_some(),
+        };
         let eos_token_id =
             u64_meta(&file.metadata, "tokenizer.ggml.eos_token_id").map(|v| v as u32);
         let unk_token_id =
@@ -197,6 +209,7 @@ impl Tokenizer {
             scores,
             token_type,
             bos_token_id,
+            add_bos,
             eos_token_id,
             unk_token_id,
             pad_token_id,
@@ -208,6 +221,12 @@ impl Tokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.tokens.len()
+    }
+
+    /// The BOS id to prepend to a fresh prompt, or `None` if this vocab
+    /// doesn't add one (no `bos_token_id`, or `add_bos_token = false`).
+    pub fn prompt_bos(&self) -> Option<u32> {
+        self.bos_token_id.filter(|_| self.add_bos)
     }
 
     /// Number of BPE merge rules loaded, for tests that need to assert
@@ -841,6 +860,7 @@ mod tests {
             scores: Vec::new(),
             token_type: Vec::new(),
             bos_token_id: Some(1),
+            add_bos: true,
             eos_token_id: Some(2),
             unk_token_id: Some(0),
             pad_token_id: None,
@@ -1018,6 +1038,51 @@ mod tests {
         assert_eq!(tok.eos_token_id, Some(2));
         assert_eq!(tok.unk_token_id, None);
         assert_eq!(tok.merge_count(), 1);
+        // No `add_bos_token` key: keep prepending the declared BOS.
+        assert!(tok.add_bos);
+        assert_eq!(tok.prompt_bos(), Some(1));
+    }
+
+    fn write_kv_bool(buf: &mut Vec<u8>, key: &str, value: bool) {
+        write_string(buf, key);
+        buf.extend_from_slice(&7u32.to_le_bytes()); // value_type = BOOL
+        buf.push(value as u8);
+    }
+
+    /// `add_bos_token = false` with a `bos_token_id` present (real
+    /// Qwen3.8-27B's shape) must suppress the BOS, matching llama.cpp.
+    #[test]
+    fn test_tokenizer_honors_add_bos_token() {
+        for (add_bos, expected) in [(false, None), (true, Some(1))] {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&0x4655_4747u32.to_le_bytes()); // magic "GGUF"
+            buf.extend_from_slice(&3u32.to_le_bytes()); // version
+            buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+            buf.extend_from_slice(&5u64.to_le_bytes()); // metadata_kv_count
+
+            write_kv_string(&mut buf, "tokenizer.ggml.model", "llama");
+            write_kv_string_array(
+                &mut buf,
+                "tokenizer.ggml.tokens",
+                &["<unk>", "\u{2581}", "hi"],
+            );
+            write_kv_string_array(&mut buf, "tokenizer.ggml.merges", &["\u{2581} hi"]);
+            write_kv_u32(&mut buf, "tokenizer.ggml.bos_token_id", 1);
+            write_kv_bool(&mut buf, "tokenizer.ggml.add_bos_token", add_bos);
+
+            while buf.len() % 32 != 0 {
+                buf.push(0);
+            }
+
+            let path = write_temp_file(&buf);
+            let file = GgufFile::open(&path).expect("parse synthetic GGUF");
+            std::fs::remove_file(&path).ok();
+
+            let tok = Tokenizer::from_gguf(&file).expect("extract tokenizer metadata");
+            assert_eq!(tok.bos_token_id, Some(1));
+            assert_eq!(tok.add_bos, add_bos);
+            assert_eq!(tok.prompt_bos(), expected);
+        }
     }
 
     #[test]
