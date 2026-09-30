@@ -291,6 +291,13 @@ peak RSS 982 MB.
 | **Ollama (bundled `llama-server`)** | **Reflex ~2.6x faster** (0.83s vs. ~2.1s cold daemon + cold model; warm model ~7–11ms) | Wraps llama.cpp's AOT runtime; tests packaging/daemon overhead. The published ThunderCompute watchdog stall did **not** recur here (0 of 9 runs); one 38.8s cold-first-run outlier is disclosed in `HISTORY.md`, not averaged away |
 | **vLLM** | **Reflex ~48–150x faster** (0.83s vs. 39.8–127.3s, depending on `torch.compile` cache state) | **The actual AOT-vs-JIT foil** — vLLM's CUDA graph capture + `torch.compile` warmup at cold start. Installed vLLM 0.30.0 still has no GGUF support; ran against the HF safetensors checkpoint instead, disclosed |
 
+![Cold-start: process launch to first token on a Tesla T4 — Reflex vs llama.cpp / Ollama / vLLM, with Reflex's phase breakdown](docs/cold-start-t4.png)
+
+*Figure: cold start = process launch → first token, external wall clock, Tesla T4,
+`Qwen3-0.6B-Q4_K_M`, `n=30` (`n=3` Ollama/vLLM). Left: Reflex vs the other engines on a
+log axis, so vLLM stays visible. Right: where Reflex's 0.83s goes. Editable vector source:
+[`docs/cold-start-t4.svg`](docs/cold-start-t4.svg).*
+
 ### Warm-API: Reflex (warm compute) vs. TypeSafe Jev (always-warm managed API)
 
 These compare Reflex's warm-compute side against Jev, an always-warm managed decision API
