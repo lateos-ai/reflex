@@ -3486,3 +3486,102 @@ was stopped at the end of the session; the `mistral-7b-v0.1.Q4_K_M.gguf` left in
 ever wanted for another reason, the recipe above (fresh CUDA `llama-simple` + `reflex
 check`, same prompt) applies unchanged.
 
+### `qwen35moe` support: Qwen3.5 hybrid + routed-MoE/shared-expert FFN (2026-09-30)
+
+The sixth architecture family and the second "extending architecture coverage" item
+(DECISIONS.md). `qwen35moe` is the already-verified `qwen35` hybrid trunk (Gated DeltaNet +
+Gated Attention, unchanged) with every layer's dense SwiGLU FFN replaced by routed MoE plus
+a shared expert. No new `.cu`.
+
+**Ground truth, established before coding** from llama.cpp's own source (`src/models/
+qwen35moe.cpp`, `src/llama-graph.cpp`'s `build_moe_ffn`, `src/llama-model.cpp`,
+`conversion/qwen.py`), then re-checked against the exact commit the comparison
+`llama-simple` was built from (`ggml-org/llama.cpp` `22bdcc4cdd54`):
+
+- Arch string `qwen35moe`; HF `Qwen3_5MoeForCausalLM`/`Qwen3_5MoeForConditionalGeneration`
+  → `Qwen3_5MoeTextModel`. Metadata is the `qwen35` key set namespaced `qwen35moe.*`, plus
+  `expert_count`, `expert_used_count`, `expert_feed_forward_length`,
+  `expert_shared_feed_forward_length`.
+- Per-layer FFN tensors (every trunk layer, both mixer kinds; pre-FFN norm is still
+  `post_attention_norm`): `ffn_gate_inp {n_embd, n_expert}`, `ffn_gate_exps`/`ffn_up_exps
+  {n_embd, n_ff_exp, n_expert}`, `ffn_down_exps {n_ff_exp, n_embd, n_expert}`,
+  `ffn_gate_inp_shexp {n_embd}` (**1-D**), `ffn_gate_shexp`/`ffn_up_shexp {n_embd,
+  n_ff_shexp}`, `ffn_down_shexp {n_ff_shexp, n_embd}`. llama.cpp can also load a fused
+  `ffn_gate_up_exps`, but its converter always splits HF's fused `gate_up_proj`, so this
+  path rejects the fused form with a clear error.
+- Router: softmax gating with `norm_w = true` hardcoded in `build_layer_ffn` → top-k weights
+  are **renormalized** (`moe::route_top_k`, the Qwen3-MoE convention, not DeepSeek's
+  metadata-driven one); `expert_weights_scale` applied only if present and not `0`/`1`.
+- **Shared expert is sigmoid-gated per token** — `out = moe_out + ffn_shexp(x) *
+  sigmoid(ffn_gate_inp_shexp · x)` (Qwen3-Next convention). This is the one real difference
+  from MLA's shared expert, which is added unconditionally; reusing MLA's shared-expert
+  math unchanged would have been silently wrong.
+- RoPE: `llama_model_rope_type` groups `QWEN35` and `QWEN35MOE` (IMROPE), so the existing
+  hybrid `RopeType::Neox` path applies unchanged.
+- MTP: the converter emits a NextN block by default; `--no-mtp` drops it. The existing
+  `nextn_predict_layers != 0` rejection stays, and its message now suggests `--no-mtp`.
+
+**What changed** (`src/model.rs`):
+
+- `GatedAttnLayerWeights`/`GatedDeltaNetLayerWeights` now hold `ffn: HybridFfn` (`Dense {
+  ffn_gate, ffn_up, ffn_down }` | `Moe(Box<HybridMoeFfn>)`, shaped like `MlaFfn`);
+  `HybridModel` gains `moe: Option<HybridMoeConfig>`.
+- `Model::load` routes `qwen35moe` to `load_hybrid` (the rejection is gone);
+  `load_hybrid_inner` reads `general.architecture` instead of hardcoding `qwen35`, parses
+  `parse_hybrid_moe_config`, treats `feed_forward_length` as optional for MoE, and widens
+  `ffn_gate_inp_shexp`'s shape to `[n_embd, 1]` so `gemv`/`gemm` treat it as a one-output
+  projection.
+- New `forward_hybrid_moe_ffn` (single row: router `gemv` → host `route_top_k` →
+  per-expert `gemv_expert` SwiGLU → weighted `moe_scatter_add`; shared expert via `gemv`,
+  its gate logit → host sigmoid → used as the scatter-add weight) and
+  `forward_hybrid_moe_ffn_batched` (routed experts via the existing grouped-GEMM
+  `moe_ffn_grouped`, shared expert via `gemm` with per-row sigmoid weights). Dispatchers
+  `forward_hybrid_layer_ffn(_batched)` replace the four hybrid FFN call sites; the dense
+  `forward_hybrid_ffn(_batched)` (also used by MLA's dense-lead layers) is unchanged.
+- `find_lora_target_mut`: hybrid `ffn_*` LoRA targets resolve only for `HybridFfn::Dense`;
+  per-expert FFN LoRA on `qwen35moe` falls through to the existing clear rejection (mixer
+  LoRA still applies).
+- Tests: host-only `qwen35moe_fixture_has_routed_and_shared_experts` and GPU
+  `qwen35moe_fixture_generates_without_error` (both `#[ignore]`d, fixture-dependent).
+
+**Fixture**: a small public checkpoint now exists, so instead of hand-building random
+weights, `test-data/tiny-qwen35moe.gguf` is `yujiepan/qwen3.5-moe-tiny-random` (HF commit
+`617c7211216116dfd8f931f630073389e240d26f`: 4 layers = 3 GDN + 1 Gated Attention, **128
+experts / top-10**, shared expert 32, hidden 8, the real Qwen3.5 tokenizer, vocab 248320)
+run through llama.cpp's unmodified `convert_hf_to_gguf.py --outtype f32 --no-mtp` at
+`22bdcc4cdd54`. Gotcha: that checkpoint's `tokenizer_config.json` names transformers
+5.x's `TokenizersBackend` class, so the converter venv needs `transformers>=5` (4.57 fails
+in `AutoTokenizer.from_pretrained`). Source + `PROVENANCE.txt` archived as
+`test-data/tiny-qwen35moe-src.tar.gz`. The real Qwen3.5-35B-A3B is ~140 GB under this
+engine's `f32` residency, far out of reach on the verification GPU.
+
+**Verification** — same T4 instance and method as the Llama/Mistral entry (`g4dn.xlarge`,
+sm_75, `REFLEX_CUDA_ARCH=sm_75 cargo build --release --bin reflex`, greedy CUDA
+`llama-simple` at `22bdcc4cdd54`), 16 tokens per prompt:
+
+| prompt | reflex `token_ids` | llama.cpp `llama-simple` continuation | match |
+|---|---|---|---|
+| `The capital of France is` | `[94338,149353,172394,23417,180952,239056,176896,27517,221498,203307,176896,27517,49719,65445,35667,213572]` | ` NOMением patiopens人を привлечениянрави reasonably dificultadไทнрави reasonablyaxed ав ew sidang` | **byte-exact** |
+| `Once upon a time` | `[117917,220969,43271,93541,202107,110609,128922,197088,183674,214275,196314,108943,217255,119301,196973,107657]` | `就用ваютьotechn conspicuous obsz向往网课inesi peste nauc 힘을刚才 Abenteuer上古 المعت大有可为答主` | **byte-exact** |
+| `def fibonacci(n):` | `[21684,22429,27517,152047,105156,40688,206684,39595,74621,22429,194333,59427,149865,176896,166637,64215]` | ` GCwnd reasonably완来电 Grat problemenAnimations IMDwnd্স.wik المستнрави전거LTR` | **byte-exact** |
+
+(`reflex generate`'s `token_text` equals each continuation; `check` prints one token as the
+escape `\u{9cd}`, i.e. the same `্`.) Also passed on the T4: `qwen35moe_fixture_*` (2/2),
+`prefill_hybrid_batched_matches_sequential` against the fixture, and — as regressions —
+the same test against a real `Qwen3.5-0.8B-Q4_K_M.gguf` (unsloth) plus byte-exact
+`check`-vs-`llama-simple` on that model (`[279,6511,314,279,3046,13,198,760]`) and on
+TinyLlama (`[3681,29889,13,13,29906,29889,350,29889]`, identical to the Llama entry).
+
+**Does the fixture actually discriminate the conventions?** Random weights with hidden 8
+give small top-1 logits (~1.2), so a match alone could in principle hide a convention that
+doesn't move the argmax. Checked by mutation on the same GPU (temporary copies, not
+committed): making the shared expert **ungated** (sigmoid → 1) changes the first prompt's
+tokens from position 2, the others from position 1; **dropping top-k renormalization**
+diverges within 1–3 tokens on every prompt. So both of the conventions that distinguish
+`qwen35moe` from its neighbours are pinned by this fixture.
+
+**Gates**: `REFLEX_SKIP_CUDA=1 cargo fmt --check`; `cargo clippy --all-targets -- -D
+warnings` (default and `--features nvml,json-output`); `cargo test` (86 passed / 14
+ignored); host-only fixture test passes locally too. One scoped
+`#[allow(clippy::large_enum_variant)]` on `HybridFfn` (always stored inside an
+already-boxed per-layer struct). The T4 instance was stopped at the end of the session.

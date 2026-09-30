@@ -557,7 +557,7 @@ The four families above cover the architectural *mechanisms* — dense attention
 MoE, hybrid linear attention, latent-KV attention. Further coverage is added only when a
 concrete target model pulls it, never chased for its own sake: broad model support is
 llama.cpp's axis, not this engine's (see [Non-goals](#non-goals) — the same reason
-throughput and serving features are out of scope). The next two candidates, in order:
+throughput and serving features are out of scope). The two additions so far, in order:
 
 - **Llama / Mistral (dense GQA)** — *implemented and verified byte-exact against llama.cpp
   on TinyLlama-1.1B* (see `STATUS.md`). The cheapest addition, because GQA, RMSNorm,
@@ -568,10 +568,14 @@ throughput and serving features are out of scope). The next two candidates, in o
   `general.architecture = "llama"` (llama.cpp has no bare `mistral` arch), so this path
   covers Mistral-7B too — though running a 7B model needs >15GB because every weight is
   held `f32`.
-- **`qwen35moe`** — combines the Qwen3.5 hybrid mixer with a routed-MoE + shared-expert
-  FFN. Both halves exist in isolation (the `qwen35` hybrid path, and MoE routing +
-  MLA's shared-expert tail), so this is integration plus a synthetic fixture, not new
-  math.
+- **`qwen35moe`** — *implemented and verified byte-exact against llama.cpp* on a
+  converted `qwen3.5-moe-tiny-random` checkpoint (128 experts / top-10, sigmoid-gated
+  shared expert; see `STATUS.md`). The Qwen3.5 hybrid trunk is reused unchanged; every
+  layer's FFN becomes routed MoE (renormalized top-k, reusing the existing per-expert and
+  grouped-GEMM dispatch) plus a shared expert scaled per token by
+  `sigmoid(ffn_gate_inp_shexp · x)` — the one convention that differs from MLA's
+  always-on shared expert. No new kernels. Real Qwen3.5-35B-A3B needs far more VRAM than
+  the verification GPU because every weight is held `f32`.
 
 Each addition counts as done only after an independent-implementation comparison
 (llama.cpp, or a host CPU reference) on real generated tokens — see `DECISIONS.md`'s

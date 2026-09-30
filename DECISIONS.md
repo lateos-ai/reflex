@@ -156,7 +156,9 @@ verification generalizes untested.
 **Decision**: MVP step 3 supports only the dense `qwen35` architecture string. The
 `qwen35moe` variant (same hybrid mixer interleaving, but every layer's FFN is additionally
 a routed+shared-expert MoE) is explicitly rejected with a clear error rather than silently
-mishandled. MTP/NextN blocks are also rejected outright (`nextn_predict_layers != 0`
+mishandled. *(Superseded for `qwen35moe` on 2026-09-30 -- now supported and verified; see
+the "Extending architecture coverage" entry below. MTP rejection and single-token GDN
+dispatch still stand.)* MTP/NextN blocks are also rejected outright (`nextn_predict_layers != 0`
 errors immediately) rather than partially supported. The forward pass processes one token
 at a time sequentially through the Gated DeltaNet recurrence, even during prompt
 processing — no chunked/parallel-prefill kernels.
@@ -295,6 +297,27 @@ isolation today (the `qwen35` hybrid mixer, and routed-MoE + shared-expert FFN f
 `qwen35moe` checkpoint exists to verify against, so its blocker is a **synthetic
 fixture** (the same hand-built-HF-checkpoint-through-`convert_hf_to_gguf.py` pattern
 as `tiny-qwen3moe.gguf`/`deepseek-tiny-mla.gguf`), not new kernel math.
+
+**`qwen35moe` outcome (2026-09-30, done and verified)** -- three choices made while
+implementing it, each pinned to llama.cpp's own source (HISTORY.md's "`qwen35moe` support"
+entry has the details and the byte-exact token table):
+
+- **Router renormalizes** (`moe::route_top_k`): `qwen35moe.cpp`'s `build_layer_ffn`
+  hardcodes softmax gating with `norm_w = true`, so unlike DeepSeek there's no metadata
+  knob to read; `expert_weights_scale` is applied only when present and not `0`/`1`.
+- **Shared expert is sigmoid-gated per token**, not added unconditionally like MLA's:
+  `ffn_shexp(x) * sigmoid(ffn_gate_inp_shexp · x)`. MLA's shared-expert code was therefore
+  *not* reused as-is; the gate is one scalar per row, computed host-side and applied as
+  `moe_scatter_add`'s weight, so no new kernel was needed.
+- **Fixture: a public tiny-random checkpoint instead of a hand-built one.** A small
+  `qwen35moe` checkpoint now exists (`yujiepan/qwen3.5-moe-tiny-random`: 128 experts /
+  top-10, shared expert, real Qwen3.5 tokenizer), so the fixture is that, pinned by HF
+  commit and converted with llama.cpp's unmodified converter (`--outtype f32 --no-mtp`).
+  Third-party-authored tensor names/shapes are a stronger authenticity check than ones
+  this project writes itself. Because random weights give small logit margins, the
+  fixture was also mutation-checked: an ungated shared expert and non-renormalized
+  routing each change the output within 1–3 tokens, so the match really pins both
+  conventions.
 
 **How to apply**: breadth is llama.cpp's axis, not this engine's (see the Non-goals
 framing) — add a family only when a concrete target model pulls it, and budget each

@@ -120,6 +120,12 @@ fn f32_meta(file: &GgufFile, key: &str) -> Option<f32> {
     file.metadata.get(key).and_then(GgufValue::as_f32)
 }
 
+/// Host-side logistic sigmoid, for `qwen35moe`'s per-token shared-expert
+/// gate (a single scalar per row -- see `Model::forward_hybrid_moe_ffn`).
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 /// Which rotary-embedding convention a model's attention RoPE must use.
 /// `Neox` is llama.cpp's `LLAMA_ROPE_TYPE_NEOX` -- half-split pairs `(i, i +
 /// rotary_dim/2)` -- implemented by `rope_kernel`/`rope_batch_kernel`, used by
@@ -1014,8 +1020,8 @@ pub fn parse_model_config(
     // RoPE scaling types other than "none" (e.g. Llama-3.1's "linear"/"yarn"
     // long-context variants) change the per-dimension rotation frequencies;
     // this path implements only the unscaled convention, so reject rather than
-    // silently run wrong frequencies (same rejection posture as MLA's YaRN/
-    // qwen35moe/MTP handling). `deepseek2`'s "yarn" is handled separately on
+    // silently run wrong frequencies (same rejection posture as MLA's Q-LoRA/
+    // MTP handling). `deepseek2`'s "yarn" is handled separately on
     // the MLA path, never here.
     if let Some(scaling) = file
         .metadata
@@ -1147,12 +1153,62 @@ fn parse_hybrid_layer_kinds(
     }
 }
 
+/// Reads a `qwen35moe` file's [`HybridMoeConfig`] from `{architecture}.*`
+/// metadata, mirroring llama.cpp's `llama_model_qwen35moe::load_arch_hparams`/
+/// `load_block_trunk`: `expert_feed_forward_length` falls back to
+/// `blk.0.ffn_gate_exps.weight`'s shape when absent. Rejects a fused
+/// `ffn_gate_up_exps` tensor -- llama.cpp can load one, but its own
+/// `convert_hf_to_gguf.py` always splits HF's fused `gate_up_proj` into
+/// separate `ffn_gate_exps`/`ffn_up_exps`, and this path only implements the
+/// split form.
+fn parse_hybrid_moe_config(file: &GgufFile, architecture: &str) -> Result<HybridMoeConfig, String> {
+    let key = |suffix: &str| format!("{architecture}.{suffix}");
+    let expert_count = u64_meta(file, &key("expert_count"))
+        .ok_or_else(|| format!("missing {}", key("expert_count")))? as usize;
+    let expert_used_count = u64_meta(file, &key("expert_used_count"))
+        .ok_or_else(|| format!("missing {}", key("expert_used_count")))?
+        as usize;
+    if expert_used_count == 0 || expert_used_count > expert_count {
+        return Err(format!(
+            "{} ({expert_used_count}) must be in 1..={} ({expert_count})",
+            key("expert_used_count"),
+            key("expert_count")
+        ));
+    }
+    if file.tensor_info("blk.0.ffn_gate_up_exps.weight").is_some() {
+        return Err(format!(
+            "{architecture} file has a fused ffn_gate_up_exps tensor, which is not supported \
+             (reconvert with llama.cpp's convert_hf_to_gguf.py, which emits split ffn_gate_exps/ffn_up_exps)"
+        ));
+    }
+    let n_ff_exp = match u64_meta(file, &key("expert_feed_forward_length")) {
+        Some(n) => n as usize,
+        None => file
+            .tensor_info("blk.0.ffn_gate_exps.weight")
+            .and_then(|info| info.shape.get(1).copied())
+            .ok_or_else(|| {
+                format!(
+                    "missing {} and blk.0.ffn_gate_exps.weight to derive it from",
+                    key("expert_feed_forward_length")
+                )
+            })? as usize,
+    };
+    let weights_scale = f32_meta(file, &key("expert_weights_scale"))
+        .filter(|&s| s != 0.0)
+        .unwrap_or(1.0);
+    Ok(HybridMoeConfig {
+        expert_used_count,
+        n_ff_exp,
+        weights_scale,
+    })
+}
+
 /// Derives [`MlaConfig`] and the layer count from a GGUF file's `deepseek2.*`
 /// metadata. Scope narrowed to real DeepSeek-V2/V3 files' actual shape (confirmed
 /// against a real `DeepSeek-V2-Lite` GGUF's metadata while extending this from the
 /// MVP-step-4 synthetic-fixture-only version): dense-lead + MoE-with-shared-expert
 /// FFN, `is_lite`-style direct `wq` (no Q-LoRA), and YaRN RoPE scaling are all
-/// supported now. Still hard-errors (matching existing `qwen35moe`/MTP rejection
+/// supported now. Still hard-errors (matching the hybrid path's MTP rejection
 /// precedent) on: Q-LoRA query decomposition (`attention.q_lora_rank` present and
 /// nonzero -- no real small file needing this has been seen yet), MTP/NextN
 /// blocks, and any RoPE scaling type other than `"none"`/`"yarn"`.
@@ -1388,9 +1444,7 @@ struct GatedAttnLayerWeights {
     attn_k_norm: Weight,
     attn_output: Weight,
     post_attn_norm: Weight,
-    ffn_gate: Weight,
-    ffn_up: Weight,
-    ffn_down: Weight,
+    ffn: HybridFfn,
 }
 
 /// One Gated DeltaNet transformer layer's weights (Qwen3.5 hybrid). Tensor
@@ -1412,9 +1466,77 @@ struct GatedDeltaNetLayerWeights {
     ssm_norm: Weight,
     ssm_out: Weight,
     post_attn_norm: Weight,
-    ffn_gate: Weight,
-    ffn_up: Weight,
-    ffn_down: Weight,
+    ffn: HybridFfn,
+}
+
+/// One Qwen3.5 hybrid layer's FFN: dense SwiGLU for `qwen35`, or routed MoE +
+/// a sigmoid-gated shared expert for every layer of `qwen35moe` (see
+/// [`HybridMoeFfn`]). Shape follows [`MlaFfn`].
+// Only ever stored inside an already-boxed `GatedAttnLayerWeights`/
+// `GatedDeltaNetLayerWeights` (one per layer), so the Dense/Moe size gap never
+// affects a hot or large-count value; boxing Dense's fields too would just add
+// indirection to the verified dense `qwen35` path.
+#[allow(clippy::large_enum_variant)]
+enum HybridFfn {
+    Dense {
+        ffn_gate: Weight,
+        ffn_up: Weight,
+        ffn_down: Weight,
+    },
+    Moe(Box<HybridMoeFfn>),
+}
+
+impl HybridFfn {
+    /// `Model::find_lora_target_mut`'s lookup for a dense FFN projection
+    /// (`ffn_gate`/`ffn_up`/`ffn_down`). `None` for [`HybridFfn::Moe`] -- LoRA
+    /// on per-expert-stacked tensors isn't supported for this architecture, so
+    /// `Model::apply_lora` rejects such a target with its usual clear error.
+    fn dense_weight_mut(&mut self, suffix: &str) -> Option<&mut Weight> {
+        match (self, suffix) {
+            (HybridFfn::Dense { ffn_gate, .. }, "ffn_gate") => Some(ffn_gate),
+            (HybridFfn::Dense { ffn_up, .. }, "ffn_up") => Some(ffn_up),
+            (HybridFfn::Dense { ffn_down, .. }, "ffn_down") => Some(ffn_down),
+            _ => None,
+        }
+    }
+}
+
+/// A `qwen35moe` layer's FFN weights. Tensor set confirmed against llama.cpp's
+/// `src/models/qwen35moe.cpp` (`load_block_trunk`/`build_layer_ffn`): routed
+/// experts (`ffn_gate_inp` router + per-expert-stacked `ffn_{gate,up,down}_exps`,
+/// the same `[in_features, out_features, expert_count]` layout
+/// `Model::gemv_expert` slices) plus one always-on shared expert
+/// (`ffn_{gate,up,down}_shexp`). Unlike MLA's shared expert (added
+/// unconditionally -- see [`MlaFfn`]), this one is scaled per token by
+/// `sigmoid(ffn_gate_inp_shexp . x)` -- the Qwen3-Next convention llama.cpp
+/// follows. `ffn_gate_inp_shexp` is a 1-D `[n_embd]` tensor in the GGUF; its
+/// `shape` is widened to `[n_embd, 1]` at load time so `Model::gemv`/`gemm`
+/// treat it as a one-output projection.
+struct HybridMoeFfn {
+    ffn_gate_inp: Weight,
+    ffn_gate_exps: Weight,
+    ffn_up_exps: Weight,
+    ffn_down_exps: Weight,
+    ffn_gate_inp_shexp: Weight,
+    ffn_gate_shexp: Weight,
+    ffn_up_shexp: Weight,
+    ffn_down_shexp: Weight,
+}
+
+/// `qwen35moe`'s routing config, read from `qwen35moe.*` metadata by
+/// `Model::load_hybrid_inner`. llama.cpp's `build_layer_ffn` hardcodes softmax
+/// gating with `norm_w = true`, so top-k weights are always renormalized
+/// (`crate::moe::route_top_k`) -- unlike DeepSeek's `expert_weights_norm`-driven
+/// choice ([`MlaMoeConfig::normalize_top_k`]).
+struct HybridMoeConfig {
+    expert_used_count: usize,
+    /// Routed-expert FFN hidden size (`expert_feed_forward_length`, falling
+    /// back to `blk.0.ffn_gate_exps.weight`'s shape).
+    n_ff_exp: usize,
+    /// `expert_weights_scale`, applied only when present and not `0`/`1`
+    /// (llama.cpp's `build_moe_ffn` treats both as no-ops) -- stored as `1.0`
+    /// in that case.
+    weights_scale: f32,
 }
 
 enum HybridLayerWeights {
@@ -1637,10 +1759,15 @@ enum HybridLayerState {
 /// (its `rotary_dim` is the real partial value); `gdn_cfg` is the Gated
 /// DeltaNet layers' shape. Both are uniform across every layer of that kind
 /// -- a real `qwen35` file has exactly one `qwen35.ssm.*`/`qwen35.attention.*`
-/// config, not a per-layer one.
+/// config, not a per-layer one. `qwen35moe` shares this whole trunk, reading
+/// the same keys under `qwen35moe.*`; only each layer's FFN differs (see
+/// [`HybridFfn`]).
 struct HybridModel {
     attn_cfg: LayerConfig,
     gdn_cfg: crate::gated_deltanet::GatedDeltaNetConfig,
+    /// `Some` for `qwen35moe` (every layer's FFN is [`HybridFfn::Moe`]),
+    /// `None` for dense `qwen35`.
+    moe: Option<HybridMoeConfig>,
     layers: Vec<HybridLayerWeights>,
     gdn_conv_k: AotKernel,
     gdn_l2_norm_k: AotKernel,
@@ -1973,12 +2100,12 @@ impl Model {
                 (HybridLayerWeights::GatedAttention(l), "attn_k") => Some(&mut l.attn_k),
                 (HybridLayerWeights::GatedAttention(l), "attn_v") => Some(&mut l.attn_v),
                 (HybridLayerWeights::GatedAttention(l), "attn_output") => Some(&mut l.attn_output),
-                (HybridLayerWeights::GatedAttention(l), "ffn_gate") => Some(&mut l.ffn_gate),
-                (HybridLayerWeights::GatedAttention(l), "ffn_up") => Some(&mut l.ffn_up),
-                (HybridLayerWeights::GatedAttention(l), "ffn_down") => Some(&mut l.ffn_down),
-                (HybridLayerWeights::GatedDeltaNet(l), "ffn_gate") => Some(&mut l.ffn_gate),
-                (HybridLayerWeights::GatedDeltaNet(l), "ffn_up") => Some(&mut l.ffn_up),
-                (HybridLayerWeights::GatedDeltaNet(l), "ffn_down") => Some(&mut l.ffn_down),
+                (HybridLayerWeights::GatedAttention(l), "ffn_gate" | "ffn_up" | "ffn_down") => {
+                    l.ffn.dense_weight_mut(suffix)
+                }
+                (HybridLayerWeights::GatedDeltaNet(l), "ffn_gate" | "ffn_up" | "ffn_down") => {
+                    l.ffn.dense_weight_mut(suffix)
+                }
                 (HybridLayerWeights::GatedDeltaNet(l), "attn_qkv") => Some(&mut l.attn_qkv),
                 (HybridLayerWeights::GatedDeltaNet(l), "attn_gate") => Some(&mut l.attn_gate),
                 (HybridLayerWeights::GatedDeltaNet(l), "ssm_alpha") => Some(&mut l.ssm_alpha),
@@ -2015,15 +2142,8 @@ impl Model {
             .get("general.architecture")
             .and_then(GgufValue::as_str)
             .unwrap_or("");
-        if architecture == "qwen35" {
+        if architecture == "qwen35" || architecture == "qwen35moe" {
             return Self::load_hybrid(device, file);
-        }
-        if architecture == "qwen35moe" {
-            return Err(
-                "qwen35moe (hybrid Gated DeltaNet + routed-MoE FFN) is not yet supported -- only the dense \
-                 qwen35 hybrid architecture, and qwen3/qwen3-MoE, are in scope for this MVP"
-                    .to_string(),
-            );
         }
         if architecture == "deepseek2" {
             return Self::load_mla(device, file);
@@ -2304,7 +2424,12 @@ impl Model {
         file: &GgufFile,
         init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), String>>,
     ) -> Result<Self, String> {
-        let architecture = "qwen35";
+        let architecture = file
+            .metadata
+            .get("general.architecture")
+            .and_then(GgufValue::as_str)
+            .unwrap_or("qwen35");
+        let is_moe = architecture == "qwen35moe";
         let key = |suffix: &str| format!("{architecture}.{suffix}");
 
         let block_count = u64_meta(file, &key("block_count"))
@@ -2313,7 +2438,8 @@ impl Model {
         let nextn = u64_meta(file, &key("nextn_predict_layers")).unwrap_or(0);
         if nextn != 0 {
             return Err(format!(
-                "{} MTP/NextN blocks (nextn_predict_layers={nextn}) are not supported by this MVP",
+                "{} MTP/NextN blocks (nextn_predict_layers={nextn}) are not supported by this MVP \
+                 (reconvert with convert_hf_to_gguf.py --no-mtp to drop them)",
                 key("nextn_predict_layers")
             ));
         }
@@ -2334,9 +2460,18 @@ impl Model {
             .unwrap_or(head_dim);
         let rope_base = f32_meta(file, &key("rope.freq_base")).unwrap_or(10_000.0);
         let rmsnorm_eps = f32_meta(file, &key("attention.layer_norm_rms_epsilon")).unwrap_or(1e-6);
-        let ffn_hidden_size = u64_meta(file, &key("feed_forward_length"))
-            .ok_or_else(|| format!("missing {}", key("feed_forward_length")))?
-            as usize;
+        // qwen35moe has no dense FFN, so `feed_forward_length` is optional there
+        // (it's only ever read by the `HybridFfn::Dense` path).
+        let ffn_hidden_size = match u64_meta(file, &key("feed_forward_length")) {
+            Some(n) => n as usize,
+            None if is_moe => 0,
+            None => return Err(format!("missing {}", key("feed_forward_length"))),
+        };
+        let moe = if is_moe {
+            Some(parse_hybrid_moe_config(file, architecture)?)
+        } else {
+            None
+        };
         let attn_cfg = LayerConfig {
             hidden_size,
             num_q_heads,
@@ -2477,9 +2612,29 @@ impl Model {
             eprint!("\rLoading weights: layer {}/{block_count}", i + 1);
             let attn_norm = load_weight(&format!("blk.{i}.attn_norm.weight"))?;
             let post_attn_norm = load_weight(&format!("blk.{i}.post_attention_norm.weight"))?;
-            let ffn_gate = load_weight(&format!("blk.{i}.ffn_gate.weight"))?;
-            let ffn_up = load_weight(&format!("blk.{i}.ffn_up.weight"))?;
-            let ffn_down = load_weight(&format!("blk.{i}.ffn_down.weight"))?;
+            let ffn = if is_moe {
+                let mut ffn_gate_inp_shexp =
+                    load_weight(&format!("blk.{i}.ffn_gate_inp_shexp.weight"))?;
+                if ffn_gate_inp_shexp.shape.len() == 1 {
+                    ffn_gate_inp_shexp.shape.push(1);
+                }
+                HybridFfn::Moe(Box::new(HybridMoeFfn {
+                    ffn_gate_inp: load_weight(&format!("blk.{i}.ffn_gate_inp.weight"))?,
+                    ffn_gate_exps: load_weight(&format!("blk.{i}.ffn_gate_exps.weight"))?,
+                    ffn_up_exps: load_weight(&format!("blk.{i}.ffn_up_exps.weight"))?,
+                    ffn_down_exps: load_weight(&format!("blk.{i}.ffn_down_exps.weight"))?,
+                    ffn_gate_inp_shexp,
+                    ffn_gate_shexp: load_weight(&format!("blk.{i}.ffn_gate_shexp.weight"))?,
+                    ffn_up_shexp: load_weight(&format!("blk.{i}.ffn_up_shexp.weight"))?,
+                    ffn_down_shexp: load_weight(&format!("blk.{i}.ffn_down_shexp.weight"))?,
+                }))
+            } else {
+                HybridFfn::Dense {
+                    ffn_gate: load_weight(&format!("blk.{i}.ffn_gate.weight"))?,
+                    ffn_up: load_weight(&format!("blk.{i}.ffn_up.weight"))?,
+                    ffn_down: load_weight(&format!("blk.{i}.ffn_down.weight"))?,
+                }
+            };
 
             let layer = if gdn {
                 HybridLayerWeights::GatedDeltaNet(Box::new(GatedDeltaNetLayerWeights {
@@ -2494,9 +2649,7 @@ impl Model {
                     ssm_norm: load_weight(&format!("blk.{i}.ssm_norm.weight"))?,
                     ssm_out: load_weight(&format!("blk.{i}.ssm_out.weight"))?,
                     post_attn_norm,
-                    ffn_gate,
-                    ffn_up,
-                    ffn_down,
+                    ffn,
                 }))
             } else {
                 HybridLayerWeights::GatedAttention(Box::new(GatedAttnLayerWeights {
@@ -2508,9 +2661,7 @@ impl Model {
                     attn_k_norm: load_weight(&format!("blk.{i}.attn_k_norm.weight"))?,
                     attn_output: load_weight(&format!("blk.{i}.attn_output.weight"))?,
                     post_attn_norm,
-                    ffn_gate,
-                    ffn_up,
-                    ffn_down,
+                    ffn,
                 }))
             };
             layers.push(layer);
@@ -2600,6 +2751,7 @@ impl Model {
             hybrid: Some(HybridModel {
                 attn_cfg,
                 gdn_cfg,
+                moe,
                 layers,
                 gdn_conv_k,
                 gdn_l2_norm_k,
@@ -6399,6 +6551,244 @@ impl Model {
         Ok(post_mixer)
     }
 
+    /// One hybrid layer's FFN tail for a single row, dispatching on
+    /// [`HybridFfn`]: dense `qwen35` -> [`Self::forward_hybrid_ffn`] (unchanged),
+    /// `qwen35moe` -> [`Self::forward_hybrid_moe_ffn`].
+    fn forward_hybrid_layer_ffn(
+        &self,
+        h: &HybridModel,
+        post_mixer: CudaSlice<f32>,
+        norm: &Weight,
+        ffn: &HybridFfn,
+    ) -> Result<CudaSlice<f32>, String> {
+        let cfg = &h.attn_cfg;
+        match ffn {
+            HybridFfn::Dense {
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+            } => self.forward_hybrid_ffn(
+                post_mixer,
+                norm,
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+                cfg.hidden_size,
+                cfg.ffn_hidden_size,
+                cfg.rmsnorm_eps,
+            ),
+            HybridFfn::Moe(w) => {
+                let moe_cfg = h.moe.as_ref().ok_or(
+                    "internal error: hybrid MoE layer without a HybridMoeConfig".to_string(),
+                )?;
+                self.forward_hybrid_moe_ffn(
+                    post_mixer,
+                    norm,
+                    w,
+                    moe_cfg,
+                    cfg.hidden_size,
+                    cfg.rmsnorm_eps,
+                )
+            }
+        }
+    }
+
+    /// Batched-prefill variant of [`Self::forward_hybrid_layer_ffn`].
+    fn forward_hybrid_layer_ffn_batched(
+        &self,
+        h: &HybridModel,
+        post_mixer: CudaSlice<f32>,
+        norm: &Weight,
+        ffn: &HybridFfn,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, String> {
+        let cfg = &h.attn_cfg;
+        match ffn {
+            HybridFfn::Dense {
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+            } => self.forward_hybrid_ffn_batched(
+                post_mixer,
+                norm,
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+                cfg.hidden_size,
+                cfg.ffn_hidden_size,
+                rows,
+                cfg.rmsnorm_eps,
+            ),
+            HybridFfn::Moe(w) => {
+                let moe_cfg = h.moe.as_ref().ok_or(
+                    "internal error: hybrid MoE layer without a HybridMoeConfig".to_string(),
+                )?;
+                self.forward_hybrid_moe_ffn_batched(
+                    post_mixer,
+                    norm,
+                    w,
+                    moe_cfg,
+                    cfg.hidden_size,
+                    rows,
+                    cfg.rmsnorm_eps,
+                )
+            }
+        }
+    }
+
+    /// `qwen35moe`'s FFN tail for a single row, ported from llama.cpp's
+    /// `llama_model_qwen35moe::graph::build_layer_ffn`: routed experts exactly
+    /// as [`Self::forward_mla_moe_ffn`] runs them (router `gemv` -> host
+    /// [`route_top_k`] -- always renormalized, llama.cpp's `norm_w = true` --
+    /// -> per-expert [`Self::gemv_expert`] SwiGLU -> weighted
+    /// [`Self::moe_scatter_add`]), then the shared expert, a dense SwiGLU scaled
+    /// by `sigmoid(ffn_gate_inp_shexp . x)` before being added (the per-token
+    /// gate MLA's shared expert doesn't have). The sigmoid runs host-side on
+    /// the single gate logit and is applied as the scatter-add's weight, so
+    /// no new kernel is needed.
+    fn forward_hybrid_moe_ffn(
+        &self,
+        mut post_mixer: CudaSlice<f32>,
+        norm: &Weight,
+        w: &HybridMoeFfn,
+        moe_cfg: &HybridMoeConfig,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<CudaSlice<f32>, String> {
+        let ffn_normed = self.rmsnorm(&post_mixer, &norm.data, 1, hidden_size, eps)?;
+
+        let router_logits_dev = self.gemv(&ffn_normed, &w.ffn_gate_inp)?;
+        let router_logits = self
+            .device
+            .dtoh_sync_copy(&router_logits_dev)
+            .map_err(|e| format!("hybrid moe router dtoh: {e}"))?;
+        let routed = route_top_k(&router_logits, moe_cfg.expert_used_count)?;
+
+        let mut ffn_out = self
+            .device
+            .alloc_zeros::<f32>(hidden_size)
+            .map_err(|e| format!("hybrid moe ffn_out alloc: {e}"))?;
+        let dest_row0 = self
+            .device
+            .htod_sync_copy(&[0u32])
+            .map_err(|e| format!("hybrid moe dest_row htod: {e}"))?;
+        for (expert_idx, weight) in routed {
+            let gate = self.gemv_expert(&ffn_normed, &w.ffn_gate_exps, expert_idx)?;
+            let up = self.gemv_expert(&ffn_normed, &w.ffn_up_exps, expert_idx)?;
+            let activated = self.silu_and_mul(&gate, &up, moe_cfg.n_ff_exp)?;
+            let down = self.gemv_expert(&activated, &w.ffn_down_exps, expert_idx)?;
+            let weight_dev = self
+                .device
+                .htod_sync_copy(&[weight * moe_cfg.weights_scale])
+                .map_err(|e| format!("hybrid moe weight htod: {e}"))?;
+            self.moe_scatter_add(&down, &dest_row0, &weight_dev, &mut ffn_out, hidden_size)?;
+        }
+
+        let shared_hidden_size = w.ffn_gate_shexp.shape[1] as usize;
+        let shared_gate = self.gemv(&ffn_normed, &w.ffn_gate_shexp)?;
+        let shared_up = self.gemv(&ffn_normed, &w.ffn_up_shexp)?;
+        let shared_activated = self.silu_and_mul(&shared_gate, &shared_up, shared_hidden_size)?;
+        let shared_down = self.gemv(&shared_activated, &w.ffn_down_shexp)?;
+        let shared_logit_dev = self.gemv(&ffn_normed, &w.ffn_gate_inp_shexp)?;
+        let shared_logit = self
+            .device
+            .dtoh_sync_copy(&shared_logit_dev)
+            .map_err(|e| format!("hybrid moe shared gate dtoh: {e}"))?;
+        let shared_weight: Vec<f32> = shared_logit.iter().map(|&g| sigmoid(g)).collect();
+        let shared_weight_dev = self
+            .device
+            .htod_sync_copy(&shared_weight)
+            .map_err(|e| format!("hybrid moe shared gate htod: {e}"))?;
+        self.moe_scatter_add(
+            &shared_down,
+            &dest_row0,
+            &shared_weight_dev,
+            &mut ffn_out,
+            hidden_size,
+        )?;
+
+        self.add_inplace(&mut post_mixer, &ffn_out)?;
+        Ok(post_mixer)
+    }
+
+    /// Batched-prefill variant of [`Self::forward_hybrid_moe_ffn`]: routed
+    /// experts via the shared grouped-GEMM core [`Self::moe_ffn_grouped`]
+    /// (renormalized, `weights_scale` folded in), accumulated into a zeroed
+    /// `ffn_out` first -- llama.cpp's `moe_out + ffn_shexp` order -- then the
+    /// shared expert batched with [`Self::gemm`] and scatter-added row by row
+    /// with each row's own host-computed `sigmoid(gate)` weight.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_hybrid_moe_ffn_batched(
+        &self,
+        mut post_mixer: CudaSlice<f32>,
+        norm: &Weight,
+        w: &HybridMoeFfn,
+        moe_cfg: &HybridMoeConfig,
+        hidden_size: usize,
+        rows: usize,
+        eps: f32,
+    ) -> Result<CudaSlice<f32>, String> {
+        let ffn_normed = self.rmsnorm(&post_mixer, &norm.data, rows, hidden_size, eps)?;
+
+        let router_logits_dev = self.gemm(&ffn_normed, &w.ffn_gate_inp, rows)?;
+        let router_logits = self
+            .device
+            .dtoh_sync_copy(&router_logits_dev)
+            .map_err(|e| format!("hybrid moe router dtoh: {e}"))?;
+        let num_experts = router_logits.len() / rows;
+
+        let mut ffn_out = self
+            .device
+            .alloc_zeros::<f32>(rows * hidden_size)
+            .map_err(|e| format!("hybrid moe ffn_out alloc: {e}"))?;
+        self.moe_ffn_grouped(
+            &ffn_normed,
+            rows,
+            hidden_size,
+            &router_logits,
+            num_experts,
+            moe_cfg.expert_used_count,
+            true,
+            moe_cfg.weights_scale,
+            &w.ffn_gate_exps,
+            &w.ffn_up_exps,
+            &w.ffn_down_exps,
+            &mut ffn_out,
+        )?;
+
+        let shared_hidden_size = w.ffn_gate_shexp.shape[1] as usize;
+        let shared_gate = self.gemm(&ffn_normed, &w.ffn_gate_shexp, rows)?;
+        let shared_up = self.gemm(&ffn_normed, &w.ffn_up_shexp, rows)?;
+        let shared_activated =
+            self.silu_and_mul(&shared_gate, &shared_up, rows * shared_hidden_size)?;
+        let shared_down = self.gemm(&shared_activated, &w.ffn_down_shexp, rows)?;
+        let shared_logits_dev = self.gemm(&ffn_normed, &w.ffn_gate_inp_shexp, rows)?;
+        let shared_logits = self
+            .device
+            .dtoh_sync_copy(&shared_logits_dev)
+            .map_err(|e| format!("hybrid moe shared gate dtoh: {e}"))?;
+        let shared_weights: Vec<f32> = shared_logits.iter().map(|&g| sigmoid(g)).collect();
+        let dest_rows: Vec<u32> = (0..rows as u32).collect();
+        let shared_weights_dev = self
+            .device
+            .htod_sync_copy(&shared_weights)
+            .map_err(|e| format!("hybrid moe shared gate htod: {e}"))?;
+        let dest_rows_dev = self
+            .device
+            .htod_sync_copy(&dest_rows)
+            .map_err(|e| format!("hybrid moe dest_rows htod: {e}"))?;
+        self.moe_scatter_add(
+            &shared_down,
+            &dest_rows_dev,
+            &shared_weights_dev,
+            &mut ffn_out,
+            hidden_size,
+        )?;
+
+        self.add_inplace(&mut post_mixer, &ffn_out)?;
+        Ok(post_mixer)
+    }
+
     /// Layer-major dispatcher for hybrid batched prefill (`Self::prefill_hybrid_batched`):
     /// runs all `rows` prompt positions through one layer at once, before the
     /// next layer sees any of them (unlike `Self::forward_one_token_hybrid`'s
@@ -6428,8 +6818,6 @@ impl Model {
         state: &mut HybridLayerState,
     ) -> Result<CudaSlice<f32>, String> {
         let hidden_size = h.attn_cfg.hidden_size;
-        let ffn_hidden_size = h.attn_cfg.ffn_hidden_size;
-        let eps = h.attn_cfg.rmsnorm_eps;
 
         match (layer, state) {
             (
@@ -6439,16 +6827,12 @@ impl Model {
                 let post_mixer = self.forward_gated_attn_mixer_batched(
                     h, w, hidden, start_pos, rows, k_cache, v_cache,
                 )?;
-                self.forward_hybrid_ffn_batched(
+                self.forward_hybrid_layer_ffn_batched(
+                    h,
                     post_mixer,
                     &w.post_attn_norm,
-                    &w.ffn_gate,
-                    &w.ffn_up,
-                    &w.ffn_down,
-                    hidden_size,
-                    ffn_hidden_size,
+                    &w.ffn,
                     rows,
-                    eps,
                 )
             }
             (
@@ -6463,16 +6847,8 @@ impl Model {
                     let row_hidden = self.extract_row(&out, row, hidden_size)?;
                     let post_mixer =
                         self.forward_gdn_mixer(h, w, row_hidden, conv_state, recurrent)?;
-                    let row_out = self.forward_hybrid_ffn(
-                        post_mixer,
-                        &w.post_attn_norm,
-                        &w.ffn_gate,
-                        &w.ffn_up,
-                        &w.ffn_down,
-                        hidden_size,
-                        ffn_hidden_size,
-                        eps,
-                    )?;
+                    let row_out =
+                        self.forward_hybrid_layer_ffn(h, post_mixer, &w.post_attn_norm, &w.ffn)?;
                     self.write_row(&mut out, row, hidden_size, &row_out)?;
                 }
                 Ok(out)
@@ -7195,9 +7571,6 @@ impl Model {
         position: usize,
         states: &mut [HybridLayerState],
     ) -> Result<CudaSlice<f32>, String> {
-        let hidden_size = h.attn_cfg.hidden_size;
-        let ffn_hidden_size = h.attn_cfg.ffn_hidden_size;
-        let eps = h.attn_cfg.rmsnorm_eps;
         let mut hidden = self
             .device
             .htod_sync_copy(&self.token_embd.row(token_id)?)
@@ -7211,16 +7584,7 @@ impl Model {
                 ) => {
                     let post_mixer =
                         self.forward_gated_attn_mixer(h, w, hidden, position, k_cache, v_cache)?;
-                    self.forward_hybrid_ffn(
-                        post_mixer,
-                        &w.post_attn_norm,
-                        &w.ffn_gate,
-                        &w.ffn_up,
-                        &w.ffn_down,
-                        hidden_size,
-                        ffn_hidden_size,
-                        eps,
-                    )?
+                    self.forward_hybrid_layer_ffn(h, post_mixer, &w.post_attn_norm, &w.ffn)?
                 }
                 (
                     HybridLayerWeights::GatedDeltaNet(w),
@@ -7230,16 +7594,7 @@ impl Model {
                     },
                 ) => {
                     let post_mixer = self.forward_gdn_mixer(h, w, hidden, conv_state, recurrent)?;
-                    self.forward_hybrid_ffn(
-                        post_mixer,
-                        &w.post_attn_norm,
-                        &w.ffn_gate,
-                        &w.ffn_up,
-                        &w.ffn_down,
-                        hidden_size,
-                        ffn_hidden_size,
-                        eps,
-                    )?
+                    self.forward_hybrid_layer_ffn(h, post_mixer, &w.post_attn_norm, &w.ffn)?
                 }
                 _ => return Err("internal error: hybrid layer/state kind mismatch".to_string()),
             };
@@ -7898,6 +8253,99 @@ mod moe_fixture_tests {
         let file = GgufFile::open(QWEN3MOE_FIXTURE).expect("failed to open qwen3moe fixture");
         let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
         let model = Model::load(device, &file).expect("failed to load qwen3moe fixture");
+        let (tokens, _text) = model
+            .generate(
+                "Once upon a time",
+                5,
+                None,
+                &SamplingParams::default(),
+                |_logits| {},
+                |_id, _text| {},
+            )
+            .expect("generate failed");
+        assert!(!tokens.is_empty(), "expected at least one generated token");
+    }
+
+    /// `test-data/tiny-qwen35moe.gguf`: the public random-weight
+    /// `yujiepan/qwen3.5-moe-tiny-random` HF checkpoint (authentic
+    /// `Qwen3_5MoeForConditionalGeneration` tensor names/shapes and the real
+    /// Qwen3.5 tokenizer) run through llama.cpp's own real, unmodified
+    /// `convert_hf_to_gguf.py --outtype f32 --no-mtp`. Source + provenance
+    /// archived as `test-data/tiny-qwen35moe-src.tar.gz`.
+    const QWEN35MOE_FIXTURE: &str = "test-data/tiny-qwen35moe.gguf";
+
+    /// Host-only, like `qwen3moe_fixture_has_excluding_topk_and_qk_norm`:
+    /// confirms the fixture really exercises what `qwen35moe` support needs
+    /// -- top-k that excludes experts, both hybrid mixer kinds, the full
+    /// routed + gated-shared-expert tensor set on every layer, and no MTP
+    /// block -- before any GPU test relies on it. Run with
+    /// `cargo test -- --ignored qwen35moe_fixture_has_routed_and_shared_experts`.
+    #[test]
+    #[ignore]
+    fn qwen35moe_fixture_has_routed_and_shared_experts() {
+        let file = GgufFile::open(QWEN35MOE_FIXTURE).expect("failed to open qwen35moe fixture");
+        let architecture = file
+            .metadata
+            .get("general.architecture")
+            .and_then(GgufValue::as_str)
+            .unwrap_or("");
+        assert_eq!(architecture, "qwen35moe");
+
+        let block_count = u64_meta(&file, "qwen35moe.block_count").expect("block_count") as usize;
+        assert_eq!(
+            u64_meta(&file, "qwen35moe.nextn_predict_layers").unwrap_or(0),
+            0,
+            "fixture must be converted with --no-mtp"
+        );
+        let expert_count = u64_meta(&file, "qwen35moe.expert_count").expect("expert_count");
+        let moe = parse_hybrid_moe_config(&file, architecture)
+            .expect("parse_hybrid_moe_config failed on qwen35moe fixture");
+        assert!(
+            (moe.expert_used_count as u64) < expert_count,
+            "top-k must exclude some experts"
+        );
+
+        let is_gdn = parse_hybrid_layer_kinds(&file, architecture, block_count)
+            .expect("parse_hybrid_layer_kinds failed");
+        assert!(is_gdn.iter().any(|&g| g), "no Gated DeltaNet layer");
+        assert!(is_gdn.iter().any(|&g| !g), "no Gated Attention layer");
+
+        for i in 0..block_count {
+            for t in [
+                "ffn_gate_inp",
+                "ffn_gate_exps",
+                "ffn_up_exps",
+                "ffn_down_exps",
+                "ffn_gate_inp_shexp",
+                "ffn_gate_shexp",
+                "ffn_up_shexp",
+                "ffn_down_shexp",
+            ] {
+                assert!(
+                    file.tensor_info(&format!("blk.{i}.{t}.weight")).is_some(),
+                    "layer {i} missing {t}.weight"
+                );
+            }
+            assert!(
+                file.tensor_info(&format!("blk.{i}.ffn_gate.weight"))
+                    .is_none(),
+                "layer {i} unexpectedly has a dense ffn_gate"
+            );
+        }
+    }
+
+    /// Real-GPU end-to-end load + generation of the `qwen35moe` fixture. Run
+    /// with `cargo test --release -- --ignored qwen35moe_fixture_generates_without_error`.
+    #[test]
+    #[ignore]
+    fn qwen35moe_fixture_generates_without_error() {
+        let file = GgufFile::open(QWEN35MOE_FIXTURE).expect("failed to open qwen35moe fixture");
+        let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+        let model = Model::load(device, &file).expect("failed to load qwen35moe fixture");
+        assert!(
+            model.hybrid.as_ref().is_some_and(|h| h.moe.is_some()),
+            "qwen35moe fixture should load as a hybrid MoE model"
+        );
         let (tokens, _text) = model
             .generate(
                 "Once upon a time",
