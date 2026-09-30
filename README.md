@@ -214,6 +214,13 @@ T4, in the same session — are sound.
 
 The llama.cpp/Ollama/Jev "loses" results above are reported as-is, not smoothed over.
 
+![Cold-start: process launch to first token on a Tesla T4 — Reflex vs llama.cpp / Ollama / vLLM, with Reflex's phase breakdown](docs/cold-start-t4.png)
+
+*Figure: cold start = process launch → first token, external wall clock, Tesla T4,
+`Qwen3-0.6B-Q4_K_M`, `n=30` (`n=3` Ollama/vLLM). Left: Reflex vs the other engines on a
+log axis, so vLLM stays visible. Right: where Reflex's 0.83s goes. Editable vector source:
+[`docs/cold-start-t4.svg`](docs/cold-start-t4.svg).*
+
 ### Cold-start phase breakdown
 
 A single aggregate number hides where the time actually goes, so both `reflex generate`

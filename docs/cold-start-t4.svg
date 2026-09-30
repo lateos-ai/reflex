@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1160" viewBox="0 0 1800 1160">
+<rect x="0" y="0" width="1800" height="1160" fill="#ffffff"/>
+<style>text{font-family:Segoe UI, Helvetica Neue, Arial, sans-serif;} .t{fill:#0f172a;} .m{fill:#64748b;} .f{fill:#94a3b8;}</style>
+<text x="80.0" y="74.0" font-size="42" font-weight="700" fill="#0f172a" text-anchor="start" opacity="1.0">Cold start: launch → first token</text>
+<text x="80.0" y="112.0" font-size="19" font-weight="400" fill="#64748b" text-anchor="start" opacity="1.0">NVIDIA Tesla T4  ·  external wall clock (process launch to exit)  ·  median of n=30, p95 within ~2% of median  ·  lower is better</text>
+<text x="80.0" y="172.0" font-size="26" font-weight="700" fill="#0f172a" text-anchor="start" opacity="1.0">Cold-start TTFT across engines</text>
+<line x1="599.1" y1="212" x2="599.1" y2="606" stroke="#e2e8f0" stroke-width="1"/>
+<text x="599.1" y="202.0" font-size="15" font-weight="400" fill="#94a3b8" text-anchor="middle" opacity="1.0">0.5s</text>
+<line x1="720.7" y1="212" x2="720.7" y2="606" stroke="#e2e8f0" stroke-width="1"/>
+<text x="720.7" y="202.0" font-size="15" font-weight="400" fill="#94a3b8" text-anchor="middle" opacity="1.0">1s</text>
+<line x1="842.3" y1="212" x2="842.3" y2="606" stroke="#e2e8f0" stroke-width="1"/>
+<text x="842.3" y="202.0" font-size="15" font-weight="400" fill="#94a3b8" text-anchor="middle" opacity="1.0">2s</text>
+<line x1="1003.0" y1="212" x2="1003.0" y2="606" stroke="#e2e8f0" stroke-width="1"/>
+<text x="1003.0" y="202.0" font-size="15" font-weight="400" fill="#94a3b8" text-anchor="middle" opacity="1.0">5s</text>
+<line x1="1124.6" y1="212" x2="1124.6" y2="606" stroke="#e2e8f0" stroke-width="1"/>
+<text x="1124.6" y="202.0" font-size="15" font-weight="400" fill="#94a3b8" text-anchor="middle" opacity="1.0">10s</text>
+<line x1="1246.1" y1="212" x2="1246.1" y2="606" stroke="#e2e8f0" stroke-width="1"/>
+<text x="1246.1" y="202.0" font-size="15" font-weight="400" fill="#94a3b8" text-anchor="middle" opacity="1.0">20s</text>
+<line x1="1406.9" y1="212" x2="1406.9" y2="606" stroke="#e2e8f0" stroke-width="1"/>
+<text x="1406.9" y="202.0" font-size="15" font-weight="400" fill="#94a3b8" text-anchor="middle" opacity="1.0">50s</text>
+<line x1="1528.4" y1="212" x2="1528.4" y2="606" stroke="#e2e8f0" stroke-width="1"/>
+<text x="1528.4" y="202.0" font-size="15" font-weight="400" fill="#94a3b8" text-anchor="middle" opacity="1.0">100s</text>
+<text x="1665.0" y="202.0" font-size="15" font-weight="700" fill="#94a3b8" text-anchor="start" opacity="1.0">vs Reflex</text>
+<text x="535.0" y="249.0" font-size="20" font-weight="700" fill="#0f172a" text-anchor="end" opacity="1.0">Reflex  (generate)</text>
+<rect x="560.0" y="214" width="128.0" height="56" fill="#1d4ed8" rx="4"/>
+<text x="702.0" y="250.0" font-size="21" font-weight="700" fill="#0f172a" text-anchor="start" opacity="1.0">0.83 s</text>
+<text x="1666.0" y="249.0" font-size="20" font-weight="700" fill="#1d4ed8" text-anchor="start" opacity="1.0">—</text>
+<text x="535.0" y="327.0" font-size="20" font-weight="500" fill="#334155" text-anchor="end" opacity="1.0">llama.cpp  llama-simple</text>
+<rect x="560.0" y="292" width="149.9" height="56" fill="#475569" rx="4"/>
+<text x="723.9" y="328.0" font-size="21" font-weight="700" fill="#334155" text-anchor="start" opacity="1.0">0.94 s</text>
+<text x="1666.0" y="327.0" font-size="20" font-weight="600" fill="#334155" text-anchor="start" opacity="1.0">1.13×</text>
+<text x="535.0" y="405.0" font-size="20" font-weight="500" fill="#334155" text-anchor="end" opacity="1.0">llama.cpp  llama-cli</text>
+<rect x="560.0" y="370" width="240.9" height="56" fill="#64748b" rx="4"/>
+<text x="814.9" y="406.0" font-size="21" font-weight="700" fill="#334155" text-anchor="start" opacity="1.0">1.58 s</text>
+<text x="1666.0" y="405.0" font-size="20" font-weight="600" fill="#334155" text-anchor="start" opacity="1.0">1.90×</text>
+<text x="535.0" y="483.0" font-size="20" font-weight="500" fill="#334155" text-anchor="end" opacity="1.0">Ollama  (cold daemon+model)</text>
+<rect x="560.0" y="448" width="290.8" height="56" fill="#94a3b8" rx="4"/>
+<text x="864.8" y="484.0" font-size="21" font-weight="700" fill="#334155" text-anchor="start" opacity="1.0">2.1 s</text>
+<text x="1666.0" y="483.0" font-size="20" font-weight="600" fill="#334155" text-anchor="start" opacity="1.0">2.6×</text>
+<text x="535.0" y="561.0" font-size="20" font-weight="500" fill="#334155" text-anchor="end" opacity="1.0">vLLM  (cold, torch.compile)</text>
+<rect x="560.0" y="526" width="1010.7" height="56" fill="#eef2f6"/>
+<rect x="560.0" y="526" width="806.6" height="56" fill="#cbd5e1"/>
+<line x1="1366.6" y1="526" x2="1366.6" y2="582" stroke="#64748b" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="1650.0" y="548.0" font-size="21" font-weight="700" fill="#0f172a" text-anchor="end" opacity="1.0">127 s cold</text>
+<text x="1650.0" y="576.0" font-size="15" font-weight="400" fill="#64748b" text-anchor="end" opacity="1.0">40–65 s with warm cache</text>
+<text x="1666.0" y="561.0" font-size="20" font-weight="600" fill="#334155" text-anchor="start" opacity="1.0">48–153×</text>
+<text x="80.0" y="700.0" font-size="26" font-weight="700" fill="#0f172a" text-anchor="start" opacity="1.0">Where Reflex’s 0.83 s goes</text>
+<text x="80.0" y="730.0" font-size="17" font-weight="400" fill="#64748b" text-anchor="start" opacity="1.0">process launch to first token, generate, n=30, p50</text>
+<clipPath id="round"><rect x="80.0" y="758.0" width="1570.0" height="66.0" rx="6"/></clipPath>
+<g clip-path="url(#round)">
+<rect x="80.0" y="758.0" width="240.2" height="66.0" fill="#dbeafe"/>
+<text x="200.1" y="798.0" font-size="18" font-weight="700" fill="#0f172a" text-anchor="middle" opacity="1.0">127 ms</text>
+<rect x="320.2" y="758.0" width="70.5" height="66.0" fill="#bfdbfe"/>
+<rect x="390.6" y="758.0" width="267.2" height="66.0" fill="#93c5fd"/>
+<text x="524.2" y="798.0" font-size="18" font-weight="700" fill="#0f172a" text-anchor="middle" opacity="1.0">141 ms</text>
+<rect x="657.8" y="758.0" width="444.2" height="66.0" fill="#60a5fa"/>
+<text x="879.9" y="798.0" font-size="18" font-weight="700" fill="#0f172a" text-anchor="middle" opacity="1.0">235 ms</text>
+<rect x="1102.0" y="758.0" width="548.0" height="66.0" fill="#1d4ed8"/>
+<text x="1376.0" y="798.0" font-size="18" font-weight="700" fill="#ffffff" text-anchor="middle" opacity="1.0">290 ms</text>
+</g>
+<rect x="80.0" y="758.0" width="1570.0" height="66.0" rx="6" fill="none" stroke="#cbd5e1" stroke-width="1"/>
+<text x="1650.0" y="744.0" font-size="18" font-weight="700" fill="#0f172a" text-anchor="end" opacity="1.0">external wall clock p50 = 830 ms</text>
+<rect x="80.0" y="862.0" width="18" height="18" rx="4" fill="#dbeafe" stroke="#cbd5e1" stroke-width="0.7"/>
+<text x="108.0" y="876.0" font-size="16" font-weight="600" fill="#0f172a" text-anchor="start" opacity="1.0">process launch</text>
+<text x="108.0" y="900.0" font-size="15" font-weight="400" fill="#64748b" text-anchor="start" opacity="1.0">127 ms   15%</text>
+<rect x="394.0" y="862.0" width="18" height="18" rx="4" fill="#bfdbfe" stroke="#cbd5e1" stroke-width="0.7"/>
+<text x="422.0" y="876.0" font-size="16" font-weight="600" fill="#0f172a" text-anchor="start" opacity="1.0">gguf + parse</text>
+<text x="422.0" y="900.0" font-size="15" font-weight="400" fill="#64748b" text-anchor="start" opacity="1.0">37 ms   4%</text>
+<rect x="708.0" y="862.0" width="18" height="18" rx="4" fill="#93c5fd" stroke="#cbd5e1" stroke-width="0.7"/>
+<text x="736.0" y="876.0" font-size="16" font-weight="600" fill="#0f172a" text-anchor="start" opacity="1.0">CUDA init</text>
+<text x="736.0" y="900.0" font-size="15" font-weight="400" fill="#64748b" text-anchor="start" opacity="1.0">141 ms   17%</text>
+<rect x="1022.0" y="862.0" width="18" height="18" rx="4" fill="#60a5fa" stroke="#cbd5e1" stroke-width="0.7"/>
+<text x="1050.0" y="876.0" font-size="16" font-weight="600" fill="#0f172a" text-anchor="start" opacity="1.0">model load</text>
+<text x="1050.0" y="900.0" font-size="15" font-weight="400" fill="#64748b" text-anchor="start" opacity="1.0">235 ms   28%</text>
+<rect x="1336.0" y="862.0" width="18" height="18" rx="4" fill="#1d4ed8" stroke="#cbd5e1" stroke-width="0.7"/>
+<text x="1364.0" y="876.0" font-size="16" font-weight="600" fill="#0f172a" text-anchor="start" opacity="1.0">prompt eval (first token)</text>
+<text x="1364.0" y="900.0" font-size="15" font-weight="400" fill="#64748b" text-anchor="start" opacity="1.0">290 ms   35%</text>
+<text x="80.0" y="1060.0" font-size="15" font-weight="400" fill="#64748b" text-anchor="start" opacity="1.0">Source: scripts/bench_cold_common.sh — external /usr/bin/time -v, process launch to exit. Same GGUF (Qwen3-0.6B-Q4_K_M), same prompt ("Once upon a time"),</text>
+<text x="80.0" y="1082.0" font-size="15" font-weight="400" fill="#64748b" text-anchor="start" opacity="1.0">same Tesla T4, same session. Reflex and llama.cpp are both AOT-compiled by nvcc, so the llama.cpp rows do not exercise the AOT-vs-JIT bet; vLLM 0.30.0 has no GGUF</text>
+<text x="80.0" y="1104.0" font-size="15" font-weight="400" fill="#64748b" text-anchor="start" opacity="1.0">support and ran on the HF safetensors checkpoint. Ollama / vLLM n=3; Ollama's 38.8 s cold-first-run outlier is omitted here (see bench-results/t4-refresh-2026-09-29/).</text>
+</svg>
