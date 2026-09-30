@@ -247,27 +247,49 @@ continuously and does not have that granularity limit.
 
 ## Benchmarks
 
-All comparisons are cold-start (process launch to first token/result), same
-ThunderCompute A6000, `n=3`, external wall-clock (`/usr/bin/time -v` — process launch
-to exit, not just Reflex's own internal timer), except the TypeSafe Jev *warm* rows
-below, which use a different, explicitly-disclosed methodology. Full methodology,
-disclosed caveats, and per-run numbers for every comparison below are in
-`DECISIONS.md` and `HISTORY.md`.
+All comparisons are cold-start (process launch to first token/result), external
+wall-clock (`/usr/bin/time -v` — process launch to exit, not just Reflex's own internal
+timer), except the TypeSafe Jev *warm* rows below, which use a different,
+explicitly-disclosed methodology. The `llama-simple`/`llama-cli`/Ollama/vLLM rows were
+refreshed on 2026-09-29 on a dedicated AWS EC2 `g4dn.xlarge` (**Tesla T4**, driver
+595.91.07 / CUDA 13.2), `n=30` per engine (`n=3` per Ollama scenario, `n=3` for vLLM),
+single session, same `Qwen3-0.6B-Q4_K_M.gguf` and same prompt (`"Once upon a time"`) on
+both sides; the TypeSafe Jev rows are unchanged from their own earlier measurements.
+Full methodology, disclosed caveats, and per-run numbers for every comparison below are
+in `DECISIONS.md` and `HISTORY.md`.
 
-### Cold-start: local process launch vs. `llama-cli` / `llama-server` / vLLM
+**Device-comparability caveat (disclosed, not buried).** This refresh could not run on
+the published table's ThunderCompute A6000 — that GPU was unavailable — so it uses the
+T4 fallback the refresh plan allows. That is not just a different card: the old A6000
+rows were measured on ThunderCompute's GPU-virtualized instances, where *every* CUDA
+process paid a multi-second post-result context-teardown tax through its virtualization
+proxy (the issue behind Reflex's `fast_exit`; see `HISTORY.md`). On a dedicated AWS T4
+that tax is absent, so **both** engines are far faster in absolute terms and the old
+A6000 numbers are not directly portable. Both engines here ran on the same T4 in the
+same session, so the ratio between them is sound; the absolute numbers are not
+comparable to the old A6000 table. The harness was re-validated first (same
+`bench_cold_common.sh`, same commands): llama.cpp no longer reads ~6.5s precisely
+because the virtualized-teardown tax it used to pay is gone — a host-class difference,
+diagnosed before any number was trusted, not a harness change.
 
-These compare a *cold* local process launch (Reflex) against llama.cpp's two front-ends
-and vLLM. Note the AOT truth before reading the "avoids runtime JIT" claim into every
-row: `llama-cli` and `llama-server` are, like Reflex, compiled ahead-of-time by `nvcc` at
-*build* time — neither pays a runtime CUDA JIT tax, so the llama.cpp rows below measure
-*other* cold-start overheads (teardown, GPU discovery), and only the vLLM row actually
-exercises Reflex's no-runtime-JIT bet.
+### Cold-start: local process launch vs. `llama-simple` / `llama-cli` / Ollama / vLLM
 
-| vs. (cold process launch) | Result | Caveat |
+These compare a *cold* local process launch (Reflex) against llama.cpp's front-ends,
+Ollama, and vLLM. Note the AOT truth before reading the "avoids runtime JIT" claim into
+every row: `llama-simple`/`llama-cli` and Ollama's bundled `llama-server` are, like
+Reflex, compiled ahead-of-time by `nvcc` at *build* time — none pays a runtime CUDA JIT
+tax, so those rows measure *other* cold-start overheads (model load, packaging, GPU
+discovery), and only the vLLM row actually exercises Reflex's no-runtime-JIT bet.
+
+Reflex's own number on this device (`reflex generate`, `n=30`): **p50 0.83s / p95 0.84s**,
+peak RSS 982 MB.
+
+| vs. (cold process launch, Tesla T4, `n=30`) | Result (p50; p95 in parens) | Caveat |
 |---|---|---|
-| **llama.cpp `llama-cli`** | **~1.3–1.4x faster** (4.71–5.05s vs. 6.45–6.56s) | Both AOT-compiled — the win is Reflex's one-line `fast_exit` teardown fix, not JIT; doesn't exercise the JIT-tax claim |
-| **Ollama (bundled `llama-server`)** | Directly competitive when it doesn't stall (~6–7s), but its bundled `llama-server` intermittently hits an internal GPU-discovery-watchdog timeout (~55–62s) | Wraps llama.cpp's AOT runtime — the stall is a GPU-probe/virtualization hang, not JIT; tests packaging/daemon overhead, not the AOT-vs-JIT bet |
-| **vLLM** | **~24–52x faster** (4.71–5.05s vs. 121–244s, depending on `torch.compile` cache state) | **The actual AOT-vs-JIT foil** — vLLM's CUDA graph capture + `torch.compile` warmup at cold start. Installed vLLM has no GGUF support; ran against an HF safetensors checkpoint instead, disclosed |
+| **llama.cpp `llama-simple`** (true prompt-in/token-out) | **Reflex ~1.13x faster** (0.83s [0.84s] vs. 0.94s [0.96s]) | Both AOT-compiled. On this dedicated T4 the win is Reflex's optimized cold load, *not* the `fast_exit` teardown fix — that only mattered on ThunderCompute's virtualized A6000; doesn't exercise the JIT-tax claim |
+| **llama.cpp `llama-cli`** | **Reflex ~1.9x faster** (0.83s vs. 1.58s [1.59s]) | `llama-cli` always applies the model's chat template even with `-p` (a documented gotcha), so `llama-simple` is the true prompt-in/token-out row; kept for continuity with the published table |
+| **Ollama (bundled `llama-server`)** | **Reflex ~2.6x faster** (0.83s vs. ~2.1s cold daemon + cold model; warm model ~7–11ms) | Wraps llama.cpp's AOT runtime; tests packaging/daemon overhead. The published ThunderCompute watchdog stall did **not** recur here (0 of 9 runs); one 38.8s cold-first-run outlier is disclosed in `HISTORY.md`, not averaged away |
+| **vLLM** | **Reflex ~48–150x faster** (0.83s vs. 39.8–127.3s, depending on `torch.compile` cache state) | **The actual AOT-vs-JIT foil** — vLLM's CUDA graph capture + `torch.compile` warmup at cold start. Installed vLLM 0.30.0 still has no GGUF support; ran against the HF safetensors checkpoint instead, disclosed |
 
 ### Warm-API: Reflex (warm compute) vs. TypeSafe Jev (always-warm managed API)
 
@@ -402,11 +424,11 @@ regression is now **closed and turned into a win**: the tied full-vocab dequant 
 on-device (2026-09-28), cutting `prompt_eval_ms` by ~426ms on that path in its own A/B
 (`generate` total ~1314ms → ~894ms there). See `STATUS.md` and `HISTORY.md`.
 
-**The comparison table above predates perf items 2–6 and the cold-load overlap round**
-and was measured on an A6000; it has not been re-run against the current code. Its
-Reflex-side figures are therefore conservative — the engine has since gotten materially
-faster — but they are stale rather than current measurements either way. Re-running that
-table is outstanding work.
+**The comparison table has since been refreshed** (2026-09-29, dedicated AWS T4): the
+`llama-simple`/`llama-cli`/Ollama/vLLM rows above are current measurements of this code,
+not the pre-perf-items A6000 figures. See `HISTORY.md`'s "Cold-start comparison table
+refresh" entry for the device, driver, `n`, per-engine p50/p95, the harness-validation
+diagnosis, and the raw-log location.
 
 Also disclosed rather than smoothed over: in the earlier L40 measurements, two batches
 in the same session showed materially different noise levels across *every* run of the

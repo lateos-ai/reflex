@@ -3295,3 +3295,113 @@ not a repo bug -- the committed files are clean.
 ignored) and `cargo test --features json-output` (87 passed). Golden `token_id=12095` /
 `" Paris"` reproduced on the real T4, confirming the output-layer change is
 forward-pass-neutral.
+
+### Cold-start comparison table refresh (llama.cpp / Ollama / vLLM), 2026-09-29
+
+README's "Cold-start: local process launch vs. ..." table was measured on a
+ThunderCompute A6000 at `n=3` and predated perf items 2--6 plus the cold-load overlap
+round; README itself flagged re-running it as outstanding work. This entry is that
+re-run. It is a harness + docs job only: no engine/model/forward-pass code changed.
+
+**Device, and why not an A6000.** ThunderCompute's A6000 was unavailable at the time
+(`tnr create --gpu a6000` returned "GPU configuration a6000 x1 is currently
+unavailable", confirmed against `/v2/status`, which listed only `a100xl` as actually
+free; `l40`/`h100` were also unavailable). Per the refresh plan's sanctioned fallback,
+the whole comparison ran on one dedicated GPU for every row, same session: an on-demand
+AWS EC2 `g4dn.xlarge` (`us-east-1c`, DLAMI "Deep Learning Base OSS Nvidia Driver GPU AMI
+(Ubuntu 22.04) 20260929"), **Tesla T4**, driver 595.91.07 / CUDA 13.2 (the same
+driver/CUDA the README's phase table already runs on), 4 vCPU / 15 GiB / 100 GB gp3.
+Both engines were built and run on that one box; no row mixes GPU generations.
+
+**Harness validation first -- and the surprise.** `scripts/bench_cold_common.sh` was
+re-run on the published commands before any new number was trusted (its own header
+requires this). It did **not** reproduce the published llama.cpp figures: the old table
+has llama.cpp at 6.45--6.56s and Reflex at 4.71--5.05s, but on this T4 llama.cpp reads
+~0.94s (llama-simple) / ~1.58s (llama-cli). Diagnosed before proceeding, per the task:
+this is a **host-class difference, not a harness bug**. The old numbers were measured on
+ThunderCompute's GPU-virtualized instances, where every CUDA process paid a multi-second
+post-result context-teardown tax through the `/tmp/.tc_hac` virtualization proxy -- the
+exact issue `fast_exit` was built to skip (see this file's `fast_exit` entry: `reflex
+smoke` went 6.3s -> 0.56s there). A ThunderCompute llama.cpp run therefore paid ~5.5s of
+pure teardown that a dedicated AWS T4 does not. Reflex's win in the old table was
+largely that teardown fix; on a dedicated GPU both engines exit promptly, so the
+refreshed comparison measures the engines' real cold-load paths instead. The ratios are
+sound (both sides same T4, same session); the absolutes are not portable to the old
+A6000 table. This is stated in the README's methodology intro.
+
+**Exact commands** (all external `/usr/bin/time -v`, process launch to exit, via
+`bench_cold_common.sh`; prompt `"Once upon a time"`; model `Qwen3-0.6B-Q4_K_M.gguf` from
+`unsloth/Qwen3-0.6B-GGUF`, sha256 `ac2d9771...d524a`, verified equal to the HF LFS
+object before use):
+
+- Reflex: `reflex generate <gguf> "Once upon a time" --max-tokens 1`
+- llama.cpp `examples/simple` (true prompt-in/token-out; prompt positional):
+  `llama-simple -m <gguf> -n 1 -ngl 99 --no-warmup "Once upon a time"`
+- llama.cpp `llama-cli` (the published front-end; applies the chat template even with
+  `-p`): `llama-cli -m <gguf> -p "Once upon a time" -n 1 --temp 0 -ngl 99 --no-warmup -st
+  --simple-io`
+- Ollama 0.34.4: `scripts/bench_cold_ollama.sh qwen3-0.6b-bench 3` (model built with
+  `ollama create ... FROM <gguf>`)
+- vLLM 0.30.0: `scripts/bench_cold_vllm.sh Qwen/Qwen3-0.6B 3` after `rm -rf ~/.cache/vllm`
+  (so run 1 is a true first-run; the HF safetensors checkpoint was pre-downloaded so no
+  network time is inside the timed window)
+
+Builds: Reflex `HEAD 5e5e0e7`, `REFLEX_CUDA_ARCH=sm_75 cargo build --release --bin
+reflex` (default features, rustc/cargo 1.98.1); llama.cpp commit
+`a6ea155d3d38b3f6f43d0c0dc29c2d592413ef44`, `cmake -DGGML_CUDA=ON
+-DCMAKE_CUDA_ARCHITECTURES=75 -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release`.
+
+**Results, p50 / p95 external wall clock (same instance, same session).** Reflex `n=30`,
+llama.cpp `n=30` each, Ollama `n=3` per scenario, vLLM `n=3`:
+
+| engine | p50 | p95 | peak RSS |
+|---|---|---|---|
+| **Reflex** (`generate`, 1 token) | **0.830s** | **0.840s** | 982 MB |
+| llama.cpp `llama-simple` | 0.940s | 0.960s | 734 MB |
+| llama.cpp `llama-cli` | 1.580s | 1.590s | 746 MB |
+
+Ratios (both engines AOT-compiled; the llama.cpp rows do not exercise the AOT-vs-JIT
+bet): **Reflex ~1.13x faster than `llama-simple`**, **~1.9x faster than `llama-cli`**
+(p95 ratios 1.14x / 1.89x). All 30 Reflex runs emitted the documented golden first token
+`token_id=11` (`","`); `llama-simple`/`llama-cli`/Ollama/vLLM all emitted the same `","`
+first token.
+
+Ollama (per-scenario, Ollama's own `total_duration` / external `/usr/bin/time -v`): cold
+daemon + cold model 38.77s, then 2.14s, 2.15s; warm daemon + cold model 2.20, 2.22,
+2.21s; warm daemon + warm model 7.59, 10.84, 6.47ms. The published ThunderCompute
+watchdog stall (55--62s) did **not** recur on this dedicated T4 (0 of 9 runs), which is
+itself the expected result: that stall was a GPU-probe/virtualization artifact of the
+ThunderCompute host. The 38.77s first run is a real cold-first-run outlier (cold page
+cache + first GPU init), reported as-is rather than dropped or averaged in; the steady
+cold number is ~2.1s, so Reflex is ~2.6x faster on that path.
+
+vLLM: true first run (compile cache cleared) 127.28s (`init engine ... took 84.86 s
+(compilation: 34.67 s)`), then 39.75s and 65.52s with a partially-warm `torch.compile`
+cache; a separate first-ever invocation before the harness measured 128.39s. Reflex is
+**~48--150x faster** depending on vLLM's cache state. vLLM 0.30.0 still has no GGUF
+support, so -- as in the original -- it ran against the HF safetensors checkpoint, an
+explicitly disclosed weight-format deviation, not a silent substitution.
+
+**Variance.** Spreads were tight (p95 within ~2% of p50 on every engine; single-session,
+single-instance). The README's existing "session-to-session variance on rented GPU
+hardware can exceed intra-session variance" caveat still applies to any single-session
+number, including these.
+
+**One odd run, disclosed not hidden.** The two very first `reflex generate --max-tokens
+1` invocations immediately after the GGUF was placed on disk returned a non-golden token
+(`397`/`">\n"`) while the concurrent llama.cpp build was hammering the disk; every run
+after the file was fully quiesced (the `n=30` batch, plus re-runs of both documented
+prompts) returned the correct golden tokens (`11`, `12095`), and the file's sha256 was
+verified equal to HF's before use. Recorded as a likely file-placement/page-cache race
+during setup, not a forward-pass issue, but flagged for whoever re-runs this.
+
+**Raw logs** (never discarded, per `bench_cold_common.sh`'s convention), copied from the
+instance to the dev machine at `bench-results/t4-refresh-2026-09-29/` (gitignored, like
+all of `bench-results/`): per-run `time_N.log` + `stdout_N.log` for the validation runs,
+`llama-simple`, `llama-cli`, `reflex-generate`, `ollama`, and `vllm` subdirectories, plus
+the `ollama_bench.log` / `vllm_bench.log` transcripts. The AWS instance, security group,
+and key pair were torn down at the end of the session.
+
+**Gates**: docs/harness only -- `REFLEX_SKIP_CUDA=1 cargo fmt --check`, `cargo clippy
+--all-targets -- -D warnings`, `cargo test` all unchanged/clean (no Rust source touched).
+
