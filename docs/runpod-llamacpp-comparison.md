@@ -1,7 +1,9 @@
-# Reflex vs. llama.cpp cold-start comparison on Runpod Serverless (procedure)
+# Reflex vs. llama.cpp cold-start comparison on Runpod Serverless
 
-**Status: prepared, not yet run.** Every result cell below is `TBD` until the
-measurement is done. Don't cite anything from this page before then.
+**Status: first run done 2026-10-01, partial.** Reflex has n=5 successful cold
+invocations, llama.cpp n=3 (two more hit a platform gateway timeout and serverless L4
+capacity then ran out). See [Results](#results) for what the numbers do and don't
+support.
 
 ## Why this comparison
 
@@ -146,25 +148,74 @@ the console). Workers scale to zero on their own, but the endpoints remain other
 
 ## Results
 
-Run date: TBD. Data center: TBD. GPU: TBD (pinned SKU and what workers actually landed
-on).
+Run date: 2026-10-01, 17:31–17:51 UTC. GPU: **NVIDIA L4 (`sm_89`)**, pinned on both
+endpoints; every worker landed on one. Data center: unpinned on both (the scheduler
+chose EU-RO-1 or EUR-IS-1; noted per run). CUDA floor 12.8 on both, FlashBoot off,
+`workersMin=0`, `workersMax=1`, 10 s idle timeout. Requests sent from a client on the US
+west coast.
+
+**Why an L4 and not the default A4500.** The run started on RTX A4500s in EU-RO-1. Within
+about 15 minutes, serverless A4500 stock on CUDA ≥ 12.8 hosts went to zero (workers sat
+in `THROTTLED`). Both endpoints were moved to the L4. It is `sm_89`, so the official
+llama.cpp image still has native code for it (see the pre-check above), and the
+engine-load comparison stays free of driver JIT. Serverless L4 stock was LOW throughout,
+which is why the data center was left unpinned: a single pinned data center ran out
+mid-run. L4 serverless capacity ran out completely at ~17:57 UTC, which ended the run.
 
 | image | size |
 |---|---|
-| Reflex (`runpod-lb`) | TBD |
-| llama.cpp (`server-cuda-b11277` + nginx + model) | TBD |
+| Reflex (`runpod-lb`) | 2.06 GB |
+| llama.cpp (`server-cuda-b11277` + nginx + model) | 7.79 GB |
 
-| run | Reflex wall clock | Reflex engine-ready | llama.cpp wall clock | llama.cpp engine-ready |
+Engine-ready is measured from the container's first log line to the engine's ready line
+(`REFLEX_STDIO_READY` for Reflex, `llama_server: listening` for llama.cpp), using the
+worker log timestamps. For llama.cpp it agrees with llama-server's own elapsed-time
+prefix to within 10 ms.
+
+| round | Reflex wall clock | Reflex engine-ready | llama.cpp wall clock | llama.cpp engine-ready |
 |---|---|---|---|---|
-| 1 | TBD | TBD | TBD | TBD |
-| 2 | TBD | TBD | TBD | TBD |
-| 3 | TBD | TBD | TBD | TBD |
-| 4 | TBD | TBD | TBD | TBD |
-| 5 | TBD | TBD | TBD | TBD |
-| **median** | **TBD** | **TBD** | **TBD** | **TBD** |
+| 1 | 28.53 s (EUR-IS-1) | 0.55 s | 138.68 s (EU-RO-1, image pulled fresh) | 0.92 s |
+| 2 | 56.11 s (EU-RO-1) | 0.43 s | 67.78 s (EU-RO-1) | 0.95 s |
+| 3 | 53.12 s (EU-RO-1) | 0.39 s | failed: gateway HTTP 400 after 300 s | not captured |
+| 4 | 73.16 s (EU-RO-1) | 0.61 s | 41.96 s (EU-RO-1) | 1.37 s |
+| 5 | 24.06 s (EUR-IS-1) | 0.49 s | failed: gateway HTTP 400 after 300 s (image pulled fresh) | not captured |
+| **median** | **53.12 s** (n=5) | **0.49 s** (n=5) | **67.78 s** (n=3) | **0.95 s** (n=3) |
 
-Optional `--no-warmup` variant, llama.cpp only: median wall clock TBD, median
-engine-ready TBD.
+Both llama.cpp failures came while Runpod's own worker-log API was timing out. In round
+3 all three workers the platform started (see below) had passed `/ping` and sat `IDLE`
+for ~4 minutes before the gateway gave up, so the request was never routed to a healthy
+worker. A Reflex request the same day (on the A4500 endpoint, before the switch) failed
+the same way. These are recorded as platform failures, not engine failures. A sixth
+llama.cpp run was started as a replacement but got no worker before L4 stock ran out,
+and was stopped.
+
+The optional `--no-warmup` variant was not run.
+
+### What the numbers support
+
+- **Engine load: Reflex ~0.5 s vs. llama.cpp ~0.95 s on an L4, about 1.9x** (medians,
+  n=5 vs. n=3; Reflex 0.39–0.61 s, llama.cpp 0.92–1.37 s). This is the like-for-like
+  engine comparison. It is consistent with the local T4 numbers in the pre-check above.
+- **End-to-end wall clock: no conclusion.** Platform overhead dominates: scheduling a
+  worker, pulling or loading the image, creating the container, and the gateway noticing
+  the worker is healthy. Even with a cached image, Reflex ranged 24–73 s for a ~0.5 s
+  engine load. The time from engine-ready to the response arriving alone ranged from
+  roughly 7 s to 58 s across runs (approximate: the request's start is inferred from
+  the cold-reset step's fixed sleep). Neither the n=5 vs. n=3 medians (53 s vs. 68 s) nor the
+  ranges support an end-to-end ratio.
+- **Image size showed up directly.** Two of the five llama.cpp workers landed on hosts
+  without the 7.79 GB image and pulled it (~55 s in round 1). No Reflex worker in the
+  measured runs needed a full pull: either the host had the image or Runpod loaded it
+  from its own image cache (7–14 s).
+
+### Platform behaviour seen during the run
+
+- `workersMax=1` was not enforced: Reflex rounds 2 and 3 each started a second worker,
+  and llama.cpp round 3 started three. This is the same overshoot noted in
+  `serverless/runpod/README.md`.
+- The cold-reset step (`workersMax` to 0, wait, back to 1) works, but a stray benchmark
+  loop that keeps doing it starves every other run on that endpoint. Make sure only one
+  `bench_cold_runpod.sh` is running per endpoint.
 
 ## Caveats to state with the result
 
