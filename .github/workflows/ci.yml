@@ -64,7 +64,7 @@ jobs:
           cargo clippy --locked --all-targets --features ipc,download -- -D warnings
 
       - name: Test (GPU-hardware tests are #[ignore]d and skipped here)
-        run: cargo test --locked --features ipc
+        run: cargo test --locked --features ipc,nvml
 
   # sidecar/openai-adapter is a deliberately separate Cargo project (own
   # Cargo.toml/Cargo.lock, not a workspace member, no dependency on reflex-engine --

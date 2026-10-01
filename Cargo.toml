@@ -83,4 +83,12 @@ path = "src/bin/reflex/main.rs"
 # subcommands are gated inside main.rs via #[cfg(feature = "ipc")] instead
 # of at the Cargo-target level, since there's only one binary now.
 
+# Measures a command's whole-process GPU energy from outside it (NVML counter,
+# idle baseline subtracted) -- see src/bin/reflex-energy.rs. Needs NVML, so it only
+# builds with `--features nvml`; the core `reflex` binary is unaffected.
+[[bin]]
+name = "reflex-energy"
+path = "src/bin/reflex-energy.rs"
+required-features = ["nvml"]
+
 [dev-dependencies]

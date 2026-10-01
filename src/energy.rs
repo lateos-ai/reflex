@@ -310,3 +310,95 @@ pub fn probe_availability(device_ordinal: usize) -> Result<EnergyMethod, ReflexE
         ))
     }
 }
+
+/// One whole-process energy measurement taken from *outside* the measured process, by
+/// the `reflex-energy` wrapper binary (`src/bin/reflex-energy.rs`). Unlike
+/// [`EnergySampler`], which can only bracket `main()`, this covers everything the GPU
+/// spends on the process: exec, dynamic linking and CUDA init before `main()` runs, and
+/// the driver's context teardown after it exits.
+///
+/// NVML's counter is device-wide, so `gross_mj` includes whatever the GPU draws while
+/// idle; [`Self::net_mj`] subtracts an idle-power baseline measured just before the run
+/// over the same window. Both figures are only meaningful on a dedicated GPU.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExternalEnergy {
+    /// Process spawn to exit.
+    pub wall_ms: f64,
+    /// Measurement window: `wall_ms` plus the settle time waited before the final
+    /// counter read, so the counter has registered the tail of the run.
+    pub window_ms: f64,
+    /// Counter delta over the window, millijoules.
+    pub gross_mj: f64,
+    /// Idle draw measured just before the run, milliwatts.
+    pub idle_power_mw: f64,
+}
+
+impl ExternalEnergy {
+    /// What the GPU would have drawn idling over the same window, millijoules
+    /// (mW x ms / 1000).
+    pub fn idle_baseline_mj(&self) -> f64 {
+        self.idle_power_mw * self.window_ms / 1000.0
+    }
+
+    /// Energy attributable to the run: gross minus the idle baseline. Can come out
+    /// slightly negative for a very short run, from counter granularity; it is reported
+    /// as measured, not clamped.
+    pub fn net_mj(&self) -> f64 {
+        self.gross_mj - self.idle_baseline_mj()
+    }
+
+    /// The `REFLEX_ENERGY_OK` line `reflex-energy` prints after the command exits.
+    pub fn report_line(&self, exit_code: i32) -> String {
+        format!(
+            "REFLEX_ENERGY_OK wall_ms={:.3} window_ms={:.3} energy_mj={:.1} idle_power_mw={:.1} \
+             idle_baseline_mj={:.1} net_energy_mj={:.1} method=total_energy_counter exit_code={exit_code}",
+            self.wall_ms,
+            self.window_ms,
+            self.gross_mj,
+            self.idle_power_mw,
+            self.idle_baseline_mj(),
+            self.net_mj()
+        )
+    }
+}
+
+#[cfg(test)]
+mod external_energy_tests {
+    use super::ExternalEnergy;
+
+    #[test]
+    fn idle_baseline_and_net_energy() {
+        // 20 W idle over a 600 ms window is 12 J of baseline.
+        let e = ExternalEnergy {
+            wall_ms: 500.0,
+            window_ms: 600.0,
+            gross_mj: 30_000.0,
+            idle_power_mw: 20_000.0,
+        };
+        assert_eq!(e.idle_baseline_mj(), 12_000.0);
+        assert_eq!(e.net_mj(), 18_000.0);
+    }
+
+    #[test]
+    fn report_line_has_every_field() {
+        let e = ExternalEnergy {
+            wall_ms: 481.25,
+            window_ms: 581.0,
+            gross_mj: 25_000.0,
+            idle_power_mw: 9_000.0,
+        };
+        let line = e.report_line(0);
+        for field in [
+            "REFLEX_ENERGY_OK ",
+            "wall_ms=481.250",
+            "window_ms=581.000",
+            "energy_mj=25000.0",
+            "idle_power_mw=9000.0",
+            "idle_baseline_mj=5229.0",
+            "net_energy_mj=19771.0",
+            "exit_code=0",
+        ] {
+            assert!(line.contains(field), "missing {field:?} in {line}");
+        }
+    }
+}

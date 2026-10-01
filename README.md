@@ -117,7 +117,7 @@ feature matrix*, not a release build — see the table for what it drags in.
 | `ipc` | `reflex stdio` / `reflex uds` (also enables `json-output` via `serde`) | none |
 | `json-output` | `--json` on `generate`/`system1`/`bench`/`smoke`/`check`/`doctor` | none |
 | `download` | `--model <org/repo:file.gguf>` / `--quickstart` (HF downloader via `hf-hub`) | `libssl-dev` + `pkg-config` on Linux (**not** Windows/macOS, where `hf-hub` uses a different TLS backend) |
-| `nvml` | `reflex` energy instrumentation (dlopen'd `libnvidia-ml`, never linked) | none |
+| `nvml` | `reflex` energy instrumentation and the `reflex-energy` whole-process meter (dlopen'd `libnvidia-ml`, never linked) | none |
 | `python` | PyO3 bindings (`src/python.rs`) | a Python 3.8+ interpreter on the build host (`pyo3-build-config` probes for it) |
 
 The host-dependency story in one line: **only `download` (Linux) and `python` ever
@@ -242,6 +242,34 @@ dedicated/rented instance, an overcount on a shared GPU); and `total_energy_coun
 updates coarsely, so short phases (e.g. the ~39 ms scoring pass) legitimately read `0.000 J`
 there — reported as-is, not smoothed over. The `polled_power` fallback integrates
 continuously and does not have that granularity limit.
+
+**Whole-process energy, net of idle.** The in-process figures above can only bracket
+`main()`, and because NVML is device-wide they include whatever the GPU draws while
+idling. `reflex-energy` (`src/bin/reflex-energy.rs`, built with `--features nvml`)
+measures from outside instead: it reads the energy counter over 2 s of idle to get the
+GPU's idle power, then over the command's whole life (exec and CUDA init before `main()`,
+driver teardown after exit, plus a 100 ms settle), and reports gross energy, the idle
+baseline for the same window, and the difference. `scripts/bench_cold_energy.sh` runs it
+n times. Measured on a dedicated T4 (`g4dn.xlarge`, driver 595.91.07, Qwen3-0.6B-Q4_K_M,
+`reflex system1`, n=10, 2026-10-01):
+
+| metric | p50 | p95 |
+|---|---|---|
+| wall clock, spawn to exit | 592 ms | 2,992 ms |
+| gross energy over the run window | 27.7 J | 104.5 J |
+| idle baseline for the same window | 22.3 J | 99.3 J |
+| **net energy (gross − idle)** | **5.35 J** | **5.66 J** |
+| idle power | 32.1 W | 32.3 W |
+| in-process `joules`, `main()` to result | 19.5 J | 93.3 J |
+
+So most of a cold start's measured energy is the GPU idling at 32 W (this T4 sat in power
+state P0 when idle); the work itself costs about **5.4 J**. The p95 column is one outlier:
+the first run after the instance booted, with the model file not yet in the page cache
+(the other nine took 0.58–0.60 s). Two checks on the method: `reflex-energy -- sleep 1`,
+which never touches the GPU, nets 0.03–0.05 J of ~35 J gross, and the net figure barely
+moves between runs (5.35 vs 5.66 J) even when the gross one quadruples. Caveats: the
+counter is device-wide, so this needs a dedicated GPU, and the idle baseline depends on
+the GPU's power state, so compare net numbers only across runs measured the same way.
 
 **Target models**: Qwen and DeepSeek families.
 
