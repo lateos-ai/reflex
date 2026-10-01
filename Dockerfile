@@ -49,7 +49,8 @@ ENV CUDA_PATH="/usr/local/cuda"
 WORKDIR /build
 COPY . .
 
-# Kernel build mode (see README's "Core technical bet" for measurements):
+# Kernel build mode (see docs/reference.md's "Kernel build modes"; measurements in
+# docs/benchmarks.md):
 #   REFLEX_CUDA_ARCH=sm_XX      one cubin for exactly that GPU architecture. When set,
 #                               it wins over REFLEX_CUDA_ARCHS.
 #   REFLEX_CUDA_ARCHS=<list>    the default: a fatbin with a native image for each listed

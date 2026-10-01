@@ -41,7 +41,7 @@ baked into a custom AMI is possible, but at minimum the container pull/start and
 mount take real time) — on the order of tens of seconds to low minutes, not the
 sub-second `process_start_to_first_token_ms` this project's own cold-start benchmarks
 report for the `reflex` process itself. Reflex's AOT-compiled-kernel cold start is real
-and measured (see [HISTORY.md](../HISTORY.md)), but it happens *after* the EC2 instance
+and measured (see [benchmarks.md](benchmarks.md)), but it happens *after* the EC2 instance
 and container are already running — it is not a substitute for instance boot time.
 
 What this pattern legitimately buys you:
@@ -85,8 +85,7 @@ Reflex dequantizes every weight tensor once and holds it GPU-resident as `f32` (
 regardless of how many experts are actually "active" per token (every expert is
 dequantized and resident, since routing happens per-token at runtime). Real-hardware-
 verified free VRAM on a `g4dn.xlarge` right after driver init: **14,775 MiB** (`nvidia-smi`
-inside a real `docker run --gpus all` container, see HISTORY.md's "docker run --rm
---gpus all" entry) — leaving headroom for the KV cache/activation buffers puts the
+inside a real `docker run --gpus all` container) — leaving headroom for the KV cache/activation buffers puts the
 practical ceiling around **~3-3.5B total parameters**.
 
 | Model class | Fits on one T4? |
@@ -100,9 +99,8 @@ practical ceiling around **~3-3.5B total parameters**.
 For latency-sensitive single-pass scoring (the `reflex system1` subcommand), smaller is
 strictly better, not just VRAM-cheaper — both the cold-load time and the per-token
 compute scale with parameter count, so the smallest viable checkpoint (Qwen3-0.6B) is
-the right choice for that use case even when a bigger one would technically fit; see
-DECISIONS.md's TypeSafe Jev comparison entry for the benchmark this reasoning is based
-on. Going to a bigger GPU instance family (`g5`/A10G-24GB, `p3`/V100-16-32GB,
+the right choice for that use case even when a bigger one would technically fit (see
+[benchmarks.md](benchmarks.md#typesafe-jev) for the comparison behind this). Going to a bigger GPU instance family (`g5`/A10G-24GB, `p3`/V100-16-32GB,
 `p4d`/A100-40-80GB — note every `g4dn` size uses the same 16GB T4, so a larger
 `g4dn.*xlarge` does not buy more VRAM) only matters for going up in *model class*
 (dense Qwen3-4B+, any MoE, or MLA/DeepSeek-V2-class); it does not meaningfully help
@@ -112,7 +110,7 @@ a T4.
 ## 1. Build and push the sidecar image
 
 The repo's root `Dockerfile` already builds the `reflex` binary and is used unchanged
-by README's Docker/Kubernetes sections. It gained one additive build arg,
+by docs/reference.md's Docker/Kubernetes sections. It gained one additive build arg,
 `REFLEX_FEATURES`, specifically for this guide — empty by default (identical image to
 before), set to `ipc` to compile in the `stdio`/`uds` subcommands this pattern needs:
 

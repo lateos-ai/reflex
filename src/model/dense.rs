@@ -909,9 +909,8 @@ impl Model {
     /// as the verification oracle for [`Self::prefill_dense_batched`]
     /// (`prefill_batching_tests` below), the same role [`Self::prefill_hybrid`]
     /// plays for `prefill_hybrid_batched`. Not used by `generate_dense_impl`/
-    /// `system1_evaluate` any more (both switched to `prefill_dense_batched`
-    /// -- see README's "Batched Prefill GEMM" section) -- kept only for the
-    /// oracle role and any future direct caller. `extra_headroom` sizes the
+    /// `system1_evaluate` any more (both switched to `prefill_dense_batched`) -- kept only
+    /// for the oracle role and any future direct caller. `extra_headroom` sizes the
     /// K/V cache with that many additional position slots beyond the
     /// encoded prompt itself. Returns the encoded prompt ids (including any
     /// inserted BOS), the final position's hidden state, the filled K/V

@@ -1,6 +1,4 @@
-//! Rust C-FFI surface for Phase 4 (Embeddability) round 2 (see README.md's
-//! "Phase 4 -- Embeddability" roadmap entry and DECISIONS.md for the exact
-//! scope confirmed with the user before starting). Lets an external
+//! Rust C-FFI surface (the "Embeddability" phase in CHANGELOG.md). Lets an external
 //! orchestrator process link against this crate directly (`cdylib`/
 //! `staticlib`, see Cargo.toml's `[lib]` section) and call
 //! load -> generate -> free, instead of `exec`-ing `reflex generate` and
@@ -379,9 +377,9 @@ pub struct ReflexSystem1Result {
 /// for each of `num_candidates` candidate strings in `candidate_texts`. No
 /// argmax-then-feedback decode loop runs -- single-token candidates are
 /// scored in one batched gather-GEMV, multi-token candidates via a short
-/// teacher-forced continuation. Dense/MoE Qwen3 models only; hybrid Qwen3.5
-/// and DeepSeek-V2/V3 MLA are rejected with an error (call
-/// `reflex_last_error` for why).
+/// teacher-forced continuation. Every architecture is supported; on the Qwen3.5
+/// hybrid models each candidate must be a single token (multi-token candidates
+/// fail with `REFLEX_ERROR_CODE_INVALID_INPUT`).
 ///
 /// `handle` must come from `reflex_load` and not have been freed yet.
 /// `prompt` must be a non-NULL, NUL-terminated UTF-8 C string. `candidate_texts`

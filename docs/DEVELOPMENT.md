@@ -17,8 +17,8 @@ that number.
 
 ## Non-goals
 
-These are permanent constraints, not current scope. The full rationale is in the
-README's [Non-goals](../README.md#non-goals) section; the rules themselves:
+These are permanent constraints, not current scope. The rules, then the full
+rationale [below](#the-full-rationale):
 
 - **`batch_size` is always 1.** No internal request queue or scheduler, no continuous
   batching, no thread pool. The engine runs exactly one request at a time, which is why
@@ -33,14 +33,69 @@ README's [Non-goals](../README.md#non-goals) section; the rules themselves:
   non-network interfaces (`reflex stdio`, `reflex uds`) and in-process bindings (the C
   FFI, the PyO3 module). These always target GPU 0.
 
+### The full rationale
+
+These are permanent constraints on this engine, not just current-MVP scope — the whole
+reason Reflex exists is to win a narrower bet (cold-start energy/latency) than
+sustained-server throughput. A broad serving feature set re-inherits the exact
+throughput/serving race that's unwinnable against llama.cpp/vLLM/SGLang's head start.
+Multi-tenancy and persistent state belong in the *host
+orchestrator*, not in this engine:
+
+> **"Optimized for serverless" describes where this engine runs well, not features it
+> grows.** A "Serverless-Native Inference Engine" pitch — building platform machinery
+> (internal queue, scheduler, autoscaling logic, `batch_size > 1`) *into* Reflex — was
+> considered and rejected on 2026-09-17. Nothing in this page's
+> serverless framing reopens that. Running the unmodified binary as a workload on
+> Runpod's (or anyone's) control plane is the same arrangement as the AWS ASG pattern
+> already documented here: the platform is the host orchestrator, and the engine stays
+> single-shot. The violation is defined by what lives *inside* the engine, never by who
+> calls it.
+
+- **`batch_size` is always 1.** No request queue, no continuous batching, no
+  PagedAttention-style dynamic allocation, no context preemption. Horizontal scaling
+  (many concurrent jobs) is the orchestrator's job — spin up N `Reflex`
+  processes across GPU slices/time-slices — not this engine's, ever.
+- **No internal multi-tenant LoRA router/scheduler.**
+- **No internal NVMe/S3 KV-cache manager or cache-hit logic.**
+- **No concurrent HTTP/gRPC server**, no request auth/rate-limiting, no autoscaling
+  decision-making. If a warm-context mode ever exists (see Phase 4 below), it accepts
+  one job at a time, strictly sequentially — never a thread pool.
+
+**No in-core HTTP/gRPC server, ever, not deferred.** This is not a separate exception
+to the rule above — a concurrent HTTP listener is the exact same violation
+("`batch_size` always 1... never a thread pool") under a different name, and an
+adoption/UX ask asking for one doesn't get to reopen it. If HTTP access to this engine
+is ever genuinely needed, the pattern is a **separate, optional sidecar binary** that
+talks to this core engine over local IPC only — the core engine itself never grows a
+network socket. That sidecar now exists:
+[`sidecar/openai-adapter`](../sidecar/openai-adapter/README.md) is a standalone crate
+(own `Cargo.toml`/`Cargo.lock`, not a workspace member, no dependency on
+`reflex-engine`) implementing an OpenAI-compatible `POST /v1/chat/completions`
+(streaming and non-streaming) in front of one managed `reflex stdio` child process —
+real HTTP concurrency on the sidecar's front door, still strictly one request at a
+time into the core engine underneath. Renders the loaded GGUF's own
+`tokenizer.chat_template` (falling back to plain role-labeled prompt concatenation
+when one isn't present or fails to render) — see its own README for usage and known
+limitations.
+
+For local, non-network ergonomics, this engine may instead expose: a **stdio JSON-line
+mode** (`reflex stdio`, one JSON request per stdin line, fully processed before the next
+line is read) and a **Unix Domain Socket mode** (`reflex uds <path>`, Unix-only, one
+connection fully processed before the next is accepted) — both strictly sequential,
+never a thread pool, mirroring the same request/response protocol. A shared-memory
+ring-buffer transport was considered and deliberately deferred — crash-safety and
+synchronization design is disproportionate complexity for the ergonomics it would buy
+— recorded here as a future-work idea only, not designed.
+
 ## Core technical bet
 
 Every CUDA kernel is compiled **ahead of time** by `nvcc` from `build.rs`, never at
 runtime through NVRTC. Runtime compilation would add a real JIT cost to every cold
 start, which is the one number this project exists to minimize. `src/aot.rs` loads the
 precompiled PTX, cubin or fatbin through the CUDA driver API at process start. The build
-modes (portable PTX, single-arch cubin, multi-arch fatbin) are described in the README's
-[Core technical bet](../README.md#core-technical-bet) section.
+modes (portable PTX, single-arch cubin, multi-arch fatbin) are described in the reference's
+[Kernel build modes](reference.md#kernel-build-modes) section.
 
 This is also why benchmarks against engines that JIT-compile or capture CUDA graphs at
 startup measure something different from a comparison with llama.cpp, whose kernels are
@@ -60,8 +115,8 @@ cargo test                                      # host-side unit tests
 ```
 
 Optional features (`ipc`, `json-output`, `download`, `nvml`, `python`) and their extra
-host dependencies are listed in the README's
-[Build features](../README.md#build-features-core-engine-vs-optional-tooling) section.
+host dependencies are listed in the reference's
+[Build features](reference.md#build-features) section.
 
 `cargo test` rebuilds only the test harness binaries. It does **not** rebuild
 `target/release/reflex`, so after a source change, run

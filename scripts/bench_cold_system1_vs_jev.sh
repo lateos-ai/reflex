@@ -16,8 +16,7 @@
 #     managed cloud API), NOT independently reproduced by this script or
 #     this project.
 #
-# Why this is illustrative rather than comparative (see DECISIONS.md's
-# "TypeSafe Jev comparison framing" entry for the full reasoning):
+# Why this is illustrative rather than comparative:
 #   - Jev's number includes a network round-trip to TypeSafe's cloud;
 #     Reflex's is a pure local process launch with zero network
 #     dependency at all — different deployment models, not just different
@@ -62,8 +61,7 @@ compute:      10-15ms    (TypeSafe's own reported figure)
 end-to-end:   70-500ms   (via TypeSafe's managed cloud API; network round-trip included)
 source:       TypeSafe AI product materials / press coverage.
               NOT independently reproduced or verified by this project.
-              Read this script's header comment and DECISIONS.md's
-              "TypeSafe Jev comparison framing" entry before citing these
+              Read this script's header comment before citing these
               numbers anywhere — this is an illustrative citation, not a
               benchmark result.
 EOF

@@ -1,8 +1,8 @@
 //! Sampling strategies for `Model::generate`'s per-step next-token choice.
 //! Greedy argmax stays the default and remains available unconditionally --
 //! it's load-bearing for this project's own byte-exact-vs-llama.cpp
-//! verification methodology (`reflex check`, `HISTORY.md`'s repeated
-//! "matched byte-exact" verification rounds), so a caller that never touches
+//! verification methodology (`reflex check`, and the repeated "matched
+//! byte-exact" verification rounds behind each architecture), so a caller that never touches
 //! sampling gets exactly the same output as before this module existed.
 //! Temperature/top-k/top-p sampling is an explicit opt-in
 //! (`SamplingParams::temperature > 0.0`) -- see README.md's Non-goals

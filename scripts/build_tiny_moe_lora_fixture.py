@@ -3,8 +3,8 @@
 adapter targeting test-data/tiny-qwen3moe.gguf's three per-expert-stacked MoE
 FFN tensors (ffn_gate_exps/ffn_up_exps/ffn_down_exps, both of that fixture's
 two layers), used to verify src/lora.rs's per-expert delta math and
-src/model.rs's shape validation without needing a real MoE LoRA adapter (see
-HISTORY.md for why no real one was usable: davidanugraha's MoE adapters use a
+src/model.rs's shape validation without needing a real MoE LoRA adapter (no real
+one was usable: davidanugraha's MoE adapters use a
 Megatron/verl fused-expert LoRA representation with no per-expert index in
 the tensor name at all, which llama.cpp's own convert_lora_to_gguf.py can't
 convert either -- its expert-stacking mechanism requires per-expert-indexed

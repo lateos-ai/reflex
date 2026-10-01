@@ -7,13 +7,12 @@ use crate::gguf::GgufFile;
 /// source archived as `test-data/tiny-qwen3moe-src.tar.gz`). Unlike
 /// `Tiny-Moe.Q4_K_M.gguf` (the only other local MoE fixture, a Mixtral-style
 /// file with `expert_used_count == expert_count`, which can't prove top-k
-/// routing excludes anything -- see STATUS.md's "Known test-fixture
-/// limitation"), this fixture sets `num_experts_per_tok=2 < num_experts=8` and
+/// routing excludes anything -- see docs/DEVELOPMENT.md's "Known test-fixture
+/// limitations"), this fixture sets `num_experts_per_tok=2 < num_experts=8` and
 /// includes real Qwen3 QK-Norm tensors (`attn_q_norm`/`attn_k_norm`), closing
 /// both gaps that entry names. Also has a `gpt2`-style tokenizer (reused
 /// verbatim from `deepseek-tiny-mla`'s), enabling text-level byte-exact resume
-/// verification the way `Tiny-Moe`'s SentencePiece tokenizer could not (see
-/// STATUS.md's Phase 3 round 2 entry).
+/// verification the way `Tiny-Moe`'s SentencePiece tokenizer could not.
 const QWEN3MOE_FIXTURE: &str = "test-data/tiny-qwen3moe.gguf";
 
 /// Host-only (no GPU/CUDA device needed -- `GgufFile::open`/`parse_model_config`

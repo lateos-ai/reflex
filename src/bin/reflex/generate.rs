@@ -50,7 +50,7 @@
 //! see `reflex_engine::cli_output`'s doc comment for the exact shapes.
 //!
 //! `--temperature F` (omitted, or `0.0`, keeps this project's original greedy-argmax
-//! behavior -- the byte-exact-reproducible default `--check`/`DECISIONS.md`'s
+//! behavior -- the byte-exact-reproducible default `reflex check`'s
 //! methodology depends on). Any positive value switches to temperature/top-k/top-p
 //! sampling (`--top-k N`, `--top-p F`, `--seed N` for a reproducible draw) -- see
 //! `reflex_engine::sampling`'s doc comment.

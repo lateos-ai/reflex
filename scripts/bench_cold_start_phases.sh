@@ -3,7 +3,7 @@
 #
 # A single aggregate `process_start_to_first_token_ms` number hides where the
 # time actually goes -- this splits it into the phases real user feedback
-# asked for (see HISTORY.md's "cold-start phase breakdown" entry): process
+# asked for (see docs/benchmarks.md's "Cold-start phase breakdown"): process
 # launch, CUDA init, model load, and prompt eval, each reported as p50/p95
 # across N cold-process runs, not a single sample.
 #

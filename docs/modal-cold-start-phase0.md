@@ -75,7 +75,7 @@ a real user's repeated-cold-start experience.)
 special flags) pays a JIT/graph-compilation tax of well over two minutes for a *0.6B* model on
 an L4 — a GPU/model combination nowhere near Modal's stated snapshot use case of large models
 with expensive compiles. Reflex's own measured cold-start numbers for comparable model sizes
-(see `README.md`'s cold-start benchmarks and `HISTORY.md`) are in the low single digits of
+(see `docs/benchmarks.md`) are in the low single digits of
 seconds — a gap of roughly two orders of magnitude, without Reflex doing anything special to win
 this comparison (it just never has a JIT/compile phase to pay for). This is a much larger gap
 than the plan's original hypothesis anticipated (which was framed around matching Modal's

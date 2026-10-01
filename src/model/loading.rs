@@ -23,8 +23,7 @@ pub(super) struct Weight {
 /// is always 1, see docs/DEVELOPMENT.md's Non-goals), yet the eager version decoded
 /// every row unconditionally -- ~548ms, ~63% of `model_load_ms` for
 /// Qwen3-0.6B-Q4_K_M on a T4, the single largest piece of cold-start time in
-/// the whole engine (see HISTORY.md's "Pipelined model load (item 5)" entry,
-/// which found this while profiling a smaller optimization). Same
+/// the whole engine (found while profiling a smaller optimization). Same
 /// lazy-materialization pattern [`LmHead::TiedLazy`] already proved out for
 /// `lm_head` -- not new math, no numerics change: every row this decodes is
 /// byte-identical to what eagerly dequantizing the whole tensor would have
@@ -668,9 +667,7 @@ impl Drop for WeightLoadPipeline {
 /// (codebook/non-uniform) family, dequantizes on-device via
 /// `src/kernels_cuda/dequant.cu` -- no host `f32` copy is ever materialized
 /// for any of them, closing the gap with llama.cpp's CUDA backend, which
-/// never materializes one either (see README.md's Phase 2 round 3 writeup,
-/// and STATUS.md's IQ-family on-device dequant entry for this format
-/// family's own closeout). The `other` arm below is unreachable for every
+/// never materializes one either. The `other` arm below is unreachable for every
 /// `GgmlType` this project's `gguf.rs` parses, but stays as the fallback to
 /// the host `dequant::dequantize` path (`src/dequant.rs`/`dequant_iq.rs`)
 /// rather than a `match` that would need updating for every future format.

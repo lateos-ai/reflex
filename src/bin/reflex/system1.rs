@@ -16,7 +16,7 @@
 //!
 //! **Phase breakdown** (same fields/rationale as `reflex generate`'s -- see
 //! that binary's doc comment; added here so the TypeSafe Jev warm-vs-cold
-//! comparison in HISTORY.md can be re-run with a real per-phase split
+//! comparison (docs/benchmarks.md) can be re-run with a real per-phase split
 //! instead of guessing from the aggregate number): the `REFLEX_SYSTEM1_OK`
 //! line also reports `gguf_open_ms`, `cuda_init_ms`, `model_load_ms`, and
 //! `prompt_eval_ms` (the single-pass scoring forward pass, including any

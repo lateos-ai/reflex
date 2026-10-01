@@ -42,8 +42,7 @@ jobs:
         # `python` and `--all-features` are deliberately excluded: the `python`
         # feature does not currently compile (pre-existing `Send` incompatibility
         # between pyo3's `#[pyclass]` bound and `WeightLoadPipeline`'s `*mut u8`
-        # pinned-host pointer -- see DECISIONS.md's "Multi-arch fatbin packaging"
-        # entry). The four features below are the ones the deploy Dockerfiles
+        # pinned-host pointer). The four features below are the ones the deploy Dockerfiles
         # actually use, and must keep building independently.
         run: |
           for feature in ipc json-output download nvml; do

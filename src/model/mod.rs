@@ -505,8 +505,7 @@ impl Model {
     /// instead of sitting on the serial path. Both are pure setup needing no loaded
     /// weights; `CudaBlas::new` binds the primary context to this thread itself
     /// (`device.bind_to_thread`). Run sequentially on one thread rather than two so
-    /// the load still spawns exactly one extra thread -- see DECISIONS.md's entries
-    /// on the load-time worker thread and the cuBLAS-init overlap.
+    /// the load still spawns exactly one extra thread.
     fn load_background_init(
         file: &GgufFile,
         device: Arc<CudaDevice>,
@@ -875,9 +874,9 @@ impl Model {
     /// row. Uses the same on-device `dequantize_tensor_to_device` path (and
     /// the `dequant_kernels`/`dequant_pipeline` kept alive on `Model` for
     /// exactly this) every other weight tensor's dequant goes through,
-    /// instead of a slow single-threaded host dequant loop -- see
-    /// HISTORY.md's "Lazy `token_embd` dequant (item 6)" for why the host
-    /// path this replaced was a real, measured regression. A no-op past the
+    /// instead of a slow single-threaded host dequant loop -- the host path this
+    /// replaced was a real, measured regression (see docs/DEVELOPMENT.md's
+    /// "Model loading"). A no-op past the
     /// first call (`Resident`, or a `TiedLazy` some earlier call already
     /// forced): `OnceLock::get`/`set` rather than the still-unstable
     /// `get_or_try_init`, safe without a race check because this project

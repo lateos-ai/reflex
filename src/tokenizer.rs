@@ -1294,7 +1294,7 @@ mod tests {
     /// a rendered chat template produces, see `sidecar/openai-adapter`) got
     /// shredded into per-byte-fragment tokens by the generic BPE path instead
     /// of mapping to its one reserved vocab id — confirmed on a real
-    /// Qwen3-0.6B GGUF on real GPU hardware before this fix (see HISTORY.md).
+    /// Qwen3-0.6B GGUF on real GPU hardware before this fix.
     #[test]
     fn test_encode_matches_special_token_as_single_id_not_bpe_fragments() {
         let mut tok = build_synthetic_tokenizer();

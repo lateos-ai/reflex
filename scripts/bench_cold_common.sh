@@ -6,14 +6,13 @@
 # internal timer), and prints a markdown results table (wall clock, peak
 # RSS, user time, sys time) per run. This mirrors the exact methodology
 # already used for the Reflex-vs-llama.cpp comparison in
-# README.md and codified in DECISIONS.md's "Cold-start-vs-llama.cpp
-# benchmark methodology" entry — reuse it for every new engine instead of
+# docs/benchmarks.md — reuse it for every new engine instead of
 # inventing a new measurement approach.
 #
 # Before trusting this harness for a NEW engine, validate it by re-running
 # it against the llama.cpp / Reflex commands from that existing
 # comparison and confirming it reproduces the already-published numbers
-# (README.md's "First real cold-start benchmark" section) within noise.
+# (docs/benchmarks.md's "Cold start vs. other engines") within noise.
 #
 # Usage: bench_cold_common.sh <label> <n_runs> -- <command...>
 # Example:

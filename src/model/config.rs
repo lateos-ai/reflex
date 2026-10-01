@@ -20,8 +20,7 @@ pub(super) fn f32_meta(file: &GgufFile, key: &str) -> Option<f32> {
 /// used by Llama/Mistral (and DeepSeek-V2/V3 MLA, handled on `MlaModel`).
 /// **Confirmed per-architecture against llama.cpp's `llama_model_rope_type`,
 /// never assumed** -- the MLA work found this is a real, easy-to-miss
-/// per-architecture difference that silently corrupts output when wrong (see
-/// DECISIONS.md's MLA RoPE entry).
+/// per-architecture difference that silently corrupts output when wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RopeType {
     Neox,
@@ -652,7 +651,7 @@ pub(super) struct MlaMoeConfig {
 /// (`Model::forward_mla_attn_block`). Derived once at load time
 /// (`parse_mla_config`) from `deepseek2.rope.scaling.*` metadata, mirroring
 /// `llama-context.cpp`'s YaRN setup and `deepseek2.cpp`'s own `kq_scale`
-/// computation (both read in full while implementing this -- see DECISIONS.md).
+/// computation (both read in full while implementing this).
 pub(super) struct MlaYarnConfig {
     /// `1 / rope.scaling.factor`.
     pub(super) freq_scale: f32,

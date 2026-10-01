@@ -5,7 +5,7 @@
 > ahead-of-time by `nvcc` at build time (`build.rs`) — never at runtime via NVRTC — so
 > there is no JIT tax on cold start. `batch_size` is always 1; no in-engine HTTP server,
 > queue, or continuous batching (see "Non-goals" in README.md). Full context: README.md,
-> docs/DEVELOPMENT.md, HISTORY.md.
+> docs/reference.md, docs/benchmarks.md, docs/DEVELOPMENT.md, CHANGELOG.md.
 
 This file gives an agent the literal commands to run Reflex on each supported platform.
 Every command below is real and has been executed against real GPU hardware at least

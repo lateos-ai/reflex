@@ -55,7 +55,7 @@ nvml-wrapper = { version = "0.13", optional = true }
 # features" behavior) so the core build's footprint is a documented contract, not
 # an accident. `cargo build --release` and `cargo build --release
 # --no-default-features` are equivalent today: neither pulls in any optional
-# dependency. See README's "Build features" section for the full core-vs-optional
+# dependency. See docs/reference.md's "Build features" section for the full core-vs-optional
 # split and each feature's extra host build requirement.
 default = []
 # `ipc`'s own wire protocol (src/ipc.rs) needs serde too, so it just pulls in

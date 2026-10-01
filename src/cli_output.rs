@@ -20,7 +20,7 @@
 //! a `schema_version` field (the current [`SCHEMA_VERSION`]) -- the one field
 //! with no plain-text `key=value` counterpart, added so a JSON consumer can
 //! detect a shape change. It's additive; readers that ignore unknown fields
-//! keep working across a minor bump. See README's "`--json` output contract"
+//! keep working across a minor bump. See docs/reference.md's "`--json` output contract"
 //! section.
 //!
 //! Extending `schema_version` to the `bench`/`check`/`doctor` result structs
@@ -52,7 +52,7 @@ use serde::Serialize;
 /// Additive/forward-compatible: `serde` readers that ignore unknown fields
 /// keep working across a minor bump, so a *major* bump is the signal that an
 /// existing field changed meaning or was removed. Keep in sync with the
-/// README's "`--json` output contract" section.
+/// docs/reference.md's "`--json` output contract" section.
 pub const SCHEMA_VERSION: &str = "1.0.0";
 
 /// Serializes `value` as one line of JSON to stdout, matching `src/ipc.rs`'s

@@ -5,8 +5,9 @@ This packages the existing [`sidecar/openai-adapter`](../../sidecar/openai-adapt
 produce a real, measured comparison of cost-per-cold-invocation against vLLM on the same
 platform/GPU, as part of evaluating whether Reflex's cold-start advantage translates into a
 real cost advantage on serverless GPU billing (which bills cold-start/init time as compute,
-unlike a per-token API marketplace). See the root project's `DECISIONS.md`/`HISTORY.md` for the
-full reasoning behind this angle and why OpenRouter's per-token pricing model doesn't work for
+unlike a per-token API marketplace). See the root project's
+[benchmarks](../../docs/benchmarks.md#where-this-engine-competes) for the full reasoning
+behind this angle and why OpenRouter's per-token pricing model doesn't work for
 an engine that deliberately never batches concurrent requests.
 
 **Nothing about this changes the core engine or the sidecar's concurrency model.** This is
@@ -52,7 +53,7 @@ this directory rather than re-deriving them:
   runs 2..N don't silently measure a warm worker.
 
 The image always uses the slimmed runtime (`base` + `libcublas-12-4`) described in the root
-README's "Container image size is part of cold start here"; `--slim`, which used to opt into
+docs/benchmarks.md's "Container images"; `--slim`, which used to opt into
 it, is still accepted and does nothing. `--teardown` deletes the endpoint and template after benchmarking.
 Run `scripts/deploy_runpod.sh --help` for the full flag/environment reference.
 

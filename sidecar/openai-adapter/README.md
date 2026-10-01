@@ -210,13 +210,13 @@ supports it. `temperature` omitted or `<= 0` selects greedy argmax, mirroring
     follow-up for whoever next touches `Model::generate`'s stop handling.
 - **Context is capped at 65,535 positions per request** (prompt tokens +
   `max_tokens`) by the core engine (11,264 if it runs with `REFLEX_ATTN_KERNEL=legacy`)
-  — see the root README's "Context-length limit" section. A request over it gets `400` with an OpenAI-style body (`"type":
+  — see the root docs/reference.md's "Context-length limit" section. A request over it gets `400` with an OpenAI-style body (`"type":
   "invalid_request_error"`, `"code": "context_length_exceeded"`), in both streaming and
   non-streaming mode: for `stream: true` the adapter waits for the engine's first event
   before sending SSE headers, so any error raised before the first token gets a real
   HTTP status instead of an empty `200` stream.
 - **Other engine errors are mapped by the engine's `error_kind`** (see the root
-  README's "Error categories"): `invalid_input` (a bad request parameter, such as a
+  docs/reference.md's "Error categories"): `invalid_input` (a bad request parameter, such as a
   sampling value) is `400` with code `invalid_input`; `out_of_memory` is `503` with type
   `server_error`; anything else is `500` with the category as `code`. With an older
   engine binary that sends no `error_kind`, only the context-length case is recognized

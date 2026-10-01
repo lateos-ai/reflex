@@ -39,9 +39,7 @@ pub mod tokenizer;
 /// nothing to do with the process's actual work and does not scale with how
 /// much was allocated -- consolidating allocations into fewer, larger
 /// buffers was tried first and made no measurable difference, which is what
-/// pointed at the `atexit` hook itself rather than allocation count (see
-/// DECISIONS.md's "fast-exit after printing the benchmark result" entry for
-/// the full investigation).
+/// pointed at the `atexit` hook itself rather than allocation count.
 ///
 /// Every one-shot `reflex` subcommand's job is finished by the time it calls this --
 /// the OS reclaims all process resources (GPU context, file descriptors,

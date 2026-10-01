@@ -1,5 +1,5 @@
 //! Formalizes this project's own byte-exact-vs-llama.cpp verification methodology
-//! (see README.md/DECISIONS.md) as a user-facing correctness check instead of an
+//! (see docs/benchmarks.md) as a user-facing correctness check instead of an
 //! ad hoc development-only comparison. Runs a forward pass on `<gguf>` for
 //! `<prompt>` and either prints a comparable summary (no `--reference`), or
 //! compares against a hand-written reference file: expected token ids (exact

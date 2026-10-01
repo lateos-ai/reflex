@@ -151,8 +151,8 @@ fn prefill_mla_batched_matches_sequential() {
 /// hidden state plus matching greedy-argmax token), but reads its GGUF path from
 /// `REFLEX_TEST_GGUF` (the same convention `prefill_dense_batched_matches_sequential_prefill`
 /// uses) instead of the hardcoded fixture constant, so it can point at the real
-/// `deepseek-ai/DeepSeek-V2-Lite` checkpoint (regenerate per STATUS.md's
-/// documented recipe). Run with:
+/// `deepseek-ai/DeepSeek-V2-Lite` checkpoint (see docs/DEVELOPMENT.md's "Known
+/// test-fixture limitations" for how to produce it). Run with:
 /// `REFLEX_TEST_GGUF=<path to a real deepseek2 GGUF with MoE layers> cargo test --release -- --ignored prefill_mla_batched_matches_sequential_real_moe_checkpoint`.
 #[test]
 #[ignore]

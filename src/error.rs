@@ -8,7 +8,7 @@
 //! message the way a `String` would, so `.expect()` panics read exactly as before too.
 //!
 //! Implemented by hand rather than with `thiserror`: the core build's dependency list
-//! is a documented contract (see README's "Build features"), and `thiserror` would add
+//! is a documented contract (see docs/reference.md's "Build features"), and `thiserror` would add
 //! a proc-macro toolchain to every build for a dozen trivial `Display` arms.
 
 use std::fmt;
