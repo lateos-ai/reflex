@@ -4,6 +4,7 @@
 //! has never seen a `CUresult` can act on. Every binary's `CudaDevice::new(0)` call
 //! site should go through [`init_device_with_diagnostics`] instead.
 
+use crate::error::ReflexError;
 use cudarc::driver::sys::{CUdevice_attribute, CUresult};
 use cudarc::driver::{result, CudaDevice, DriverError};
 use std::sync::Arc;
@@ -37,18 +38,18 @@ impl std::fmt::Display for GpuDiagnostics {
 /// calling thread's *current* CUDA context, which `CudaDevice::new` already made
 /// current for `device` -- there is no per-device-handle overload in this cudarc
 /// version).
-pub fn probe(device: &Arc<CudaDevice>) -> Result<GpuDiagnostics, String> {
+pub fn probe(device: &Arc<CudaDevice>) -> Result<GpuDiagnostics, ReflexError> {
     let name = device
         .name()
-        .map_err(|e| format!("querying GPU name: {e}"))?;
+        .map_err(|e| crate::gpu_err!(e, "querying GPU name: {e}"))?;
     let major = device
         .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-        .map_err(|e| format!("querying compute capability major: {e}"))?;
+        .map_err(|e| crate::gpu_err!(e, "querying compute capability major: {e}"))?;
     let minor = device
         .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-        .map_err(|e| format!("querying compute capability minor: {e}"))?;
+        .map_err(|e| crate::gpu_err!(e, "querying compute capability minor: {e}"))?;
     let (vram_free_bytes, vram_total_bytes) =
-        result::mem_get_info().map_err(|e| format!("querying VRAM: {e}"))?;
+        result::mem_get_info().map_err(|e| crate::gpu_err!(e, "querying VRAM: {e}"))?;
     Ok(GpuDiagnostics {
         name,
         compute_capability: (major, minor),
@@ -61,8 +62,8 @@ pub fn probe(device: &Arc<CudaDevice>) -> Result<GpuDiagnostics, String> {
 /// invalid device index, driver/toolkit mismatch, driver not initialized) into a
 /// plain-English message instead of a raw `CUresult`. Falls back to the driver's own
 /// `error_string()` for anything else, so no failure mode is silently swallowed.
-pub fn init_device_with_diagnostics(ordinal: usize) -> Result<Arc<CudaDevice>, String> {
-    CudaDevice::new(ordinal).map_err(|e| explain_driver_error(ordinal, &e))
+pub fn init_device_with_diagnostics(ordinal: usize) -> Result<Arc<CudaDevice>, ReflexError> {
+    CudaDevice::new(ordinal).map_err(|e| ReflexError::gpu(&e, explain_driver_error(ordinal, &e)))
 }
 
 /// The `REFLEX_CUDA_ARCH` build.rs was invoked with (e.g. `"sm_86"`), or empty in the
@@ -77,7 +78,7 @@ pub const COMPILED_ARCHS: &str = env!("REFLEX_CUDA_ARCHS");
 /// matching CUDA's own convention (all digits but the last are major, the last digit
 /// is minor -- e.g. `sm_86` -> `(8, 6)`, `sm_90a` -> `(9, 0)`, the trailing `a`
 /// "family-specific" suffix stripped since it doesn't affect binary compatibility here).
-fn parse_arch(arch: &str) -> Result<(i32, i32), String> {
+fn parse_arch(arch: &str) -> Result<(i32, i32), ReflexError> {
     let digits: String = arch
         .strip_prefix("sm_")
         .or_else(|| arch.strip_prefix("compute_"))
@@ -86,17 +87,18 @@ fn parse_arch(arch: &str) -> Result<(i32, i32), String> {
         .take_while(|c| c.is_ascii_digit())
         .collect();
     if digits.len() < 2 {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            Cuda,
             "couldn't parse compute capability out of REFLEX_CUDA_ARCH={arch:?}"
         ));
     }
     let (major, minor) = digits.split_at(digits.len() - 1);
-    let major = major
-        .parse::<i32>()
-        .map_err(|e| format!("parsing major compute capability from {arch:?}: {e}"))?;
-    let minor = minor
-        .parse::<i32>()
-        .map_err(|e| format!("parsing minor compute capability from {arch:?}: {e}"))?;
+    let major = major.parse::<i32>().map_err(|e| {
+        crate::reflex_err!(Other, "parsing major compute capability from {arch:?}: {e}")
+    })?;
+    let minor = minor.parse::<i32>().map_err(|e| {
+        crate::reflex_err!(Other, "parsing minor compute capability from {arch:?}: {e}")
+    })?;
     Ok((major, minor))
 }
 
@@ -107,7 +109,7 @@ fn parse_arch(arch: &str) -> Result<(i32, i32), String> {
 /// short-circuits immediately. Called once from `Model::load`, before any kernel is
 /// loaded, so a mismatch surfaces as this plain-English error instead of an opaque
 /// CUDA driver load/launch failure.
-pub fn check_kernel_compute_capability(device: &Arc<CudaDevice>) -> Result<(), String> {
+pub fn check_kernel_compute_capability(device: &Arc<CudaDevice>) -> Result<(), ReflexError> {
     if COMPILED_ARCH.is_empty() {
         if COMPILED_ARCHS.is_empty() {
             // Portable PTX: the driver JITs it for whatever GPU is present.
@@ -121,7 +123,7 @@ pub fn check_kernel_compute_capability(device: &Arc<CudaDevice>) -> Result<(), S
         if let FatbinCoverage::Unsupported { oldest, ptx } =
             fatbin_coverage(&compiled_archs()?, diag.compute_capability)
         {
-            return Err(format!(
+            return Err(crate::reflex_err!(Cuda,
                 "this binary's fatbin kernels cover REFLEX_CUDA_ARCHS={COMPILED_ARCHS} (native images, the \
                  oldest sm_{}{}) plus PTX for compute_{}{}, but the detected GPU ({}) has compute capability \
                  {major}.{minor}, which none of them can run on -- rebuild with sm_{major}{minor} in \
@@ -135,7 +137,7 @@ pub fn check_kernel_compute_capability(device: &Arc<CudaDevice>) -> Result<(), S
     let diag = probe(device)?;
     let (major, minor) = diag.compute_capability;
     if (major, minor) != (compiled_major, compiled_minor) {
-        return Err(format!(
+        return Err(crate::reflex_err!(Cuda,
             "this binary's CUDA kernels were compiled for compute capability {compiled_major}.{compiled_minor} \
              (sm_{compiled_major}{compiled_minor}), but the detected GPU ({}) has compute capability {major}.{minor} \
              -- rebuild with REFLEX_CUDA_ARCH=sm_{major}{minor}, or omit REFLEX_CUDA_ARCH for a portable PTX build.",
@@ -187,7 +189,7 @@ pub fn fatbin_coverage(compiled: &[(i32, i32)], device: (i32, i32)) -> FatbinCov
 
 /// `REFLEX_CUDA_ARCHS` parsed into `(major, minor)` pairs. Errs if it's empty, i.e. this
 /// isn't a fatbin build.
-pub fn compiled_archs() -> Result<Vec<(i32, i32)>, String> {
+pub fn compiled_archs() -> Result<Vec<(i32, i32)>, ReflexError> {
     let archs = COMPILED_ARCHS
         .split(',')
         .map(str::trim)
@@ -195,7 +197,9 @@ pub fn compiled_archs() -> Result<Vec<(i32, i32)>, String> {
         .map(parse_arch)
         .collect::<Result<Vec<_>, _>>()?;
     if archs.is_empty() {
-        return Err("not a fatbin build: REFLEX_CUDA_ARCHS was empty at build time".to_string());
+        return Err(ReflexError::Cuda(
+            "not a fatbin build: REFLEX_CUDA_ARCHS was empty at build time".to_string(),
+        ));
     }
     Ok(archs)
 }
@@ -203,7 +207,7 @@ pub fn compiled_archs() -> Result<Vec<(i32, i32)>, String> {
 /// [`fatbin_coverage`] for the detected GPU. Only meaningful in fatbin mode -- a
 /// portable-PTX build always JITs and a single-arch cubin build is already enforced as
 /// an exact match by [`check_kernel_compute_capability`].
-pub fn fatbin_coverage_for_device(device: &Arc<CudaDevice>) -> Result<FatbinCoverage, String> {
+pub fn fatbin_coverage_for_device(device: &Arc<CudaDevice>) -> Result<FatbinCoverage, ReflexError> {
     let diag = probe(device)?;
     Ok(fatbin_coverage(&compiled_archs()?, diag.compute_capability))
 }

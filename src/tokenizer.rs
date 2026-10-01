@@ -23,6 +23,7 @@
 //! same "flag the real gap honestly" posture this module's SentencePiece
 //! path already held before its own real-file verification.
 
+use crate::error::ReflexError;
 use crate::gguf::{GgufFile, GgufValue};
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -140,7 +141,7 @@ impl Tokenizer {
     /// `tokenizer.ggml.model` and `tokenizer.ggml.tokens`; every other key
     /// (`scores`, `token_type`, `merges`, special-token ids) is optional and
     /// defaults to empty/`None` when absent.
-    pub fn from_gguf(file: &GgufFile) -> Result<Self, String> {
+    pub fn from_gguf(file: &GgufFile) -> Result<Self, ReflexError> {
         let architecture = string_meta(&file.metadata, "tokenizer.ggml.model")?.to_string();
         let tokens = string_array(&file.metadata, "tokenizer.ggml.tokens")?;
 
@@ -162,10 +163,16 @@ impl Tokenizer {
         for (rank, entry) in merges_raw.iter().enumerate() {
             let mut parts = entry.split(' ');
             let left = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-                format!("malformed merge entry '{entry}' (expected 'left right')")
+                crate::reflex_err!(
+                    Tokenizer,
+                    "malformed merge entry '{entry}' (expected 'left right')"
+                )
             })?;
             let right = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-                format!("malformed merge entry '{entry}' (expected 'left right')")
+                crate::reflex_err!(
+                    Tokenizer,
+                    "malformed merge entry '{entry}' (expected 'left right')"
+                )
             })?;
             merge_rank.insert((left.to_string(), right.to_string()), rank);
         }
@@ -241,7 +248,7 @@ impl Tokenizer {
     /// see [`Self::encode_gpt2`]) — every other value falls back to the
     /// SentencePiece path unchanged, this module's original Phase 21.5.1
     /// scope.
-    pub fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
         if self.special_tokens.is_empty() {
             return self.encode_plain(text);
         }
@@ -284,7 +291,7 @@ impl Tokenizer {
     /// literal special-token match. See [`Self::encode`]'s doc for why
     /// special tokens (this struct's `special_tokens` field) are matched
     /// separately, before this ever runs on their text.
-    fn encode_plain(&self, text: &str) -> Result<Vec<u32>, String> {
+    fn encode_plain(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
         if self.architecture == "gpt2" {
             self.encode_gpt2(text)
         } else {
@@ -305,7 +312,7 @@ impl Tokenizer {
     /// vocab has it directly; otherwise it's decomposed into UTF-8 bytes,
     /// each represented by a `<0xXX>` byte-fallback token. Errs if a
     /// byte-fallback token or a final merged symbol isn't in the vocab.
-    fn encode_sentencepiece(&self, text: &str) -> Result<Vec<u32>, String> {
+    fn encode_sentencepiece(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
         let mut preprocessed = String::with_capacity(text.len() + 1);
         if !text.is_empty() {
             preprocessed.push(WORD_BOUNDARY);
@@ -325,7 +332,8 @@ impl Tokenizer {
             for &b in ch.encode_utf8(&mut buf).as_bytes() {
                 let bt = byte_fallback_token(b);
                 if !self.token_to_id.contains_key(&bt) {
-                    return Err(format!(
+                    return Err(crate::reflex_err!(
+                        Tokenizer,
                         "character '{ch}' not in vocab and byte-fallback token '{bt}' also missing"
                     ));
                 }
@@ -337,10 +345,9 @@ impl Tokenizer {
         symbols
             .into_iter()
             .map(|s| {
-                self.token_to_id
-                    .get(&s)
-                    .copied()
-                    .ok_or_else(|| format!("merged token '{s}' not found in vocab"))
+                self.token_to_id.get(&s).copied().ok_or_else(|| {
+                    crate::reflex_err!(Tokenizer, "merged token '{s}' not found in vocab")
+                })
             })
             .collect()
     }
@@ -377,7 +384,7 @@ impl Tokenizer {
     /// caveat this module's own SentencePiece path already carried before
     /// its own real-file verification; `PHASE21_14_PLAN.md`'s 21.14.2b is
     /// where that verification happens.
-    fn encode_gpt2(&self, text: &str) -> Result<Vec<u32>, String> {
+    fn encode_gpt2(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
         let chars: Vec<char> = text.chars().collect();
         let byte_to_unicode = gpt2_byte_to_unicode_table();
         let mut ids = Vec::new();
@@ -394,7 +401,10 @@ impl Tokenizer {
             self.bpe_merge(&mut symbols);
             for s in symbols {
                 let id = self.token_to_id.get(&s).copied().ok_or_else(|| {
-                    format!("gpt2 BPE symbol {s:?} not found in vocab (piece {piece:?})")
+                    crate::reflex_err!(
+                        Tokenizer,
+                        "gpt2 BPE symbol {s:?} not found in vocab (piece {piece:?})"
+                    )
                 })?;
                 ids.push(id);
             }
@@ -756,48 +766,67 @@ fn u64_meta(metadata: &HashMap<String, GgufValue>, key: &str) -> Option<u64> {
     metadata.get(key).and_then(GgufValue::as_u64)
 }
 
-fn string_meta<'a>(metadata: &'a HashMap<String, GgufValue>, key: &str) -> Result<&'a str, String> {
+fn string_meta<'a>(
+    metadata: &'a HashMap<String, GgufValue>,
+    key: &str,
+) -> Result<&'a str, ReflexError> {
     metadata
         .get(key)
         .and_then(GgufValue::as_str)
-        .ok_or_else(|| format!("missing or non-string metadata key '{key}'"))
+        .ok_or_else(|| crate::reflex_err!(Tokenizer, "missing or non-string metadata key '{key}'"))
 }
 
-fn string_array_value(value: &GgufValue, key: &str) -> Result<Vec<String>, String> {
+fn string_array_value(value: &GgufValue, key: &str) -> Result<Vec<String>, ReflexError> {
     match value {
         GgufValue::Array(items) => items
             .iter()
             .map(|v| {
-                v.as_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| format!("expected string array element in '{key}', got {v:?}"))
+                v.as_str().map(str::to_string).ok_or_else(|| {
+                    crate::reflex_err!(
+                        Tokenizer,
+                        "expected string array element in '{key}', got {v:?}"
+                    )
+                })
             })
             .collect(),
-        other => Err(format!("expected array for '{key}', got {other:?}")),
+        other => Err(crate::reflex_err!(
+            Tokenizer,
+            "expected array for '{key}', got {other:?}"
+        )),
     }
 }
 
-fn string_array(metadata: &HashMap<String, GgufValue>, key: &str) -> Result<Vec<String>, String> {
+fn string_array(
+    metadata: &HashMap<String, GgufValue>,
+    key: &str,
+) -> Result<Vec<String>, ReflexError> {
     let value = metadata
         .get(key)
-        .ok_or_else(|| format!("missing metadata key '{key}'"))?;
+        .ok_or_else(|| crate::reflex_err!(Tokenizer, "missing metadata key '{key}'"))?;
     string_array_value(value, key)
 }
 
-fn f32_array(value: &GgufValue, key: &str) -> Result<Vec<f32>, String> {
+fn f32_array(value: &GgufValue, key: &str) -> Result<Vec<f32>, ReflexError> {
     match value {
         GgufValue::Array(items) => items
             .iter()
             .map(|v| {
-                v.as_f32()
-                    .ok_or_else(|| format!("expected f32 array element in '{key}', got {v:?}"))
+                v.as_f32().ok_or_else(|| {
+                    crate::reflex_err!(
+                        Tokenizer,
+                        "expected f32 array element in '{key}', got {v:?}"
+                    )
+                })
             })
             .collect(),
-        other => Err(format!("expected array for '{key}', got {other:?}")),
+        other => Err(crate::reflex_err!(
+            Tokenizer,
+            "expected array for '{key}', got {other:?}"
+        )),
     }
 }
 
-fn i32_array(value: &GgufValue, key: &str) -> Result<Vec<i32>, String> {
+fn i32_array(value: &GgufValue, key: &str) -> Result<Vec<i32>, ReflexError> {
     match value {
         GgufValue::Array(items) => items
             .iter()
@@ -805,12 +834,16 @@ fn i32_array(value: &GgufValue, key: &str) -> Result<Vec<i32>, String> {
                 GgufValue::I32(x) => Ok(*x),
                 GgufValue::I8(x) => Ok(*x as i32),
                 GgufValue::I16(x) => Ok(*x as i32),
-                other => Err(format!(
+                other => Err(crate::reflex_err!(
+                    Tokenizer,
                     "expected i32 array element in '{key}', got {other:?}"
                 )),
             })
             .collect(),
-        other => Err(format!("expected array for '{key}', got {other:?}")),
+        other => Err(crate::reflex_err!(
+            Tokenizer,
+            "expected array for '{key}', got {other:?}"
+        )),
     }
 }
 

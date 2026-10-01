@@ -47,7 +47,7 @@ const USAGE: &str = "usage: reflex <subcommand> [args...]\n\
 /// stderr and exits with status 1 -- for engine errors a user can act on (e.g.
 /// the attention context-length limit, `reflex_engine::limits`), which
 /// `.expect()` would otherwise dump as a panic with a Debug-quoted string.
-pub(crate) fn fail(context: &str, err: String) -> ! {
+pub(crate) fn fail(context: &str, err: impl std::fmt::Display) -> ! {
     eprintln!("error: {context}: {err}");
     reflex_engine::fast_exit(1)
 }

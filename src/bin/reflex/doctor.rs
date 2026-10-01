@@ -106,7 +106,7 @@ pub fn run(args: Vec<String>) {
         Ok(device) => {
             let detail = diagnostics::probe(&device)
                 .map(|diag| diag.to_string())
-                .unwrap_or_else(|e| e);
+                .unwrap_or_else(|e| e.to_string());
             checks.push(Check {
                 name: "gpu_probe",
                 status: Status::Pass,
@@ -118,7 +118,7 @@ pub fn run(args: Vec<String>) {
             checks.push(Check {
                 name: "gpu_probe",
                 status: Status::Fail,
-                detail: e,
+                detail: e.to_string(),
             });
             None
         }
@@ -134,7 +134,7 @@ pub fn run(args: Vec<String>) {
             Err(e) => checks.push(Check {
                 name: "compute_capability",
                 status: Status::Fail,
-                detail: e,
+                detail: e.to_string(),
             }),
             Ok(()) => {
                 // In a fatbin build a GPU with no usable image already failed above
@@ -166,7 +166,7 @@ pub fn run(args: Vec<String>) {
                             Status::Fail,
                             format!("kernel_format={KERNEL_FORMAT} compiled_archs={archs} cannot run on the detected GPU"),
                         ),
-                        Err(e) => (Status::Fail, e),
+                        Err(e) => (Status::Fail, e.to_string()),
                     }
                 } else {
                     (
@@ -200,7 +200,7 @@ pub fn run(args: Vec<String>) {
             Err(e) => checks.push(Check {
                 name: "aot_kernel_launch",
                 status: Status::Fail,
-                detail: e,
+                detail: e.to_string(),
             }),
         },
         None => checks.push(Check {

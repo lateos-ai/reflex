@@ -127,8 +127,8 @@ pub fn run(args: Vec<String>) {
 
     let file = GgufFile::open(&gguf_path)
         .unwrap_or_else(|e| exit_usage_error(&format!("failed to open {gguf_path}: {e}")));
-    let device =
-        diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| exit_usage_error(&e));
+    let device = diagnostics::init_device_with_diagnostics(0)
+        .unwrap_or_else(|e| exit_usage_error(&e.to_string()));
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }

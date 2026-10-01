@@ -19,6 +19,7 @@
 //! bytes into f32) is a separate concern, kept in a sibling module —
 //! see [`crate::dequant::dequantize`].
 
+use crate::error::ReflexError;
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
@@ -188,21 +189,24 @@ pub struct GgufFile {
 
 impl GgufFile {
     /// Open and parse a GGUF file, mmap'ing its contents.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, String> {
-        let file = File::open(path.as_ref()).map_err(|e| format!("opening GGUF file: {e}"))?;
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, ReflexError> {
+        let file = File::open(path.as_ref())
+            .map_err(|e| crate::reflex_err!(Io, "opening GGUF file: {e}"))?;
         // Safety: standard mmap caveat — the file must not be mutated by
         // another process while mapped. Checkpoint files are read-only
         // model artifacts in every real usage this repo has.
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap GGUF file: {e}"))?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| crate::reflex_err!(Io, "mmap GGUF file: {e}"))?;
         Self::parse(mmap)
     }
 
-    fn parse(mmap: Mmap) -> Result<Self, String> {
+    fn parse(mmap: Mmap) -> Result<Self, ReflexError> {
         let mut cur = Cursor::new(&mmap);
 
         let magic = cur.read_u32()?;
         if magic != GGUF_MAGIC {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Gguf,
                 "not a GGUF file: magic={magic:#010x}, expected {GGUF_MAGIC:#010x}"
             ));
         }
@@ -248,7 +252,8 @@ impl GgufFile {
         let data_section_start = data_section_start as usize;
 
         if data_section_start > mmap.len() {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Gguf,
                 "data section start {data_section_start} beyond file length {}",
                 mmap.len()
             ));
@@ -268,14 +273,15 @@ impl GgufFile {
     }
 
     /// Raw bytes for a tensor, as a slice directly into the mmap — no copy.
-    pub fn tensor_bytes(&self, info: &GgufTensorInfo) -> Result<&[u8], String> {
+    pub fn tensor_bytes(&self, info: &GgufTensorInfo) -> Result<&[u8], ReflexError> {
         let start = self.data_section_start + info.offset as usize;
         let nbytes = ggml_type_size_bytes(info.ggml_type, info.element_count())?;
-        let end = start
-            .checked_add(nbytes)
-            .ok_or_else(|| format!("tensor '{}' byte range overflows usize", info.name))?;
+        let end = start.checked_add(nbytes).ok_or_else(|| {
+            crate::reflex_err!(Gguf, "tensor '{}' byte range overflows usize", info.name)
+        })?;
         self.mmap.get(start..end).ok_or_else(|| {
-            format!(
+            crate::reflex_err!(
+                Gguf,
                 "tensor '{}' range {start}..{end} exceeds file length {}",
                 info.name,
                 self.mmap.len()
@@ -287,7 +293,7 @@ impl GgufFile {
 /// Number of raw bytes an `element_count`-element tensor of `ggml_type`
 /// occupies on disk. Block-quantized types round the element count up to a
 /// full block per GGUF's own on-disk padding rule.
-fn ggml_type_size_bytes(ggml_type: GgmlType, element_count: u64) -> Result<usize, String> {
+fn ggml_type_size_bytes(ggml_type: GgmlType, element_count: u64) -> Result<usize, ReflexError> {
     let (block_size, block_bytes) = ggml_type_block_dims(ggml_type)?;
     let num_blocks = element_count.div_ceil(block_size);
     Ok((num_blocks * block_bytes) as usize)
@@ -299,7 +305,7 @@ fn ggml_type_size_bytes(ggml_type: GgmlType, element_count: u64) -> Result<usize
 /// number of blocks, by ggml's own invariant that a quantized tensor's
 /// row width is always a multiple of its block size) can share the same
 /// table instead of a third hand-copied one.
-pub(crate) fn ggml_type_block_dims(ggml_type: GgmlType) -> Result<(u64, u64), String> {
+pub(crate) fn ggml_type_block_dims(ggml_type: GgmlType) -> Result<(u64, u64), ReflexError> {
     Ok(match ggml_type {
         GgmlType::F32 => (1, 4),
         GgmlType::F16 | GgmlType::Bf16 => (1, 2),
@@ -333,7 +339,8 @@ pub(crate) fn ggml_type_block_dims(ggml_type: GgmlType) -> Result<(u64, u64), St
         GgmlType::IQ1M => (256, 56),   // u8 qs[32] + qh[16] + scales[8] (packed f16 scale)
         GgmlType::IQ4XS => (256, 136), // f16 d + u16 scales_h + scales_l[4] + qs[128]
         GgmlType::Unknown(t) => {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Gguf,
                 "unknown ggml_type={t}: on-disk block size not known to this parser"
             ))
         }
@@ -350,13 +357,14 @@ impl<'a> Cursor<'a> {
         Cursor { data, pos: 0 }
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], ReflexError> {
         let end = self
             .pos
             .checked_add(n)
             .ok_or_else(|| "cursor offset overflow".to_string())?;
         let slice = self.data.get(self.pos..end).ok_or_else(|| {
-            format!(
+            crate::reflex_err!(
+                Gguf,
                 "unexpected end of file at offset {} (need {n} more bytes)",
                 self.pos
             )
@@ -365,53 +373,54 @@ impl<'a> Cursor<'a> {
         Ok(slice)
     }
 
-    fn read_u8(&mut self) -> Result<u8, String> {
+    fn read_u8(&mut self) -> Result<u8, ReflexError> {
         Ok(self.take(1)?[0])
     }
-    fn read_i8(&mut self) -> Result<i8, String> {
+    fn read_i8(&mut self) -> Result<i8, ReflexError> {
         Ok(self.take(1)?[0] as i8)
     }
-    fn read_u16(&mut self) -> Result<u16, String> {
+    fn read_u16(&mut self) -> Result<u16, ReflexError> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
-    fn read_i16(&mut self) -> Result<i16, String> {
+    fn read_i16(&mut self) -> Result<i16, ReflexError> {
         Ok(i16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
-    fn read_u32(&mut self) -> Result<u32, String> {
+    fn read_u32(&mut self) -> Result<u32, ReflexError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn read_i32(&mut self) -> Result<i32, String> {
+    fn read_i32(&mut self) -> Result<i32, ReflexError> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn read_u64(&mut self) -> Result<u64, String> {
+    fn read_u64(&mut self) -> Result<u64, ReflexError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
-    fn read_i64(&mut self) -> Result<i64, String> {
+    fn read_i64(&mut self) -> Result<i64, ReflexError> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
-    fn read_f32(&mut self) -> Result<f32, String> {
+    fn read_f32(&mut self) -> Result<f32, ReflexError> {
         Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn read_f64(&mut self) -> Result<f64, String> {
+    fn read_f64(&mut self) -> Result<f64, ReflexError> {
         Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
-    fn read_bool(&mut self) -> Result<bool, String> {
+    fn read_bool(&mut self) -> Result<bool, ReflexError> {
         Ok(self.read_u8()? != 0)
     }
 
     /// GGUF string: `u64` byte length, then that many UTF-8 bytes (not
     /// null-terminated).
-    fn read_string(&mut self) -> Result<String, String> {
+    fn read_string(&mut self) -> Result<String, ReflexError> {
         let len = self.read_u64()? as usize;
         let bytes = self.take(len)?;
-        String::from_utf8(bytes.to_vec()).map_err(|e| format!("string not valid UTF-8: {e}"))
+        String::from_utf8(bytes.to_vec())
+            .map_err(|e| crate::reflex_err!(Gguf, "string not valid UTF-8: {e}"))
     }
 
-    fn read_value_type(&mut self) -> Result<u32, String> {
+    fn read_value_type(&mut self) -> Result<u32, ReflexError> {
         self.read_u32()
     }
 
-    fn read_scalar(&mut self, value_type: u32) -> Result<GgufValue, String> {
+    fn read_scalar(&mut self, value_type: u32) -> Result<GgufValue, ReflexError> {
         Ok(match value_type {
             0 => GgufValue::U8(self.read_u8()?),
             1 => GgufValue::I8(self.read_i8()?),
@@ -425,12 +434,17 @@ impl<'a> Cursor<'a> {
             10 => GgufValue::U64(self.read_u64()?),
             11 => GgufValue::I64(self.read_i64()?),
             12 => GgufValue::F64(self.read_f64()?),
-            other => return Err(format!("unsupported GGUF metadata value type {other}")),
+            other => {
+                return Err(crate::reflex_err!(
+                    Gguf,
+                    "unsupported GGUF metadata value type {other}"
+                ))
+            }
         })
     }
 
     /// Read one metadata value, recursing into `ARRAY` (type 9).
-    fn read_value(&mut self) -> Result<GgufValue, String> {
+    fn read_value(&mut self) -> Result<GgufValue, ReflexError> {
         let value_type = self.read_value_type()?;
         if value_type == 9 {
             let elem_type = self.read_value_type()?;
@@ -452,7 +466,7 @@ impl<'a> Cursor<'a> {
     /// Helper for nested arrays: an array element that is itself declared
     /// as an array carries its own `elem_type`+`len` header (no outer
     /// value_type prefix, since the outer array already declared type 9).
-    fn read_value_as_array(&mut self) -> Result<GgufValue, String> {
+    fn read_value_as_array(&mut self) -> Result<GgufValue, ReflexError> {
         let elem_type = self.read_value_type()?;
         let len = self.read_u64()?;
         let mut items = Vec::with_capacity(len as usize);
