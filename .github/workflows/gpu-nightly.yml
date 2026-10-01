@@ -134,7 +134,7 @@ jobs:
           fi
 
       - name: Build
-        run: cargo build --release --locked --features ipc,nvml --bin reflex
+        run: cargo build --release --locked --features ipc,nvml --bin reflex --bin reflex-energy
 
       - name: GPU tests
         id: tests
@@ -161,6 +161,14 @@ jobs:
             --baseline bench/baseline-t4.json \
             --threshold-pct "${{ inputs.threshold_pct || '15' }}" \
             --summary-file "$GITHUB_STEP_SUMMARY"
+
+      # Whole-process energy, net of the GPU's idle draw (src/bin/reflex-energy.rs).
+      # Reported in the summary, not gated: energy has no committed baseline yet.
+      - name: Cold-start energy
+        if: always() && steps.tests.outcome != 'skipped'
+        run: |
+          set -o pipefail
+          bash scripts/bench_cold_energy.sh "$MODELS_DIR/$DENSE_FILE" "${{ inputs.bench_runs || '10' }}"             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload raw logs
         if: always()

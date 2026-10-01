@@ -10,6 +10,9 @@
    `reflex system1` on Qwen3-0.6B-Q4_K_M, n=10), compared with
    `scripts/bench_compare.py` against `bench/baseline-t4.json`. The job fails if total
    p50 regresses by more than 15%.
+3. **Whole-process energy** (`scripts/bench_cold_energy.sh`, `reflex system1` under
+   `reflex-energy`): gross energy, idle baseline and net energy, p50/p95. Reported in
+   the run summary only; it does not gate the job.
 
 Both results go to the run's summary page. The raw logs (per-test logs, per-run
 `/usr/bin/time -v` output, bench stdout) are uploaded as an artifact kept for 30 days.
