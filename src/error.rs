@@ -125,6 +125,29 @@ impl ReflexError {
         self.code().as_str()
     }
 
+    /// The same kind of error with a new message, for adding context to an error from a
+    /// call that already classified it, e.g.
+    /// `.map_err(|e| e.rewrap(format!("load weight '{name}': {e}")))`. A
+    /// `ContextOverflow` has a fixed, structured message and is returned unchanged.
+    pub fn rewrap(&self, message: String) -> ReflexError {
+        match self {
+            ReflexError::Gguf(_) => ReflexError::Gguf(message),
+            ReflexError::UnsupportedArchitecture(_) => {
+                ReflexError::UnsupportedArchitecture(message)
+            }
+            ReflexError::Cuda(_) => ReflexError::Cuda(message),
+            ReflexError::Cublas(_) => ReflexError::Cublas(message),
+            ReflexError::OutOfMemory(_) => ReflexError::OutOfMemory(message),
+            ReflexError::Tokenizer(_) => ReflexError::Tokenizer(message),
+            ReflexError::ContextOverflow { .. } => self.clone(),
+            ReflexError::KvCache(_) => ReflexError::KvCache(message),
+            ReflexError::Lora(_) => ReflexError::Lora(message),
+            ReflexError::Io(_) => ReflexError::Io(message),
+            ReflexError::InvalidInput(_) => ReflexError::InvalidInput(message),
+            ReflexError::Other(_) => ReflexError::Other(message),
+        }
+    }
+
     /// Classifies a failed CUDA driver or cuBLAS call: [`ReflexError::OutOfMemory`]
     /// when the call ran out of memory, otherwise [`ReflexError::Cuda`] or
     /// [`ReflexError::Cublas`]. `message` is the full, already-formatted text. Prefer

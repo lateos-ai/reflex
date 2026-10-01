@@ -2,6 +2,7 @@
 //! forward passes.
 
 use super::*;
+use crate::error::ReflexError;
 
 /// Prefill result: encoded prompt ids, the final position's hidden state,
 /// the filled per-layer K/V caches (separate K and V buffers), and the next
@@ -70,7 +71,10 @@ pub(super) enum LayerWeights {
 }
 
 impl Model {
-    pub(super) fn load_dense(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
+    pub(super) fn load_dense(
+        device: Arc<CudaDevice>,
+        file: &GgufFile,
+    ) -> Result<Self, ReflexError> {
         std::thread::scope(|scope| {
             let init_device = device.clone();
             let init = scope.spawn(move || Self::load_background_init(file, init_device));
@@ -81,8 +85,8 @@ impl Model {
     pub(super) fn load_dense_inner<'scope>(
         device: Arc<CudaDevice>,
         file: &GgufFile,
-        init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), String>>,
-    ) -> Result<Self, String> {
+        init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), ReflexError>>,
+    ) -> Result<Self, ReflexError> {
         let (cfg, block_count, moe) = parse_model_config(file)?;
         let expert_used_count = moe.map(|m| m.expert_used_count);
 
@@ -104,10 +108,18 @@ impl Model {
             ],
         )?
         .into_iter();
-        let rope_k = rope_fns.next().ok_or("missing rope_kernel")?;
-        let rope_batch_k = rope_fns.next().ok_or("missing rope_batch_kernel")?;
-        let rope_norm_k = rope_fns.next().ok_or("missing rope_norm_kernel")?;
-        let rope_norm_batch_k = rope_fns.next().ok_or("missing rope_norm_batch_kernel")?;
+        let rope_k = rope_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing rope_kernel".to_string()))?;
+        let rope_batch_k = rope_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing rope_batch_kernel".to_string()))?;
+        let rope_norm_k = rope_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing rope_norm_kernel".to_string()))?;
+        let rope_norm_batch_k = rope_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing rope_norm_batch_kernel".to_string()))?;
         let silu_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")),
@@ -151,15 +163,21 @@ impl Model {
             ],
         )?
         .into_iter();
-        let add_k = elementwise_fns.next().ok_or("missing add_kernel")?;
-        let split_qg_k = elementwise_fns.next().ok_or("missing split_qg_kernel")?;
+        let add_k = elementwise_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing add_kernel".to_string()))?;
+        let split_qg_k = elementwise_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing split_qg_kernel".to_string()))?;
         let sigmoid_gate_k = elementwise_fns
             .next()
-            .ok_or("missing sigmoid_gate_kernel")?;
-        let moe_gather_k = elementwise_fns.next().ok_or("missing moe_gather_kernel")?;
+            .ok_or_else(|| ReflexError::Other("missing sigmoid_gate_kernel".to_string()))?;
+        let moe_gather_k = elementwise_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing moe_gather_kernel".to_string()))?;
         let moe_scatter_add_k = elementwise_fns
             .next()
-            .ok_or("missing moe_scatter_add_kernel")?;
+            .ok_or_else(|| ReflexError::Other("missing moe_scatter_add_kernel".to_string()))?;
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
 
@@ -171,7 +189,7 @@ impl Model {
         // call re-uploads it (see `Weight`'s doc comment). Pipelined across
         // successive calls via `pipeline` (see `WeightLoadPipeline`'s doc
         // comment) instead of the old sequential blocking-H2D-copy path.
-        let mut load_weight = |name: &str| -> Result<Weight, String> {
+        let mut load_weight = |name: &str| -> Result<Weight, ReflexError> {
             load_weight_device(&mut pipeline, &dequant_kernels, file, name)
         };
 
@@ -249,7 +267,7 @@ impl Model {
                     bytes,
                     info.element_count(),
                 )
-                .map_err(|e| format!("load weight 'output.weight': {e}"))?;
+                .map_err(|e| e.rewrap(format!("load weight 'output.weight': {e}")))?;
                 LmHead::Resident(Weight {
                     data,
                     shape: info.shape.clone(),
@@ -320,7 +338,7 @@ impl Model {
         position: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &self.cfg;
         let normed = self.rmsnorm(
             &hidden,
@@ -372,13 +390,13 @@ impl Model {
             let mut dst = k_cache.slice_mut(offset..offset + kv_stride);
             self.device
                 .dtod_copy(&k, &mut dst)
-                .map_err(|e| format!("attn kv-cache dtod k: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "attn kv-cache dtod k: {e}"))?;
         }
         {
             let mut dst = v_cache.slice_mut(offset..offset + kv_stride);
             self.device
                 .dtod_copy(&v, &mut dst)
-                .map_err(|e| format!("attn kv-cache dtod v: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "attn kv-cache dtod v: {e}"))?;
         }
         let seq_len = position + 1;
 
@@ -405,7 +423,7 @@ impl Model {
         position: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut post_attn = self.forward_attn_block(
             &layer.attn_norm,
             &layer.attn_q,
@@ -456,7 +474,7 @@ impl Model {
         position: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut post_attn = self.forward_attn_block(
             &layer.attn_norm,
             &layer.attn_q,
@@ -484,20 +502,22 @@ impl Model {
         let router_logits = self
             .device
             .dtoh_sync_copy(&router_logits_dev)
-            .map_err(|e| format!("moe router dtoh: {e}"))?;
-        let k = self
-            .expert_used_count
-            .ok_or("forward_layer_moe called on a model with no expert_used_count")?;
+            .map_err(|e| crate::gpu_err!(e, "moe router dtoh: {e}"))?;
+        let k = self.expert_used_count.ok_or_else(|| {
+            ReflexError::Other(
+                "forward_layer_moe called on a model with no expert_used_count".to_string(),
+            )
+        })?;
         let routed = route_top_k(&router_logits, k)?;
 
         let mut ffn_out_dev = self
             .device
             .alloc_zeros::<f32>(cfg.hidden_size)
-            .map_err(|e| format!("moe ffn_out alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "moe ffn_out alloc: {e}"))?;
         let dest_row0 = self
             .device
             .htod_sync_copy(&[0u32])
-            .map_err(|e| format!("moe dest_row htod: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "moe dest_row htod: {e}"))?;
         for (expert_idx, weight) in routed {
             let gate = self.gemv_expert(&ffn_normed, &layer.ffn_gate_exps, expert_idx)?;
             let up = self.gemv_expert(&ffn_normed, &layer.ffn_up_exps, expert_idx)?;
@@ -506,7 +526,7 @@ impl Model {
             let weight_dev = self
                 .device
                 .htod_sync_copy(&[weight])
-                .map_err(|e| format!("moe weight htod: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "moe weight htod: {e}"))?;
             self.moe_scatter_add(
                 &down,
                 &dest_row0,
@@ -527,7 +547,7 @@ impl Model {
         position: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         match layer {
             LayerWeights::Dense(l) => {
                 self.forward_layer_dense(l, hidden, position, k_cache, v_cache)
@@ -558,7 +578,7 @@ impl Model {
         rows: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &self.cfg;
         let normed = self.rmsnorm(
             &hidden,
@@ -619,13 +639,13 @@ impl Model {
             let mut dst = k_cache.slice_mut(offset..offset + write_len);
             self.device
                 .dtod_copy(&k, &mut dst)
-                .map_err(|e| format!("attn_batched kv-cache dtod k: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "attn_batched kv-cache dtod k: {e}"))?;
         }
         {
             let mut dst = v_cache.slice_mut(offset..offset + write_len);
             self.device
                 .dtod_copy(&v, &mut dst)
-                .map_err(|e| format!("attn_batched kv-cache dtod v: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "attn_batched kv-cache dtod v: {e}"))?;
         }
         let seq_len = start_pos + rows;
 
@@ -659,7 +679,7 @@ impl Model {
         rows: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut post_attn = self.forward_attn_block_batched(
             &layer.attn_norm,
             &layer.attn_q,
@@ -727,7 +747,7 @@ impl Model {
         ffn_up_exps: &Weight,
         ffn_down_exps: &Weight,
         ffn_out: &mut CudaSlice<f32>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReflexError> {
         let mut groups: Vec<Vec<(u32, f32)>> = vec![Vec::new(); expert_count];
         for row in 0..rows {
             let row_logits = &router_logits[row * expert_count..(row + 1) * expert_count];
@@ -747,11 +767,11 @@ impl Model {
             let perm_row = self
                 .device
                 .htod_sync_copy(&rows_e)
-                .map_err(|e| format!("moe_ffn_grouped upload rows_e: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "moe_ffn_grouped upload rows_e: {e}"))?;
             let weight_dev = self
                 .device
                 .htod_sync_copy(&weights_e)
-                .map_err(|e| format!("moe_ffn_grouped upload weights_e: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "moe_ffn_grouped upload weights_e: {e}"))?;
             let group_size = rows_e.len();
 
             let x_e = self.moe_gather(ffn_normed, &perm_row, hidden_size)?;
@@ -789,7 +809,7 @@ impl Model {
         rows: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut post_attn = self.forward_attn_block_batched(
             &layer.attn_norm,
             &layer.attn_q,
@@ -817,16 +837,18 @@ impl Model {
         let router_logits = self
             .device
             .dtoh_sync_copy(&router_logits_dev)
-            .map_err(|e| format!("moe router dtoh: {e}"))?;
-        let k = self
-            .expert_used_count
-            .ok_or("forward_layer_moe_batched called on a model with no expert_used_count")?;
+            .map_err(|e| crate::gpu_err!(e, "moe router dtoh: {e}"))?;
+        let k = self.expert_used_count.ok_or_else(|| {
+            ReflexError::Other(
+                "forward_layer_moe_batched called on a model with no expert_used_count".to_string(),
+            )
+        })?;
         let num_experts = router_logits.len() / rows;
 
         let mut ffn_out = self
             .device
             .alloc_zeros::<f32>(rows * cfg.hidden_size)
-            .map_err(|e| format!("moe ffn_out alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "moe ffn_out alloc: {e}"))?;
         self.moe_ffn_grouped(
             &ffn_normed,
             rows,
@@ -855,7 +877,7 @@ impl Model {
         rows: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         match layer {
             LayerWeights::Dense(l) => {
                 self.forward_layer_dense_batched(l, hidden, start_pos, rows, k_cache, v_cache)
@@ -888,7 +910,7 @@ impl Model {
         prompt: &str,
         imported: Option<&crate::kv_io::DenseKvCache>,
         extra_headroom: usize,
-    ) -> Result<DensePrefillResult, String> {
+    ) -> Result<DensePrefillResult, ReflexError> {
         let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
 
         let mut ids = self.tokenizer.encode(prompt)?;
@@ -900,7 +922,9 @@ impl Model {
             }
         }
         if ids.is_empty() {
-            return Err("encode produced no tokens".to_string());
+            return Err(ReflexError::InvalidInput(
+                "encode produced no tokens".to_string(),
+            ));
         }
 
         crate::limits::check_positions(start_pos, ids.len(), extra_headroom)?;
@@ -915,21 +939,22 @@ impl Model {
         let mut k_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
             .map(|_| self.device.alloc_zeros::<f32>(total_len * kv_stride))
             .collect::<Result<_, _>>()
-            .map_err(|e| format!("alloc k_cache: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "alloc k_cache: {e}"))?;
         let mut v_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
             .map(|_| self.device.alloc_zeros::<f32>(total_len * kv_stride))
             .collect::<Result<_, _>>()
-            .map_err(|e| format!("alloc v_cache: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "alloc v_cache: {e}"))?;
 
         if let Some(cache) = imported {
             if cache.num_kv_heads != self.cfg.num_kv_heads || cache.head_dim != self.cfg.head_dim {
-                return Err(format!(
+                return Err(crate::reflex_err!(KvCache,
                     "imported KV cache shape mismatch: file has num_kv_heads={} head_dim={}, model expects num_kv_heads={} head_dim={}",
                     cache.num_kv_heads, cache.head_dim, self.cfg.num_kv_heads, self.cfg.head_dim
                 ));
             }
             if cache.k_caches.len() != self.layers.len() {
-                return Err(format!(
+                return Err(crate::reflex_err!(
+                    Other,
                     "imported KV cache has {} layers, model has {}",
                     cache.k_caches.len(),
                     self.layers.len()
@@ -942,11 +967,15 @@ impl Model {
                 let mut k_dst = k_caches[layer_idx].slice_mut(0..imported_len);
                 self.device
                     .htod_sync_copy_into(k_host, &mut k_dst)
-                    .map_err(|e| format!("import k_cache htod layer {layer_idx}: {e}"))?;
+                    .map_err(|e| {
+                        crate::gpu_err!(e, "import k_cache htod layer {layer_idx}: {e}")
+                    })?;
                 let mut v_dst = v_caches[layer_idx].slice_mut(0..imported_len);
                 self.device
                     .htod_sync_copy_into(v_host, &mut v_dst)
-                    .map_err(|e| format!("import v_cache htod layer {layer_idx}: {e}"))?;
+                    .map_err(|e| {
+                        crate::gpu_err!(e, "import v_cache htod layer {layer_idx}: {e}")
+                    })?;
             }
         }
 
@@ -961,7 +990,8 @@ impl Model {
             )?);
             position += 1;
         }
-        let hidden = hidden_dev.ok_or("no tokens processed")?;
+        let hidden =
+            hidden_dev.ok_or_else(|| ReflexError::Other("no tokens processed".to_string()))?;
 
         Ok((ids, hidden, k_caches, v_caches, position))
     }
@@ -982,7 +1012,7 @@ impl Model {
         prompt: &str,
         imported: Option<&crate::kv_io::DenseKvCache>,
         extra_headroom: usize,
-    ) -> Result<DensePrefillResult, String> {
+    ) -> Result<DensePrefillResult, ReflexError> {
         let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
 
         let mut ids = self.tokenizer.encode(prompt)?;
@@ -994,7 +1024,9 @@ impl Model {
             }
         }
         if ids.is_empty() {
-            return Err("encode produced no tokens".to_string());
+            return Err(ReflexError::InvalidInput(
+                "encode produced no tokens".to_string(),
+            ));
         }
         let rows = ids.len();
         crate::limits::check_positions(start_pos, rows, extra_headroom)?;
@@ -1004,21 +1036,22 @@ impl Model {
         let mut k_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
             .map(|_| self.device.alloc_zeros::<f32>(total_len * kv_stride))
             .collect::<Result<_, _>>()
-            .map_err(|e| format!("alloc k_cache: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "alloc k_cache: {e}"))?;
         let mut v_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
             .map(|_| self.device.alloc_zeros::<f32>(total_len * kv_stride))
             .collect::<Result<_, _>>()
-            .map_err(|e| format!("alloc v_cache: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "alloc v_cache: {e}"))?;
 
         if let Some(cache) = imported {
             if cache.num_kv_heads != self.cfg.num_kv_heads || cache.head_dim != self.cfg.head_dim {
-                return Err(format!(
+                return Err(crate::reflex_err!(KvCache,
                     "imported KV cache shape mismatch: file has num_kv_heads={} head_dim={}, model expects num_kv_heads={} head_dim={}",
                     cache.num_kv_heads, cache.head_dim, self.cfg.num_kv_heads, self.cfg.head_dim
                 ));
             }
             if cache.k_caches.len() != self.layers.len() {
-                return Err(format!(
+                return Err(crate::reflex_err!(
+                    Other,
                     "imported KV cache has {} layers, model has {}",
                     cache.k_caches.len(),
                     self.layers.len()
@@ -1031,11 +1064,15 @@ impl Model {
                 let mut k_dst = k_caches[layer_idx].slice_mut(0..imported_len);
                 self.device
                     .htod_sync_copy_into(k_host, &mut k_dst)
-                    .map_err(|e| format!("import k_cache htod layer {layer_idx}: {e}"))?;
+                    .map_err(|e| {
+                        crate::gpu_err!(e, "import k_cache htod layer {layer_idx}: {e}")
+                    })?;
                 let mut v_dst = v_caches[layer_idx].slice_mut(0..imported_len);
                 self.device
                     .htod_sync_copy_into(v_host, &mut v_dst)
-                    .map_err(|e| format!("import v_cache htod layer {layer_idx}: {e}"))?;
+                    .map_err(|e| {
+                        crate::gpu_err!(e, "import v_cache htod layer {layer_idx}: {e}")
+                    })?;
             }
         }
 
@@ -1048,7 +1085,7 @@ impl Model {
         let mut hidden = self
             .device
             .htod_sync_copy(&host_embd)
-            .map_err(|e| format!("embedding htod: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "embedding htod: {e}"))?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             hidden = self.forward_layer_batched(
@@ -1087,9 +1124,11 @@ impl Model {
         sampling: &SamplingParams,
         mut on_first_token: impl FnMut(&[f32]),
         mut on_token: impl FnMut(u32, &str),
-    ) -> Result<DenseGenerateResult, String> {
+    ) -> Result<DenseGenerateResult, ReflexError> {
         if max_new_tokens == 0 {
-            return Err("max_new_tokens must be at least 1".to_string());
+            return Err(ReflexError::InvalidInput(
+                "max_new_tokens must be at least 1".to_string(),
+            ));
         }
 
         let (ids, hidden_batched, mut k_caches, mut v_caches, mut position) =
@@ -1139,9 +1178,11 @@ impl Model {
         prompt: &str,
         candidates: &[System1Candidate],
         temperature: f32,
-    ) -> Result<System1Response, String> {
+    ) -> Result<System1Response, ReflexError> {
         if candidates.is_empty() {
-            return Err("system1_evaluate: candidates must not be empty".to_string());
+            return Err(ReflexError::InvalidInput(
+                "system1_evaluate: candidates must not be empty".to_string(),
+            ));
         }
 
         let resolved: Vec<Vec<u32>> = candidates
@@ -1201,11 +1242,11 @@ impl Model {
         position: usize,
         k_caches: &mut [CudaSlice<f32>],
         v_caches: &mut [CudaSlice<f32>],
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut hidden = self
             .device
             .htod_sync_copy(&self.token_embd.row(token_id)?)
-            .map_err(|e| format!("embedding htod: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "embedding htod: {e}"))?;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             hidden = self.forward_layer(
                 layer,
@@ -1228,12 +1269,12 @@ impl Model {
     pub fn forward_prompt_capture_kv(
         &self,
         prompt: &str,
-    ) -> Result<((u32, String), crate::kv_io::DenseKvCache), String> {
+    ) -> Result<((u32, String), crate::kv_io::DenseKvCache), ReflexError> {
         if self.hybrid.is_some() {
-            return Err("--export-kv on a hybrid Qwen3.5 model needs forward_prompt_capture_kv_hybrid, not this function".to_string());
+            return Err(ReflexError::Other("--export-kv on a hybrid Qwen3.5 model needs forward_prompt_capture_kv_hybrid, not this function".to_string()));
         }
         if self.mla.is_some() {
-            return Err("--export-kv on an MLA model needs forward_prompt_capture_kv_mla, not this function".to_string());
+            return Err(ReflexError::Other("--export-kv on an MLA model needs forward_prompt_capture_kv_mla, not this function".to_string()));
         }
         let (generated, text, k_caches, v_caches, seq_len) = self.generate_dense_impl(
             prompt,
@@ -1251,7 +1292,7 @@ impl Model {
             .map(|c| {
                 self.device
                     .dtoh_sync_copy(&c.slice(0..per_layer_len))
-                    .map_err(|e| format!("k_cache dtoh: {e}"))
+                    .map_err(|e| crate::gpu_err!(e, "k_cache dtoh: {e}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
         let v_caches = v_caches
@@ -1259,7 +1300,7 @@ impl Model {
             .map(|c| {
                 self.device
                     .dtoh_sync_copy(&c.slice(0..per_layer_len))
-                    .map_err(|e| format!("v_cache dtoh: {e}"))
+                    .map_err(|e| crate::gpu_err!(e, "v_cache dtoh: {e}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
 

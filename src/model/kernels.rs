@@ -1,6 +1,7 @@
 //! Thin launch wrappers around the AOT-compiled CUDA kernels and cuBLAS GEMMs.
 
 use super::*;
+use crate::error::ReflexError;
 
 impl Model {
     /// `x` is already device-resident (Phase 2 round 2) -- unlike the
@@ -13,12 +14,12 @@ impl Model {
         rows: usize,
         hidden_size: usize,
         eps: f32,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let n = x.len() as u32;
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(x.len())
-            .map_err(|e| format!("rmsnorm alloc out: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "rmsnorm alloc out: {e}"))?;
 
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
@@ -42,7 +43,7 @@ impl Model {
                         eps,
                     ),
                 )
-                .map_err(|e| format!("rmsnorm launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "rmsnorm launch: {e}"))?;
         }
         Ok(dev_out)
     }
@@ -57,9 +58,10 @@ impl Model {
         w_dev: W,
         in_features: usize,
         out_features: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         if x.len() != in_features {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Other,
                 "gemv: x.len()={} != in_features={in_features}",
                 x.len()
             ));
@@ -68,7 +70,7 @@ impl Model {
         let mut dev_y = self
             .device
             .alloc_zeros::<f32>(out_features)
-            .map_err(|e| format!("gemv alloc y: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "gemv alloc y: {e}"))?;
 
         // One warp per output row (gemv_kernel's doc comment has the
         // coalescing rationale) -- 256 threads/block = 8 warps/block, same
@@ -97,12 +99,16 @@ impl Model {
                         out_features as u32,
                     ),
                 )
-                .map_err(|e| format!("gemv launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "gemv launch: {e}"))?;
         }
         Ok(dev_y)
     }
 
-    pub(super) fn gemv(&self, x: &CudaSlice<f32>, w: &Weight) -> Result<CudaSlice<f32>, String> {
+    pub(super) fn gemv(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let in_features = w.shape[0] as usize;
         let out_features = w.shape[1] as usize;
         self.gemv_raw(x, &w.data, in_features, out_features)
@@ -133,11 +139,12 @@ impl Model {
         x: &CudaSlice<f32>,
         w: &Weight,
         rows: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let in_features = w.shape[0] as usize;
         let out_features = w.shape[1] as usize;
         if x.len() != rows * in_features {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Other,
                 "gemm: x.len()={} != rows*in_features={}",
                 x.len(),
                 rows * in_features
@@ -147,7 +154,7 @@ impl Model {
         let mut dev_y = self
             .device
             .alloc_zeros::<f32>(rows * out_features)
-            .map_err(|e| format!("gemm alloc y: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "gemm alloc y: {e}"))?;
 
         let cfg = GemmConfig {
             transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
@@ -164,7 +171,7 @@ impl Model {
         unsafe {
             self.cublas
                 .gemm(cfg, &w.data, x, &mut dev_y)
-                .map_err(|e| format!("gemm launch: {e:?}"))?;
+                .map_err(|e| crate::gpu_err!(e, "gemm launch: {e:?}"))?;
         }
         Ok(dev_y)
     }
@@ -188,11 +195,11 @@ impl Model {
         in_features: usize,
         out_features: usize,
         rows: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut dev_y = self
             .device
             .alloc_zeros::<f32>(rows * out_features)
-            .map_err(|e| format!("gemm_view alloc y: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "gemm_view alloc y: {e}"))?;
         let cfg = GemmConfig {
             transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
             transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
@@ -208,7 +215,7 @@ impl Model {
         unsafe {
             self.cublas
                 .gemm(cfg, w, x, &mut dev_y)
-                .map_err(|e| format!("gemm_view launch: {e:?}"))?;
+                .map_err(|e| crate::gpu_err!(e, "gemm_view launch: {e:?}"))?;
         }
         Ok(dev_y)
     }
@@ -225,17 +232,18 @@ impl Model {
     pub(super) fn expert_weight_view<'a>(
         w: &'a Weight,
         expert_idx: usize,
-    ) -> Result<(CudaView<'a, f32>, usize, usize), String> {
+    ) -> Result<(CudaView<'a, f32>, usize, usize), ReflexError> {
         let (in_features, out_features, expert_count) = match w.shape.as_slice() {
             [i, o, e] => (*i as usize, *o as usize, *e as usize),
             other => {
-                return Err(format!(
+                return Err(crate::reflex_err!(
+                    Other,
                     "expert_weight_view: expected 3-D per-expert tensor shape, got {other:?}"
                 ))
             }
         };
         if expert_idx >= expert_count {
-            return Err(format!("expert_weight_view: expert_idx {expert_idx} out of range (expert_count={expert_count})"));
+            return Err(crate::reflex_err!(Other, "expert_weight_view: expert_idx {expert_idx} out of range (expert_count={expert_count})"));
         }
         let expert_len = in_features * out_features;
         let start = expert_idx * expert_len;
@@ -261,7 +269,7 @@ impl Model {
         x: X,
         w: &Weight,
         expert_idx: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let (view, in_features, out_features) = Self::expert_weight_view(w, expert_idx)?;
         self.gemv_view(x, &view, in_features, out_features)
     }
@@ -277,12 +285,12 @@ impl Model {
         src: &CudaSlice<f32>,
         perm_row: &CudaSlice<u32>,
         hidden_size: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let num_assignments = perm_row.len();
         let mut dst = self
             .device
             .alloc_zeros::<f32>(num_assignments * hidden_size)
-            .map_err(|e| format!("moe_gather alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "moe_gather alloc: {e}"))?;
         let n = (num_assignments * hidden_size) as u32;
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
@@ -305,7 +313,7 @@ impl Model {
                         hidden_size as u32,
                     ),
                 )
-                .map_err(|e| format!("moe_gather launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "moe_gather launch: {e}"))?;
         }
         Ok(dst)
     }
@@ -327,7 +335,7 @@ impl Model {
         weight: &CudaSlice<f32>,
         dst: &mut CudaSlice<f32>,
         hidden_size: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReflexError> {
         let num_assignments = dest_row.len();
         let n = (num_assignments * hidden_size) as u32;
         let threads = 256u32;
@@ -352,7 +360,7 @@ impl Model {
                         hidden_size as u32,
                     ),
                 )
-                .map_err(|e| format!("moe_scatter_add launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "moe_scatter_add launch: {e}"))?;
         }
         Ok(())
     }
@@ -371,20 +379,24 @@ impl Model {
         x: &CudaSlice<f32>,
         w: &Weight,
         row_indices: &[u32],
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<Vec<f32>, ReflexError> {
         let in_features = w.shape[0] as usize;
         let out_features = w.shape[1] as usize;
         if x.len() != in_features {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Other,
                 "gemv_gather: x.len()={} != in_features={in_features}",
                 x.len()
             ));
         }
         if row_indices.is_empty() {
-            return Err("gemv_gather: row_indices must not be empty".to_string());
+            return Err(ReflexError::Other(
+                "gemv_gather: row_indices must not be empty".to_string(),
+            ));
         }
         if let Some(&bad) = row_indices.iter().find(|&&r| r as usize >= out_features) {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Other,
                 "gemv_gather: row index {bad} out of range (out_features={out_features})"
             ));
         }
@@ -392,11 +404,11 @@ impl Model {
         let dev_indices = self
             .device
             .htod_sync_copy(row_indices)
-            .map_err(|e| format!("gemv_gather upload row_indices: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "gemv_gather upload row_indices: {e}"))?;
         let mut dev_y = self
             .device
             .alloc_zeros::<f32>(num_rows)
-            .map_err(|e| format!("gemv_gather alloc y: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "gemv_gather alloc y: {e}"))?;
         // One warp per gathered row -- see gemv_raw's identical comment.
         let threads = 256u32;
         let warps_per_block = threads / WARP_SIZE;
@@ -421,11 +433,11 @@ impl Model {
                         num_rows as u32,
                     ),
                 )
-                .map_err(|e| format!("gemv_gather launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "gemv_gather launch: {e}"))?;
         }
         self.device
             .dtoh_sync_copy(&dev_y)
-            .map_err(|e| format!("gemv_gather dtoh: {e}"))
+            .map_err(|e| crate::gpu_err!(e, "gemv_gather dtoh: {e}"))
     }
 
     /// In-place: `t` is already device-resident. `position` is a plain
@@ -444,7 +456,7 @@ impl Model {
         position: usize,
         base: f32,
         rope_type: RopeType,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReflexError> {
         let half_rotary = rotary_dim / 2;
         let total_pairs = (num_heads * half_rotary) as u32;
         let threads = 256u32;
@@ -457,10 +469,9 @@ impl Model {
 
         let kernel = match rope_type {
             RopeType::Neox => &self.rope_k,
-            RopeType::Norm => self
-                .rope_norm_k
-                .as_ref()
-                .ok_or("rope_norm_kernel not loaded for this model")?,
+            RopeType::Norm => self.rope_norm_k.as_ref().ok_or_else(|| {
+                ReflexError::Other("rope_norm_kernel not loaded for this model".to_string())
+            })?,
         };
         unsafe {
             kernel
@@ -477,7 +488,7 @@ impl Model {
                         base,
                     ),
                 )
-                .map_err(|e| format!("rope launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "rope launch: {e}"))?;
         }
         Ok(())
     }
@@ -497,7 +508,7 @@ impl Model {
         rows: usize,
         base: f32,
         rope_type: RopeType,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReflexError> {
         let half_rotary = rotary_dim / 2;
         let total_pairs = (rows * num_heads * half_rotary) as u32;
         let threads = 256u32;
@@ -510,10 +521,9 @@ impl Model {
 
         let kernel = match rope_type {
             RopeType::Neox => &self.rope_batch_k,
-            RopeType::Norm => self
-                .rope_norm_batch_k
-                .as_ref()
-                .ok_or("rope_norm_batch_kernel not loaded for this model")?,
+            RopeType::Norm => self.rope_norm_batch_k.as_ref().ok_or_else(|| {
+                ReflexError::Other("rope_norm_batch_kernel not loaded for this model".to_string())
+            })?,
         };
         unsafe {
             kernel
@@ -531,7 +541,7 @@ impl Model {
                         base,
                     ),
                 )
-                .map_err(|e| format!("rope_batch launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "rope_batch launch: {e}"))?;
         }
         Ok(())
     }
@@ -553,7 +563,7 @@ impl Model {
         rotary_dim: usize,
         position: usize,
         base: f32,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReflexError> {
         let half_rotary = rotary_dim / 2;
         let total_pairs = (num_heads * half_rotary) as u32;
         let threads = 256u32;
@@ -579,7 +589,7 @@ impl Model {
                         base,
                     ),
                 )
-                .map_err(|e| format!("rope_norm launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "rope_norm launch: {e}"))?;
         }
         Ok(())
     }
@@ -599,7 +609,7 @@ impl Model {
         rotary_dim: usize,
         position: usize,
         base: f32,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReflexError> {
         let half_rotary = rotary_dim / 2;
         let total_pairs = (num_heads * half_rotary) as u32;
         let threads = 256u32;
@@ -630,7 +640,7 @@ impl Model {
                         yarn.corr_dim_end,
                     ),
                 )
-                .map_err(|e| format!("rope_norm_yarn launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "rope_norm_yarn launch: {e}"))?;
         }
         Ok(())
     }
@@ -650,7 +660,7 @@ impl Model {
         start_pos: usize,
         rows: usize,
         base: f32,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReflexError> {
         let half_rotary = rotary_dim / 2;
         let total_pairs = (rows * num_heads * half_rotary) as u32;
         let threads = 256u32;
@@ -677,7 +687,7 @@ impl Model {
                         base,
                     ),
                 )
-                .map_err(|e| format!("rope_norm_batch launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "rope_norm_batch launch: {e}"))?;
         }
         Ok(())
     }
@@ -696,7 +706,7 @@ impl Model {
         start_pos: usize,
         rows: usize,
         base: f32,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReflexError> {
         let half_rotary = rotary_dim / 2;
         let total_pairs = (rows * num_heads * half_rotary) as u32;
         let threads = 256u32;
@@ -728,7 +738,7 @@ impl Model {
                         yarn.corr_dim_end,
                     ),
                 )
-                .map_err(|e| format!("rope_norm_yarn_batch launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "rope_norm_yarn_batch launch: {e}"))?;
         }
         Ok(())
     }
@@ -741,11 +751,11 @@ impl Model {
         gate: &CudaSlice<f32>,
         up: &CudaSlice<f32>,
         hidden_size: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(hidden_size)
-            .map_err(|e| format!("silu alloc out: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "silu alloc out: {e}"))?;
 
         let threads = 256u32;
         let blocks = (hidden_size as u32).div_ceil(threads).max(1);
@@ -762,7 +772,7 @@ impl Model {
                     launch_cfg,
                     (gate, up, &mut dev_out, 1u32, hidden_size as u32),
                 )
-                .map_err(|e| format!("silu launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "silu launch: {e}"))?;
         }
         Ok(dev_out)
     }
@@ -786,11 +796,11 @@ impl Model {
         num_kv_heads: usize,
         head_dim: usize,
         seq_len: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(num_q_heads * head_dim)
-            .map_err(|e| format!("attn alloc out: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "attn alloc out: {e}"))?;
 
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let launch_cfg = LaunchConfig {
@@ -816,7 +826,7 @@ impl Model {
                         scale,
                     ),
                 )
-                .map_err(|e| format!("attn launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "attn launch: {e}"))?;
         }
         Ok(dev_out)
     }
@@ -841,11 +851,11 @@ impl Model {
         head_dim: usize,
         start_pos: usize,
         rows: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(rows * num_q_heads * head_dim)
-            .map_err(|e| format!("attn_prefill alloc out: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "attn_prefill alloc out: {e}"))?;
 
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let max_seq_len = start_pos + rows;
@@ -873,7 +883,7 @@ impl Model {
                         scale,
                     ),
                 )
-                .map_err(|e| format!("attn_prefill launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "attn_prefill launch: {e}"))?;
         }
         Ok(dev_out)
     }
@@ -886,7 +896,7 @@ impl Model {
         &self,
         a: &mut CudaSlice<f32>,
         b: &CudaSlice<f32>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReflexError> {
         let n = a.len() as u32;
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
@@ -900,7 +910,7 @@ impl Model {
                 .function
                 .clone()
                 .launch(launch_cfg, (a, b, n))
-                .map_err(|e| format!("add launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "add launch: {e}"))?;
         }
         Ok(())
     }
@@ -919,11 +929,11 @@ impl Model {
         w_dev: W,
         in_features: usize,
         out_features: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut dev_y = self
             .device
             .alloc_zeros::<f32>(out_features)
-            .map_err(|e| format!("gemv_view alloc y: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "gemv_view alloc y: {e}"))?;
         // One warp per output row -- see gemv_raw's identical comment. Same
         // gemv_kernel, so this must stay in lockstep with gemv_raw's launch
         // geometry.
@@ -949,7 +959,7 @@ impl Model {
                         out_features as u32,
                     ),
                 )
-                .map_err(|e| format!("gemv_view launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "gemv_view launch: {e}"))?;
         }
         Ok(dev_y)
     }
@@ -969,24 +979,26 @@ impl Model {
         x: &CudaSlice<f32>,
         w: &Weight,
         n_head: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let (in_features, out_features, head_count) = match w.shape.as_slice() {
             [i, o, h] => (*i as usize, *o as usize, *h as usize),
             other => {
-                return Err(format!(
+                return Err(crate::reflex_err!(
+                    Other,
                     "gemv_per_head: expected 3-D per-head tensor shape, got {other:?}"
                 ))
             }
         };
         if head_count != n_head {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Other,
                 "gemv_per_head: tensor's head dim {head_count} != n_head {n_head}"
             ));
         }
         let mut out = self
             .device
             .alloc_zeros::<f32>(n_head * out_features)
-            .map_err(|e| format!("gemv_per_head alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "gemv_per_head alloc: {e}"))?;
         for h in 0..n_head {
             let w_view = w
                 .data
@@ -996,7 +1008,7 @@ impl Model {
             let mut dst = out.slice_mut(h * out_features..(h + 1) * out_features);
             self.device
                 .dtod_copy(&y, &mut dst)
-                .map_err(|e| format!("gemv_per_head dtod head {h}: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "gemv_per_head dtod head {h}: {e}"))?;
         }
         Ok(out)
     }
@@ -1025,24 +1037,26 @@ impl Model {
         x_row_stride: usize,
         x_head_stride: usize,
         x_head_offset: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let (in_features, out_features, head_count) = match w.shape.as_slice() {
             [i, o, h] => (*i as usize, *o as usize, *h as usize),
             other => {
-                return Err(format!(
+                return Err(crate::reflex_err!(
+                    Other,
                     "gemv_per_head_batch: expected 3-D per-head tensor shape, got {other:?}"
                 ))
             }
         };
         if head_count != n_head {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Other,
                 "gemv_per_head_batch: tensor's head dim {head_count} != n_head {n_head}"
             ));
         }
         let mut out = self
             .device
             .alloc_zeros::<f32>(rows * n_head * out_features)
-            .map_err(|e| format!("gemv_per_head_batch alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "gemv_per_head_batch alloc: {e}"))?;
 
         let threads = 256u32;
         let out_blocks = (out_features as u32).div_ceil(threads).max(1);
@@ -1070,7 +1084,7 @@ impl Model {
                         x_head_offset as u32,
                     ),
                 )
-                .map_err(|e| format!("gemv_per_head_batch launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "gemv_per_head_batch launch: {e}"))?;
         }
         Ok(out)
     }
@@ -1099,11 +1113,11 @@ impl Model {
         v_dim: usize,
         seq_len: usize,
         scale: f32,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(num_q_heads * v_dim)
-            .map_err(|e| format!("mla_attn alloc out: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "mla_attn alloc out: {e}"))?;
         let block_dim = (qk_dim as u32).next_power_of_two();
         let launch_cfg = LaunchConfig {
             grid_dim: (num_q_heads as u32, 1, 1),
@@ -1127,7 +1141,7 @@ impl Model {
                         scale,
                     ),
                 )
-                .map_err(|e| format!("mla_attn launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "mla_attn launch: {e}"))?;
         }
         Ok(dev_out)
     }
@@ -1153,11 +1167,11 @@ impl Model {
         start_pos: usize,
         rows: usize,
         scale: f32,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(rows * num_q_heads * v_dim)
-            .map_err(|e| format!("mla_attn_prefill alloc out: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "mla_attn_prefill alloc out: {e}"))?;
         let block_dim = (qk_dim as u32).next_power_of_two();
         let max_seq_len = start_pos + rows;
         let launch_cfg = LaunchConfig {
@@ -1183,7 +1197,7 @@ impl Model {
                         scale,
                     ),
                 )
-                .map_err(|e| format!("mla_attn_prefill launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "mla_attn_prefill launch: {e}"))?;
         }
         Ok(dev_out)
     }
@@ -1202,11 +1216,11 @@ impl Model {
         src_head_width: usize,
         dst_width: usize,
         src_head_offset: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut dst = self
             .device
             .alloc_zeros::<f32>(rows * num_heads * dst_width)
-            .map_err(|e| format!("mla_extract_batch alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "mla_extract_batch alloc: {e}"))?;
         let n = (rows * num_heads * dst_width) as u32;
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
@@ -1231,7 +1245,7 @@ impl Model {
                         src_head_offset as u32,
                     ),
                 )
-                .map_err(|e| format!("mla_extract_batch launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "mla_extract_batch launch: {e}"))?;
         }
         Ok(dst)
     }
@@ -1252,12 +1266,12 @@ impl Model {
         n_head: usize,
         kv_lora: usize,
         qk_rope: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let qk_dim = kv_lora + qk_rope;
         let mut out = self
             .device
             .alloc_zeros::<f32>(rows * n_head * qk_dim)
-            .map_err(|e| format!("mla_concat_qcur_batch alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "mla_concat_qcur_batch alloc: {e}"))?;
         let n = (rows * n_head * qk_dim) as u32;
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
@@ -1282,7 +1296,7 @@ impl Model {
                         qk_rope as u32,
                     ),
                 )
-                .map_err(|e| format!("mla_concat_qcur_batch launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "mla_concat_qcur_batch launch: {e}"))?;
         }
         Ok(out)
     }
@@ -1301,7 +1315,7 @@ impl Model {
         rows: usize,
         kv_lora: usize,
         qk_rope: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReflexError> {
         let qk_dim = kv_lora + qk_rope;
         let n = (rows * qk_dim) as u32;
         let threads = 256u32;
@@ -1327,7 +1341,7 @@ impl Model {
                         qk_rope as u32,
                     ),
                 )
-                .map_err(|e| format!("mla_write_kv_cache_batch launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "mla_write_kv_cache_batch launch: {e}"))?;
         }
         Ok(())
     }

@@ -2,6 +2,7 @@
 //! hybrid and MLA settings, and the RoPE convention.
 
 use super::*;
+use crate::error::ReflexError;
 
 pub(super) fn u64_meta(file: &GgufFile, key: &str) -> Option<u64> {
     file.metadata.get(key).and_then(GgufValue::as_u64)
@@ -92,7 +93,7 @@ pub struct MoeMetaConfig {
 /// MVP order).
 pub fn parse_model_config(
     file: &GgufFile,
-) -> Result<(LayerConfig, usize, Option<MoeMetaConfig>), String> {
+) -> Result<(LayerConfig, usize, Option<MoeMetaConfig>), ReflexError> {
     let architecture = file
         .metadata
         .get("general.architecture")
@@ -102,7 +103,12 @@ pub fn parse_model_config(
     let moe = match u64_meta(file, &format!("{architecture}.expert_count")).filter(|&n| n > 0) {
         Some(expert_count) => {
             let expert_used_count = u64_meta(file, &format!("{architecture}.expert_used_count"))
-                .ok_or_else(|| format!("missing {architecture}.expert_used_count metadata key"))?;
+                .ok_or_else(|| {
+                    crate::reflex_err!(
+                        Gguf,
+                        "missing {architecture}.expert_used_count metadata key"
+                    )
+                })?;
             Some(MoeMetaConfig {
                 expert_count: expert_count as usize,
                 expert_used_count: expert_used_count as usize,
@@ -115,7 +121,7 @@ pub fn parse_model_config(
         && !matches!(architecture, "llama" | "mistral" | "mixtral")
         && moe.is_none()
     {
-        return Err(format!(
+        return Err(crate::reflex_err!(UnsupportedArchitecture,
             "unsupported architecture '{architecture}': only dense 'qwen3'/'llama'/'mistral' and MoE architectures reporting a nonzero '{architecture}.expert_count' are in scope for this MVP"
         ));
     }
@@ -132,21 +138,26 @@ pub fn parse_model_config(
         .and_then(GgufValue::as_str)
     {
         if scaling != "none" {
-            return Err(format!(
+            return Err(crate::reflex_err!(UnsupportedArchitecture,
                 "{architecture}.rope.scaling.type = {scaling:?} is not supported by this MVP (only unscaled RoPE, i.e. no scaling or \"none\", is implemented)"
             ));
         }
     }
 
-    let block_count = u64_meta(file, &format!("{architecture}.block_count"))
-        .ok_or_else(|| format!("missing {architecture}.block_count metadata key"))?
-        as usize;
-    let hidden_size = u64_meta(file, &format!("{architecture}.embedding_length"))
-        .ok_or_else(|| format!("missing {architecture}.embedding_length metadata key"))?
-        as usize;
-    let num_q_heads = u64_meta(file, &format!("{architecture}.attention.head_count"))
-        .ok_or_else(|| format!("missing {architecture}.attention.head_count metadata key"))?
-        as usize;
+    let block_count = u64_meta(file, &format!("{architecture}.block_count")).ok_or_else(|| {
+        crate::reflex_err!(Gguf, "missing {architecture}.block_count metadata key")
+    })? as usize;
+    let hidden_size =
+        u64_meta(file, &format!("{architecture}.embedding_length")).ok_or_else(|| {
+            crate::reflex_err!(Gguf, "missing {architecture}.embedding_length metadata key")
+        })? as usize;
+    let num_q_heads =
+        u64_meta(file, &format!("{architecture}.attention.head_count")).ok_or_else(|| {
+            crate::reflex_err!(
+                Gguf,
+                "missing {architecture}.attention.head_count metadata key"
+            )
+        })? as usize;
     let num_kv_heads = u64_meta(file, &format!("{architecture}.attention.head_count_kv"))
         .unwrap_or(num_q_heads as u64) as usize;
     // Qwen3 (dense and MoE) decouples head_dim from hidden_size/num_q_heads via
@@ -172,12 +183,13 @@ pub fn parse_model_config(
     };
     let ffn_gate_info = file
         .tensor_info(ffn_gate_weight_name)
-        .ok_or_else(|| format!("missing {ffn_gate_weight_name} tensor"))?;
+        .ok_or_else(|| crate::reflex_err!(Gguf, "missing {ffn_gate_weight_name} tensor"))?;
     let ffn_hidden_size = match ffn_gate_info.shape.as_slice() {
         [_in_features, out_features] => *out_features as usize,
         [_in_features, out_features, _expert_count] => *out_features as usize,
         other => {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Gguf,
                 "{ffn_gate_weight_name} has unexpected shape {other:?}"
             ))
         }
@@ -220,13 +232,14 @@ pub(super) fn parse_hybrid_layer_kinds(
     file: &GgufFile,
     architecture: &str,
     block_count: usize,
-) -> Result<Vec<bool>, String> {
+) -> Result<Vec<bool>, ReflexError> {
     let key = |suffix: &str| format!("{architecture}.{suffix}");
     let recurrent_key = key("attention.recurrent_layers");
     match file.metadata.get(&recurrent_key) {
         Some(GgufValue::Array(items)) => {
             if items.len() != block_count {
-                return Err(format!(
+                return Err(crate::reflex_err!(
+                    Gguf,
                     "{recurrent_key} has {} entries but block_count is {block_count}",
                     items.len()
                 ));
@@ -235,21 +248,26 @@ pub(super) fn parse_hybrid_layer_kinds(
                 .iter()
                 .map(|v| match v {
                     GgufValue::Bool(b) => Ok(*b),
-                    other => other
-                        .as_u64()
-                        .map(|x| x != 0)
-                        .ok_or_else(|| format!("{recurrent_key} has non-boolean entry {other:?}")),
+                    other => other.as_u64().map(|x| x != 0).ok_or_else(|| {
+                        crate::reflex_err!(Gguf, "{recurrent_key} has non-boolean entry {other:?}")
+                    }),
                 })
                 .collect()
         }
-        Some(other) => Err(format!("{recurrent_key} must be an array, got {other:?}")),
+        Some(other) => Err(crate::reflex_err!(
+            Gguf,
+            "{recurrent_key} must be an array, got {other:?}"
+        )),
         None => {
             let interval_key = key("full_attention_interval");
             let interval = u64_meta(file, &interval_key).ok_or_else(|| {
-                format!("{architecture} model has neither {recurrent_key} nor {interval_key}")
+                crate::reflex_err!(
+                    Gguf,
+                    "{architecture} model has neither {recurrent_key} nor {interval_key}"
+                )
             })? as usize;
             if interval == 0 {
-                return Err(format!("{interval_key} must be > 0"));
+                return Err(crate::reflex_err!(Gguf, "{interval_key} must be > 0"));
             }
             Ok((0..block_count).map(|i| (i + 1) % interval != 0).collect())
         }
@@ -267,22 +285,24 @@ pub(super) fn parse_hybrid_layer_kinds(
 pub(super) fn parse_hybrid_moe_config(
     file: &GgufFile,
     architecture: &str,
-) -> Result<HybridMoeConfig, String> {
+) -> Result<HybridMoeConfig, ReflexError> {
     let key = |suffix: &str| format!("{architecture}.{suffix}");
     let expert_count = u64_meta(file, &key("expert_count"))
-        .ok_or_else(|| format!("missing {}", key("expert_count")))? as usize;
+        .ok_or_else(|| crate::reflex_err!(Gguf, "missing {}", key("expert_count")))?
+        as usize;
     let expert_used_count = u64_meta(file, &key("expert_used_count"))
-        .ok_or_else(|| format!("missing {}", key("expert_used_count")))?
+        .ok_or_else(|| crate::reflex_err!(Gguf, "missing {}", key("expert_used_count")))?
         as usize;
     if expert_used_count == 0 || expert_used_count > expert_count {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            Gguf,
             "{} ({expert_used_count}) must be in 1..={} ({expert_count})",
             key("expert_used_count"),
             key("expert_count")
         ));
     }
     if file.tensor_info("blk.0.ffn_gate_up_exps.weight").is_some() {
-        return Err(format!(
+        return Err(crate::reflex_err!(UnsupportedArchitecture,
             "{architecture} file has a fused ffn_gate_up_exps tensor, which is not supported \
              (reconvert with llama.cpp's convert_hf_to_gguf.py, which emits split ffn_gate_exps/ffn_up_exps)"
         ));
@@ -293,7 +313,8 @@ pub(super) fn parse_hybrid_moe_config(
             .tensor_info("blk.0.ffn_gate_exps.weight")
             .and_then(|info| info.shape.get(1).copied())
             .ok_or_else(|| {
-                format!(
+                crate::reflex_err!(
+                    Gguf,
                     "missing {} and blk.0.ffn_gate_exps.weight to derive it from",
                     key("expert_feed_forward_length")
                 )
@@ -318,54 +339,58 @@ pub(super) fn parse_hybrid_moe_config(
 /// precedent) on: Q-LoRA query decomposition (`attention.q_lora_rank` present and
 /// nonzero -- no real small file needing this has been seen yet), MTP/NextN
 /// blocks, and any RoPE scaling type other than `"none"`/`"yarn"`.
-pub(super) fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usize), String> {
+pub(super) fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usize), ReflexError> {
     let architecture = "deepseek2";
     let key = |suffix: &str| format!("{architecture}.{suffix}");
 
     let block_count = u64_meta(file, &key("block_count"))
-        .ok_or_else(|| format!("missing {}", key("block_count")))? as usize;
+        .ok_or_else(|| crate::reflex_err!(Gguf, "missing {}", key("block_count")))?
+        as usize;
 
     let nextn = u64_meta(file, &key("nextn_predict_layers")).unwrap_or(0);
     if nextn != 0 {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            Gguf,
             "{} MTP/NextN blocks (nextn_predict_layers={nextn}) are not supported by this MVP",
             key("nextn_predict_layers")
         ));
     }
 
     let leading_dense = u64_meta(file, &key("leading_dense_block_count"))
-        .ok_or_else(|| format!("missing {}", key("leading_dense_block_count")))?
+        .ok_or_else(|| crate::reflex_err!(Gguf, "missing {}", key("leading_dense_block_count")))?
         as usize;
 
     if u64_meta(file, &key("attention.q_lora_rank"))
         .filter(|&n| n > 0)
         .is_some()
     {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            Gguf,
             "{} (Q-LoRA query decomposition) is not supported by this MVP",
             key("attention.q_lora_rank")
         ));
     }
 
     let hidden_size = u64_meta(file, &key("embedding_length"))
-        .ok_or_else(|| format!("missing {}", key("embedding_length")))?
+        .ok_or_else(|| crate::reflex_err!(Gguf, "missing {}", key("embedding_length")))?
         as usize;
     let num_heads = u64_meta(file, &key("attention.head_count"))
-        .ok_or_else(|| format!("missing {}", key("attention.head_count")))?
+        .ok_or_else(|| crate::reflex_err!(Gguf, "missing {}", key("attention.head_count")))?
         as usize;
     let kv_lora_rank = u64_meta(file, &key("attention.kv_lora_rank"))
-        .ok_or_else(|| format!("missing {}", key("attention.kv_lora_rank")))?
+        .ok_or_else(|| crate::reflex_err!(Gguf, "missing {}", key("attention.kv_lora_rank")))?
         as usize;
     let n_embd_head_k_mla = u64_meta(file, &key("attention.key_length_mla"))
-        .ok_or_else(|| format!("missing {} (a legacy pre-MLA-split deepseek2 GGUF -- unsplit attn_kv_b, no key_length_mla/value_length_mla metadata -- is not supported by this MVP; reconvert from the original checkpoint with a current convert_hf_to_gguf.py)", key("attention.key_length_mla")))? as usize;
+        .ok_or_else(|| crate::reflex_err!(UnsupportedArchitecture, "missing {} (a legacy pre-MLA-split deepseek2 GGUF -- unsplit attn_kv_b, no key_length_mla/value_length_mla metadata -- is not supported by this MVP; reconvert from the original checkpoint with a current convert_hf_to_gguf.py)", key("attention.key_length_mla")))? as usize;
     let v_head_dim = u64_meta(file, &key("attention.value_length_mla"))
-        .ok_or_else(|| format!("missing {}", key("attention.value_length_mla")))?
+        .ok_or_else(|| crate::reflex_err!(Gguf, "missing {}", key("attention.value_length_mla")))?
         as usize;
     let qk_rope_head_dim = u64_meta(file, &key("rope.dimension_count"))
-        .ok_or_else(|| format!("missing {}", key("rope.dimension_count")))?
+        .ok_or_else(|| crate::reflex_err!(Gguf, "missing {}", key("rope.dimension_count")))?
         as usize;
     if n_embd_head_k_mla <= qk_rope_head_dim {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            Gguf,
             "{} ({n_embd_head_k_mla}) must be greater than {} ({qk_rope_head_dim})",
             key("attention.key_length_mla"),
             key("rope.dimension_count")
@@ -379,11 +404,12 @@ pub(super) fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usi
     // an all-MoE deepseek2 file (leading_dense == 0) is not supported.
     let ffn_gate_info = file
         .tensor_info("blk.0.ffn_gate.weight")
-        .ok_or("missing blk.0.ffn_gate.weight tensor (an all-MoE deepseek2 file, leading_dense_block_count == 0, is not supported by this MVP)")?;
+        .ok_or_else(|| ReflexError::UnsupportedArchitecture("missing blk.0.ffn_gate.weight tensor (an all-MoE deepseek2 file, leading_dense_block_count == 0, is not supported by this MVP)".to_string()))?;
     let ffn_hidden_size = match ffn_gate_info.shape.as_slice() {
         [_in_features, out_features] => *out_features as usize,
         other => {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Gguf,
                 "blk.0.ffn_gate.weight has unexpected shape {other:?}"
             ))
         }
@@ -395,11 +421,12 @@ pub(super) fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usi
     // producing a wrong-sized attention output deep in the forward pass.
     let wv_b_info = file
         .tensor_info("blk.0.attn_v_b.weight")
-        .ok_or("missing blk.0.attn_v_b.weight tensor")?;
+        .ok_or_else(|| ReflexError::Gguf("missing blk.0.attn_v_b.weight tensor".to_string()))?;
     match wv_b_info.shape.as_slice() {
         [_in_features, out_features, _n_head] if *out_features as usize == v_head_dim => {}
         other => {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Gguf,
                 "blk.0.attn_v_b.weight shape {other:?} doesn't match {} ({v_head_dim})",
                 key("attention.value_length_mla")
             ))
@@ -408,18 +435,25 @@ pub(super) fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usi
 
     let moe = if leading_dense < block_count {
         let expert_used_count = u64_meta(file, &key("expert_used_count")).ok_or_else(|| {
-            format!(
+            crate::reflex_err!(
+                Gguf,
                 "missing {} (expert_count > 0 implied by leading_dense_block_count < block_count)",
                 key("expert_used_count")
             )
         })? as usize;
         let ffn_gate_exps_info = file
             .tensor_info(&format!("blk.{leading_dense}.ffn_gate_exps.weight"))
-            .ok_or_else(|| format!("missing blk.{leading_dense}.ffn_gate_exps.weight tensor"))?;
+            .ok_or_else(|| {
+                crate::reflex_err!(
+                    Gguf,
+                    "missing blk.{leading_dense}.ffn_gate_exps.weight tensor"
+                )
+            })?;
         let n_ff_exp = match ffn_gate_exps_info.shape.as_slice() {
             [_in_features, out_features, _expert_count] => *out_features as usize,
             other => {
-                return Err(format!(
+                return Err(crate::reflex_err!(
+                    Gguf,
                     "blk.{leading_dense}.ffn_gate_exps.weight has unexpected shape {other:?}"
                 ))
             }
@@ -449,11 +483,17 @@ pub(super) fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usi
     let yarn = match rope_scaling_type {
         None | Some("none") => None,
         Some("yarn") => {
-            let factor = f32_meta(file, &key("rope.scaling.factor"))
-                .ok_or_else(|| format!("missing {}", key("rope.scaling.factor")))?;
+            let factor = f32_meta(file, &key("rope.scaling.factor")).ok_or_else(|| {
+                crate::reflex_err!(Gguf, "missing {}", key("rope.scaling.factor"))
+            })?;
             let orig_ctx_len = u64_meta(file, &key("rope.scaling.original_context_length"))
-                .ok_or_else(|| format!("missing {}", key("rope.scaling.original_context_length")))?
-                as f32;
+                .ok_or_else(|| {
+                    crate::reflex_err!(
+                        Gguf,
+                        "missing {}",
+                        key("rope.scaling.original_context_length")
+                    )
+                })? as f32;
             // llama.cpp's own CLI-settable defaults (32.0/1.0), used when the GGUF
             // doesn't override them -- real DeepSeek-V2-Lite doesn't set these keys
             // either, relying on the same defaults.
@@ -502,7 +542,8 @@ pub(super) fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usi
             })
         }
         Some(other) => {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Gguf,
                 "{} = {other:?} (only \"none\"/\"yarn\" RoPE scaling is supported by this MVP)",
                 key("rope.scaling.type")
             ))

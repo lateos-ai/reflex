@@ -2,6 +2,7 @@
 //! lazy token embedding.
 
 use super::*;
+use crate::error::ReflexError;
 
 /// A weight tensor, dequantized to `f32` once at load time and uploaded to
 /// device memory immediately after (see `Model::load`'s `load_weight`) so
@@ -57,12 +58,16 @@ pub(super) struct LazyTokenEmbedding {
 impl LazyTokenEmbedding {
     /// `shape` is `token_embd.weight`'s GGUF shape, `[hidden_size,
     /// vocab_size]` (row-major `(vocab_size, hidden_size)` flat data).
-    pub(super) fn new(ggml_type: GgmlType, raw: Vec<u8>, shape: &[u64]) -> Result<Self, String> {
+    pub(super) fn new(
+        ggml_type: GgmlType,
+        raw: Vec<u8>,
+        shape: &[u64],
+    ) -> Result<Self, ReflexError> {
         let hidden_size = shape[0] as usize;
         let vocab_size = shape[1] as usize;
         let (block_size, block_bytes) = crate::gguf::ggml_type_block_dims(ggml_type)?;
         if !(hidden_size as u64).is_multiple_of(block_size) {
-            return Err(format!(
+            return Err(crate::reflex_err!(Gguf,
                 "token_embd row width {hidden_size} is not a multiple of {ggml_type:?}'s block size {block_size}"
             ));
         }
@@ -87,9 +92,10 @@ impl LazyTokenEmbedding {
 
     /// Dequantizes (or returns the already-cached decode of) row `token_id`
     /// -- `hidden_size` contiguous `f32`s.
-    pub(super) fn row(&self, token_id: u32) -> Result<std::cell::Ref<'_, [f32]>, String> {
+    pub(super) fn row(&self, token_id: u32) -> Result<std::cell::Ref<'_, [f32]>, ReflexError> {
         if token_id as usize >= self.vocab_size {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Other,
                 "token id {token_id} out of range (vocab_size={})",
                 self.vocab_size
             ));
@@ -98,7 +104,7 @@ impl LazyTokenEmbedding {
             let start = token_id as usize * self.row_bytes;
             let end = start + self.row_bytes;
             let block = self.raw.get(start..end).ok_or_else(|| {
-                format!(
+                crate::reflex_err!(Gguf,
                     "token_embd row {token_id} byte range {start}..{end} exceeds raw buffer length {}",
                     self.raw.len()
                 )
@@ -229,7 +235,9 @@ pub(super) struct DequantKernels {
 /// Loads every on-device dequant kernel from the AOT-compiled `dequant`
 /// module in one call -- shared by `Model::load`/`load_hybrid`/`load_mla`,
 /// which each used to repeat this loading boilerplate individually.
-pub(super) fn load_dequant_kernels(device: &Arc<CudaDevice>) -> Result<DequantKernels, String> {
+pub(super) fn load_dequant_kernels(
+    device: &Arc<CudaDevice>,
+) -> Result<DequantKernels, ReflexError> {
     let names = [
         "dequantize_q4k_kernel",
         "dequantize_q5k_kernel",
@@ -260,26 +268,66 @@ pub(super) fn load_dequant_kernels(device: &Arc<CudaDevice>) -> Result<DequantKe
     )?
     .into_iter();
     Ok(DequantKernels {
-        q4k: fns.next().ok_or("missing dequantize_q4k_kernel")?,
-        q5k: fns.next().ok_or("missing dequantize_q5k_kernel")?,
-        q6k: fns.next().ok_or("missing dequantize_q6k_kernel")?,
-        q4_0: fns.next().ok_or("missing dequantize_q4_0_kernel")?,
-        q4_1: fns.next().ok_or("missing dequantize_q4_1_kernel")?,
-        q5_0: fns.next().ok_or("missing dequantize_q5_0_kernel")?,
-        q5_1: fns.next().ok_or("missing dequantize_q5_1_kernel")?,
-        q8_0: fns.next().ok_or("missing dequantize_q8_0_kernel")?,
-        q8_1: fns.next().ok_or("missing dequantize_q8_1_kernel")?,
-        q2k: fns.next().ok_or("missing dequantize_q2k_kernel")?,
-        q3k: fns.next().ok_or("missing dequantize_q3k_kernel")?,
-        q8k: fns.next().ok_or("missing dequantize_q8k_kernel")?,
-        iq2xxs: fns.next().ok_or("missing dequantize_iq2xxs_kernel")?,
-        iq2xs: fns.next().ok_or("missing dequantize_iq2xs_kernel")?,
-        iq2s: fns.next().ok_or("missing dequantize_iq2s_kernel")?,
-        iq3xxs: fns.next().ok_or("missing dequantize_iq3xxs_kernel")?,
-        iq3s: fns.next().ok_or("missing dequantize_iq3s_kernel")?,
-        iq1s: fns.next().ok_or("missing dequantize_iq1s_kernel")?,
-        iq1m: fns.next().ok_or("missing dequantize_iq1m_kernel")?,
-        iq4xs: fns.next().ok_or("missing dequantize_iq4xs_kernel")?,
+        q4k: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_q4k_kernel".to_string()))?,
+        q5k: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_q5k_kernel".to_string()))?,
+        q6k: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_q6k_kernel".to_string()))?,
+        q4_0: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_q4_0_kernel".to_string()))?,
+        q4_1: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_q4_1_kernel".to_string()))?,
+        q5_0: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_q5_0_kernel".to_string()))?,
+        q5_1: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_q5_1_kernel".to_string()))?,
+        q8_0: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_q8_0_kernel".to_string()))?,
+        q8_1: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_q8_1_kernel".to_string()))?,
+        q2k: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_q2k_kernel".to_string()))?,
+        q3k: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_q3k_kernel".to_string()))?,
+        q8k: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_q8k_kernel".to_string()))?,
+        iq2xxs: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_iq2xxs_kernel".to_string()))?,
+        iq2xs: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_iq2xs_kernel".to_string()))?,
+        iq2s: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_iq2s_kernel".to_string()))?,
+        iq3xxs: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_iq3xxs_kernel".to_string()))?,
+        iq3s: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_iq3s_kernel".to_string()))?,
+        iq1s: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_iq1s_kernel".to_string()))?,
+        iq1m: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_iq1m_kernel".to_string()))?,
+        iq4xs: fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing dequantize_iq4xs_kernel".to_string()))?,
     })
 }
 
@@ -316,7 +364,7 @@ impl PinnedHostBuffer {
     /// current allocation -- [`WeightLoadPipeline::dequantize`] only grows
     /// a slot right after waiting for that slot's prior kernel (which also
     /// covers the copy that fed it) to finish.
-    unsafe fn ensure_capacity(&mut self, len: usize) -> Result<(), String> {
+    unsafe fn ensure_capacity(&mut self, len: usize) -> Result<(), ReflexError> {
         if len <= self.cap {
             return Ok(());
         }
@@ -325,7 +373,7 @@ impl PinnedHostBuffer {
         sys::lib()
             .cuMemHostAlloc(&mut raw_ptr, len, 0)
             .result()
-            .map_err(|e| format!("cuMemHostAlloc({len} bytes): {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "cuMemHostAlloc({len} bytes): {e}"))?;
         self.ptr = raw_ptr as *mut u8;
         self.cap = len;
         Ok(())
@@ -431,12 +479,12 @@ pub(super) struct WeightLoadPipeline {
 }
 
 impl WeightLoadPipeline {
-    pub(super) fn new(device: &Arc<CudaDevice>) -> Result<Self, String> {
+    pub(super) fn new(device: &Arc<CudaDevice>) -> Result<Self, ReflexError> {
         let copy_stream = result::stream::create(result::stream::StreamKind::NonBlocking)
-            .map_err(|e| format!("create pipeline copy stream: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "create pipeline copy stream: {e}"))?;
         let mk_event = || {
             result::event::create(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
-                .map_err(|e| format!("create pipeline event: {e}"))
+                .map_err(|e| crate::gpu_err!(e, "create pipeline event: {e}"))
         };
         Ok(Self {
             device: device.clone(),
@@ -458,17 +506,21 @@ impl WeightLoadPipeline {
     /// which both retires the old buffer's readers and guarantees the new
     /// stream-ordered allocation is materialized before `copy_stream`
     /// writes into it.
-    pub(super) fn ensure_raw_capacity(&mut self, slot: usize, len: usize) -> Result<(), String> {
+    pub(super) fn ensure_raw_capacity(
+        &mut self,
+        slot: usize,
+        len: usize,
+    ) -> Result<(), ReflexError> {
         if len <= self.raw_cap[slot] {
             return Ok(());
         }
         let buf = unsafe { self.device.alloc::<u8>(len) }
-            .map_err(|e| format!("alloc device staging buffer: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "alloc device staging buffer: {e}"))?;
         self.raw_dev[slot] = Some(buf);
         self.raw_cap[slot] = len;
         self.device
             .synchronize()
-            .map_err(|e| format!("pipeline: sync after staging-buffer growth: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "pipeline: sync after staging-buffer growth: {e}"))?;
         Ok(())
     }
 
@@ -483,7 +535,7 @@ impl WeightLoadPipeline {
         block_elems: usize,
         bytes: &[u8],
         element_count: u64,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let slot = self.next % 2;
         self.next += 1;
         let compute_stream = *self.device.cu_stream();
@@ -495,7 +547,9 @@ impl WeightLoadPipeline {
         if self.slot_used[slot] {
             unsafe { sys::lib().cuEventSynchronize(self.copy_done[slot]) }
                 .result()
-                .map_err(|e| format!("pipeline: await slot {slot}'s prior H2D copy: {e}"))?;
+                .map_err(|e| {
+                    crate::gpu_err!(e, "pipeline: await slot {slot}'s prior H2D copy: {e}")
+                })?;
         }
 
         // GPU-side wait -- step 2: this slot's device staging buffer is
@@ -509,7 +563,9 @@ impl WeightLoadPipeline {
                     sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
                 )
             }
-            .map_err(|e| format!("pipeline: wait for slot {slot}'s prior kernel: {e}"))?;
+            .map_err(|e| {
+                crate::gpu_err!(e, "pipeline: wait for slot {slot}'s prior kernel: {e}")
+            })?;
         }
 
         unsafe {
@@ -529,9 +585,9 @@ impl WeightLoadPipeline {
                 self.copy_stream,
             )
         }
-        .map_err(|e| format!("pipeline: async H2D copy: {e}"))?;
+        .map_err(|e| crate::gpu_err!(e, "pipeline: async H2D copy: {e}"))?;
         unsafe { result::event::record(self.copy_done[slot], self.copy_stream) }
-            .map_err(|e| format!("pipeline: record copy_done: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "pipeline: record copy_done: {e}"))?;
         self.slot_used[slot] = true;
         unsafe {
             result::stream::wait_event(
@@ -540,12 +596,12 @@ impl WeightLoadPipeline {
                 sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
             )
         }
-        .map_err(|e| format!("pipeline: wait for copy_done: {e}"))?;
+        .map_err(|e| crate::gpu_err!(e, "pipeline: wait for copy_done: {e}"))?;
 
         let num_blocks = bytes.len() / block_bytes;
         let out_len = num_blocks * block_elems;
         let mut dev_out = unsafe { self.device.alloc::<f32>(out_len) }
-            .map_err(|e| format!("alloc dequant output: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "alloc dequant output: {e}"))?;
 
         let threads = 256u32;
         let blocks = (num_blocks as u32).div_ceil(threads).max(1);
@@ -562,28 +618,28 @@ impl WeightLoadPipeline {
                 .function
                 .clone()
                 .launch(launch_cfg, (raw, &mut dev_out, num_blocks as u32))
-                .map_err(|e| format!("dequant kernel launch: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "dequant kernel launch: {e}"))?;
         }
 
         if self.kernel_done[slot].is_none() {
             let ev = result::event::create(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
-                .map_err(|e| format!("create pipeline kernel_done event: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "create pipeline kernel_done event: {e}"))?;
             self.kernel_done[slot] = Some(ev);
         }
         let kdone = self.kernel_done[slot].expect("kernel_done[slot] was just set");
         unsafe { result::event::record(kdone, compute_stream) }
-            .map_err(|e| format!("pipeline: record kernel_done: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "pipeline: record kernel_done: {e}"))?;
 
         if out_len as u64 == element_count {
             return Ok(dev_out);
         }
         let n = element_count as usize;
         let mut truncated = unsafe { self.device.alloc::<f32>(n) }
-            .map_err(|e| format!("alloc truncated dequant output: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "alloc truncated dequant output: {e}"))?;
         let src = dev_out.slice(0..n);
         self.device
             .dtod_copy(&src, &mut truncated)
-            .map_err(|e| format!("truncate dequant output: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "truncate dequant output: {e}"))?;
         Ok(truncated)
     }
 }
@@ -624,7 +680,7 @@ pub(super) fn dequantize_tensor_to_device(
     ggml_type: GgmlType,
     bytes: &[u8],
     element_count: u64,
-) -> Result<CudaSlice<f32>, String> {
+) -> Result<CudaSlice<f32>, ReflexError> {
     match ggml_type {
         GgmlType::Q4K => {
             pipeline.dequantize(&kernels.q4k, Q4K_BLOCK_BYTES, QK_K, bytes, element_count)
@@ -731,7 +787,7 @@ pub(super) fn dequantize_tensor_to_device(
             pipeline
                 .device
                 .htod_sync_copy(&host)
-                .map_err(|e| format!("upload weight to device: {e}"))
+                .map_err(|e| crate::gpu_err!(e, "upload weight to device: {e}"))
         }
     }
 }
@@ -745,10 +801,10 @@ pub(super) fn load_weight_device(
     kernels: &DequantKernels,
     file: &GgufFile,
     name: &str,
-) -> Result<Weight, String> {
+) -> Result<Weight, ReflexError> {
     let info = file
         .tensor_info(name)
-        .ok_or_else(|| format!("missing weight '{name}'"))?;
+        .ok_or_else(|| crate::reflex_err!(Gguf, "missing weight '{name}'"))?;
     let bytes = file.tensor_bytes(info)?;
     let data = dequantize_tensor_to_device(
         pipeline,
@@ -757,7 +813,7 @@ pub(super) fn load_weight_device(
         bytes,
         info.element_count(),
     )
-    .map_err(|e| format!("load weight '{name}': {e}"))?;
+    .map_err(|e| e.rewrap(format!("load weight '{name}': {e}")))?;
     Ok(Weight {
         data,
         shape: info.shape.clone(),

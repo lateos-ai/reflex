@@ -88,6 +88,7 @@ use self::dense::*;
 use self::hybrid::*;
 use self::loading::*;
 use self::mla::*;
+use crate::error::ReflexError;
 
 #[cfg(test)]
 mod hybrid_batching_tests;
@@ -274,7 +275,7 @@ impl Model {
     /// (BOS not included) -- a narrow, derived-value accessor for callers
     /// like `reflex bench` that need to report actual prompt length,
     /// without exposing the private `tokenizer` field itself.
-    pub fn encoded_prompt_len(&self, prompt: &str) -> Result<usize, String> {
+    pub fn encoded_prompt_len(&self, prompt: &str) -> Result<usize, ReflexError> {
         Ok(self.tokenizer.encode(prompt)?.len())
     }
 
@@ -312,13 +313,13 @@ impl Model {
     /// adapter tensor that doesn't resolve to a supported base weight, or
     /// whose shape doesn't match that weight's, is a hard error -- never a
     /// silent skip.
-    pub fn apply_lora(&mut self, path: &std::path::Path) -> Result<usize, String> {
+    pub fn apply_lora(&mut self, path: &std::path::Path) -> Result<usize, ReflexError> {
         if self.mla.is_some() {
-            return Err(
+            return Err(ReflexError::Lora(
                 "--lora is not supported for DeepSeek-V2/V3 MLA models in this round -- only dense/MoE Qwen3 \
                  and the Qwen3.5 hybrid architecture are supported LoRA base models"
                     .to_string(),
-            );
+            ));
         }
 
         let adapter = lora::load(path)?;
@@ -333,10 +334,10 @@ impl Model {
         for target in &adapter.targets {
             let delta_dev = device
                 .htod_sync_copy(&target.delta)
-                .map_err(|e| format!("upload LoRA delta for '{}': {e}", target.name))?;
+                .map_err(|e| crate::gpu_err!(e, "upload LoRA delta for '{}': {e}", target.name))?;
 
             let weight = self.find_lora_target_mut(&target.name).ok_or_else(|| {
-                format!(
+                crate::reflex_err!(Lora,
                     "LoRA adapter targets '{}' but this project's Model has no matching weight for it \
                      (dense/MoE attention+FFN including MoE's per-expert-stacked ffn_*_exps tensors, Qwen3.5 \
                      hybrid Gated-Attention-layer tensors, and the hybrid Gated DeltaNet mixer's \
@@ -360,7 +361,7 @@ impl Model {
                 _ => false,
             };
             if !shape_ok {
-                return Err(format!(
+                return Err(crate::reflex_err!(Lora,
                     "LoRA adapter tensor '{}' has shape [in={}, out={}, experts={:?}] but the base model's tensor has shape {:?} -- wrong base model?",
                     target.name, target.in_features, target.out_features, target.expert_count, weight.shape
                 ));
@@ -378,13 +379,15 @@ impl Model {
                 add_fn
                     .clone()
                     .launch(launch_cfg, (&mut weight.data, &delta_dev, n))
-                    .map_err(|e| format!("LoRA add launch for '{}': {e}", target.name))?;
+                    .map_err(|e| {
+                        crate::gpu_err!(e, "LoRA add launch for '{}': {e}", target.name)
+                    })?;
             }
             applied += 1;
         }
 
         if applied == 0 {
-            return Err("LoRA adapter matched no tensors in the base model -- check it targets a compatible architecture/checkpoint".to_string());
+            return Err(ReflexError::Lora("LoRA adapter matched no tensors in the base model -- check it targets a compatible architecture/checkpoint".to_string()));
         }
         Ok(applied)
     }
@@ -469,7 +472,7 @@ impl Model {
         }
     }
 
-    pub fn load(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
+    pub fn load(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, ReflexError> {
         diagnostics::check_kernel_compute_capability(&device)?;
         let architecture = file
             .metadata
@@ -497,9 +500,10 @@ impl Model {
     fn load_background_init(
         file: &GgufFile,
         device: Arc<CudaDevice>,
-    ) -> Result<(Tokenizer, CudaBlas), String> {
+    ) -> Result<(Tokenizer, CudaBlas), ReflexError> {
         let tokenizer = Tokenizer::from_gguf(file)?;
-        let cublas = CudaBlas::new(device).map_err(|e| format!("cublas handle: {e:?}"))?;
+        let cublas =
+            CudaBlas::new(device).map_err(|e| crate::gpu_err!(e, "cublas handle: {e:?}"))?;
         unsafe {
             cublas_sys::lib()
                 .cublasSetMathMode(
@@ -507,7 +511,7 @@ impl Model {
                     cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH,
                 )
                 .result()
-                .map_err(|e| format!("cublasSetMathMode: {e:?}"))?;
+                .map_err(|e| crate::gpu_err!(e, "cublasSetMathMode: {e:?}"))?;
         }
         Ok((tokenizer, cublas))
     }
@@ -516,7 +520,7 @@ impl Model {
     /// (real causal self-attention throughout, matching RustFeference's own
     /// documented scope choice for its minimal forward pass), and returns
     /// the argmax-sampled first generated token id plus its decoded text.
-    pub fn forward_prompt(&self, prompt: &str) -> Result<(u32, String), String> {
+    pub fn forward_prompt(&self, prompt: &str) -> Result<(u32, String), ReflexError> {
         if let Some(h) = &self.hybrid {
             return self.forward_prompt_hybrid(h, prompt);
         }
@@ -571,11 +575,11 @@ impl Model {
         sampling: &SamplingParams,
         on_first_token: impl FnMut(&[f32]),
         on_token: impl FnMut(u32, &str),
-    ) -> Result<(Vec<u32>, String), String> {
+    ) -> Result<(Vec<u32>, String), ReflexError> {
         match imported {
             Some(crate::kv_io::ImportedKv::Dense(cache)) => {
                 if self.hybrid.is_some() || self.mla.is_some() {
-                    return Err("imported KV cache file is dense/MoE format, but this model is not a dense/MoE Qwen3 model".to_string());
+                    return Err(ReflexError::KvCache("imported KV cache file is dense/MoE format, but this model is not a dense/MoE Qwen3 model".to_string()));
                 }
                 let (generated, text, _, _, _) = self.generate_dense_impl(
                     prompt,
@@ -591,7 +595,7 @@ impl Model {
                 let h = self
                     .hybrid
                     .as_ref()
-                    .ok_or("imported KV cache file is hybrid format, but this model is not a Qwen3.5 hybrid model")?;
+                    .ok_or_else(|| ReflexError::KvCache("imported KV cache file is hybrid format, but this model is not a Qwen3.5 hybrid model".to_string()))?;
                 let (generated, text, _, _) = self.generate_hybrid_impl(
                     h,
                     prompt,
@@ -668,16 +672,16 @@ impl Model {
         hidden_batched: &CudaSlice<f32>,
         rows: usize,
         hidden_size: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let offset = (rows - 1) * hidden_size;
         let mut out = self
             .device
             .alloc_zeros::<f32>(hidden_size)
-            .map_err(|e| format!("last_row alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "last_row alloc: {e}"))?;
         let src = hidden_batched.slice(offset..offset + hidden_size);
         self.device
             .dtod_copy(&src, &mut out)
-            .map_err(|e| format!("last_row dtod: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "last_row dtod: {e}"))?;
         Ok(out)
     }
 
@@ -692,16 +696,16 @@ impl Model {
         batched: &CudaSlice<f32>,
         row: usize,
         hidden_size: usize,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let offset = row * hidden_size;
         let mut out = self
             .device
             .alloc_zeros::<f32>(hidden_size)
-            .map_err(|e| format!("extract_row alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "extract_row alloc: {e}"))?;
         let src = batched.slice(offset..offset + hidden_size);
         self.device
             .dtod_copy(&src, &mut out)
-            .map_err(|e| format!("extract_row dtod: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "extract_row dtod: {e}"))?;
         Ok(out)
     }
 
@@ -715,12 +719,12 @@ impl Model {
         row: usize,
         hidden_size: usize,
         src: &CudaSlice<f32>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReflexError> {
         let offset = row * hidden_size;
         let mut dst = batched.slice_mut(offset..offset + hidden_size);
         self.device
             .dtod_copy(src, &mut dst)
-            .map_err(|e| format!("write_row dtod: {e}"))
+            .map_err(|e| crate::gpu_err!(e, "write_row dtod: {e}"))
     }
 
     /// Resolves `candidate`'s actual continuation token ids given `prompt`,
@@ -735,11 +739,11 @@ impl Model {
         &self,
         prompt: &str,
         candidate: &str,
-    ) -> Result<Vec<u32>, String> {
+    ) -> Result<Vec<u32>, ReflexError> {
         let prompt_ids = self.tokenizer.encode(prompt)?;
         let full_ids = self.tokenizer.encode(&format!("{prompt}{candidate}"))?;
         if full_ids.len() <= prompt_ids.len() || full_ids[..prompt_ids.len()] != prompt_ids[..] {
-            return Err(format!("system1: candidate {candidate:?} does not tokenize as a clean continuation of the prompt"));
+            return Err(crate::reflex_err!(InvalidInput, "system1: candidate {candidate:?} does not tokenize as a clean continuation of the prompt"));
         }
         Ok(full_ids[prompt_ids.len()..].to_vec())
     }
@@ -771,7 +775,7 @@ impl Model {
         prompt: &str,
         candidates: &[System1Candidate],
         temperature: f32,
-    ) -> Result<System1Response, String> {
+    ) -> Result<System1Response, ReflexError> {
         if let Some(h) = &self.hybrid {
             return self.system1_evaluate_hybrid(h, prompt, candidates, temperature);
         }
@@ -792,7 +796,7 @@ impl Model {
         resolved: Vec<Vec<u32>>,
         scores: Vec<f32>,
         temperature: f32,
-    ) -> Result<System1Response, String> {
+    ) -> Result<System1Response, ReflexError> {
         let probabilities =
             crate::calibration::softmax_scores_with_temperature(&scores, temperature)?;
         let entropy = crate::calibration::shannon_entropy(&probabilities)?;
@@ -826,7 +830,7 @@ impl Model {
         hidden: &CudaSlice<f32>,
         hidden_size: usize,
         eps: f32,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, ReflexError> {
         let logits = self.lm_head_logits(hidden, hidden_size, eps)?;
         Self::argmax(&logits)
     }
@@ -843,12 +847,12 @@ impl Model {
         hidden: &CudaSlice<f32>,
         hidden_size: usize,
         eps: f32,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<Vec<f32>, ReflexError> {
         let normed = self.rmsnorm(hidden, &self.output_norm.data, 1, hidden_size, eps)?;
         let logits_dev = self.gemv(&normed, self.lm_head_resident()?)?;
         self.device
             .dtoh_sync_copy(&logits_dev)
-            .map_err(|e| format!("logits dtoh: {e}"))
+            .map_err(|e| crate::gpu_err!(e, "logits dtoh: {e}"))
     }
 
     /// Forces the LM head fully device-resident, on-device-dequantizing
@@ -867,7 +871,7 @@ impl Model {
     /// never runs more than one request at a time (`batch_size` is a
     /// permanent constraint, see docs/DEVELOPMENT.md's Non-goals) -- there is never a
     /// second caller to race against.
-    fn lm_head_resident(&self) -> Result<&Weight, String> {
+    fn lm_head_resident(&self) -> Result<&Weight, ReflexError> {
         match &self.lm_head {
             LmHead::Resident(w) => Ok(w),
             LmHead::TiedLazy { shape, cell } => {
@@ -883,7 +887,9 @@ impl Model {
                     &self.token_embd.raw,
                     element_count,
                 )
-                .map_err(|e| format!("upload weight 'token_embd.weight' to device: {e}"))?;
+                .map_err(|e| {
+                    e.rewrap(format!("upload weight 'token_embd.weight' to device: {e}"))
+                })?;
                 let _ = cell.set(Weight {
                     data,
                     shape: shape.clone(),
@@ -911,7 +917,7 @@ impl Model {
         &self,
         x: &CudaSlice<f32>,
         row_indices: &[u32],
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<Vec<f32>, ReflexError> {
         let (shape, cell) = match &self.lm_head {
             LmHead::Resident(w) => return self.gemv_gather(x, w, row_indices),
             LmHead::TiedLazy { shape, cell } => (shape, cell),
@@ -923,7 +929,8 @@ impl Model {
         let hidden_size = shape[0] as usize;
         let vocab_size = shape[1] as usize;
         if let Some(&bad) = row_indices.iter().find(|&&r| r as usize >= vocab_size) {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Other,
                 "gemv_gather_lm_head: row index {bad} out of range (vocab_size={vocab_size})"
             ));
         }
@@ -934,7 +941,7 @@ impl Model {
         let dev_compact = self
             .device
             .htod_sync_copy(&compact)
-            .map_err(|e| format!("gemv_gather_lm_head upload compact rows: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "gemv_gather_lm_head upload compact rows: {e}"))?;
         let compact_w = Weight {
             data: dev_compact,
             shape: vec![hidden_size as u64, row_indices.len() as u64],
@@ -945,12 +952,14 @@ impl Model {
 
     /// `pub(crate)` (not private) so [`crate::sampling::sample`]'s greedy
     /// path can delegate straight here instead of duplicating this scan.
-    pub(crate) fn argmax(logits: &[f32]) -> Result<u32, String> {
+    pub(crate) fn argmax(logits: &[f32]) -> Result<u32, ReflexError> {
         logits
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i as u32)
-            .ok_or_else(|| "cannot argmax an empty logits slice".to_string())
+            .ok_or_else(|| {
+                ReflexError::InvalidInput("cannot argmax an empty logits slice".to_string())
+            })
     }
 }

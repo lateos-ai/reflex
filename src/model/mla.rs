@@ -1,6 +1,7 @@
 //! DeepSeek-V2/V3 Multi-head Latent Attention models: loading and forward passes.
 
 use super::*;
+use crate::error::ReflexError;
 
 /// MLA prefill result: encoded prompt ids, the final position's hidden
 /// state, the filled per-layer compressed-latent K/V caches, and the next
@@ -119,7 +120,7 @@ impl Model {
     /// the scope this supports. `cfg`/`layers`/`expert_used_count` below are
     /// unused garbage (matching the `hybrid` path's own convention) --
     /// `forward_prompt` branches on `self.mla` before touching them.
-    pub(super) fn load_mla(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, String> {
+    pub(super) fn load_mla(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, ReflexError> {
         std::thread::scope(|scope| {
             let init_device = device.clone();
             let init = scope.spawn(move || Self::load_background_init(file, init_device));
@@ -130,8 +131,8 @@ impl Model {
     pub(super) fn load_mla_inner<'scope>(
         device: Arc<CudaDevice>,
         file: &GgufFile,
-        init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), String>>,
-    ) -> Result<Self, String> {
+        init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), ReflexError>>,
+    ) -> Result<Self, ReflexError> {
         let (mla_cfg, block_count, leading_dense) = parse_mla_config(file)?;
 
         let rmsnorm_k = aot::load_kernel(
@@ -147,8 +148,12 @@ impl Model {
             &["rope_kernel", "rope_batch_kernel"],
         )?
         .into_iter();
-        let rope_k = rope_fns.next().ok_or("missing rope_kernel")?;
-        let rope_batch_k = rope_fns.next().ok_or("missing rope_batch_kernel")?;
+        let rope_k = rope_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing rope_kernel".to_string()))?;
+        let rope_batch_k = rope_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing rope_batch_kernel".to_string()))?;
         let silu_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")),
@@ -195,24 +200,30 @@ impl Model {
             ],
         )?
         .into_iter();
-        let add_k = elementwise_fns.next().ok_or("missing add_kernel")?;
-        let split_qg_k = elementwise_fns.next().ok_or("missing split_qg_kernel")?;
+        let add_k = elementwise_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing add_kernel".to_string()))?;
+        let split_qg_k = elementwise_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing split_qg_kernel".to_string()))?;
         let sigmoid_gate_k = elementwise_fns
             .next()
-            .ok_or("missing sigmoid_gate_kernel")?;
+            .ok_or_else(|| ReflexError::Other("missing sigmoid_gate_kernel".to_string()))?;
         let mla_extract_batch_k = elementwise_fns
             .next()
-            .ok_or("missing mla_extract_batch_kernel")?;
-        let mla_concat_qcur_batch_k = elementwise_fns
+            .ok_or_else(|| ReflexError::Other("missing mla_extract_batch_kernel".to_string()))?;
+        let mla_concat_qcur_batch_k = elementwise_fns.next().ok_or_else(|| {
+            ReflexError::Other("missing mla_concat_qcur_batch_kernel".to_string())
+        })?;
+        let mla_write_kv_cache_batch_k = elementwise_fns.next().ok_or_else(|| {
+            ReflexError::Other("missing mla_write_kv_cache_batch_kernel".to_string())
+        })?;
+        let moe_gather_k = elementwise_fns
             .next()
-            .ok_or("missing mla_concat_qcur_batch_kernel")?;
-        let mla_write_kv_cache_batch_k = elementwise_fns
-            .next()
-            .ok_or("missing mla_write_kv_cache_batch_kernel")?;
-        let moe_gather_k = elementwise_fns.next().ok_or("missing moe_gather_kernel")?;
+            .ok_or_else(|| ReflexError::Other("missing moe_gather_kernel".to_string()))?;
         let moe_scatter_add_k = elementwise_fns
             .next()
-            .ok_or("missing moe_scatter_add_kernel")?;
+            .ok_or_else(|| ReflexError::Other("missing moe_scatter_add_kernel".to_string()))?;
         let mla_attn_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_MLA_ATTENTION")),
@@ -237,16 +248,18 @@ impl Model {
             ],
         )?
         .into_iter();
-        let rope_norm_k = rope_norm_fns.next().ok_or("missing rope_norm_kernel")?;
+        let rope_norm_k = rope_norm_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing rope_norm_kernel".to_string()))?;
         let rope_norm_yarn_k = rope_norm_fns
             .next()
-            .ok_or("missing rope_norm_yarn_kernel")?;
+            .ok_or_else(|| ReflexError::Other("missing rope_norm_yarn_kernel".to_string()))?;
         let rope_norm_batch_k = rope_norm_fns
             .next()
-            .ok_or("missing rope_norm_batch_kernel")?;
+            .ok_or_else(|| ReflexError::Other("missing rope_norm_batch_kernel".to_string()))?;
         let rope_norm_yarn_batch_k = rope_norm_fns
             .next()
-            .ok_or("missing rope_norm_yarn_batch_kernel")?;
+            .ok_or_else(|| ReflexError::Other("missing rope_norm_yarn_batch_kernel".to_string()))?;
         let gemv_per_head_batch_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_GEMV_PER_HEAD_BATCH")),
@@ -256,7 +269,7 @@ impl Model {
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
 
-        let mut load_weight = |name: &str| -> Result<Weight, String> {
+        let mut load_weight = |name: &str| -> Result<Weight, ReflexError> {
             load_weight_device(&mut pipeline, &dequant_kernels, file, name)
         };
 
@@ -323,7 +336,7 @@ impl Model {
                     bytes,
                     info.element_count(),
                 )
-                .map_err(|e| format!("load weight 'output.weight': {e}"))?;
+                .map_err(|e| e.rewrap(format!("load weight 'output.weight': {e}")))?;
                 LmHead::Resident(Weight {
                     data,
                     shape: info.shape.clone(),
@@ -337,7 +350,7 @@ impl Model {
                     &token_embd.raw,
                     token_embd_info.element_count(),
                 )
-                .map_err(|e| format!("load weight 'token_embd.weight': {e}"))?;
+                .map_err(|e| e.rewrap(format!("load weight 'token_embd.weight': {e}")))?;
                 LmHead::Resident(Weight {
                     data,
                     shape: token_embd_info.shape.clone(),
@@ -420,9 +433,11 @@ impl Model {
         prompt: &str,
         candidates: &[System1Candidate],
         temperature: f32,
-    ) -> Result<System1Response, String> {
+    ) -> Result<System1Response, ReflexError> {
         if candidates.is_empty() {
-            return Err("system1_evaluate: candidates must not be empty".to_string());
+            return Err(ReflexError::InvalidInput(
+                "system1_evaluate: candidates must not be empty".to_string(),
+            ));
         }
 
         let resolved: Vec<Vec<u32>> = candidates
@@ -479,7 +494,7 @@ impl Model {
         mut hidden: CudaSlice<f32>,
         position: usize,
         kv_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &m.cfg;
         let n_head = cfg.num_heads;
         let qk_nope = cfg.qk_nope_head_dim;
@@ -506,12 +521,12 @@ impl Model {
         let mut k_pe = self
             .device
             .alloc_zeros::<f32>(qk_rope)
-            .map_err(|e| format!("mla k_pe alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "mla k_pe alloc: {e}"))?;
         {
             let src = kv_cmpr_pe.slice(kv_lora..kv_lora + qk_rope);
             self.device
                 .dtod_copy(&src, &mut k_pe)
-                .map_err(|e| format!("mla k_pe dtod: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "mla k_pe dtod: {e}"))?;
         }
         match &cfg.yarn {
             Some(yarn) => self.rope_norm_yarn(
@@ -530,12 +545,12 @@ impl Model {
         let mut kv_cmpr_owned = self
             .device
             .alloc_zeros::<f32>(kv_lora)
-            .map_err(|e| format!("mla kv_cmpr alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "mla kv_cmpr alloc: {e}"))?;
         {
             let src = kv_cmpr_pe.slice(0..kv_lora);
             self.device
                 .dtod_copy(&src, &mut kv_cmpr_owned)
-                .map_err(|e| format!("mla kv_cmpr dtod: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "mla kv_cmpr dtod: {e}"))?;
         }
         let kv_cmpr_normed = self.rmsnorm(
             &kv_cmpr_owned,
@@ -552,14 +567,14 @@ impl Model {
         let mut q_pe = self
             .device
             .alloc_zeros::<f32>(n_head * qk_rope)
-            .map_err(|e| format!("mla q_pe alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "mla q_pe alloc: {e}"))?;
         for h in 0..n_head {
             let src =
                 q.slice(h * n_embd_head_k_mla + qk_nope..h * n_embd_head_k_mla + n_embd_head_k_mla);
             let mut dst = q_pe.slice_mut(h * qk_rope..(h + 1) * qk_rope);
             self.device
                 .dtod_copy(&src, &mut dst)
-                .map_err(|e| format!("mla q_pe dtod head {h}: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "mla q_pe dtod head {h}: {e}"))?;
         }
         match &cfg.yarn {
             Some(yarn) => self.rope_norm_yarn(
@@ -588,7 +603,7 @@ impl Model {
         let mut qcur = self
             .device
             .alloc_zeros::<f32>(n_head * qk_dim)
-            .map_err(|e| format!("mla qcur alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "mla qcur alloc: {e}"))?;
         for h in 0..n_head {
             let q_nope_view = q.slice(h * n_embd_head_k_mla..h * n_embd_head_k_mla + qk_nope);
             let wk_b_view = w
@@ -600,13 +615,13 @@ impl Model {
             let mut dst_nope = qcur.slice_mut(h * qk_dim..h * qk_dim + kv_lora);
             self.device
                 .dtod_copy(&absorbed, &mut dst_nope)
-                .map_err(|e| format!("mla qcur absorbed dtod head {h}: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "mla qcur absorbed dtod head {h}: {e}"))?;
 
             let pe_src = q_pe.slice(h * qk_rope..(h + 1) * qk_rope);
             let mut dst_pe = qcur.slice_mut(h * qk_dim + kv_lora..h * qk_dim + qk_dim);
             self.device
                 .dtod_copy(&pe_src, &mut dst_pe)
-                .map_err(|e| format!("mla qcur pe dtod head {h}: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "mla qcur pe dtod head {h}: {e}"))?;
         }
 
         // Write this position's compressed Kcur (== kv_cmpr_normed ++ k_pe) into the
@@ -617,13 +632,13 @@ impl Model {
             let mut dst = kv_cache.slice_mut(offset..offset + kv_lora);
             self.device
                 .dtod_copy(&kv_cmpr_normed, &mut dst)
-                .map_err(|e| format!("mla kv_cache dtod cmpr: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "mla kv_cache dtod cmpr: {e}"))?;
         }
         {
             let mut dst = kv_cache.slice_mut(offset + kv_lora..offset + qk_dim);
             self.device
                 .dtod_copy(&k_pe, &mut dst)
-                .map_err(|e| format!("mla kv_cache dtod k_pe: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "mla kv_cache dtod k_pe: {e}"))?;
         }
         let seq_len = position + 1;
 
@@ -669,7 +684,7 @@ impl Model {
         start_pos: usize,
         rows: usize,
         kv_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &m.cfg;
         let n_head = cfg.num_heads;
         let qk_nope = cfg.qk_nope_head_dim;
@@ -876,7 +891,7 @@ impl Model {
         start_pos: usize,
         rows: usize,
         kv_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let post_attn =
             self.forward_mla_attn_block_batched(m, layer, hidden, start_pos, rows, kv_cache)?;
 
@@ -902,10 +917,11 @@ impl Model {
                 eps,
             ),
             MlaFfn::Moe { .. } => {
-                let moe_cfg = cfg
-                    .moe
-                    .as_ref()
-                    .ok_or("internal error: MlaFfn::Moe layer but MlaConfig::moe is None")?;
+                let moe_cfg = cfg.moe.as_ref().ok_or_else(|| {
+                    ReflexError::Other(
+                        "internal error: MlaFfn::Moe layer but MlaConfig::moe is None".to_string(),
+                    )
+                })?;
                 self.forward_mla_moe_ffn_batched(layer, post_attn, hidden_size, rows, moe_cfg, eps)
             }
         }
@@ -937,7 +953,7 @@ impl Model {
         hidden_size: usize,
         moe_cfg: &MlaMoeConfig,
         eps: f32,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let MlaFfn::Moe {
             ffn_gate_inp,
             ffn_gate_exps,
@@ -948,7 +964,9 @@ impl Model {
             ffn_down_shexp,
         } = &layer.ffn
         else {
-            return Err("internal error: forward_mla_moe_ffn called on a Dense layer".to_string());
+            return Err(ReflexError::Other(
+                "internal error: forward_mla_moe_ffn called on a Dense layer".to_string(),
+            ));
         };
 
         let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, 1, hidden_size, eps)?;
@@ -957,7 +975,7 @@ impl Model {
         let router_logits = self
             .device
             .dtoh_sync_copy(&router_logits_dev)
-            .map_err(|e| format!("mla moe router dtoh: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "mla moe router dtoh: {e}"))?;
         let routed = route_top_k_with_norm(
             &router_logits,
             moe_cfg.expert_used_count,
@@ -967,11 +985,11 @@ impl Model {
         let mut ffn_out_dev = self
             .device
             .alloc_zeros::<f32>(hidden_size)
-            .map_err(|e| format!("mla moe ffn_out alloc: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "mla moe ffn_out alloc: {e}"))?;
         let dest_row0 = self
             .device
             .htod_sync_copy(&[0u32])
-            .map_err(|e| format!("mla moe dest_row htod: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "mla moe dest_row htod: {e}"))?;
         for (expert_idx, weight) in routed {
             let gate = self.gemv_expert(&ffn_normed, ffn_gate_exps, expert_idx)?;
             let up = self.gemv_expert(&ffn_normed, ffn_up_exps, expert_idx)?;
@@ -980,7 +998,7 @@ impl Model {
             let weight_dev = self
                 .device
                 .htod_sync_copy(&[weight * moe_cfg.routed_scaling_factor])
-                .map_err(|e| format!("mla moe weight htod: {e}"))?;
+                .map_err(|e| crate::gpu_err!(e, "mla moe weight htod: {e}"))?;
             self.moe_scatter_add(
                 &down,
                 &dest_row0,
@@ -1023,7 +1041,7 @@ impl Model {
         rows: usize,
         moe_cfg: &MlaMoeConfig,
         eps: f32,
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let MlaFfn::Moe {
             ffn_gate_inp,
             ffn_gate_exps,
@@ -1034,9 +1052,9 @@ impl Model {
             ffn_down_shexp,
         } = &layer.ffn
         else {
-            return Err(
+            return Err(ReflexError::Other(
                 "internal error: forward_mla_moe_ffn_batched called on a Dense layer".to_string(),
-            );
+            ));
         };
 
         let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, rows, hidden_size, eps)?;
@@ -1054,7 +1072,7 @@ impl Model {
         let router_logits = self
             .device
             .dtoh_sync_copy(&router_logits_dev)
-            .map_err(|e| format!("mla moe router dtoh: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "mla moe router dtoh: {e}"))?;
         let num_experts = router_logits.len() / rows;
 
         self.moe_ffn_grouped(
@@ -1083,7 +1101,7 @@ impl Model {
         &self,
         m: &MlaModel,
         prompt: &str,
-    ) -> Result<(u32, String), String> {
+    ) -> Result<(u32, String), ReflexError> {
         let (generated, text, _kv_caches, _seq_len) = self.generate_mla_impl(
             m,
             prompt,
@@ -1109,24 +1127,27 @@ impl Model {
         start_pos: usize,
         rows: usize,
         extra_headroom: usize,
-    ) -> Result<Vec<CudaSlice<f32>>, String> {
+    ) -> Result<Vec<CudaSlice<f32>>, ReflexError> {
         crate::limits::check_positions(start_pos, rows, extra_headroom)?;
         let qk_dim = m.cfg.kv_lora_rank + m.cfg.qk_rope_head_dim;
         let total_len = start_pos + rows + extra_headroom;
         let mut kv_caches: Vec<CudaSlice<f32>> = (0..m.layers.len())
             .map(|_| self.device.alloc_zeros::<f32>(total_len * qk_dim))
             .collect::<Result<_, _>>()
-            .map_err(|e| format!("alloc mla kv_cache: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "alloc mla kv_cache: {e}"))?;
 
         if let Some(cache) = imported {
             if cache.qk_dim != qk_dim {
-                return Err(format!(
+                return Err(crate::reflex_err!(
+                    Other,
                     "imported KV cache shape mismatch: file has qk_dim={}, model expects qk_dim={}",
-                    cache.qk_dim, qk_dim
+                    cache.qk_dim,
+                    qk_dim
                 ));
             }
             if cache.kv_caches.len() != m.layers.len() {
-                return Err(format!(
+                return Err(crate::reflex_err!(
+                    Other,
                     "imported KV cache has {} layers, model has {}",
                     cache.kv_caches.len(),
                     m.layers.len()
@@ -1137,7 +1158,9 @@ impl Model {
                 let mut dst = kv_caches[layer_idx].slice_mut(0..imported_len);
                 self.device
                     .htod_sync_copy_into(kv_host, &mut dst)
-                    .map_err(|e| format!("import mla kv_cache htod layer {layer_idx}: {e}"))?;
+                    .map_err(|e| {
+                        crate::gpu_err!(e, "import mla kv_cache htod layer {layer_idx}: {e}")
+                    })?;
             }
         }
         Ok(kv_caches)
@@ -1158,7 +1181,7 @@ impl Model {
         prompt: &str,
         imported: Option<&crate::kv_io::MlaKvCache>,
         extra_headroom: usize,
-    ) -> Result<MlaPrefillResult, String> {
+    ) -> Result<MlaPrefillResult, ReflexError> {
         let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
 
         let mut ids = self.tokenizer.encode(prompt)?;
@@ -1170,7 +1193,9 @@ impl Model {
             }
         }
         if ids.is_empty() {
-            return Err("encode produced no tokens".to_string());
+            return Err(ReflexError::InvalidInput(
+                "encode produced no tokens".to_string(),
+            ));
         }
 
         let mut kv_caches =
@@ -1182,7 +1207,8 @@ impl Model {
             hidden_dev = Some(self.forward_one_token_mla(m, token_id, position, &mut kv_caches)?);
             position += 1;
         }
-        let hidden = hidden_dev.ok_or("no tokens processed")?;
+        let hidden =
+            hidden_dev.ok_or_else(|| ReflexError::Other("no tokens processed".to_string()))?;
 
         Ok((ids, hidden, kv_caches, position))
     }
@@ -1201,7 +1227,7 @@ impl Model {
         prompt: &str,
         imported: Option<&crate::kv_io::MlaKvCache>,
         extra_headroom: usize,
-    ) -> Result<MlaPrefillResult, String> {
+    ) -> Result<MlaPrefillResult, ReflexError> {
         let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
 
         let mut ids = self.tokenizer.encode(prompt)?;
@@ -1213,7 +1239,9 @@ impl Model {
             }
         }
         if ids.is_empty() {
-            return Err("encode produced no tokens".to_string());
+            return Err(ReflexError::InvalidInput(
+                "encode produced no tokens".to_string(),
+            ));
         }
         let rows = ids.len();
 
@@ -1229,7 +1257,7 @@ impl Model {
         let mut hidden = self
             .device
             .htod_sync_copy(&host_embd)
-            .map_err(|e| format!("embedding htod: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "embedding htod: {e}"))?;
 
         for (layer_idx, layer) in m.layers.iter().enumerate() {
             hidden = self.forward_mla_layer_batched(
@@ -1267,9 +1295,11 @@ impl Model {
         sampling: &SamplingParams,
         mut on_first_token: impl FnMut(&[f32]),
         mut on_token: impl FnMut(u32, &str),
-    ) -> Result<MlaGenerateResult, String> {
+    ) -> Result<MlaGenerateResult, ReflexError> {
         if max_new_tokens == 0 {
-            return Err("max_new_tokens must be at least 1".to_string());
+            return Err(ReflexError::InvalidInput(
+                "max_new_tokens must be at least 1".to_string(),
+            ));
         }
 
         let (ids, hidden_batched, mut kv_caches, mut position) =
@@ -1315,7 +1345,7 @@ impl Model {
         token_id: u32,
         position: usize,
         kv_caches: &mut [CudaSlice<f32>],
-    ) -> Result<CudaSlice<f32>, String> {
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &m.cfg;
         let hidden_size = cfg.hidden_size;
         let ffn_hidden_size = cfg.ffn_hidden_size;
@@ -1323,7 +1353,7 @@ impl Model {
         let mut hidden = self
             .device
             .htod_sync_copy(&self.token_embd.row(token_id)?)
-            .map_err(|e| format!("embedding htod: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "embedding htod: {e}"))?;
 
         for (layer_idx, layer) in m.layers.iter().enumerate() {
             let post_attn =
@@ -1344,10 +1374,12 @@ impl Model {
                     eps,
                 )?,
                 MlaFfn::Moe { .. } => {
-                    let moe_cfg = cfg
-                        .moe
-                        .as_ref()
-                        .ok_or("internal error: MlaFfn::Moe layer but MlaConfig::moe is None")?;
+                    let moe_cfg = cfg.moe.as_ref().ok_or_else(|| {
+                        ReflexError::Other(
+                            "internal error: MlaFfn::Moe layer but MlaConfig::moe is None"
+                                .to_string(),
+                        )
+                    })?;
                     self.forward_mla_moe_ffn(layer, post_attn, hidden_size, moe_cfg, eps)?
                 }
             };
@@ -1364,11 +1396,12 @@ impl Model {
     pub fn forward_prompt_capture_kv_mla(
         &self,
         prompt: &str,
-    ) -> Result<((u32, String), crate::kv_io::MlaKvCache), String> {
-        let m = self
-            .mla
-            .as_ref()
-            .ok_or("forward_prompt_capture_kv_mla called on a non-MLA model")?;
+    ) -> Result<((u32, String), crate::kv_io::MlaKvCache), ReflexError> {
+        let m = self.mla.as_ref().ok_or_else(|| {
+            ReflexError::Other(
+                "forward_prompt_capture_kv_mla called on a non-MLA model".to_string(),
+            )
+        })?;
         let (generated, text, kv_caches, seq_len) = self.generate_mla_impl(
             m,
             prompt,
@@ -1386,7 +1419,7 @@ impl Model {
             .map(|c| {
                 self.device
                     .dtoh_sync_copy(&c.slice(0..per_layer_len))
-                    .map_err(|e| format!("mla kv_cache dtoh: {e}"))
+                    .map_err(|e| crate::gpu_err!(e, "mla kv_cache dtoh: {e}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
 

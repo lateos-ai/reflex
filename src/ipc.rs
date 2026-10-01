@@ -208,7 +208,7 @@ pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
                 candidates: None,
                 entropy: None,
             },
-            Err(e) => IpcResponse::err(id, e),
+            Err(e) => IpcResponse::err(id, e.to_string()),
         }
     } else {
         let candidates: Vec<System1Candidate> = req
@@ -240,7 +240,7 @@ pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
                     entropy: Some(response.entropy),
                 }
             }
-            Err(e) => IpcResponse::err(id, e),
+            Err(e) => IpcResponse::err(id, e.to_string()),
         }
     }
 }
@@ -323,7 +323,7 @@ pub fn handle_request_streaming<W: Write>(
             candidates: None,
             entropy: None,
         },
-        Err(e) => IpcResponse::err(id, e),
+        Err(e) => IpcResponse::err(id, e.to_string()),
     };
     write_json_line(&mut output, &response)
 }

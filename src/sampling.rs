@@ -82,7 +82,7 @@ pub fn sample(
         ));
     }
     if params.is_greedy() {
-        return crate::model::Model::argmax(logits).map_err(ReflexError::from);
+        return crate::model::Model::argmax(logits);
     }
     if !params.temperature.is_finite() || params.temperature <= 0.0 {
         return Err(crate::reflex_err!(
