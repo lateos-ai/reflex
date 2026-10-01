@@ -1,0 +1,17 @@
+{
+  "provisional": true,
+  "source": "README.md 'Cold-start phase breakdown' table (dedicated AWS g4dn.xlarge, manual run, driver 595.91.07 / CUDA 13.2, REFLEX_CUDA_ARCH=sm_75)",
+  "recorded": "2026-09-30",
+  "gpu": "Tesla T4",
+  "subcommand": "system1",
+  "model": "Qwen3-0.6B-Q4_K_M.gguf",
+  "n_runs": 10,
+  "phases": {
+    "process_launch": {"p50_ms": 112.1, "p95_ms": 125.3},
+    "gguf_open": {"p50_ms": 64.2, "p95_ms": 67.0},
+    "cuda_init": {"p50_ms": 142.3, "p95_ms": 144.0},
+    "model_load": {"p50_ms": 235.1, "p95_ms": 244.4},
+    "prompt_eval": {"p50_ms": 39.2, "p95_ms": 39.5},
+    "total": {"p50_ms": 485.4, "p95_ms": 494.0}
+  }
+}

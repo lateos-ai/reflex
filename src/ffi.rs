@@ -1,6 +1,4 @@
-//! Rust C-FFI surface for Phase 4 (Embeddability) round 2 (see README.md's
-//! "Phase 4 -- Embeddability" roadmap entry and DECISIONS.md for the exact
-//! scope confirmed with the user before starting). Lets an external
+//! Rust C-FFI surface (the "Embeddability" phase in CHANGELOG.md). Lets an external
 //! orchestrator process link against this crate directly (`cdylib`/
 //! `staticlib`, see Cargo.toml's `[lib]` section) and call
 //! load -> generate -> free, instead of `exec`-ing `reflex generate` and
@@ -19,11 +17,12 @@
 //! yet.
 //!
 //! **Panics never cross the FFI boundary.** Every entry point wraps its body
-//! in `catch_unwind` and converts both an `Err(String)` (this crate's usual
-//! `Result<_, String>` convention) and a caught panic into the same
-//! thread-local last-error-string convention (`reflex_last_error`) --
-//! unwinding a Rust panic across an `extern "C"` boundary is undefined
-//! behavior in the C caller.
+//! in `catch_unwind` and converts both an `Err(ReflexError)` and a caught panic
+//! into the same thread-local last-error convention: a message
+//! (`reflex_last_error`) and a stable category (`reflex_last_error_code`, a
+//! `ReflexErrorCode`) -- unwinding a Rust panic across an `extern "C"` boundary
+//! is undefined behavior in the C caller. Each entry point clears both on entry,
+//! so they always describe the most recent call.
 //!
 //! **Concurrency**: matches README's Non-goals -- `batch_size` is still
 //! always 1 and there is still no request queue/scheduler inside this
@@ -38,10 +37,11 @@
 //! dependency). Regenerate it after editing this file's public surface with:
 //! `cbindgen --config cbindgen.toml --crate reflex-engine --output include/reflex_engine.h`
 
+use crate::error::{ReflexError, ReflexErrorCode};
 use crate::gguf::GgufFile;
 use crate::model::{Model, System1Candidate};
 use cudarc::driver::CudaDevice;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, CStr, CString};
 use std::os::raw::c_int;
 use std::panic::{self, AssertUnwindSafe};
@@ -57,12 +57,30 @@ pub struct ReflexModel {
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+    static LAST_ERROR_CODE: Cell<ReflexErrorCode> = const { Cell::new(ReflexErrorCode::Ok) };
 }
 
-fn set_last_error(msg: String) {
+/// Called on entry to every fallible `reflex_*` function, so the last-error state
+/// describes the most recent call, as `reflex_last_error` documents.
+fn clear_last_error() {
+    LAST_ERROR.with(|slot| *slot.borrow_mut() = None);
+    LAST_ERROR_CODE.with(|code| code.set(ReflexErrorCode::Ok));
+}
+
+fn set_last_error(e: ReflexError) {
+    LAST_ERROR_CODE.with(|code| code.set(e.code()));
+    set_last_error_message(e.to_string());
+}
+
+fn set_last_panic(payload: Box<dyn std::any::Any + Send>) {
+    LAST_ERROR_CODE.with(|code| code.set(ReflexErrorCode::Panic));
+    set_last_error_message(panic_message(payload));
+}
+
+fn set_last_error_message(msg: String) {
     // An embedded NUL would make CString::new fail outright; strip rather
     // than lose the message entirely (error text is host-controlled data --
-    // a GGUF path, a Result<_, String> from model.rs/lora.rs -- not
+    // a GGUF path, an error from model.rs/lora.rs -- not
     // attacker input, but still not guaranteed NUL-free).
     let sanitized = if msg.contains('\0') {
         msg.replace('\0', "")
@@ -97,6 +115,18 @@ pub extern "C" fn reflex_last_error() -> *const c_char {
     })
 }
 
+/// Returns the category of this thread's most recent `reflex_*` failure, or
+/// `REFLEX_ERROR_CODE_OK` (0) if the most recent call succeeded (or none has run
+/// yet on this thread). Use it to branch on *why* a call failed -- e.g. retry a
+/// smaller request on `REFLEX_ERROR_CODE_CONTEXT_OVERFLOW`, back off on
+/// `REFLEX_ERROR_CODE_OUT_OF_MEMORY` -- instead of matching `reflex_last_error`'s
+/// text. Codes are stable: existing values never change meaning, and new ones are
+/// only appended.
+#[no_mangle]
+pub extern "C" fn reflex_last_error_code() -> ReflexErrorCode {
+    LAST_ERROR_CODE.with(Cell::get)
+}
+
 /// Loads a GGUF model from `gguf_path` onto CUDA device 0, optionally
 /// applying a llama.cpp-format LoRA adapter from `lora_path` first (pass
 /// NULL to skip -- see `Model::apply_lora`'s doc comment in `model.rs` for
@@ -117,27 +147,37 @@ pub unsafe extern "C" fn reflex_load(
     gguf_path: *const c_char,
     lora_path: *const c_char,
 ) -> *mut ReflexModel {
-    let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<ReflexModel, String> {
+    clear_last_error();
+    let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<ReflexModel, ReflexError> {
         if gguf_path.is_null() {
-            return Err("reflex_load: gguf_path must not be NULL".to_string());
+            return Err(ReflexError::InvalidInput(
+                "reflex_load: gguf_path must not be NULL".to_string(),
+            ));
         }
-        let gguf_path_str = unsafe { CStr::from_ptr(gguf_path) }
-            .to_str()
-            .map_err(|e| format!("reflex_load: gguf_path is not valid UTF-8: {e}"))?;
+        let gguf_path_str = unsafe { CStr::from_ptr(gguf_path) }.to_str().map_err(|e| {
+            crate::reflex_err!(
+                InvalidInput,
+                "reflex_load: gguf_path is not valid UTF-8: {e}"
+            )
+        })?;
         let lora_path_str = if lora_path.is_null() {
             None
         } else {
-            Some(
-                unsafe { CStr::from_ptr(lora_path) }
-                    .to_str()
-                    .map_err(|e| format!("reflex_load: lora_path is not valid UTF-8: {e}"))?,
-            )
+            Some(unsafe { CStr::from_ptr(lora_path) }.to_str().map_err(|e| {
+                crate::reflex_err!(
+                    InvalidInput,
+                    "reflex_load: lora_path is not valid UTF-8: {e}"
+                )
+            })?)
         };
 
-        let file = GgufFile::open(gguf_path_str)
-            .map_err(|e| format!("reflex_load: failed to open {gguf_path_str:?}: {e}"))?;
+        let file = GgufFile::open(gguf_path_str).map_err(|e| {
+            e.rewrap(format!(
+                "reflex_load: failed to open {gguf_path_str:?}: {e}"
+            ))
+        })?;
         let device = CudaDevice::new(0)
-            .map_err(|e| format!("reflex_load: failed to init CUDA device 0: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "reflex_load: failed to init CUDA device 0: {e}"))?;
         let mut model = Model::load(device, &file)?;
         if let Some(lora_path_str) = lora_path_str {
             model.apply_lora(Path::new(lora_path_str))?;
@@ -152,7 +192,7 @@ pub unsafe extern "C" fn reflex_load(
             ptr::null_mut()
         }
         Err(payload) => {
-            set_last_error(panic_message(payload));
+            set_last_panic(payload);
             ptr::null_mut()
         }
     }
@@ -200,23 +240,35 @@ pub unsafe extern "C" fn reflex_generate(
     max_new_tokens: usize,
     out: *mut ReflexGenerateResult,
 ) -> c_int {
+    clear_last_error();
     let result = panic::catch_unwind(AssertUnwindSafe(
-        || -> Result<ReflexGenerateResult, String> {
+        || -> Result<ReflexGenerateResult, ReflexError> {
             if handle.is_null() {
-                return Err("reflex_generate: handle must not be NULL".to_string());
+                return Err(ReflexError::InvalidInput(
+                    "reflex_generate: handle must not be NULL".to_string(),
+                ));
             }
             if prompt.is_null() {
-                return Err("reflex_generate: prompt must not be NULL".to_string());
+                return Err(ReflexError::InvalidInput(
+                    "reflex_generate: prompt must not be NULL".to_string(),
+                ));
             }
             if out.is_null() {
-                return Err("reflex_generate: out must not be NULL".to_string());
+                return Err(ReflexError::InvalidInput(
+                    "reflex_generate: out must not be NULL".to_string(),
+                ));
             }
             if max_new_tokens == 0 {
-                return Err("reflex_generate: max_new_tokens must be at least 1".to_string());
+                return Err(ReflexError::InvalidInput(
+                    "reflex_generate: max_new_tokens must be at least 1".to_string(),
+                ));
             }
-            let prompt_str = unsafe { CStr::from_ptr(prompt) }
-                .to_str()
-                .map_err(|e| format!("reflex_generate: prompt is not valid UTF-8: {e}"))?;
+            let prompt_str = unsafe { CStr::from_ptr(prompt) }.to_str().map_err(|e| {
+                crate::reflex_err!(
+                    InvalidInput,
+                    "reflex_generate: prompt is not valid UTF-8: {e}"
+                )
+            })?;
             let model = unsafe { &(*handle).model };
 
             let (tokens, text) = model.generate(
@@ -254,7 +306,7 @@ pub unsafe extern "C" fn reflex_generate(
             -1
         }
         Err(payload) => {
-            set_last_error(panic_message(payload));
+            set_last_panic(payload);
             -1
         }
     }
@@ -325,9 +377,9 @@ pub struct ReflexSystem1Result {
 /// for each of `num_candidates` candidate strings in `candidate_texts`. No
 /// argmax-then-feedback decode loop runs -- single-token candidates are
 /// scored in one batched gather-GEMV, multi-token candidates via a short
-/// teacher-forced continuation. Dense/MoE Qwen3 models only; hybrid Qwen3.5
-/// and DeepSeek-V2/V3 MLA are rejected with an error (call
-/// `reflex_last_error` for why).
+/// teacher-forced continuation. Every architecture is supported; on the Qwen3.5
+/// hybrid models each candidate must be a single token (multi-token candidates
+/// fail with `REFLEX_ERROR_CODE_INVALID_INPUT`).
 ///
 /// `handle` must come from `reflex_load` and not have been freed yet.
 /// `prompt` must be a non-NULL, NUL-terminated UTF-8 C string. `candidate_texts`
@@ -358,28 +410,40 @@ pub unsafe extern "C" fn reflex_system1_evaluate(
     temperature: f32,
     out: *mut ReflexSystem1Result,
 ) -> c_int {
+    clear_last_error();
     let result = panic::catch_unwind(AssertUnwindSafe(
-        || -> Result<ReflexSystem1Result, String> {
+        || -> Result<ReflexSystem1Result, ReflexError> {
             if handle.is_null() {
-                return Err("reflex_system1_evaluate: handle must not be NULL".to_string());
+                return Err(ReflexError::InvalidInput(
+                    "reflex_system1_evaluate: handle must not be NULL".to_string(),
+                ));
             }
             if prompt.is_null() {
-                return Err("reflex_system1_evaluate: prompt must not be NULL".to_string());
+                return Err(ReflexError::InvalidInput(
+                    "reflex_system1_evaluate: prompt must not be NULL".to_string(),
+                ));
             }
             if candidate_texts.is_null() {
-                return Err("reflex_system1_evaluate: candidate_texts must not be NULL".to_string());
+                return Err(ReflexError::InvalidInput(
+                    "reflex_system1_evaluate: candidate_texts must not be NULL".to_string(),
+                ));
             }
             if num_candidates == 0 {
-                return Err(
-                    "reflex_system1_evaluate: num_candidates must be at least 1".to_string()
-                );
+                return Err(ReflexError::InvalidInput(
+                    "reflex_system1_evaluate: num_candidates must be at least 1".to_string(),
+                ));
             }
             if out.is_null() {
-                return Err("reflex_system1_evaluate: out must not be NULL".to_string());
+                return Err(ReflexError::InvalidInput(
+                    "reflex_system1_evaluate: out must not be NULL".to_string(),
+                ));
             }
-            let prompt_str = unsafe { CStr::from_ptr(prompt) }
-                .to_str()
-                .map_err(|e| format!("reflex_system1_evaluate: prompt is not valid UTF-8: {e}"))?;
+            let prompt_str = unsafe { CStr::from_ptr(prompt) }.to_str().map_err(|e| {
+                crate::reflex_err!(
+                    InvalidInput,
+                    "reflex_system1_evaluate: prompt is not valid UTF-8: {e}"
+                )
+            })?;
 
             let candidate_ptrs =
                 unsafe { std::slice::from_raw_parts(candidate_texts, num_candidates) };
@@ -388,15 +452,15 @@ pub unsafe extern "C" fn reflex_system1_evaluate(
             .enumerate()
             .map(|(i, &ptr)| {
                 if ptr.is_null() {
-                    return Err(format!("reflex_system1_evaluate: candidate_texts[{i}] must not be NULL"));
+                    return Err(crate::reflex_err!(InvalidInput, "reflex_system1_evaluate: candidate_texts[{i}] must not be NULL"));
                 }
                 let text = unsafe { CStr::from_ptr(ptr) }
                     .to_str()
-                    .map_err(|e| format!("reflex_system1_evaluate: candidate_texts[{i}] is not valid UTF-8: {e}"))?
+                    .map_err(|e| crate::reflex_err!(InvalidInput, "reflex_system1_evaluate: candidate_texts[{i}] is not valid UTF-8: {e}"))?
                     .to_string();
                 Ok(System1Candidate { text })
             })
-            .collect::<Result<_, String>>()?;
+            .collect::<Result<_, ReflexError>>()?;
 
             let model = unsafe { &(*handle).model };
             let response = model.system1_evaluate(prompt_str, &candidates, temperature)?;
@@ -444,7 +508,7 @@ pub unsafe extern "C" fn reflex_system1_evaluate(
             -1
         }
         Err(payload) => {
-            set_last_error(panic_message(payload));
+            set_last_panic(payload);
             -1
         }
     }
@@ -500,6 +564,7 @@ pub unsafe extern "C" fn reflex_free_system1_result(result: *mut ReflexSystem1Re
 /// freed, and must not be in use on any other thread.
 #[no_mangle]
 pub unsafe extern "C" fn reflex_free(handle: *mut ReflexModel) {
+    clear_last_error();
     if handle.is_null() {
         return;
     }
@@ -507,6 +572,6 @@ pub unsafe extern "C" fn reflex_free(handle: *mut ReflexModel) {
         drop(Box::from_raw(handle));
     }));
     if let Err(payload) = result {
-        set_last_error(panic_message(payload));
+        set_last_panic(payload);
     }
 }

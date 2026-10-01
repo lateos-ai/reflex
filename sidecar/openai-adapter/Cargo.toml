@@ -11,7 +11,7 @@ description = "OpenAI-compatible /v1/chat/completions HTTP sidecar in front of t
 # JSON-line-IPC translation in front of an already-running `reflex stdio` child
 # process. Keeping it a fully separate Cargo project (own Cargo.lock) is what keeps
 # axum/tokio/etc. out of the core engine's dependency graph entirely, per this
-# project's CLAUDE.md/README.md Non-goals section.
+# project's README.md Non-goals section.
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "net", "sync"] }

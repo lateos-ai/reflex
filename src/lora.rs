@@ -65,6 +65,7 @@
 //! error here, since those are never architecture-dependent.
 
 use crate::dequant;
+use crate::error::ReflexError;
 use crate::gguf::{GgufFile, GgufValue};
 use std::path::Path;
 
@@ -107,17 +108,18 @@ pub struct LoraAdapter {
 /// `lora_b` via the existing `dequant::dequantize` host path -- these are
 /// small low-rank factors, not worth a device round trip) -- no CUDA device
 /// is touched here; `Model::apply_lora` does the one-time upload.
-pub fn load(path: &Path) -> Result<LoraAdapter, String> {
-    let file =
-        GgufFile::open(path).map_err(|e| format!("failed to open LoRA adapter {path:?}: {e}"))?;
+pub fn load(path: &Path) -> Result<LoraAdapter, ReflexError> {
+    let file = GgufFile::open(path)
+        .map_err(|e| crate::reflex_err!(Io, "failed to open LoRA adapter {path:?}: {e}"))?;
 
     let adapter_type = file
         .metadata
         .get("adapter.type")
         .and_then(GgufValue::as_str)
-        .ok_or_else(|| format!("{path:?} is missing the required 'adapter.type' metadata key -- not a llama.cpp-format LoRA adapter GGUF"))?;
+        .ok_or_else(|| crate::reflex_err!(Lora, "{path:?} is missing the required 'adapter.type' metadata key -- not a llama.cpp-format LoRA adapter GGUF"))?;
     if adapter_type != "lora" {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            Lora,
             "{path:?} has adapter.type={adapter_type:?} (only \"lora\" is supported)"
         ));
     }
@@ -126,7 +128,10 @@ pub fn load(path: &Path) -> Result<LoraAdapter, String> {
         .get("adapter.lora.alpha")
         .and_then(GgufValue::as_f32)
         .ok_or_else(|| {
-            format!("{path:?} is missing the required 'adapter.lora.alpha' metadata key")
+            crate::reflex_err!(
+                Lora,
+                "{path:?} is missing the required 'adapter.lora.alpha' metadata key"
+            )
         })?;
 
     let mut targets = Vec::new();
@@ -135,16 +140,20 @@ pub fn load(path: &Path) -> Result<LoraAdapter, String> {
             continue;
         };
         let lora_b_name = format!("{base_name}.lora_b");
-        let b_info = file
-            .tensor_info(&lora_b_name)
-            .ok_or_else(|| format!("{path:?}: '{}' has no matching '{lora_b_name}'", info.name))?;
+        let b_info = file.tensor_info(&lora_b_name).ok_or_else(|| {
+            crate::reflex_err!(
+                Lora,
+                "{path:?}: '{}' has no matching '{lora_b_name}'",
+                info.name
+            )
+        })?;
 
         let a_bytes = file.tensor_bytes(info)?;
         let b_bytes = file.tensor_bytes(b_info)?;
         let a_host = dequant::dequantize(info.ggml_type, a_bytes, info.element_count())
-            .map_err(|e| format!("{path:?}: dequantize '{}': {e}", info.name))?;
+            .map_err(|e| crate::reflex_err!(Lora, "{path:?}: dequantize '{}': {e}", info.name))?;
         let b_host = dequant::dequantize(b_info.ggml_type, b_bytes, b_info.element_count())
-            .map_err(|e| format!("{path:?}: dequantize '{lora_b_name}': {e}"))?;
+            .map_err(|e| crate::reflex_err!(Lora, "{path:?}: dequantize '{lora_b_name}': {e}"))?;
 
         let (in_features, rank, expert_count_a) = match info.shape.as_slice() {
             [in_features, rank] => (*in_features as usize, *rank as usize, None),
@@ -153,7 +162,7 @@ pub fn load(path: &Path) -> Result<LoraAdapter, String> {
                 *rank as usize,
                 Some(*expert_count as usize),
             ),
-            other => return Err(format!(
+            other => return Err(crate::reflex_err!(Lora,
                 "{path:?}: '{}' has unexpected shape {other:?} (expected 2-D [in_features, rank] or 3-D per-expert-stacked [in_features, rank, expert_count])",
                 info.name
             )),
@@ -165,16 +174,16 @@ pub fn load(path: &Path) -> Result<LoraAdapter, String> {
                 *out_features as usize,
                 Some(*expert_count as usize),
             ),
-            other => return Err(format!("{path:?}: '{lora_b_name}' has unexpected shape {other:?} (expected 2-D [rank, out_features] or 3-D per-expert-stacked [rank, out_features, expert_count])")),
+            other => return Err(crate::reflex_err!(Lora, "{path:?}: '{lora_b_name}' has unexpected shape {other:?} (expected 2-D [rank, out_features] or 3-D per-expert-stacked [rank, out_features, expert_count])")),
         };
         if rank == 0 || rank_b != rank {
-            return Err(format!(
+            return Err(crate::reflex_err!(Lora,
                 "{path:?}: rank mismatch between '{}' (rank={rank}) and '{lora_b_name}' (rank={rank_b})",
                 info.name
             ));
         }
         if expert_count_a != expert_count_b {
-            return Err(format!(
+            return Err(crate::reflex_err!(Lora,
                 "{path:?}: expert-count mismatch between '{}' ({expert_count_a:?}) and '{lora_b_name}' ({expert_count_b:?})",
                 info.name
             ));
@@ -215,7 +224,10 @@ pub fn load(path: &Path) -> Result<LoraAdapter, String> {
     }
 
     if targets.is_empty() {
-        return Err(format!("{path:?} has no 'lora_a'/'lora_b' tensor pairs"));
+        return Err(crate::reflex_err!(
+            Lora,
+            "{path:?} has no 'lora_a'/'lora_b' tensor pairs"
+        ));
     }
 
     Ok(LoraAdapter { alpha, targets })

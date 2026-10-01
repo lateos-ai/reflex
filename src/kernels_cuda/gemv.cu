@@ -9,7 +9,7 @@
 // `w[j*in_features + i]` for consecutive j is strided by `in_features`
 // elements, so no two lanes of a warp ever land in the same 128-byte cache
 // line. Measured at ~9% of a T4's peak memory bandwidth on the decode path
-// (65ms/token) -- see STATUS.md's "warm-latency perf vs. TypeSafe Jev" entry.
+// (65ms/token).
 // Assigning one WARP to each output row instead means all 32 lanes read the
 // SAME row at the same iteration, just 32 consecutive elements apart --
 // fully coalesced. `float4` loads add a second 4x on top when `in_features`
@@ -22,7 +22,7 @@
 // floating-point addition isn't associative, so results can differ at the
 // ULP level from before. Needs real-hardware byte-exact re-verification
 // against llama.cpp before being trusted for `reflex check`'s methodology
-// (see STATUS.md) -- not yet done as of this kernel's rewrite.
+// -- not yet done as of this kernel's rewrite.
 extern "C" __global__ void gemv_kernel(
     const float* __restrict__ x,
     const float* __restrict__ w,

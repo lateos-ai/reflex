@@ -14,7 +14,7 @@
 //! dense/MoE's separate K/V pair or hybrid's per-layer Attn/Gdn split), the
 //! last of the three cache shapes this project's architectures produce. The
 //! engine stays ignorant of where the file lives (NVMe, S3-backed FUSE,
-//! tmpfs) -- see CLAUDE.md's Non-goals.
+//! tmpfs) -- see docs/DEVELOPMENT.md's Non-goals.
 //!
 //! File format is a flat, home-grown binary layout, not a stable public
 //! spec: magic + version-gated, so the version-1 dense/MoE-only layout
@@ -44,6 +44,7 @@
 //! `Kcur == kv_cmpr_normed ++ k_pe` latent, no separate V -- see
 //! `Model::forward_mla_attn_block`).
 
+use crate::error::ReflexError;
 use std::io::{Read, Write};
 
 const MAGIC: &[u8; 4] = b"CSKV";
@@ -107,20 +108,21 @@ pub enum ImportedKv {
     Mla(MlaKvCache),
 }
 
-pub fn export_dense_kv(path: &str, cache: &DenseKvCache) -> Result<(), String> {
-    let mut f = std::fs::File::create(path).map_err(|e| format!("create {path}: {e}"))?;
+pub fn export_dense_kv(path: &str, cache: &DenseKvCache) -> Result<(), ReflexError> {
+    let mut f =
+        std::fs::File::create(path).map_err(|e| crate::reflex_err!(Io, "create {path}: {e}"))?;
     f.write_all(MAGIC)
-        .map_err(|e| format!("write magic: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write magic: {e}"))?;
     f.write_all(&VERSION_DENSE.to_le_bytes())
-        .map_err(|e| format!("write version: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write version: {e}"))?;
     f.write_all(&(cache.k_caches.len() as u32).to_le_bytes())
-        .map_err(|e| format!("write num_layers: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write num_layers: {e}"))?;
     f.write_all(&(cache.seq_len as u32).to_le_bytes())
-        .map_err(|e| format!("write seq_len: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write seq_len: {e}"))?;
     f.write_all(&(cache.num_kv_heads as u32).to_le_bytes())
-        .map_err(|e| format!("write num_kv_heads: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write num_kv_heads: {e}"))?;
     f.write_all(&(cache.head_dim as u32).to_le_bytes())
-        .map_err(|e| format!("write head_dim: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write head_dim: {e}"))?;
 
     for (k, v) in cache.k_caches.iter().zip(&cache.v_caches) {
         write_f32_slice(&mut f, k)?;
@@ -129,33 +131,34 @@ pub fn export_dense_kv(path: &str, cache: &DenseKvCache) -> Result<(), String> {
     Ok(())
 }
 
-pub fn import_dense_kv(path: &str) -> Result<DenseKvCache, String> {
+pub fn import_dense_kv(path: &str) -> Result<DenseKvCache, ReflexError> {
     let mut f = open_and_check_magic(path)?;
     let version = read_u32(&mut f)?;
     if version != VERSION_DENSE {
-        return Err(format!("{path}: unsupported dense KV cache format version {version} (expected {VERSION_DENSE})"));
+        return Err(crate::reflex_err!(KvCache, "{path}: unsupported dense KV cache format version {version} (expected {VERSION_DENSE})"));
     }
     read_dense_body(&mut f)
 }
 
-pub fn export_hybrid_kv(path: &str, cache: &HybridKvCache) -> Result<(), String> {
-    let mut f = std::fs::File::create(path).map_err(|e| format!("create {path}: {e}"))?;
+pub fn export_hybrid_kv(path: &str, cache: &HybridKvCache) -> Result<(), ReflexError> {
+    let mut f =
+        std::fs::File::create(path).map_err(|e| crate::reflex_err!(Io, "create {path}: {e}"))?;
     f.write_all(MAGIC)
-        .map_err(|e| format!("write magic: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write magic: {e}"))?;
     f.write_all(&VERSION_HYBRID.to_le_bytes())
-        .map_err(|e| format!("write version: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write version: {e}"))?;
     f.write_all(&(cache.layers.len() as u32).to_le_bytes())
-        .map_err(|e| format!("write num_layers: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write num_layers: {e}"))?;
     f.write_all(&(cache.seq_len as u32).to_le_bytes())
-        .map_err(|e| format!("write seq_len: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write seq_len: {e}"))?;
     f.write_all(&(cache.attn_num_kv_heads as u32).to_le_bytes())
-        .map_err(|e| format!("write attn_num_kv_heads: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write attn_num_kv_heads: {e}"))?;
     f.write_all(&(cache.attn_head_dim as u32).to_le_bytes())
-        .map_err(|e| format!("write attn_head_dim: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write attn_head_dim: {e}"))?;
     f.write_all(&(cache.gdn_conv_state_len as u32).to_le_bytes())
-        .map_err(|e| format!("write gdn_conv_state_len: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write gdn_conv_state_len: {e}"))?;
     f.write_all(&(cache.gdn_recurrent_len as u32).to_le_bytes())
-        .map_err(|e| format!("write gdn_recurrent_len: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write gdn_recurrent_len: {e}"))?;
 
     let kinds: Vec<u8> = cache
         .layers
@@ -166,7 +169,7 @@ pub fn export_hybrid_kv(path: &str, cache: &HybridKvCache) -> Result<(), String>
         })
         .collect();
     f.write_all(&kinds)
-        .map_err(|e| format!("write layer kinds: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write layer kinds: {e}"))?;
 
     for layer in &cache.layers {
         match layer {
@@ -186,27 +189,28 @@ pub fn export_hybrid_kv(path: &str, cache: &HybridKvCache) -> Result<(), String>
     Ok(())
 }
 
-pub fn import_hybrid_kv(path: &str) -> Result<HybridKvCache, String> {
+pub fn import_hybrid_kv(path: &str) -> Result<HybridKvCache, ReflexError> {
     let mut f = open_and_check_magic(path)?;
     let version = read_u32(&mut f)?;
     if version != VERSION_HYBRID {
-        return Err(format!("{path}: unsupported hybrid KV cache format version {version} (expected {VERSION_HYBRID})"));
+        return Err(crate::reflex_err!(KvCache, "{path}: unsupported hybrid KV cache format version {version} (expected {VERSION_HYBRID})"));
     }
     read_hybrid_body(&mut f)
 }
 
-pub fn export_mla_kv(path: &str, cache: &MlaKvCache) -> Result<(), String> {
-    let mut f = std::fs::File::create(path).map_err(|e| format!("create {path}: {e}"))?;
+pub fn export_mla_kv(path: &str, cache: &MlaKvCache) -> Result<(), ReflexError> {
+    let mut f =
+        std::fs::File::create(path).map_err(|e| crate::reflex_err!(Io, "create {path}: {e}"))?;
     f.write_all(MAGIC)
-        .map_err(|e| format!("write magic: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write magic: {e}"))?;
     f.write_all(&VERSION_MLA.to_le_bytes())
-        .map_err(|e| format!("write version: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write version: {e}"))?;
     f.write_all(&(cache.kv_caches.len() as u32).to_le_bytes())
-        .map_err(|e| format!("write num_layers: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write num_layers: {e}"))?;
     f.write_all(&(cache.seq_len as u32).to_le_bytes())
-        .map_err(|e| format!("write seq_len: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write seq_len: {e}"))?;
     f.write_all(&(cache.qk_dim as u32).to_le_bytes())
-        .map_err(|e| format!("write qk_dim: {e}"))?;
+        .map_err(|e| crate::reflex_err!(Io, "write qk_dim: {e}"))?;
 
     for kv in &cache.kv_caches {
         write_f32_slice(&mut f, kv)?;
@@ -214,11 +218,12 @@ pub fn export_mla_kv(path: &str, cache: &MlaKvCache) -> Result<(), String> {
     Ok(())
 }
 
-pub fn import_mla_kv(path: &str) -> Result<MlaKvCache, String> {
+pub fn import_mla_kv(path: &str) -> Result<MlaKvCache, ReflexError> {
     let mut f = open_and_check_magic(path)?;
     let version = read_u32(&mut f)?;
     if version != VERSION_MLA {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            KvCache,
             "{path}: unsupported MLA KV cache format version {version} (expected {VERSION_MLA})"
         ));
     }
@@ -228,35 +233,38 @@ pub fn import_mla_kv(path: &str) -> Result<MlaKvCache, String> {
 /// Reads the magic + version header once and dispatches on the version to
 /// the matching body reader, so the CLI doesn't need to know in advance
 /// whether a file holds a dense/MoE, hybrid, or MLA cache.
-pub fn import_kv(path: &str) -> Result<ImportedKv, String> {
+pub fn import_kv(path: &str) -> Result<ImportedKv, ReflexError> {
     let mut f = open_and_check_magic(path)?;
     let version = read_u32(&mut f)?;
     match version {
         VERSION_DENSE => Ok(ImportedKv::Dense(read_dense_body(&mut f)?)),
         VERSION_HYBRID => Ok(ImportedKv::Hybrid(read_hybrid_body(&mut f)?)),
         VERSION_MLA => Ok(ImportedKv::Mla(read_mla_body(&mut f)?)),
-        other => Err(format!(
+        other => Err(crate::reflex_err!(KvCache,
             "{path}: unsupported KV cache format version {other} (expected {VERSION_DENSE}, {VERSION_HYBRID}, or {VERSION_MLA})"
         )),
     }
 }
 
-fn open_and_check_magic(path: &str) -> Result<std::fs::File, String> {
-    let mut f = std::fs::File::open(path).map_err(|e| format!("open {path}: {e}"))?;
+fn open_and_check_magic(path: &str) -> Result<std::fs::File, ReflexError> {
+    let mut f =
+        std::fs::File::open(path).map_err(|e| crate::reflex_err!(Io, "open {path}: {e}"))?;
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)
-        .map_err(|e| format!("read magic: {e}"))?;
+        .map_err(|e| crate::reflex_err!(KvCache, "read magic: {e}"))?;
     if &magic != MAGIC {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            KvCache,
             "{path}: not a reflex-engine KV cache file (bad magic)"
         ));
     }
     Ok(f)
 }
 
-fn read_dense_body(f: &mut std::fs::File) -> Result<DenseKvCache, String> {
+fn read_dense_body(f: &mut std::fs::File) -> Result<DenseKvCache, ReflexError> {
     let num_layers = read_u32(f)? as usize;
     let seq_len = read_u32(f)? as usize;
+    crate::limits::check_positions(seq_len, 0, 0)?;
     let num_kv_heads = read_u32(f)? as usize;
     let head_dim = read_u32(f)? as usize;
     let per_layer_len = seq_len * num_kv_heads * head_dim;
@@ -277,9 +285,10 @@ fn read_dense_body(f: &mut std::fs::File) -> Result<DenseKvCache, String> {
     })
 }
 
-fn read_hybrid_body(f: &mut std::fs::File) -> Result<HybridKvCache, String> {
+fn read_hybrid_body(f: &mut std::fs::File) -> Result<HybridKvCache, ReflexError> {
     let num_layers = read_u32(f)? as usize;
     let seq_len = read_u32(f)? as usize;
+    crate::limits::check_positions(seq_len, 0, 0)?;
     let attn_num_kv_heads = read_u32(f)? as usize;
     let attn_head_dim = read_u32(f)? as usize;
     let gdn_conv_state_len = read_u32(f)? as usize;
@@ -287,7 +296,7 @@ fn read_hybrid_body(f: &mut std::fs::File) -> Result<HybridKvCache, String> {
 
     let mut kinds = vec![0u8; num_layers];
     f.read_exact(&mut kinds)
-        .map_err(|e| format!("read layer kinds: {e}"))?;
+        .map_err(|e| crate::reflex_err!(KvCache, "read layer kinds: {e}"))?;
 
     let attn_len = seq_len * attn_num_kv_heads * attn_head_dim;
     let mut layers = Vec::with_capacity(num_layers);
@@ -307,7 +316,8 @@ fn read_hybrid_body(f: &mut std::fs::File) -> Result<HybridKvCache, String> {
                 });
             }
             other => {
-                return Err(format!(
+                return Err(crate::reflex_err!(
+                    KvCache,
                     "layer {layer_idx}: unknown hybrid layer kind byte {other} (expected 0 or 1)"
                 ))
             }
@@ -324,9 +334,10 @@ fn read_hybrid_body(f: &mut std::fs::File) -> Result<HybridKvCache, String> {
     })
 }
 
-fn read_mla_body(f: &mut std::fs::File) -> Result<MlaKvCache, String> {
+fn read_mla_body(f: &mut std::fs::File) -> Result<MlaKvCache, ReflexError> {
     let num_layers = read_u32(f)? as usize;
     let seq_len = read_u32(f)? as usize;
+    crate::limits::check_positions(seq_len, 0, 0)?;
     let qk_dim = read_u32(f)? as usize;
     let per_layer_len = seq_len * qk_dim;
 
@@ -342,26 +353,26 @@ fn read_mla_body(f: &mut std::fs::File) -> Result<MlaKvCache, String> {
     })
 }
 
-fn write_f32_slice(f: &mut std::fs::File, data: &[f32]) -> Result<(), String> {
+fn write_f32_slice(f: &mut std::fs::File, data: &[f32]) -> Result<(), ReflexError> {
     let mut buf = Vec::with_capacity(data.len() * 4);
     for x in data {
         buf.extend_from_slice(&x.to_le_bytes());
     }
     f.write_all(&buf)
-        .map_err(|e| format!("write f32 slice: {e}"))
+        .map_err(|e| crate::reflex_err!(Io, "write f32 slice: {e}"))
 }
 
-fn read_u32(f: &mut std::fs::File) -> Result<u32, String> {
+fn read_u32(f: &mut std::fs::File) -> Result<u32, ReflexError> {
     let mut buf = [0u8; 4];
     f.read_exact(&mut buf)
-        .map_err(|e| format!("read u32: {e}"))?;
+        .map_err(|e| crate::reflex_err!(KvCache, "read u32: {e}"))?;
     Ok(u32::from_le_bytes(buf))
 }
 
-fn read_f32_vec(f: &mut std::fs::File, len: usize) -> Result<Vec<f32>, String> {
+fn read_f32_vec(f: &mut std::fs::File, len: usize) -> Result<Vec<f32>, ReflexError> {
     let mut buf = vec![0u8; len * 4];
     f.read_exact(&mut buf)
-        .map_err(|e| format!("read f32 slice: {e}"))?;
+        .map_err(|e| crate::reflex_err!(KvCache, "read f32 slice: {e}"))?;
     Ok(buf
         .as_chunks::<4>()
         .0
@@ -410,6 +421,38 @@ mod tests {
         assert_eq!(reimported.k_caches, cache.k_caches);
         assert_eq!(reimported.v_caches, cache.v_caches);
         assert_eq!(via_import_kv.k_caches, cache.k_caches);
+    }
+
+    #[test]
+    fn import_rejects_cache_longer_than_attention_limit() {
+        let seq_len = crate::limits::ATTN_MAX_POSITIONS + 1;
+        let cache = DenseKvCache {
+            seq_len,
+            num_kv_heads: 1,
+            head_dim: 1,
+            k_caches: vec![vec![0.0; seq_len]],
+            v_caches: vec![vec![0.0; seq_len]],
+        };
+
+        let path = std::env::temp_dir().join(format!(
+            "reflex_kv_io_test_too_long_{}.bin",
+            std::process::id()
+        ));
+        let path_str = path.to_str().unwrap();
+
+        export_dense_kv(path_str, &cache).expect("export failed");
+        let result = import_kv(path_str);
+        std::fs::remove_file(&path).ok();
+        let Err(err) = result else {
+            panic!("oversized import must fail");
+        };
+
+        assert_eq!(err.code(), crate::error::ReflexErrorCode::ContextOverflow);
+        assert!(
+            err.to_string()
+                .starts_with(crate::limits::CONTEXT_LENGTH_EXCEEDED_PREFIX),
+            "{err}"
+        );
     }
 
     #[test]
@@ -518,7 +561,9 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("reflex_kv_io_badmagic_{}.bin", std::process::id()));
         std::fs::write(&path, b"NOPE\x01\x00\x00\x00").unwrap();
-        let err = import_dense_kv(path.to_str().unwrap()).unwrap_err();
+        let err = import_dense_kv(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
         std::fs::remove_file(&path).ok();
         assert!(err.contains("bad magic"));
     }

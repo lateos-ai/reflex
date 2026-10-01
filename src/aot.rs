@@ -30,7 +30,8 @@
 //! CUDA driver ultimately loads came from *this process's own binary*, never a
 //! path that only existed on the machine that built it.
 
-use cudarc::driver::{CudaDevice, CudaFunction};
+use crate::error::ReflexError;
+use cudarc::driver::{CudaDevice, CudaFunction, LaunchAsync, LaunchConfig};
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
 
@@ -57,11 +58,14 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 /// Turns embedded kernel bytes into a `cudarc::nvrtc::Ptx` the driver can load,
 /// branching on the crate-wide `REFLEX_KERNEL_FORMAT` build.rs set. See this
 /// module's doc comment for why the two formats need different handling.
-fn ptx_from_embedded_bytes(kernel_bytes: &'static [u8], module_name: &str) -> Result<Ptx, String> {
+fn ptx_from_embedded_bytes(
+    kernel_bytes: &'static [u8],
+    module_name: &str,
+) -> Result<Ptx, ReflexError> {
     match KERNEL_FORMAT {
         "ptx" => {
             let src = std::str::from_utf8(kernel_bytes)
-                .map_err(|e| format!("embedded PTX for module {module_name} is not valid UTF-8: {e}"))?;
+                .map_err(|e| crate::reflex_err!(Other, "embedded PTX for module {module_name} is not valid UTF-8: {e}"))?;
             Ok(Ptx::from_src(src.to_string()))
         }
         "cubin" => {
@@ -73,13 +77,30 @@ fn ptx_from_embedded_bytes(kernel_bytes: &'static [u8], module_name: &str) -> Re
             // somehow hashed to the same value, astronomically unlikely for FNV-1a
             // at kernel-file sizes) must never be silently reused.
             std::fs::write(&tmp_path, kernel_bytes)
-                .map_err(|e| format!("failed to materialize embedded cubin for module {module_name} at {tmp_path:?}: {e}"))?;
+                .map_err(|e| crate::reflex_err!(Io, "failed to materialize embedded cubin for module {module_name} at {tmp_path:?}: {e}"))?;
             let path_str = tmp_path
                 .to_str()
-                .ok_or_else(|| format!("materialized cubin temp path for module {module_name} is not valid UTF-8: {tmp_path:?}"))?;
+                .ok_or_else(|| crate::reflex_err!(Cuda, "materialized cubin temp path for module {module_name} is not valid UTF-8: {tmp_path:?}"))?;
             Ok(Ptx::from_file(path_str))
         }
-        other => Err(format!("unknown REFLEX_KERNEL_FORMAT {other:?} (build.rs should only ever emit \"ptx\" or \"cubin\")")),
+        // A fatbin (multi-arch cubin container with an embedded PTX fallback, see
+        // build.rs) is also arbitrary binary, so it takes the same materialize-
+        // to-temp-file-then-`Ptx::from_file` path as a single cubin -- the CUDA
+        // driver's `cuModuleLoad` is format-agnostic, so no separate handling is
+        // needed beyond giving the temp file a distinct extension.
+        "fatbin" => {
+            let hash = fnv1a_hash(kernel_bytes);
+            let tmp_path = std::env::temp_dir().join(format!("reflex-engine-kernel-{module_name}-{hash:016x}.fatbin"));
+            std::fs::write(&tmp_path, kernel_bytes)
+                .map_err(|e| crate::reflex_err!(Io, "failed to materialize embedded fatbin for module {module_name} at {tmp_path:?}: {e}"))?;
+            let path_str = tmp_path
+                .to_str()
+                .ok_or_else(|| crate::reflex_err!(Cuda, "materialized fatbin temp path for module {module_name} is not valid UTF-8: {tmp_path:?}"))?;
+            Ok(Ptx::from_file(path_str))
+        }
+        other => Err(crate::reflex_err!(Cuda,
+            "unknown REFLEX_KERNEL_FORMAT {other:?} (build.rs should only ever emit \"ptx\", \"cubin\", or \"fatbin\")"
+        )),
     }
 }
 
@@ -94,14 +115,17 @@ pub fn load_kernel(
     kernel_bytes: &'static [u8],
     module_name: &'static str,
     function_name: &'static str,
-) -> Result<AotKernel, String> {
+) -> Result<AotKernel, ReflexError> {
     let ptx = ptx_from_embedded_bytes(kernel_bytes, module_name)?;
     device
         .load_ptx(ptx, module_name, &[function_name])
-        .map_err(|e| format!("failed to load AOT-compiled module {module_name}: {e}"))?;
-    let function = device
-        .get_func(module_name, function_name)
-        .ok_or_else(|| format!("function {function_name} not found in module {module_name}"))?;
+        .map_err(|e| crate::gpu_err!(e, "failed to load AOT-compiled module {module_name}: {e}"))?;
+    let function = device.get_func(module_name, function_name).ok_or_else(|| {
+        crate::reflex_err!(
+            Cuda,
+            "function {function_name} not found in module {module_name}"
+        )
+    })?;
     Ok(AotKernel { function })
 }
 
@@ -114,11 +138,11 @@ pub fn load_kernel_module(
     kernel_bytes: &'static [u8],
     module_name: &'static str,
     function_names: &[&'static str],
-) -> Result<Vec<AotKernel>, String> {
+) -> Result<Vec<AotKernel>, ReflexError> {
     let ptx = ptx_from_embedded_bytes(kernel_bytes, module_name)?;
     device
         .load_ptx(ptx, module_name, function_names)
-        .map_err(|e| format!("failed to load AOT-compiled module {module_name}: {e}"))?;
+        .map_err(|e| crate::gpu_err!(e, "failed to load AOT-compiled module {module_name}: {e}"))?;
     function_names
         .iter()
         .map(|&function_name| {
@@ -126,8 +150,66 @@ pub fn load_kernel_module(
                 .get_func(module_name, function_name)
                 .map(|function| AotKernel { function })
                 .ok_or_else(|| {
-                    format!("function {function_name} not found in module {module_name}")
+                    crate::reflex_err!(
+                        Cuda,
+                        "function {function_name} not found in module {module_name}"
+                    )
                 })
         })
         .collect()
+}
+
+/// Loads and launches the same trivial `axpy_f32` smoke kernel `reflex smoke`
+/// runs (`out = a*x + y`), for `reflex doctor`'s "AOT kernel load+launch"
+/// check. Deliberately **not** used by `smoke.rs` itself: that subcommand's
+/// whole reason for existing is measuring process-start-to-first-kernel-
+/// result as precisely as possible (see its doc comment), and it captures
+/// `elapsed` *before* the dtoh copy/assert this function folds in, so
+/// reusing it there would change exactly the timing-critical sequence
+/// `smoke` exists to protect. `doctor` only needs pass/fail, not a
+/// nanosecond-faithful cold-start number, so it gets its own copy of the
+/// same logic here instead. Returns an error string (never panics) so
+/// `doctor` can report it as a failed check rather than aborting the whole
+/// report.
+pub fn verify_kernel_launch(device: &Arc<CudaDevice>) -> Result<(), ReflexError> {
+    let kernel = load_kernel(
+        device,
+        include_bytes!(env!("REFLEX_KERNEL_SMOKE")),
+        "smoke",
+        "axpy_f32",
+    )?;
+
+    let n = 1024usize;
+    let x = device
+        .htod_copy(vec![1.0f32; n])
+        .map_err(|e| crate::gpu_err!(e, "verify_kernel_launch: htod x: {e}"))?;
+    let y = device
+        .htod_copy(vec![2.0f32; n])
+        .map_err(|e| crate::gpu_err!(e, "verify_kernel_launch: htod y: {e}"))?;
+    let mut out = device
+        .alloc_zeros::<f32>(n)
+        .map_err(|e| crate::gpu_err!(e, "verify_kernel_launch: alloc out: {e}"))?;
+
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    unsafe {
+        kernel
+            .function
+            .launch(cfg, (3.0f32, &x, &y, &mut out, n as i32))
+    }
+    .map_err(|e| crate::gpu_err!(e, "verify_kernel_launch: launch failed: {e}"))?;
+    device
+        .synchronize()
+        .map_err(|e| crate::gpu_err!(e, "verify_kernel_launch: sync failed: {e}"))?;
+
+    let result = device
+        .dtoh_sync_copy(&out)
+        .map_err(|e| crate::gpu_err!(e, "verify_kernel_launch: dtoh: {e}"))?;
+    if (result[0] - 5.0).abs() >= 1e-5 {
+        return Err(crate::reflex_err!(
+            Cuda,
+            "verify_kernel_launch: wrong result: expected 5.0, got {}",
+            result[0]
+        ));
+    }
+    Ok(())
 }

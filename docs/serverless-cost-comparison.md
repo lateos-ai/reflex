@@ -2,7 +2,7 @@
 
 This is a real, measured comparison of cold-invocation latency between Reflex and vLLM,
 deployed on identical hardware on the same serverless platform (Runpod), run 2026-09-26.
-It exists to test the claim made in the root [README](../README.md#why-serverless-is-the-fit)
+It exists to test the claim made in the root [README](../README.md#why-cold-start)
 and [`serverless/runpod/README.md`](../serverless/runpod/README.md): that Reflex's AOT-compiled
 cold start adds near-zero marginal time on top of a serverless platform's own provisioning
 floor, where a JIT/graph-compiling engine adds substantially more on top of that same floor.
@@ -140,4 +140,4 @@ single cold, single-shot invocation, matching this project's own architecture â€
 [Non-goals](../README.md#non-goals)). This comparison is specifically about the bursty,
 single-shot workload this deployment shape targets, not a claim that Reflex outperforms vLLM
 as a high-throughput server â€” it deliberately doesn't try to, and would lose that comparison
-(see the root README's "Why this exists" section).
+(see [benchmarks.md](benchmarks.md#where-this-engine-competes)).

@@ -13,6 +13,7 @@ shim whose only job is speaking Runpod's queue job-envelope format.
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -68,8 +69,13 @@ def _watchdog():
 def _start_adapter():
     global _adapter_process
     gguf_path = os.environ["GGUF_PATH"]
+    # Optional extra adapter flags (e.g. "--max-tokens-cap 1024"); unset = the
+    # adapter's own request-limit defaults. Its default --request-timeout-secs (300)
+    # matches this shim's own urlopen timeout below.
+    extra_args = shlex.split(os.environ.get("ADAPTER_ARGS", ""))
     _adapter_process = subprocess.Popen(
-        ["reflex-openai-adapter", gguf_path, "--host", ADAPTER_HOST, "--port", str(ADAPTER_PORT)],
+        ["reflex-openai-adapter", gguf_path, "--host", ADAPTER_HOST, "--port", str(ADAPTER_PORT)]
+        + extra_args,
     )
     _wait_for_ready()
     threading.Thread(target=_watchdog, daemon=True).start()

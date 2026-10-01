@@ -23,7 +23,7 @@ Internet
        -> Target Group (HTTP:8000, health check "/healthz")
             -> Auto Scaling Group: min=1/max=2, g4dn.xlarge, On-Demand baseline +
                Spot burst (mixed-instances-policy, OnDemandBaseCapacity=1)
-                 each instance: sidecar/openai-adapter/Dockerfile's combined image,
+                 each instance: the root Dockerfile's `adapter` image,
                  reflex-openai-adapter bound 0.0.0.0:8000, spawning
                  reflex stdio <gguf> as a child in the same container
 ```
@@ -84,12 +84,11 @@ What it does *not* buy you:
 Unlike the sibling guide (which uses the root `Dockerfile` unchanged), this pattern
 needs both `reflex` (with the `ipc` feature, for `reflex stdio`) and
 `reflex-openai-adapter` in one image, since the adapter spawns `reflex stdio` as a
-literal child process. Build from the repo root using
-[`sidecar/openai-adapter/Dockerfile`](../sidecar/openai-adapter/Dockerfile) (build
-context = repo root):
+literal child process. Build the root [`Dockerfile`](../Dockerfile)'s `adapter`
+target (build context = repo root):
 
 ```bash
-docker build -f sidecar/openai-adapter/Dockerfile \
+docker build --target adapter \
   --build-arg REFLEX_CUDA_ARCH=sm_75 \
   -t reflex-openai-adapter:latest .
 
@@ -183,6 +182,9 @@ export EFS_ID=fs-0123456789abcdef0
 export MODEL_REPO=Qwen/Qwen3-0.6B-GGUF
 export MODEL_FILE=Qwen3-0.6B-Q8_0.gguf
 export PORT=8000
+# Optional: tune the adapter's request limits (defaults apply without this). Keep
+# --request-timeout-secs under the ALB idle timeout -- see "Known limitations".
+# export ADAPTER_ARGS="--max-tokens-cap 1024 --request-timeout-secs 55"
 # export HF_TOKEN populated from SSM here if the repo is gated
 curl -fsSL https://raw.githubusercontent.com/YOUR_ORG/reflex/main/scripts/aws_ec2_bootstrap_warm.sh -o /tmp/bootstrap.sh
 bash /tmp/bootstrap.sh
@@ -408,6 +410,16 @@ public endpoint.
   always-on On-Demand baseline, not the only capacity, but not a guarantee.
 - The WAF shared-secret header is abuse deterrence, not real per-user
   authentication/billing/rate-limiting.
+- The sidecar bounds every request by default (`max_tokens` ≤ 2048, rendered prompt
+  ≤ 256 KiB, ≤ 16 jobs queued or running → `429` beyond that, 300 s response
+  timeout; see the sidecar README's "Request limits"). Those limits are per
+  instance, not per caller. Tune them with `ADAPTER_ARGS` in the user-data.
+- The ALB's default idle timeout is **60 s**, shorter than the sidecar's default
+  300 s `--request-timeout-secs`. A non-streaming request that runs past 60 s
+  without sending bytes gets the ALB's own `504` first, and the engine keeps working
+  on it regardless. Either raise the ALB's `idle_timeout.timeout_seconds` to at least
+  the sidecar timeout, or set `--request-timeout-secs` below the ALB's value (as in
+  the step 5 example). Streaming requests are unaffected once tokens are flowing.
 - `ALBRequestCountPerTarget`'s request-completion attribution is an imperfect signal
   for long-lived SSE streams (see step 8).
 - `usage.prompt_tokens` in the sidecar's responses remains a whitespace-word-count

@@ -4,10 +4,14 @@
 
 pub mod aot;
 pub mod calibration;
+#[cfg(feature = "json-output")]
+pub mod cli_output;
 pub mod dequant;
 pub mod dequant_iq;
 pub mod dequant_iq_tables;
 pub mod diagnostics;
+pub mod energy;
+pub mod error;
 pub mod ffi;
 pub mod gated_deltanet;
 pub mod gguf;
@@ -16,6 +20,7 @@ pub mod hf;
 #[cfg(feature = "ipc")]
 pub mod ipc;
 pub mod kv_io;
+pub mod limits;
 pub mod lora;
 pub mod model;
 pub mod moe;
@@ -34,9 +39,7 @@ pub mod tokenizer;
 /// nothing to do with the process's actual work and does not scale with how
 /// much was allocated -- consolidating allocations into fewer, larger
 /// buffers was tried first and made no measurable difference, which is what
-/// pointed at the `atexit` hook itself rather than allocation count (see
-/// DECISIONS.md's "fast-exit after printing the benchmark result" entry for
-/// the full investigation).
+/// pointed at the `atexit` hook itself rather than allocation count.
 ///
 /// Every one-shot `reflex` subcommand's job is finished by the time it calls this --
 /// the OS reclaims all process resources (GPU context, file descriptors,

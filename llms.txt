@@ -1,0 +1,120 @@
+# Reflex
+
+> GGUF-native GPU inference engine optimized for cold-start latency and energy (process
+> launch to first token), not sustained server throughput. Every CUDA kernel is compiled
+> ahead-of-time by `nvcc` at build time (`build.rs`) — never at runtime via NVRTC — so
+> there is no JIT tax on cold start. `batch_size` is always 1; no in-engine HTTP server,
+> queue, or continuous batching (see "Non-goals" in README.md). Full context: README.md,
+> docs/reference.md, docs/benchmarks.md, docs/DEVELOPMENT.md, CHANGELOG.md.
+
+This file gives an agent the literal commands to run Reflex on each supported platform.
+Every command below is real and has been executed against real GPU hardware at least
+once — see each platform's linked README for the measured numbers and any caveats.
+
+## Prerequisites, all platforms
+
+A GGUF model file. The project's own benchmarks/fixtures center on `Qwen3-0.6B-Q4_K_M`
+(~379MB) — e.g. `unsloth/Qwen3-0.6B-GGUF` on Hugging Face. Reflex auto-detects dense,
+MoE, hybrid (Qwen3.5 Gated DeltaNet), and MLA (DeepSeek-V2/V3) architectures from GGUF
+metadata; no flag needed.
+
+An NVIDIA GPU with a known compute capability, since a from-source build defaults to
+portable PTX (small driver-JIT cost) unless you pin `REFLEX_CUDA_ARCH=sm_XX` for a true
+zero-JIT cubin build. Common values: `sm_75` (T4, most AWS/some Runpod GPUs), `sm_86`
+(A4500/A6000/3090-class, Runpod's cheapest serverless pool), `sm_89` (L4/Ada, Modal's
+`gpu="L4"`). **A pinned cubin only runs on the exact compute capability it was built
+for** — this is the single most common mistake across every platform below.
+
+## Local GPU
+
+Requires the CUDA toolkit (`nvcc` on `PATH` or `CUDA_PATH`/`CUDA_HOME`).
+
+```
+cargo build --release
+cargo run --release --bin reflex -- smoke                          # proves the AOT pipeline works end to end
+cargo run --release --bin reflex -- generate <path-to-gguf> "prompt"
+```
+
+`REFLEX_CUDA_ARCH=sm_86 cargo build --release` pins a cubin to one GPU instead of
+portable PTX. `REFLEX_SKIP_CUDA=1 cargo build` skips kernel compilation for editing on a
+machine with no CUDA toolkit (no subcommand actually runs on this build). Run `reflex` with no
+arguments for the subcommand list (`system1`, `bench`, `check`, `stdio`/`uds` IPC modes,
+etc.) and `reflex <subcommand>` for its usage; `docs/DEVELOPMENT.md` covers building and testing.
+
+## Docker (any host with `nvidia-container-toolkit`)
+
+```
+docker build -t reflex .   # multi-arch fatbin; --build-arg REFLEX_CUDA_ARCH=sm_XX pins one GPU arch
+docker run --rm --gpus all -v /path/to/models:/models \
+  reflex /models/Qwen3-0.6B-Q4_K_M.gguf "Once upon a time"
+```
+
+Default entrypoint is `reflex generate`. For any other subcommand, override it:
+`docker run --rm --gpus all -v /path/to/models:/models --entrypoint /usr/local/bin/reflex reflex smoke`.
+
+## AWS
+
+**Fastest path — one GPU instance, no autoscaling**: launch a `g4dn.xlarge` (Tesla T4,
+`sm_75`) from a DLAMI with Docker + NVIDIA Container Toolkit preinstalled
+(`base-oss-nvidia-driver-gpu-ubuntu-22.04`, resolved via
+`aws ssm get-parameter --name /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id`),
+ship this repo to it, then run the Docker recipe above with `REFLEX_CUDA_ARCH=sm_75`. No
+SSH key needed — use SSM Session Manager (`AmazonSSMManagedInstanceCore` on the
+instance's IAM role) for shell access.
+
+**Production pattern (Spot GPU instances, Auto Scaling Group, scale-to-zero, EFS shared
+model cache, `reflex uds` sidecar over a local Unix Domain Socket)**: see
+[`docs/aws-deployment.md`](docs/aws-deployment.md). **Always-warm alternative** (On-Demand
+instance, public HTTPS load balancer, `sidecar/openai-adapter` HTTP sidecar instead of
+raw UDS): see [`docs/aws-deployment-warm.md`](docs/aws-deployment-warm.md).
+
+## Runpod
+
+**Recommended: [`serverless/runpod/`](serverless/runpod/README.md)** — a Runpod
+Serverless **Load-Balancing** endpoint (not queue-based; the existing
+`reflex-openai-adapter` HTTP sidecar runs unmodified, zero Python glue).
+[`scripts/deploy_runpod.sh`](scripts/deploy_runpod.sh) automates the whole path: it builds
+and pushes the image, creates the load-balancing template + endpoint, pins the `sm_86`
+SKU, and runs the cold-start benchmark (`scripts/bench_cold_runpod.sh`) against it.
+The image uses the slim `base` + `libcublas-12-4` runtime and multi-arch fatbin kernels by
+default (see the README's image-size section). To do it by hand, build and push the root
+`Dockerfile`'s `runpod-lb` target (`docker build --target runpod-lb .`), then create the endpoint (console, API,
+or `runpod-mcp`'s `create-endpoint` / `runpodctl`) with:
+- Endpoint type: Load Balancing
+- `GGUF_PATH` env var (model is baked into the image at build time), `PORT` if not `80`
+- **Pin the GPU SKU to RTX A4500** (`sm_86`) — the cheapest pool `AMPERE_16` is
+  mixed-architecture (also contains Ada `sm_89` cards) despite its name; an unpinned
+  endpoint fails nondeterministically depending on which card it lands on.
+- Do not rely on `HEALTH_CHECK_PATH` — Runpod's gateway polls the hardcoded `/ping` path
+  regardless; the adapter serves the same three-state health check at both paths.
+
+Real measured result: ~3.4x faster cold start than Runpod's own official `worker-vllm`
+on identical hardware — see [`docs/serverless-cost-comparison.md`](docs/serverless-cost-comparison.md).
+
+**Discoverability via the Runpod Hub** (browsable catalog, one-click deploy): see
+[`.runpod/`](.runpod/README.md) — a second, parallel, queue-based build required only
+because the Hub's publishing pipeline doesn't currently accept load-balancing endpoints.
+Deploy via the Hub UI or `deploy-hub-repo` pointing at this GitHub repo; `.runpod/hub.json`
+carries the listing metadata. Prefer `serverless/runpod/` for a manual/direct deployment.
+
+## Modal
+
+```
+PYTHONUTF8=1 python -m modal run .modal/app.py       # one-shot: ephemeral App, real cold-start measurement, tears down after
+PYTHONUTF8=1 python -m modal deploy .modal/app.py    # persistent deployment
+```
+
+`PYTHONUTF8=1` works around a Windows console encoding crash on Modal's CLI Unicode
+output — omit it on Linux/macOS. Builds from `.modal/Dockerfile` (same builder recipe as
+`serverless/runpod/`, `REFLEX_CUDA_ARCH=sm_89` for Modal's `gpu="L4"`), model baked in.
+See [`.modal/README.md`](.modal/README.md) for real measured numbers (~7-8s cold start,
+`n=3`) and [`docs/modal-phase3-comparison.md`](docs/modal-phase3-comparison.md) for a
+controlled comparison against plain vLLM on the same platform (~25x faster).
+
+## Non-goals, so an agent doesn't propose them
+
+`batch_size` is always 1. No internal request queue/scheduler, no continuous batching,
+no in-engine HTTP/gRPC server — ever. Multi-tenancy and any network-facing serving layer
+belong in a host orchestrator or one of the sidecar/adapter binaries above, never inside
+the core `reflex` engine. See README.md's "Non-goals" section for the full rationale
+before proposing anything in this direction.

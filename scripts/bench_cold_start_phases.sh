@@ -3,7 +3,7 @@
 #
 # A single aggregate `process_start_to_first_token_ms` number hides where the
 # time actually goes -- this splits it into the phases real user feedback
-# asked for (see HISTORY.md's "cold-start phase breakdown" entry): process
+# asked for (see docs/benchmarks.md's "Cold-start phase breakdown"): process
 # launch, CUDA init, model load, and prompt eval, each reported as p50/p95
 # across N cold-process runs, not a single sample.
 #
@@ -59,6 +59,20 @@ extract_field() {
   grep -o "$2=[0-9.]*" "$1" | head -1 | cut -d= -f2
 }
 
+extract_phase_field() {
+  # $1 = file, $2 = phase name, $3 = field (e.g. energy_joules)
+  # Anchors to the specific `REFLEX_PHASE_OK phase=<name> ` line, so it can't
+  # accidentally read a different phase's field (the plain `extract_field`
+  # above would match `energy_joules=` as a substring of `joules=`).
+  grep "REFLEX_PHASE_OK phase=$2 " "$1" | head -1 | grep -o "$3=[0-9.]*" | cut -d= -f2
+}
+
+extract_total_joules() {
+  # $1 = file; reads the aggregate line's `joules=`, anchored to the result
+  # line so it never picks up a preceding phase line's `energy_joules=`.
+  grep '^REFLEX_GENERATE_OK' "$1" | grep -o ' joules=[0-9.]*' | head -1 | cut -d= -f2
+}
+
 percentile() {
   # $1 = percentile (0-100), reads sorted numbers from stdin (one per line)
   local p="$1"
@@ -71,27 +85,41 @@ percentile() {
   }'
 }
 
+# $3 is the `REFLEX_PHASE_OK` phase name to read energy from, or empty for the
+# aggregate result line's `joules=` (the "total" row).
 report_phase() {
   local label="$1"
   local field="$2"
-  local values=""
+  local phase="${3:-}"
+  local values="" joules=""
   for i in $(seq 1 "$n_runs"); do
     stdout_log="$results_dir/stdout_${i}.log"
     v=$(extract_field "$stdout_log" "$field")
     [[ -n "$v" ]] && values+="$v"$'\n'
+    if [[ -n "$phase" ]]; then
+      j=$(extract_phase_field "$stdout_log" "$phase" "energy_joules")
+    else
+      j=$(extract_total_joules "$stdout_log")
+    fi
+    [[ -n "$j" ]] && joules+="$j"$'\n'
   done
   local sorted
   sorted=$(echo -n "$values" | sort -n)
   local n
   n=$(echo -n "$sorted" | grep -c . || true)
   if [[ "$n" -eq 0 ]]; then
-    echo "| $label | n/a (field missing) | n/a |"
+    echo "| $label | n/a (field missing) | n/a | n/a |"
     return
   fi
-  local p50 p95
+  local p50 p95 j50
   p50=$(echo "$sorted" | percentile 50)
   p95=$(echo "$sorted" | percentile 95)
-  echo "| $label | ${p50} ms | ${p95} ms |"
+  if [[ -z "$joules" ]]; then
+    j50="n/a"
+  else
+    j50=$(echo -n "$joules" | sort -n | percentile 50)
+  fi
+  echo "| $label | ${p50} ms | ${p95} ms | ${j50} J |"
 }
 
 report_process_launch_phase() {
@@ -117,24 +145,27 @@ report_process_launch_phase() {
   local n
   n=$(echo -n "$sorted" | grep -c . || true)
   if [[ "$n" -eq 0 ]]; then
-    echo "| process launch (external − internal) | n/a | n/a |"
+    echo "| process launch (external − internal) | n/a | n/a | n/a |"
     return
   fi
   local p50 p95
   p50=$(echo "$sorted" | percentile 50)
   p95=$(echo "$sorted" | percentile 95)
-  echo "| process launch (external − internal) | ${p50} ms | ${p95} ms |"
+  # No joules cell: this phase is derived from external wall clock and spans
+  # OS exec/dynamic-linking before `main()`, which this process cannot sample.
+  echo "| process launch (external − internal) | ${p50} ms | ${p95} ms | n/a (pre-main) |"
 }
 
 echo
 echo "Cold-start phase breakdown, n=$n_runs runs, $(basename "$gguf_path"):"
 echo
-echo "| phase | p50 | p95 |"
-echo "|---|---|---|"
+echo "| phase | p50 | p95 | p50 joules |"
+echo "|---|---|---|---|"
 report_process_launch_phase
-report_phase "cuda init" "cuda_init_ms"
-report_phase "model load" "model_load_ms"
-report_phase "prompt eval (first token)" "prompt_eval_ms"
-report_phase "total (process_start_to_first_token_ms)" "process_start_to_first_token_ms"
+report_phase "gguf open (mmap + metadata parse)" "gguf_open_ms" "gguf_open"
+report_phase "cuda init" "cuda_init_ms" "cuda_init"
+report_phase "model load" "model_load_ms" "model_load"
+report_phase "prompt eval (first token)" "prompt_eval_ms" "prompt_eval"
+report_phase "total (process_start_to_first_token_ms)" "process_start_to_first_token_ms" ""
 echo
 echo "raw logs kept in: $results_dir" >&2

@@ -6,14 +6,13 @@
 # internal timer), and prints a markdown results table (wall clock, peak
 # RSS, user time, sys time) per run. This mirrors the exact methodology
 # already used for the Reflex-vs-llama.cpp comparison in
-# README.md and codified in DECISIONS.md's "Cold-start-vs-llama.cpp
-# benchmark methodology" entry — reuse it for every new engine instead of
+# docs/benchmarks.md — reuse it for every new engine instead of
 # inventing a new measurement approach.
 #
 # Before trusting this harness for a NEW engine, validate it by re-running
 # it against the llama.cpp / Reflex commands from that existing
 # comparison and confirming it reproduces the already-published numbers
-# (README.md's "First real cold-start benchmark" section) within noise.
+# (docs/benchmarks.md's "Cold start vs. other engines") within noise.
 #
 # Usage: bench_cold_common.sh <label> <n_runs> -- <command...>
 # Example:
@@ -25,6 +24,18 @@
 # bench-results/<timestamp>_<label>/ for later inspection — never
 # discarded, since disclosing what actually happened (including failed or
 # odd runs) matters more here than a tidy summary.
+#
+# Optional cold-state hook: if BENCH_PREPARE_CMD is set to a shell command, it is
+# run through `bash -c` once *before each timed run* (with the run index as $1),
+# outside the /usr/bin/time window so its own duration never leaks into the
+# reported wall clock. It exists for targets whose cold state has to be
+# re-established between runs — e.g. scripts/bench_cold_runpod.sh forcing a
+# serverless endpoint back to zero workers — while keeping this script's
+# single-timing-loop methodology unchanged. Unset (the default) is a complete
+# no-op, so every existing caller behaves exactly as before. The hook's own
+# output goes to stderr to keep the markdown table on stdout clean; a non-zero
+# hook exit is warned about but does not abort the run, matching this harness's
+# "report what actually happened" rule.
 
 set -euo pipefail
 
@@ -63,6 +74,14 @@ for i in $(seq 1 "$n_runs"); do
   time_log="$results_dir/time_${i}.log"
   stdout_log="$results_dir/stdout_${i}.log"
   stderr_log="$results_dir/stderr_${i}.log"
+
+  # Untimed cold-state reset (no-op unless the caller opted in). Runs before the
+  # timer starts so the reset itself is never counted as "cold start" time.
+  if [[ -n "${BENCH_PREPARE_CMD:-}" ]]; then
+    if ! bash -c "$BENCH_PREPARE_CMD" _ "$i" >&2; then
+      echo "warning: BENCH_PREPARE_CMD failed for run $i — proceeding to time the run anyway" >&2
+    fi
+  fi
 
   status=0
   /usr/bin/time -v -o "$time_log" -- "${cmd[@]}" >"$stdout_log" 2>"$stderr_log" || status=$?

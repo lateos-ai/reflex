@@ -20,6 +20,8 @@
 //! `llama.*`, and `<arch>.expert_count` being present and nonzero (rather
 //! than the architecture string itself) is the dense-vs-MoE signal.
 
+use crate::error::ReflexError;
+
 /// Per-token MoE router: softmax `router_logits` over *all* experts, select
 /// the top-`k` by probability, then renormalize just those `k` probabilities
 /// to sum to 1. Returns `k` `(expert_index, combination_weight)` pairs,
@@ -30,7 +32,7 @@
 /// Errs if `logits` is empty, `k` is 0 or exceeds `logits.len()`, or the
 /// softmax/top-k probability mass is non-finite or non-positive (e.g. every
 /// logit is `-inf`).
-pub fn route_top_k(logits: &[f32], k: usize) -> Result<Vec<(usize, f32)>, String> {
+pub fn route_top_k(logits: &[f32], k: usize) -> Result<Vec<(usize, f32)>, ReflexError> {
     route_top_k_with_norm(logits, k, true)
 }
 
@@ -46,12 +48,15 @@ pub fn route_top_k_with_norm(
     logits: &[f32],
     k: usize,
     normalize: bool,
-) -> Result<Vec<(usize, f32)>, String> {
+) -> Result<Vec<(usize, f32)>, ReflexError> {
     if logits.is_empty() {
-        return Err("route_top_k: logits must not be empty".to_string());
+        return Err(ReflexError::Other(
+            "route_top_k: logits must not be empty".to_string(),
+        ));
     }
     if k == 0 || k > logits.len() {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            Other,
             "route_top_k: k ({k}) must be in 1..={} (logits.len())",
             logits.len()
         ));
@@ -61,7 +66,8 @@ pub fn route_top_k_with_norm(
     let exps: Vec<f32> = logits.iter().map(|&l| (l - max_logit).exp()).collect();
     let sum: f32 = exps.iter().sum();
     if !sum.is_finite() || sum <= 0.0 {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            Other,
             "route_top_k: softmax sum is non-finite or non-positive ({sum})"
         ));
     }
@@ -82,7 +88,8 @@ pub fn route_top_k_with_norm(
 
     let top_sum: f32 = top.iter().map(|&i| probs[i]).sum();
     if !top_sum.is_finite() || top_sum <= 0.0 {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            Other,
             "route_top_k: top-{k} probability mass is non-finite or non-positive ({top_sum})"
         ));
     }

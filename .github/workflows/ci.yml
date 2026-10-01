@@ -8,9 +8,9 @@ on:
 env:
   # No GitHub-hosted runner has an NVIDIA GPU, so build.rs must skip invoking
   # nvcc entirely -- this is exactly the "editing/type-checking on a machine
-  # without CUDA" path CLAUDE.md documents. It does not build or run any CUDA
+  # without CUDA" path docs/DEVELOPMENT.md documents. It does not build or run any CUDA
   # kernel; real GPU-hardware verification stays a manual step (see
-  # CLAUDE.md's "There is no CPU/mock fallback" note).
+  # docs/DEVELOPMENT.md's "No CPU fallback" section).
   REFLEX_SKIP_CUDA: "1"
 
 jobs:
@@ -31,14 +31,39 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+      # `--features ipc` on build/clippy/test: src/ipc.rs (the `reflex stdio`/`uds`
+      # JSON-line protocol the sidecar, Runpod images and AWS guides all speak) is
+      # compiled only under this feature, so without it its unit tests never run.
+      # `ipc` only adds serde/serde_json -- no OpenSSL or Python host deps.
       - name: Build (nvcc skipped, no GPU on hosted runners)
-        run: cargo build --locked --all-targets
+        run: cargo build --locked --all-targets --features ipc
+
+      - name: Feature-matrix build (each optional feature in isolation, nvcc skipped)
+        # `python` and `--all-features` are deliberately excluded: the `python`
+        # feature does not currently compile (pre-existing `Send` incompatibility
+        # between pyo3's `#[pyclass]` bound and `WeightLoadPipeline`'s `*mut u8`
+        # pinned-host pointer). The four features below are the ones the deploy Dockerfiles
+        # actually use, and must keep building independently.
+        run: |
+          for feature in ipc json-output download nvml; do
+            cargo check --locked --features "$feature"
+          done
 
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets --features ipc -- -D warnings
+
+      # Lints the `download` feature (not just type-checks it, as the feature
+      # matrix above does). Ubuntu-only because it needs libssl-dev/pkg-config;
+      # `python` stays out (needs maturin, and currently doesn't compile).
+      - name: Clippy (ipc + download, Ubuntu only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+          cargo clippy --locked --all-targets --features ipc,download -- -D warnings
 
       - name: Test (GPU-hardware tests are #[ignore]d and skipped here)
-        run: cargo test --locked
+        run: cargo test --locked --features ipc,nvml
 
   # sidecar/openai-adapter is a deliberately separate Cargo project (own
   # Cargo.toml/Cargo.lock, not a workspace member, no dependency on reflex-engine --
@@ -93,3 +118,19 @@ jobs:
 
       - name: Compile-check handler.py (syntax only)
         run: python -m py_compile .runpod/handler.py
+
+  # scripts/bench_compare.py gates the GPU nightly's perf check (gpu-nightly.yml);
+  # its parser/threshold logic is pure Python and tested here against the sample
+  # bench logs in bench/testdata/, so a broken compare script is caught on every
+  # push rather than only once a nightly GPU run happens.
+  bench-compare-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Unit-test bench_compare.py
+        run: python -m unittest discover -s bench -v

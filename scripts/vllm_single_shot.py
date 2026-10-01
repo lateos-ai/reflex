@@ -6,7 +6,7 @@ prints it, and exits. Does no internal timing of its own — this script is
 meant to be wrapped externally by `/usr/bin/time -v` (via
 scripts/bench_cold_vllm.sh), matching the external-wall-clock methodology
 already used for the Reflex-vs-llama.cpp comparison (see
-DECISIONS.md's benchmark-methodology entry) so process launch, Python
+docs/benchmarks.md) so process launch, Python
 startup, and vLLM's own engine init (including CUDA graph capture) are all
 included on vLLM's side of the comparison, the same way OS exec/dynamic-
 linking overhead is included on every other engine measured this way.

@@ -9,7 +9,7 @@
 // inefficiency at real prefill lengths -- see model.rs's
 // Model::forward_mla_attn_block_batched doc comment for the actual math -- so this
 // kernel exists specifically to avoid reintroducing the kind of per-call-overhead
-// regression CLAUDE.md documents for Phase 2 round 1. Used for DeepSeek-V2/V3 MLA's
+// regression docs/DEVELOPMENT.md's model-loading section documents. Used for DeepSeek-V2/V3 MLA's
 // batched-prefill absorption (`wk_b`) and decompression (`wv_b`) steps.
 //
 // `x` is read with explicit row/head strides plus a per-head offset instead of

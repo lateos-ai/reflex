@@ -23,6 +23,7 @@
 //! same "flag the real gap honestly" posture this module's SentencePiece
 //! path already held before its own real-file verification.
 
+use crate::error::ReflexError;
 use crate::gguf::{GgufFile, GgufValue};
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -100,6 +101,14 @@ pub struct Tokenizer {
     pub scores: Vec<f32>,
     pub token_type: Vec<i32>,
     pub bos_token_id: Option<u32>,
+    /// `tokenizer.ggml.add_bos_token` -- whether a prompt gets `bos_token_id`
+    /// prepended. llama.cpp's `llama_vocab::load` honors this key when present
+    /// (e.g. real Qwen3.8-27B GGUFs define `bos_token_id = 248044` but set
+    /// `add_bos_token = false`, so prepending it anyway diverges from
+    /// llama.cpp). When the key is absent this falls back to "prepend if a BOS
+    /// id exists", the behavior every earlier golden token was recorded under.
+    /// Read via [`Self::prompt_bos`], not directly.
+    pub add_bos: bool,
     pub eos_token_id: Option<u32>,
     pub unk_token_id: Option<u32>,
     pub pad_token_id: Option<u32>,
@@ -132,7 +141,7 @@ impl Tokenizer {
     /// `tokenizer.ggml.model` and `tokenizer.ggml.tokens`; every other key
     /// (`scores`, `token_type`, `merges`, special-token ids) is optional and
     /// defaults to empty/`None` when absent.
-    pub fn from_gguf(file: &GgufFile) -> Result<Self, String> {
+    pub fn from_gguf(file: &GgufFile) -> Result<Self, ReflexError> {
         let architecture = string_meta(&file.metadata, "tokenizer.ggml.model")?.to_string();
         let tokens = string_array(&file.metadata, "tokenizer.ggml.tokens")?;
 
@@ -154,10 +163,16 @@ impl Tokenizer {
         for (rank, entry) in merges_raw.iter().enumerate() {
             let mut parts = entry.split(' ');
             let left = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-                format!("malformed merge entry '{entry}' (expected 'left right')")
+                crate::reflex_err!(
+                    Tokenizer,
+                    "malformed merge entry '{entry}' (expected 'left right')"
+                )
             })?;
             let right = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-                format!("malformed merge entry '{entry}' (expected 'left right')")
+                crate::reflex_err!(
+                    Tokenizer,
+                    "malformed merge entry '{entry}' (expected 'left right')"
+                )
             })?;
             merge_rank.insert((left.to_string(), right.to_string()), rank);
         }
@@ -170,6 +185,10 @@ impl Tokenizer {
 
         let bos_token_id =
             u64_meta(&file.metadata, "tokenizer.ggml.bos_token_id").map(|v| v as u32);
+        let add_bos = match file.metadata.get("tokenizer.ggml.add_bos_token") {
+            Some(GgufValue::Bool(b)) => *b,
+            _ => bos_token_id.is_some(),
+        };
         let eos_token_id =
             u64_meta(&file.metadata, "tokenizer.ggml.eos_token_id").map(|v| v as u32);
         let unk_token_id =
@@ -197,6 +216,7 @@ impl Tokenizer {
             scores,
             token_type,
             bos_token_id,
+            add_bos,
             eos_token_id,
             unk_token_id,
             pad_token_id,
@@ -208,6 +228,12 @@ impl Tokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.tokens.len()
+    }
+
+    /// The BOS id to prepend to a fresh prompt, or `None` if this vocab
+    /// doesn't add one (no `bos_token_id`, or `add_bos_token = false`).
+    pub fn prompt_bos(&self) -> Option<u32> {
+        self.bos_token_id.filter(|_| self.add_bos)
     }
 
     /// Number of BPE merge rules loaded, for tests that need to assert
@@ -222,7 +248,7 @@ impl Tokenizer {
     /// see [`Self::encode_gpt2`]) — every other value falls back to the
     /// SentencePiece path unchanged, this module's original Phase 21.5.1
     /// scope.
-    pub fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
         if self.special_tokens.is_empty() {
             return self.encode_plain(text);
         }
@@ -265,7 +291,7 @@ impl Tokenizer {
     /// literal special-token match. See [`Self::encode`]'s doc for why
     /// special tokens (this struct's `special_tokens` field) are matched
     /// separately, before this ever runs on their text.
-    fn encode_plain(&self, text: &str) -> Result<Vec<u32>, String> {
+    fn encode_plain(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
         if self.architecture == "gpt2" {
             self.encode_gpt2(text)
         } else {
@@ -286,7 +312,7 @@ impl Tokenizer {
     /// vocab has it directly; otherwise it's decomposed into UTF-8 bytes,
     /// each represented by a `<0xXX>` byte-fallback token. Errs if a
     /// byte-fallback token or a final merged symbol isn't in the vocab.
-    fn encode_sentencepiece(&self, text: &str) -> Result<Vec<u32>, String> {
+    fn encode_sentencepiece(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
         let mut preprocessed = String::with_capacity(text.len() + 1);
         if !text.is_empty() {
             preprocessed.push(WORD_BOUNDARY);
@@ -306,7 +332,8 @@ impl Tokenizer {
             for &b in ch.encode_utf8(&mut buf).as_bytes() {
                 let bt = byte_fallback_token(b);
                 if !self.token_to_id.contains_key(&bt) {
-                    return Err(format!(
+                    return Err(crate::reflex_err!(
+                        Tokenizer,
                         "character '{ch}' not in vocab and byte-fallback token '{bt}' also missing"
                     ));
                 }
@@ -318,10 +345,9 @@ impl Tokenizer {
         symbols
             .into_iter()
             .map(|s| {
-                self.token_to_id
-                    .get(&s)
-                    .copied()
-                    .ok_or_else(|| format!("merged token '{s}' not found in vocab"))
+                self.token_to_id.get(&s).copied().ok_or_else(|| {
+                    crate::reflex_err!(Tokenizer, "merged token '{s}' not found in vocab")
+                })
             })
             .collect()
     }
@@ -358,7 +384,7 @@ impl Tokenizer {
     /// caveat this module's own SentencePiece path already carried before
     /// its own real-file verification; `PHASE21_14_PLAN.md`'s 21.14.2b is
     /// where that verification happens.
-    fn encode_gpt2(&self, text: &str) -> Result<Vec<u32>, String> {
+    fn encode_gpt2(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
         let chars: Vec<char> = text.chars().collect();
         let byte_to_unicode = gpt2_byte_to_unicode_table();
         let mut ids = Vec::new();
@@ -375,7 +401,10 @@ impl Tokenizer {
             self.bpe_merge(&mut symbols);
             for s in symbols {
                 let id = self.token_to_id.get(&s).copied().ok_or_else(|| {
-                    format!("gpt2 BPE symbol {s:?} not found in vocab (piece {piece:?})")
+                    crate::reflex_err!(
+                        Tokenizer,
+                        "gpt2 BPE symbol {s:?} not found in vocab (piece {piece:?})"
+                    )
                 })?;
                 ids.push(id);
             }
@@ -737,48 +766,67 @@ fn u64_meta(metadata: &HashMap<String, GgufValue>, key: &str) -> Option<u64> {
     metadata.get(key).and_then(GgufValue::as_u64)
 }
 
-fn string_meta<'a>(metadata: &'a HashMap<String, GgufValue>, key: &str) -> Result<&'a str, String> {
+fn string_meta<'a>(
+    metadata: &'a HashMap<String, GgufValue>,
+    key: &str,
+) -> Result<&'a str, ReflexError> {
     metadata
         .get(key)
         .and_then(GgufValue::as_str)
-        .ok_or_else(|| format!("missing or non-string metadata key '{key}'"))
+        .ok_or_else(|| crate::reflex_err!(Tokenizer, "missing or non-string metadata key '{key}'"))
 }
 
-fn string_array_value(value: &GgufValue, key: &str) -> Result<Vec<String>, String> {
+fn string_array_value(value: &GgufValue, key: &str) -> Result<Vec<String>, ReflexError> {
     match value {
         GgufValue::Array(items) => items
             .iter()
             .map(|v| {
-                v.as_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| format!("expected string array element in '{key}', got {v:?}"))
+                v.as_str().map(str::to_string).ok_or_else(|| {
+                    crate::reflex_err!(
+                        Tokenizer,
+                        "expected string array element in '{key}', got {v:?}"
+                    )
+                })
             })
             .collect(),
-        other => Err(format!("expected array for '{key}', got {other:?}")),
+        other => Err(crate::reflex_err!(
+            Tokenizer,
+            "expected array for '{key}', got {other:?}"
+        )),
     }
 }
 
-fn string_array(metadata: &HashMap<String, GgufValue>, key: &str) -> Result<Vec<String>, String> {
+fn string_array(
+    metadata: &HashMap<String, GgufValue>,
+    key: &str,
+) -> Result<Vec<String>, ReflexError> {
     let value = metadata
         .get(key)
-        .ok_or_else(|| format!("missing metadata key '{key}'"))?;
+        .ok_or_else(|| crate::reflex_err!(Tokenizer, "missing metadata key '{key}'"))?;
     string_array_value(value, key)
 }
 
-fn f32_array(value: &GgufValue, key: &str) -> Result<Vec<f32>, String> {
+fn f32_array(value: &GgufValue, key: &str) -> Result<Vec<f32>, ReflexError> {
     match value {
         GgufValue::Array(items) => items
             .iter()
             .map(|v| {
-                v.as_f32()
-                    .ok_or_else(|| format!("expected f32 array element in '{key}', got {v:?}"))
+                v.as_f32().ok_or_else(|| {
+                    crate::reflex_err!(
+                        Tokenizer,
+                        "expected f32 array element in '{key}', got {v:?}"
+                    )
+                })
             })
             .collect(),
-        other => Err(format!("expected array for '{key}', got {other:?}")),
+        other => Err(crate::reflex_err!(
+            Tokenizer,
+            "expected array for '{key}', got {other:?}"
+        )),
     }
 }
 
-fn i32_array(value: &GgufValue, key: &str) -> Result<Vec<i32>, String> {
+fn i32_array(value: &GgufValue, key: &str) -> Result<Vec<i32>, ReflexError> {
     match value {
         GgufValue::Array(items) => items
             .iter()
@@ -786,12 +834,16 @@ fn i32_array(value: &GgufValue, key: &str) -> Result<Vec<i32>, String> {
                 GgufValue::I32(x) => Ok(*x),
                 GgufValue::I8(x) => Ok(*x as i32),
                 GgufValue::I16(x) => Ok(*x as i32),
-                other => Err(format!(
+                other => Err(crate::reflex_err!(
+                    Tokenizer,
                     "expected i32 array element in '{key}', got {other:?}"
                 )),
             })
             .collect(),
-        other => Err(format!("expected array for '{key}', got {other:?}")),
+        other => Err(crate::reflex_err!(
+            Tokenizer,
+            "expected array for '{key}', got {other:?}"
+        )),
     }
 }
 
@@ -841,6 +893,7 @@ mod tests {
             scores: Vec::new(),
             token_type: Vec::new(),
             bos_token_id: Some(1),
+            add_bos: true,
             eos_token_id: Some(2),
             unk_token_id: Some(0),
             pad_token_id: None,
@@ -1018,6 +1071,51 @@ mod tests {
         assert_eq!(tok.eos_token_id, Some(2));
         assert_eq!(tok.unk_token_id, None);
         assert_eq!(tok.merge_count(), 1);
+        // No `add_bos_token` key: keep prepending the declared BOS.
+        assert!(tok.add_bos);
+        assert_eq!(tok.prompt_bos(), Some(1));
+    }
+
+    fn write_kv_bool(buf: &mut Vec<u8>, key: &str, value: bool) {
+        write_string(buf, key);
+        buf.extend_from_slice(&7u32.to_le_bytes()); // value_type = BOOL
+        buf.push(value as u8);
+    }
+
+    /// `add_bos_token = false` with a `bos_token_id` present (real
+    /// Qwen3.8-27B's shape) must suppress the BOS, matching llama.cpp.
+    #[test]
+    fn test_tokenizer_honors_add_bos_token() {
+        for (add_bos, expected) in [(false, None), (true, Some(1))] {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&0x4655_4747u32.to_le_bytes()); // magic "GGUF"
+            buf.extend_from_slice(&3u32.to_le_bytes()); // version
+            buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+            buf.extend_from_slice(&5u64.to_le_bytes()); // metadata_kv_count
+
+            write_kv_string(&mut buf, "tokenizer.ggml.model", "llama");
+            write_kv_string_array(
+                &mut buf,
+                "tokenizer.ggml.tokens",
+                &["<unk>", "\u{2581}", "hi"],
+            );
+            write_kv_string_array(&mut buf, "tokenizer.ggml.merges", &["\u{2581} hi"]);
+            write_kv_u32(&mut buf, "tokenizer.ggml.bos_token_id", 1);
+            write_kv_bool(&mut buf, "tokenizer.ggml.add_bos_token", add_bos);
+
+            while buf.len() % 32 != 0 {
+                buf.push(0);
+            }
+
+            let path = write_temp_file(&buf);
+            let file = GgufFile::open(&path).expect("parse synthetic GGUF");
+            std::fs::remove_file(&path).ok();
+
+            let tok = Tokenizer::from_gguf(&file).expect("extract tokenizer metadata");
+            assert_eq!(tok.bos_token_id, Some(1));
+            assert_eq!(tok.add_bos, add_bos);
+            assert_eq!(tok.prompt_bos(), expected);
+        }
     }
 
     #[test]
@@ -1196,7 +1294,7 @@ mod tests {
     /// a rendered chat template produces, see `sidecar/openai-adapter`) got
     /// shredded into per-byte-fragment tokens by the generic BPE path instead
     /// of mapping to its one reserved vocab id — confirmed on a real
-    /// Qwen3-0.6B GGUF on real GPU hardware before this fix (see HISTORY.md).
+    /// Qwen3-0.6B GGUF on real GPU hardware before this fix.
     #[test]
     fn test_encode_matches_special_token_as_single_id_not_bpe_fragments() {
         let mut tok = build_synthetic_tokenizer();

@@ -1,8 +1,8 @@
 //! Sampling strategies for `Model::generate`'s per-step next-token choice.
 //! Greedy argmax stays the default and remains available unconditionally --
 //! it's load-bearing for this project's own byte-exact-vs-llama.cpp
-//! verification methodology (`reflex check`, `HISTORY.md`'s repeated
-//! "matched byte-exact" verification rounds), so a caller that never touches
+//! verification methodology (`reflex check`, and the repeated "matched
+//! byte-exact" verification rounds behind each architecture), so a caller that never touches
 //! sampling gets exactly the same output as before this module existed.
 //! Temperature/top-k/top-p sampling is an explicit opt-in
 //! (`SamplingParams::temperature > 0.0`) -- see README.md's Non-goals
@@ -14,6 +14,7 @@
 //! `crate::calibration` -- the GPU produces raw logits (already downloaded
 //! to host by `Model::lm_head_logits`), sampling itself needs no kernel.
 
+use crate::error::ReflexError;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -70,27 +71,39 @@ pub fn make_rng(seed: Option<u64>) -> StdRng {
 /// entries, optionally nucleus-filter to the smallest highest-probability
 /// prefix whose cumulative probability reaches `top_p`, renormalize over
 /// whatever survived, then draw categorically from `rng`.
-pub fn sample(logits: &[f32], params: &SamplingParams, rng: &mut StdRng) -> Result<u32, String> {
+pub fn sample(
+    logits: &[f32],
+    params: &SamplingParams,
+    rng: &mut StdRng,
+) -> Result<u32, ReflexError> {
     if logits.is_empty() {
-        return Err("sample: logits must not be empty".to_string());
+        return Err(ReflexError::InvalidInput(
+            "sample: logits must not be empty".to_string(),
+        ));
     }
     if params.is_greedy() {
         return crate::model::Model::argmax(logits);
     }
     if !params.temperature.is_finite() || params.temperature <= 0.0 {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            InvalidInput,
             "sample: temperature must be positive and finite when sampling, got {}",
             params.temperature
         ));
     }
     if let Some(k) = params.top_k {
         if k == 0 {
-            return Err("sample: top_k must be at least 1".to_string());
+            return Err(ReflexError::InvalidInput(
+                "sample: top_k must be at least 1".to_string(),
+            ));
         }
     }
     if let Some(p) = params.top_p {
         if !p.is_finite() || !(0.0..=1.0).contains(&p) {
-            return Err(format!("sample: top_p must be in [0, 1], got {p}"));
+            return Err(crate::reflex_err!(
+                InvalidInput,
+                "sample: top_p must be in [0, 1], got {p}"
+            ));
         }
     }
 
@@ -102,7 +115,8 @@ pub fn sample(logits: &[f32], params: &SamplingParams, rng: &mut StdRng) -> Resu
         .collect();
     let sum: f32 = probs.iter().map(|&(_, p)| p).sum();
     if !sum.is_finite() || sum <= 0.0 {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            InvalidInput,
             "sample: softmax sum is non-finite or non-positive ({sum})"
         ));
     }

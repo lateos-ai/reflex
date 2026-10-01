@@ -24,7 +24,7 @@ loopback port — queue-based endpoints don't proxy external HTTP to a configure
 load-balancing endpoints do), waits for its existing three-state `/healthz` check to report
 ready, and then forwards each Runpod job's `input` straight to that process's existing
 `POST /v1/chat/completions`, unmodified. No IPC/HTTP protocol logic is reimplemented in
-Python — see the root `CLAUDE.md`'s non-goals: the core engine never grows a network socket or
+Python — see [`docs/DEVELOPMENT.md`](../docs/DEVELOPMENT.md)'s non-goals: the core engine never grows a network socket or
 an internal queue/scheduler, and this handler doesn't change that. The queue here is Runpod's
 own platform queue, external to the engine, exactly like `serverless/runpod/`'s load balancer
 is also external to the engine.
@@ -47,10 +47,13 @@ listing has no equivalent lever: Runpod's own Hub build/test pipeline schedules 
 test job wherever it wants, and **real evidence (2026-09-27, below) shows it does not reliably
 honor either `hub.json`'s `gpuIds` exclusion list or `tests.json`'s `gpuTypeId` pin.** Since an
 `sm_86`-pinned cubin crashes outright on an `sm_89` card (not just slower — a hard panic), this
-build uses **portable PTX** (`REFLEX_CUDA_ARCH` left unset in `.runpod/Dockerfile`, JIT-compiled
-by the driver to whichever GPU is actually present) instead. This trades away the zero-JIT
-cold-start advantage `serverless/runpod/`'s pinned build gets, in exchange for actually working
-regardless of which card in the pool the Hub schedules it onto.
+build first switched to **portable PTX**, JIT-compiled by the driver to whichever GPU is present.
+That works anywhere but was later measured to cost about 0.8 s of JIT on every fresh worker (a
+new container has no driver JIT cache). It now builds a **multi-arch fatbin**
+(`REFLEX_CUDA_ARCHS=sm_75,sm_80,sm_86,sm_89,sm_90` in `.runpod/Dockerfile`): a native image for
+every card in the pool, Ada included, plus PTX that newer GPUs JIT. So it runs whichever card the
+Hub picks, with no JIT on the listed ones. `hub.json`'s Ada exclusions are kept until this is
+confirmed on a real Hub worker.
 
 ## Non-goals for this addition
 

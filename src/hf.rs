@@ -5,6 +5,7 @@
 //! (`download`) so the default `cargo build` keeps this project's original
 //! 3-dependency footprint for users who never pass `--model`/`--quickstart`.
 
+use crate::error::ReflexError;
 use hf_hub::api::sync::Api;
 use std::path::{Path, PathBuf};
 
@@ -30,33 +31,41 @@ pub const QUICKSTART_FILE: &str = "Qwen3-0.6B-Q8_0.gguf";
 /// The returned path is handed straight to the existing, unmodified
 /// `crate::gguf::GgufFile::open` by callers -- this function does no GGUF parsing
 /// itself.
-pub fn resolve_gguf_path(spec: &str) -> Result<PathBuf, String> {
+pub fn resolve_gguf_path(spec: &str) -> Result<PathBuf, ReflexError> {
     if Path::new(spec).is_file() {
         return Ok(PathBuf::from(spec));
     }
 
     let (repo_id, filename) = match spec.split_once(':') {
         Some((repo, file)) => (repo.to_string(), file.to_string()),
-        None => return Err(format!(
+        None => return Err(crate::reflex_err!(Io,
             "'{spec}' is not an existing local file and has no ':<filename>' suffix to treat as a Hugging Face repo spec \
              (expected e.g. 'org/repo:file.gguf')"
         )),
     };
 
-    let api = Api::new()
-        .map_err(|e| format!("hf-hub: failed to initialize Hugging Face API client: {e}"))?;
-    api.model(repo_id.clone())
-        .get(&filename)
-        .map_err(|e| format!("hf-hub: failed to resolve '{repo_id}:{filename}': {e}"))
+    let api = Api::new().map_err(|e| {
+        crate::reflex_err!(
+            Io,
+            "hf-hub: failed to initialize Hugging Face API client: {e}"
+        )
+    })?;
+    api.model(repo_id.clone()).get(&filename).map_err(|e| {
+        crate::reflex_err!(Io, "hf-hub: failed to resolve '{repo_id}:{filename}': {e}")
+    })
 }
 
 /// Resolves the `--quickstart` default model ([`QUICKSTART_REPO`]/[`QUICKSTART_FILE`]).
-pub fn resolve_quickstart() -> Result<PathBuf, String> {
-    let api = Api::new()
-        .map_err(|e| format!("hf-hub: failed to initialize Hugging Face API client: {e}"))?;
+pub fn resolve_quickstart() -> Result<PathBuf, ReflexError> {
+    let api = Api::new().map_err(|e| {
+        crate::reflex_err!(
+            Io,
+            "hf-hub: failed to initialize Hugging Face API client: {e}"
+        )
+    })?;
     api.model(QUICKSTART_REPO.to_string())
         .get(QUICKSTART_FILE)
-        .map_err(|e| format!("hf-hub: failed to download --quickstart model ({QUICKSTART_REPO}:{QUICKSTART_FILE}): {e}"))
+        .map_err(|e| crate::reflex_err!(Io, "hf-hub: failed to download --quickstart model ({QUICKSTART_REPO}:{QUICKSTART_FILE}): {e}"))
 }
 
 #[cfg(test)]
@@ -119,7 +128,9 @@ mod tests {
 
     #[test]
     fn resolve_gguf_path_errs_on_a_spec_with_no_colon_and_no_local_file() {
-        let err = resolve_gguf_path("not-a-real-local-file-and-no-colon").unwrap_err();
+        let err = resolve_gguf_path("not-a-real-local-file-and-no-colon")
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("':<filename>'"),
             "expected a clear 'missing :<filename>' error, got: {err}"

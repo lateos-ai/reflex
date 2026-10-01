@@ -1,5 +1,5 @@
 //! Local, non-network IPC protocol shared by the `reflex stdio`/`reflex uds`
-//! subcommands (`src/bin/reflex/stdio.rs`/`uds.rs`) -- see CLAUDE.md/README.md's
+//! subcommands (`src/bin/reflex/stdio.rs`/`uds.rs`) -- see README.md's
 //! Non-goals: no HTTP/gRPC server, ever; this is the sequential, non-thread-pool
 //! local-ergonomics surface that stands in for one. One line of JSON in; one or
 //! more lines of JSON out (see `stream` below), one request fully processed before
@@ -29,6 +29,7 @@
 //! argmax, byte-identical to this protocol's pre-sampling behavior. See
 //! [`IpcSamplingParams`]/`crate::sampling::SamplingParams`.
 
+use crate::error::ReflexError;
 use crate::model::{Model, System1Candidate};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
@@ -133,6 +134,11 @@ pub struct IpcResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Present exactly when `error` is: the failure's stable category, one of
+    /// `crate::error::ReflexErrorCode::as_str`'s names (e.g. `"context_overflow"`,
+    /// `"out_of_memory"`, `"invalid_input"`). Branch on this, not on `error`'s text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<&'static str>,
     /// `Model::generate` path only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_ids: Option<Vec<u32>>,
@@ -149,12 +155,13 @@ pub struct IpcResponse {
 }
 
 impl IpcResponse {
-    fn err(id: Option<String>, error: String) -> Self {
+    fn err(id: Option<String>, error: ReflexError) -> Self {
         IpcResponse {
             id,
             event: "final",
             ok: false,
-            error: Some(error),
+            error_kind: Some(error.kind()),
+            error: Some(error.to_string()),
             token_ids: None,
             text: None,
             candidates: None,
@@ -203,6 +210,7 @@ pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
                 event: "final",
                 ok: true,
                 error: None,
+                error_kind: None,
                 token_ids: Some(token_ids),
                 text: Some(text),
                 candidates: None,
@@ -234,6 +242,7 @@ pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
                     event: "final",
                     ok: true,
                     error: None,
+                    error_kind: None,
                     token_ids: None,
                     text: None,
                     candidates: Some(candidates),
@@ -318,6 +327,7 @@ pub fn handle_request_streaming<W: Write>(
             event: "final",
             ok: true,
             error: None,
+            error_kind: None,
             token_ids: Some(token_ids),
             text: Some(text),
             candidates: None,
@@ -358,7 +368,10 @@ pub fn run_request_loop<R: BufRead, W: Write>(
         match serde_json::from_str::<IpcRequest>(trimmed) {
             Ok(req) => handle_request_streaming(model, req, &mut output)?,
             Err(e) => {
-                let response = IpcResponse::err(None, format!("ipc: malformed request JSON: {e}"));
+                let response = IpcResponse::err(
+                    None,
+                    crate::reflex_err!(InvalidInput, "ipc: malformed request JSON: {e}"),
+                );
                 write_json_line(&mut output, &response)?;
             }
         }
@@ -401,7 +414,10 @@ mod tests {
 
     #[test]
     fn test_ipc_response_error_variant_omits_result_fields() {
-        let resp = IpcResponse::err(Some("id1".to_string()), "boom".to_string());
+        let resp = IpcResponse::err(
+            Some("id1".to_string()),
+            ReflexError::Other("boom".to_string()),
+        );
         let json = serde_json::to_string(&resp).expect("should serialize");
         assert!(json.contains("\"ok\":false"));
         assert!(json.contains("\"error\":\"boom\""));
@@ -416,10 +432,48 @@ mod tests {
     }
 
     #[test]
+    fn test_ipc_error_response_carries_error_kind() {
+        let overflow = crate::limits::check_positions(0, crate::limits::ATTN_MAX_POSITIONS + 1, 0)
+            .unwrap_err();
+        let json = serde_json::to_string(&IpcResponse::err(None, overflow)).unwrap();
+        assert!(
+            json.contains("\"error_kind\":\"context_overflow\""),
+            "{json}"
+        );
+        assert!(
+            json.contains(&format!(
+                "\"error\":\"{}",
+                crate::limits::CONTEXT_LENGTH_EXCEEDED_PREFIX
+            )),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn test_ipc_success_response_omits_error_kind() {
+        let resp = IpcResponse {
+            id: None,
+            event: "final",
+            ok: true,
+            error: None,
+            error_kind: None,
+            token_ids: Some(vec![1]),
+            text: Some("x".to_string()),
+            candidates: None,
+            entropy: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("error_kind"), "{json}");
+    }
+
+    #[test]
     fn test_malformed_json_line_produces_error_response_not_a_loop_abort() {
         let model_free_response = match serde_json::from_str::<IpcRequest>("not json") {
             Ok(_) => panic!("expected parse failure"),
-            Err(e) => IpcResponse::err(None, format!("ipc: malformed request JSON: {e}")),
+            Err(e) => IpcResponse::err(
+                None,
+                crate::reflex_err!(InvalidInput, "ipc: malformed request JSON: {e}"),
+            ),
         };
         assert!(!model_free_response.ok);
         assert!(model_free_response
@@ -465,7 +519,10 @@ mod tests {
 
     #[test]
     fn test_ipc_response_final_event_and_stream_token_event_are_distinguishable() {
-        let final_resp = IpcResponse::err(Some("id1".to_string()), "boom".to_string());
+        let final_resp = IpcResponse::err(
+            Some("id1".to_string()),
+            ReflexError::Other("boom".to_string()),
+        );
         assert_eq!(final_resp.event, "final");
 
         let token = IpcStreamToken {
@@ -482,7 +539,7 @@ mod tests {
     #[test]
     fn test_write_json_line_writes_one_flushed_line() {
         let mut buf: Vec<u8> = Vec::new();
-        let resp = IpcResponse::err(None, "boom".to_string());
+        let resp = IpcResponse::err(None, ReflexError::Other("boom".to_string()));
         write_json_line(&mut buf, &resp).expect("should write");
         let text = String::from_utf8(buf).expect("should be valid UTF-8");
         assert_eq!(

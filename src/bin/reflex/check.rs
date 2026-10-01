@@ -1,5 +1,5 @@
 //! Formalizes this project's own byte-exact-vs-llama.cpp verification methodology
-//! (see README.md/DECISIONS.md) as a user-facing correctness check instead of an
+//! (see docs/benchmarks.md) as a user-facing correctness check instead of an
 //! ad hoc development-only comparison. Runs a forward pass on `<gguf>` for
 //! `<prompt>` and either prints a comparable summary (no `--reference`), or
 //! compares against a hand-written reference file: expected token ids (exact
@@ -16,12 +16,18 @@
 //! expected, comma-separated token ids; an optional line 2 is the expected
 //! `logit_checksum` as a single `f64`.
 //!
-//! Usage: `reflex check <path-to-gguf> <prompt> [--max-tokens N] [--reference <file>] [--tolerance F]`
+//! Usage: `reflex check <path-to-gguf> <prompt> [--max-tokens N] [--reference <file>] [--tolerance F] [--json]`
 //!
 //! Exit codes: `0` = pass, `1` = mismatch, `2` = internal error (bad args, load/
 //! generate failure, malformed reference file) -- scriptable for CI. Uses
 //! `std::process::exit` directly rather than `reflex_engine::fast_exit`,
 //! deliberately: this exit-code contract is the whole point of the subcommand.
+//!
+//! `--json` (needs `cargo build --features json-output`) prints the result
+//! as one line of JSON instead of the plain `REFLEX_CHECK key=value` text
+//! plus a separate pass/fail line -- see `reflex_engine::cli_output`'s doc
+//! comment for the exact shape and its "Scope boundary" note on why
+//! `REFLEX_CHECK_FAIL`'s per-reason stderr diagnostics aren't mirrored 1:1.
 
 use reflex_engine::diagnostics;
 use reflex_engine::gguf::GgufFile;
@@ -76,10 +82,12 @@ pub fn run(args: Vec<String>) {
     let mut max_tokens: usize = 1;
     let mut reference_path: Option<String> = None;
     let mut tolerance: f64 = 1e-2;
+    let mut json = false;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--json" => json = true,
             "--max-tokens" => {
                 let raw = args
                     .next()
@@ -119,8 +127,8 @@ pub fn run(args: Vec<String>) {
 
     let file = GgufFile::open(&gguf_path)
         .unwrap_or_else(|e| exit_usage_error(&format!("failed to open {gguf_path}: {e}")));
-    let device =
-        diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| exit_usage_error(&e));
+    let device = diagnostics::init_device_with_diagnostics(0)
+        .unwrap_or_else(|e| exit_usage_error(&e.to_string()));
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }
@@ -146,24 +154,51 @@ pub fn run(args: Vec<String>) {
         .cloned()
         .fold(f32::NEG_INFINITY, f32::max);
 
-    let token_ids_str: Vec<String> = token_ids.iter().map(|t| t.to_string()).collect();
-    println!(
-        "REFLEX_CHECK token_ids=[{}] token_texts={:?} logit_checksum={logit_checksum:.6} top1_logit={top1_logit:.6} vocab_size={vocab_size}",
-        token_ids_str.join(","),
-        token_texts,
-    );
+    if !json {
+        let token_ids_str: Vec<String> = token_ids.iter().map(|t| t.to_string()).collect();
+        println!(
+            "REFLEX_CHECK token_ids=[{}] token_texts={:?} logit_checksum={logit_checksum:.6} top1_logit={top1_logit:.6} vocab_size={vocab_size}",
+            token_ids_str.join(","),
+            token_texts,
+        );
+    }
 
     let Some(reference_path) = reference_path else {
+        if json {
+            #[cfg(feature = "json-output")]
+            reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::CheckJson {
+                token_ids,
+                token_texts,
+                logit_checksum,
+                top1_logit,
+                vocab_size,
+                pass: None,
+                fail_reason: None,
+            });
+            #[cfg(not(feature = "json-output"))]
+            exit_usage_error(
+                "--json requires this binary to be built with `cargo build --features json-output`",
+            );
+        }
         std::process::exit(0);
     };
     let reference = parse_reference(&reference_path).unwrap_or_else(|e| exit_usage_error(&e));
 
     let mut ok = true;
+    // Only read back from the `#[cfg(feature = "json-output")]` branch at
+    // the end of this function -- a build without that feature never reads
+    // it, hence the `#[allow]` rather than a false "never read" warning.
+    #[allow(unused_assignments)]
+    let mut fail_reason: Option<String> = None;
     if reference.token_ids != token_ids {
         eprintln!(
             "REFLEX_CHECK_FAIL reason=token_id_mismatch expected={:?} got={token_ids:?}",
             reference.token_ids
         );
+        fail_reason = Some(format!(
+            "token_id_mismatch expected={:?} got={token_ids:?}",
+            reference.token_ids
+        ));
         ok = false;
     }
     if let Some(expected_checksum) = reference.logit_checksum {
@@ -174,12 +209,40 @@ pub fn run(args: Vec<String>) {
                 "REFLEX_CHECK_FAIL reason=logit_checksum_mismatch expected={expected_checksum:.6} got={logit_checksum:.6} \
                  relative_delta={relative_delta:.6} tolerance={tolerance:.6}"
             );
+            let msg = format!(
+                "logit_checksum_mismatch expected={expected_checksum:.6} got={logit_checksum:.6} relative_delta={relative_delta:.6} tolerance={tolerance:.6}"
+            );
+            #[allow(unused_assignments)]
+            {
+                fail_reason = Some(match fail_reason {
+                    Some(prev) => format!("{prev}; {msg}"),
+                    None => msg,
+                });
+            }
             ok = false;
         }
     }
 
-    if ok {
+    if json {
+        #[cfg(feature = "json-output")]
+        reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::CheckJson {
+            token_ids,
+            token_texts,
+            logit_checksum,
+            top1_logit,
+            vocab_size,
+            pass: Some(ok),
+            fail_reason,
+        });
+        #[cfg(not(feature = "json-output"))]
+        exit_usage_error(
+            "--json requires this binary to be built with `cargo build --features json-output`",
+        );
+    } else if ok {
         println!("REFLEX_CHECK_PASS");
+    }
+
+    if ok {
         std::process::exit(0);
     }
     std::process::exit(1);

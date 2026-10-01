@@ -20,6 +20,14 @@
 //! `scripts/bench_cold_start_phases.sh` runs this N times and reports
 //! per-phase p50/p95 across runs.
 //!
+//! Each phase is additionally emitted as its own additive `REFLEX_PHASE_OK
+//! phase=<name> duration_ms=<ms> energy_joules=<j> energy_method=<m>` line,
+//! printed *before* the aggregate `REFLEX_GENERATE_OK` line (the `energy_*`
+//! fields appear only when a measurement is available) -- the existing
+//! aggregate line and its fields are unchanged. See `src/energy.rs`'s doc
+//! comment for the per-phase (delta-from-cumulative) semantics and the
+//! counter-vs-polled granularity caveat.
+//!
 //! Exits via `reflex_engine::fast_exit` after printing the result instead
 //! of returning from `run` normally -- see that function's doc comment for
 //! why a graceful return costs several extra seconds of CUDA-context-
@@ -34,11 +42,15 @@
 //! fresh prompt. `--max-tokens N` (default 1) generates up to N tokens,
 //! feeding each one back in, stopping early on the tokenizer's EOS.
 //!
-//! Usage: `reflex generate <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>]`
+//! Usage: `reflex generate <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>] [--json]`
 //!        `reflex generate <path-to-gguf> [continuation-prompt] [--max-tokens N] --import-kv <file>`
 //!
+//! `--json` (needs `cargo build --features json-output`) prints each result
+//! as one line of JSON instead of the plain `REFLEX_*_OK key=value` text --
+//! see `reflex_engine::cli_output`'s doc comment for the exact shapes.
+//!
 //! `--temperature F` (omitted, or `0.0`, keeps this project's original greedy-argmax
-//! behavior -- the byte-exact-reproducible default `--check`/`DECISIONS.md`'s
+//! behavior -- the byte-exact-reproducible default `reflex check`'s
 //! methodology depends on). Any positive value switches to temperature/top-k/top-p
 //! sampling (`--top-k N`, `--top-p F`, `--seed N` for a reproducible draw) -- see
 //! `reflex_engine::sampling`'s doc comment.
@@ -56,11 +68,51 @@
 //! `src/hf.rs`'s module doc comment. Exactly one of a positional
 //! `<path-to-gguf>`, `--model`, or `--quickstart` must be given.
 
+#[cfg(not(feature = "json-output"))]
+use crate::phase::json_output_unavailable;
+use crate::phase::{energy_suffix, print_phase_report};
 use reflex_engine::diagnostics;
+use reflex_engine::energy;
 use reflex_engine::gguf::GgufFile;
 use reflex_engine::kv_io;
 use reflex_engine::model::{ArchitectureKind, Model};
 use std::time::Instant;
+
+fn print_lora_ok(json: bool, path: &str, tensors_applied: usize) {
+    if !json {
+        println!("REFLEX_LORA_OK path={path:?} tensors_applied={tensors_applied}");
+        return;
+    }
+    #[cfg(feature = "json-output")]
+    reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::LoraAppliedJson {
+        path: path.to_string(),
+        tensors_applied,
+    });
+    #[cfg(not(feature = "json-output"))]
+    json_output_unavailable();
+}
+
+fn print_kv_export_ok(
+    json: bool,
+    path: &str,
+    kind: &'static str,
+    seq_len: usize,
+    num_layers: usize,
+) {
+    if !json {
+        println!("REFLEX_GENERATE_KV_EXPORT_OK path={path:?} kind={kind} seq_len={seq_len} num_layers={num_layers}");
+        return;
+    }
+    #[cfg(feature = "json-output")]
+    reflex_engine::cli_output::print_json_line(&reflex_engine::cli_output::GenerateKvExportJson {
+        path: path.to_string(),
+        kind,
+        seq_len,
+        num_layers,
+    });
+    #[cfg(not(feature = "json-output"))]
+    json_output_unavailable();
+}
 
 /// Resolves `--model`/`--quickstart` to a local GGUF path, or returns `None` if
 /// neither was passed (the caller falls back to the positional `<path-to-gguf>`
@@ -94,6 +146,7 @@ fn resolve_model_flag(model_spec: Option<&str>, quickstart: bool) -> Option<Stri
 
 pub fn run(args: Vec<String>) {
     let t0 = Instant::now();
+    let sampler = energy::EnergySampler::start(0);
 
     let mut positional: Vec<String> = Vec::new();
     let mut export_kv: Option<String> = None;
@@ -106,10 +159,12 @@ pub fn run(args: Vec<String>) {
     let mut top_k: Option<usize> = None;
     let mut top_p: Option<f32> = None;
     let mut seed: Option<u64> = None;
+    let mut json = false;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--json" => json = true,
             "--export-kv" => {
                 export_kv = Some(args.next().expect("--export-kv requires a file path"))
             }
@@ -195,20 +250,23 @@ pub fn run(args: Vec<String>) {
     let file =
         GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
     let gguf_open_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let e_gguf_open = sampler.measure();
     let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
     let cuda_init_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms;
+    let e_cuda_init = sampler.measure();
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }
     let mut model = Model::load(device, &file).expect("failed to load model");
     let model_load_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms - cuda_init_ms;
+    let e_model_load = sampler.measure();
     let model_ready_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     if let Some(lora_path) = &lora_path {
         let applied = model
             .apply_lora(std::path::Path::new(lora_path))
             .expect("failed to apply LoRA adapter");
-        println!("REFLEX_LORA_OK path={lora_path:?} tensors_applied={applied}");
+        print_lora_ok(json, lora_path, applied);
     }
 
     if let Some(export_path) = &export_kv {
@@ -216,24 +274,28 @@ pub fn run(args: Vec<String>) {
             ArchitectureKind::Hybrid => {
                 let ((token_id, text), cache) = model
                     .forward_prompt_capture_kv_hybrid(&prompt)
-                    .expect("forward_prompt_capture_kv_hybrid failed");
+                    .unwrap_or_else(|e| crate::fail("forward_prompt_capture_kv_hybrid failed", e));
                 kv_io::export_hybrid_kv(export_path, &cache)
                     .expect("failed to export hybrid KV cache");
-                println!(
-                    "REFLEX_GENERATE_KV_EXPORT_OK path={export_path:?} kind=hybrid seq_len={} num_layers={}",
+                print_kv_export_ok(
+                    json,
+                    export_path,
+                    "hybrid",
                     cache.seq_len,
-                    cache.layers.len()
+                    cache.layers.len(),
                 );
                 (token_id, text)
             }
             ArchitectureKind::Dense => {
                 let ((token_id, text), cache) = model
                     .forward_prompt_capture_kv(&prompt)
-                    .expect("forward_prompt_capture_kv failed");
-                println!(
-                    "REFLEX_GENERATE_KV_EXPORT_OK path={export_path:?} kind=dense seq_len={} num_layers={}",
+                    .unwrap_or_else(|e| crate::fail("forward_prompt_capture_kv failed", e));
+                print_kv_export_ok(
+                    json,
+                    export_path,
+                    "dense",
                     cache.seq_len,
-                    cache.k_caches.len()
+                    cache.k_caches.len(),
                 );
                 kv_io::export_dense_kv(export_path, &cache).expect("failed to export KV cache");
                 (token_id, text)
@@ -241,30 +303,69 @@ pub fn run(args: Vec<String>) {
             ArchitectureKind::Mla => {
                 let ((token_id, text), cache) = model
                     .forward_prompt_capture_kv_mla(&prompt)
-                    .expect("forward_prompt_capture_kv_mla failed");
-                println!(
-                    "REFLEX_GENERATE_KV_EXPORT_OK path={export_path:?} kind=mla seq_len={} num_layers={}",
+                    .unwrap_or_else(|e| crate::fail("forward_prompt_capture_kv_mla failed", e));
+                print_kv_export_ok(
+                    json,
+                    export_path,
+                    "mla",
                     cache.seq_len,
-                    cache.kv_caches.len()
+                    cache.kv_caches.len(),
                 );
                 kv_io::export_mla_kv(export_path, &cache).expect("failed to export MLA KV cache");
                 (token_id, text)
             }
         };
         let elapsed = t0.elapsed();
+        let energy_measurement = sampler.measure();
         let prompt_eval_ms = elapsed.as_secs_f64() * 1000.0 - model_ready_ms;
-        println!(
-            "REFLEX_GENERATE_OK process_start_to_first_token_ms={:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} token_id={token_id} token_text={text:?}",
-            elapsed.as_secs_f64() * 1000.0
+        let process_start_to_first_token_ms = elapsed.as_secs_f64() * 1000.0;
+        print_phase_report(
+            json,
+            gguf_open_ms,
+            cuda_init_ms,
+            model_load_ms,
+            prompt_eval_ms,
+            &e_gguf_open,
+            &e_cuda_init,
+            &e_model_load,
+            &energy_measurement,
         );
+        if json {
+            #[cfg(feature = "json-output")]
+            reflex_engine::cli_output::print_json_line(
+                &reflex_engine::cli_output::GenerateResultJson {
+                    schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
+                    process_start_to_first_token_ms,
+                    process_start_to_last_token_ms: None,
+                    gguf_open_ms,
+                    cuda_init_ms,
+                    model_load_ms,
+                    prompt_eval_ms,
+                    num_generated: None,
+                    token_id,
+                    token_ids: None,
+                    token_text: text,
+                    joules: energy_measurement.as_ref().map(|m| m.joules),
+                    energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
+                },
+            );
+            #[cfg(not(feature = "json-output"))]
+            json_output_unavailable();
+        } else {
+            println!(
+                "REFLEX_GENERATE_OK process_start_to_first_token_ms={process_start_to_first_token_ms:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} token_id={token_id} token_text={text:?}{}",
+                energy_suffix(energy_measurement.as_ref()),
+            );
+        }
         reflex_engine::fast_exit(0);
     }
 
-    let imported = import_kv
-        .as_ref()
-        .map(|path| kv_io::import_kv(path).expect("failed to import KV cache"));
+    let imported = import_kv.as_ref().map(|path| {
+        kv_io::import_kv(path).unwrap_or_else(|e| crate::fail("failed to import KV cache", e))
+    });
 
     let mut first_token_ms: Option<f64> = None;
+    let mut first_token_energy: Option<energy::EnergyMeasurement> = None;
     let (tokens, text) = model
         .generate(
             &prompt,
@@ -273,21 +374,59 @@ pub fn run(args: Vec<String>) {
             &sampling,
             |_logits| {
                 first_token_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+                first_token_energy = sampler.measure();
             },
             |_id, _text| {},
         )
-        .expect("generate failed");
+        .unwrap_or_else(|e| crate::fail("generate failed", e));
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let energy_measurement = sampler.measure();
     let prompt_eval_ms = first_token_ms.unwrap_or(total_ms) - model_ready_ms;
 
-    let token_ids: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
-    println!(
-        "REFLEX_GENERATE_OK process_start_to_first_token_ms={:.3} process_start_to_last_token_ms={:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} num_generated={} token_id={} token_ids=[{}] token_text={text:?}",
-        first_token_ms.unwrap_or(total_ms),
-        total_ms,
-        tokens.len(),
-        tokens[0],
-        token_ids.join(","),
+    print_phase_report(
+        json,
+        gguf_open_ms,
+        cuda_init_ms,
+        model_load_ms,
+        prompt_eval_ms,
+        &e_gguf_open,
+        &e_cuda_init,
+        &e_model_load,
+        &first_token_energy,
     );
+
+    if json {
+        #[cfg(feature = "json-output")]
+        reflex_engine::cli_output::print_json_line(
+            &reflex_engine::cli_output::GenerateResultJson {
+                schema_version: reflex_engine::cli_output::SCHEMA_VERSION,
+                process_start_to_first_token_ms: first_token_ms.unwrap_or(total_ms),
+                process_start_to_last_token_ms: Some(total_ms),
+                gguf_open_ms,
+                cuda_init_ms,
+                model_load_ms,
+                prompt_eval_ms,
+                num_generated: Some(tokens.len()),
+                token_id: tokens[0],
+                token_ids: Some(tokens.clone()),
+                token_text: text,
+                joules: energy_measurement.as_ref().map(|m| m.joules),
+                energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
+            },
+        );
+        #[cfg(not(feature = "json-output"))]
+        json_output_unavailable();
+    } else {
+        let token_ids: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        println!(
+            "REFLEX_GENERATE_OK process_start_to_first_token_ms={:.3} process_start_to_last_token_ms={:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} num_generated={} token_id={} token_ids=[{}] token_text={text:?}{}",
+            first_token_ms.unwrap_or(total_ms),
+            total_ms,
+            tokens.len(),
+            tokens[0],
+            token_ids.join(","),
+            energy_suffix(energy_measurement.as_ref()),
+        );
+    }
     reflex_engine::fast_exit(0);
 }

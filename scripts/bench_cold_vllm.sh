@@ -3,19 +3,19 @@
 #
 # Reuses bench_cold_common.sh's methodology (external wall clock via
 # /usr/bin/time -v, greedy decode, disclosed caveats) so the result is
-# directly comparable in kind to the existing llama.cpp comparison — see
-# DECISIONS.md's "Cold-start-vs-llama.cpp benchmark methodology" entry.
+# directly comparable in kind to the existing llama.cpp comparison (see
+# docs/benchmarks.md).
 #
 # WHY vLLM (not just another llama.cpp-style engine): llama.cpp is, like
 # Reflex, AOT-compiled via nvcc — it never JIT-compiles CUDA
 # kernels, so it doesn't actually test this project's core AOT-vs-JIT
-# cold-start bet (see CLAUDE.md). vLLM's CUDA graph capture / historically
+# cold-start bet (see docs/DEVELOPMENT.md). vLLM's CUDA graph capture / historically
 # JIT-driven kernel compilation is a real, well-documented warmup cost and
 # a much better foil for that specific claim.
 #
 # Prerequisites (install once per ThunderCompute session, not automated
-# here — see DECISIONS.md for why this stays a manual step rather than a
-# new binary/dependency of the core engine):
+# here: it stays a manual step rather than a new binary/dependency of the
+# core engine):
 #   pip install vllm
 #
 # IMPORTANT — resolve before trusting any number this produces: vLLM's
