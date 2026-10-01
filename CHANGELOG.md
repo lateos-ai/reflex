@@ -12,7 +12,12 @@ What has been built, in order. Measurements live in
   the GPU nightly workflow reports it.
 - **Runpod comparison against llama.cpp, prepared**: an image for llama.cpp's official
   CUDA server on the same Runpod load-balancing setup, and a procedure in
-  [docs/runpod-llamacpp-comparison.md](docs/runpod-llamacpp-comparison.md). Not yet run.
+  [docs/runpod-llamacpp-comparison.md](docs/runpod-llamacpp-comparison.md). First run on
+  an L4: engine load 0.49 s (Reflex) vs. 0.95 s (llama.cpp); end-to-end wall clock is
+  dominated by the platform and inconclusive (Reflex n=5, llama.cpp n=3).
+- **`.gitattributes` forces LF for `*.sh`**: a Windows checkout (`core.autocrlf=true`)
+  put CRLF into `serverless/runpod-llamacpp/start.sh`, and the built image failed with
+  `exec /start.sh failed: No such file or directory`.
 
 ## 2026-09-30
 
