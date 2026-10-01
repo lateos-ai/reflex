@@ -608,9 +608,12 @@ impl Model {
                 Ok((generated, text))
             }
             Some(crate::kv_io::ImportedKv::Mla(cache)) => {
-                let m = self.mla.as_ref().ok_or(
-                    "imported KV cache file is MLA format, but this model is not an MLA model",
-                )?;
+                let m = self.mla.as_ref().ok_or_else(|| {
+                    ReflexError::KvCache(
+                        "imported KV cache file is MLA format, but this model is not an MLA model"
+                            .to_string(),
+                    )
+                })?;
                 let (generated, text, _, _) = self.generate_mla_impl(
                     m,
                     prompt,

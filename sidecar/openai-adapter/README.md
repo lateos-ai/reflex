@@ -215,7 +215,13 @@ supports it. `temperature` omitted or `<= 0` selects greedy argmax, mirroring
   "invalid_request_error"`, `"code": "context_length_exceeded"`), in both streaming and
   non-streaming mode: for `stream: true` the adapter waits for the engine's first event
   before sending SSE headers, so any error raised before the first token gets a real
-  HTTP status instead of an empty `200` stream. Other engine errors stay `500`.
+  HTTP status instead of an empty `200` stream.
+- **Other engine errors are mapped by the engine's `error_kind`** (see the root
+  README's "Error categories"): `invalid_input` (a bad request parameter, such as a
+  sampling value) is `400` with code `invalid_input`; `out_of_memory` is `503` with type
+  `server_error`; anything else is `500` with the category as `code`. With an older
+  engine binary that sends no `error_kind`, only the context-length case is recognized
+  (by its message prefix) and everything else is `500`.
 - **No function/tool calling, no `logprobs`, no `n > 1`, no multimodal content
   parts.** A `messages[i].content` that isn't a plain string (e.g. an image/text
   content-parts array) is rejected with a `400`.

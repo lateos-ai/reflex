@@ -361,7 +361,7 @@ impl<'a> Cursor<'a> {
         let end = self
             .pos
             .checked_add(n)
-            .ok_or_else(|| "cursor offset overflow".to_string())?;
+            .ok_or_else(|| ReflexError::Gguf("cursor offset overflow".to_string()))?;
         let slice = self.data.get(self.pos..end).ok_or_else(|| {
             crate::reflex_err!(
                 Gguf,

@@ -520,40 +520,68 @@ fn timeout_response(timeout: Duration) -> Response {
 /// imported, since this crate deliberately doesn't depend on `reflex-engine`).
 const CONTEXT_LENGTH_EXCEEDED_PREFIX: &str = "context length exceeded";
 
-/// Maps an engine-side error message (an IPC `final` event with `ok: false`) to
-/// the HTTP status and OpenAI-style error `type`/`code` the client should see.
-/// Requests over the engine's attention context-length limit are the client's
-/// to fix, so they get `400`/`context_length_exceeded`, as OpenAI returns;
-/// everything else stays a `500`.
-fn classify_engine_error(msg: &str) -> (StatusCode, &'static str, Option<&'static str>) {
-    if msg.starts_with(CONTEXT_LENGTH_EXCEEDED_PREFIX) {
-        (
+/// An engine failure, from an IPC `final` event with `ok: false`.
+#[derive(Debug, PartialEq)]
+struct EngineError<'a> {
+    message: &'a str,
+    /// The engine's stable error category (IPC `error_kind`, e.g.
+    /// `"context_overflow"`). `None` from an engine build that predates it.
+    kind: Option<&'a str>,
+}
+
+/// Maps an engine failure to the HTTP status and OpenAI-style error `type`/`code`
+/// the client should see, by the engine's `error_kind`:
+/// - `context_overflow` -> `400` `context_length_exceeded`, as OpenAI returns
+///   (also recognized by message prefix, for engines without `error_kind`);
+/// - `invalid_input` -> `400` (the adapter already validates `max_tokens`, so this
+///   is a bad request parameter such as a sampling value);
+/// - `out_of_memory` -> `503`: the server is temporarily out of GPU memory;
+/// - anything else -> `500`, with the kind as `code` when the engine sent one.
+fn classify_engine_error(err: &EngineError) -> (StatusCode, &'static str, Option<String>) {
+    let kind = err.kind.or_else(|| {
+        err.message
+            .starts_with(CONTEXT_LENGTH_EXCEEDED_PREFIX)
+            .then_some("context_overflow")
+    });
+    match kind {
+        Some("context_overflow") => (
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            Some("context_length_exceeded"),
-        )
-    } else {
-        (
+            Some("context_length_exceeded".to_string()),
+        ),
+        Some("invalid_input") => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            Some("invalid_input".to_string()),
+        ),
+        Some("out_of_memory") => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_error",
+            Some("out_of_memory".to_string()),
+        ),
+        other => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "reflex_adapter_error",
-            None,
-        )
+            other.map(str::to_string),
+        ),
     }
 }
 
-fn engine_error_response(msg: &str) -> Response {
-    let (status, error_type, code) = classify_engine_error(msg);
-    error_response_with(status, msg, error_type, code)
+fn engine_error_response(err: &EngineError) -> Response {
+    let (status, error_type, code) = classify_engine_error(err);
+    error_response_with(status, err.message, error_type, code.as_deref())
 }
 
-/// `Some(message)` if `v` is the engine's terminal `final` event reporting failure.
-fn engine_error_message(v: &Value) -> Option<&str> {
+/// `Some` if `v` is the engine's terminal `final` event reporting failure.
+fn engine_error(v: &Value) -> Option<EngineError<'_>> {
     let is_final = v.get("event").and_then(Value::as_str) == Some("final");
     let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    (is_final && !ok).then(|| {
-        v.get("error")
+    (is_final && !ok).then(|| EngineError {
+        message: v
+            .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("unknown reflex error")
+            .unwrap_or("unknown reflex error"),
+        kind: v.get("error_kind").and_then(Value::as_str),
     })
 }
 
@@ -631,8 +659,8 @@ async fn chat_completions(
             Ok(first) => first,
             Err(_) => return timeout_response(timeout),
         };
-        if let Some(msg) = first.as_ref().and_then(engine_error_message) {
-            return engine_error_response(msg);
+        if let Some(err) = first.as_ref().and_then(engine_error) {
+            return engine_error_response(&err);
         }
         let sse_stream = build_sse_stream(
             first,
@@ -670,8 +698,8 @@ async fn non_streaming_response(
         if event != "final" {
             continue; // shouldn't happen for a non-streaming IPC request, but ignore rather than choke on it
         }
-        if let Some(msg) = engine_error_message(&v) {
-            return engine_error_response(msg);
+        if let Some(err) = engine_error(&v) {
+            return engine_error_response(&err);
         }
         let text = v
             .get("text")
@@ -928,23 +956,57 @@ mod tests {
         assert!(body["error"]["message"].as_str().unwrap().contains("300s"));
     }
 
+    fn engine(message: &'static str, kind: Option<&'static str>) -> EngineError<'static> {
+        EngineError { message, kind }
+    }
+
     #[test]
-    fn context_length_error_maps_to_400_context_length_exceeded() {
-        let msg = "context length exceeded: request needs 12000 positions (imported KV 0 +                    prompt 11999 + generation headroom 1), but this engine's attention kernels                    support at most 11264 positions per sequence.";
+    fn context_overflow_maps_to_400_context_length_exceeded() {
+        let expected = (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            Some("context_length_exceeded".to_string()),
+        );
+        let msg = "context length exceeded: request needs 12000 positions";
         assert_eq!(
-            classify_engine_error(msg),
+            classify_engine_error(&engine(msg, Some("context_overflow"))),
+            expected
+        );
+        // An engine build without `error_kind`: recognized by the message prefix.
+        assert_eq!(classify_engine_error(&engine(msg, None)), expected);
+    }
+
+    #[test]
+    fn out_of_memory_maps_to_503_and_invalid_input_to_400() {
+        assert_eq!(
+            classify_engine_error(&engine("attn alloc out: OOM", Some("out_of_memory"))).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            classify_engine_error(&engine("top_p must be in (0, 1]", Some("invalid_input"))),
             (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                Some("context_length_exceeded")
+                Some("invalid_input".to_string())
             )
         );
     }
 
     #[test]
-    fn other_engine_errors_stay_500() {
+    fn other_engine_errors_stay_500_with_the_kind_as_code() {
         assert_eq!(
-            classify_engine_error("attn launch: CUDA_ERROR_OUT_OF_MEMORY"),
+            classify_engine_error(&engine(
+                "attn launch: CUDA_ERROR_LAUNCH_FAILED",
+                Some("cuda")
+            )),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "reflex_adapter_error",
+                Some("cuda".to_string())
+            )
+        );
+        assert_eq!(
+            classify_engine_error(&engine("boom", None)),
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "reflex_adapter_error",
@@ -954,12 +1016,16 @@ mod tests {
     }
 
     #[test]
-    fn engine_error_message_only_matches_failed_final_events() {
-        let failed = serde_json::json!({"event": "final", "ok": false, "error": "boom"});
+    fn engine_error_only_matches_failed_final_events() {
+        let failed = serde_json::json!(
+            {"event": "final", "ok": false, "error": "boom", "error_kind": "other"}
+        );
+        let old_engine = serde_json::json!({"event": "final", "ok": false, "error": "boom"});
         let succeeded = serde_json::json!({"event": "final", "ok": true, "text": "hi"});
         let token = serde_json::json!({"event": "token", "text": "hi"});
-        assert_eq!(engine_error_message(&failed), Some("boom"));
-        assert_eq!(engine_error_message(&succeeded), None);
-        assert_eq!(engine_error_message(&token), None);
+        assert_eq!(engine_error(&failed), Some(engine("boom", Some("other"))));
+        assert_eq!(engine_error(&old_engine), Some(engine("boom", None)));
+        assert_eq!(engine_error(&succeeded), None);
+        assert_eq!(engine_error(&token), None);
     }
 }

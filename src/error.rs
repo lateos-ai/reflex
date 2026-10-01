@@ -209,20 +209,6 @@ impl fmt::Debug for ReflexError {
 
 impl std::error::Error for ReflexError {}
 
-/// Unclassified string errors (e.g. from a helper that still builds its message with
-/// `format!`) become [`ReflexError::Other`].
-impl From<String> for ReflexError {
-    fn from(message: String) -> Self {
-        ReflexError::Other(message)
-    }
-}
-
-impl From<&str> for ReflexError {
-    fn from(message: &str) -> Self {
-        ReflexError::Other(message.to_string())
-    }
-}
-
 /// Lets code that still reports errors as `String` (the CLI binaries, IPC framing)
 /// use `?` on engine calls.
 impl From<ReflexError> for String {
@@ -306,7 +292,6 @@ mod tests {
         let e = ReflexError::InvalidInput("max_new_tokens must be at least 1".into());
         assert_eq!(e.code(), ReflexErrorCode::InvalidInput);
         assert_eq!(e.kind(), "invalid_input");
-        assert_eq!(ReflexError::from("x".to_string()).kind(), "other");
     }
 
     #[test]

@@ -613,9 +613,11 @@ A single sequence can hold at most **11,264 positions** in total: any imported K
 This is an engine limit, not the model's: all four attention kernels keep one `f32`
 softmax score per position in shared memory, within the default 48 KiB per-block budget
 (`(49152 − 4096) / 4`; see `src/limits.rs`). Requests over it are rejected before any GPU
-allocation with an error starting `context length exceeded:` — from `reflex generate`/
-`system1`, the IPC `error` field, the C FFI's `reflex_last_error()`, and as an HTTP `400`
-with code `context_length_exceeded` from the OpenAI sidecar. Qwen3 models advertise 32K+
+allocation with an error starting `context length exceeded:` and category
+`context_overflow` (see [Error categories](#error-categories)) — from `reflex generate`/
+`system1`, the IPC `error`/`error_kind` fields, the C FFI's `reflex_last_error()`/
+`reflex_last_error_code()`, and as an HTTP `400` with code `context_length_exceeded` from
+the OpenAI sidecar. Qwen3 models advertise 32K+
 context, so long-context prompts hit this well before the model's own limit.
 
 ## Non-goals
@@ -735,6 +737,42 @@ objects also carry a **`schema_version`** field so a consumer can detect a shape
   changed meaning or was removed.
 - Plain-text output (no `--json`) is byte-for-byte unchanged by this contract, and the
   existing `REFLEX_*_OK` fields are unchanged by a `schema_version` bump.
+
+## Error categories
+
+Every engine error carries a stable category alongside its message, so callers can branch
+on *why* something failed instead of matching message text (the text itself is unchanged
+and still safe to grep). The categories are `src/error.rs`'s `ReflexError` variants:
+
+| category (IPC `error_kind`) | C `ReflexErrorCode` | meaning |
+|---|---|---|
+| `gguf` | `REFLEX_ERROR_CODE_GGUF` (1) | malformed GGUF: bad header, missing metadata or tensors |
+| `unsupported_architecture` | `..._UNSUPPORTED_ARCHITECTURE` (2) | valid model this engine doesn't support |
+| `cuda` | `..._CUDA` (3) | a CUDA driver call failed, or this build's kernels can't run on the GPU |
+| `cublas` | `..._CUBLAS` (4) | a cuBLAS call failed |
+| `out_of_memory` | `..._OUT_OF_MEMORY` (5) | a GPU allocation failed |
+| `tokenizer` | `..._TOKENIZER` (6) | encoding or decoding failed |
+| `context_overflow` | `..._CONTEXT_OVERFLOW` (7) | over the [context-length limit](#context-length-limit-all-architectures) |
+| `kv_cache` | `..._KV_CACHE` (8) | an imported KV cache is malformed or doesn't match the model |
+| `lora` | `..._LORA` (9) | a LoRA adapter is malformed or doesn't match the model |
+| `io` | `..._IO` (10) | a file couldn't be opened, created or written |
+| `invalid_input` | `..._INVALID_INPUT` (11) | a bad argument (empty prompt, `max_new_tokens` 0, NULL pointer, bad sampling value) |
+| `other` | `..._OTHER` (12) | anything else, mostly internal invariant violations |
+| — | `..._PANIC` (13) | the engine panicked (C FFI only; it catches the panic) |
+
+Where they surface:
+
+- **IPC** (`reflex stdio`/`uds`): failed responses add `"error_kind"` next to `"error"`;
+  successful ones omit it.
+- **C FFI**: `reflex_last_error_code()` returns the code (`REFLEX_ERROR_CODE_OK`, 0, after
+  a successful call) next to `reflex_last_error()`'s message. Both are reset at the start
+  of every `reflex_*` call.
+- **OpenAI sidecar**: `context_overflow` and `invalid_input` become `400`, `out_of_memory`
+  `503`, everything else `500` with the category as the error `code`.
+- **CLI and Python**: the message only, as before.
+
+Codes and category names are stable: existing ones never change meaning, and new ones
+are only appended.
 
 ## Docker
 

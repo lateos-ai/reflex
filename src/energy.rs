@@ -288,10 +288,11 @@ impl EnergySampler {
 pub fn probe_availability(device_ordinal: usize) -> Result<EnergyMethod, ReflexError> {
     #[cfg(feature = "nvml")]
     {
-        let nvml = nvml_wrapper::Nvml::init().map_err(|e| explain_nvml_error(&e))?;
+        let nvml =
+            nvml_wrapper::Nvml::init().map_err(|e| ReflexError::Other(explain_nvml_error(&e)))?;
         let device = nvml
             .device_by_index(device_ordinal as u32)
-            .map_err(|e| explain_nvml_error(&e))?;
+            .map_err(|e| ReflexError::Other(explain_nvml_error(&e)))?;
         if !force_polled_requested() && device.total_energy_consumption().is_ok() {
             return Ok(EnergyMethod::TotalEnergyCounter);
         }

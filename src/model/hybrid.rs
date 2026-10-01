@@ -464,7 +464,7 @@ impl Model {
 
         let token_embd_info = file
             .tensor_info("token_embd.weight")
-            .ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
+            .ok_or_else(|| ReflexError::Gguf("missing weight 'token_embd.weight'".to_string()))?;
         let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
         let token_embd = LazyTokenEmbedding::new(
             token_embd_info.ggml_type,
@@ -511,9 +511,9 @@ impl Model {
             }
         };
 
-        let (tokenizer, cublas) = init
-            .join()
-            .map_err(|_| "background load-init thread panicked".to_string())??;
+        let (tokenizer, cublas) = init.join().map_err(|_| {
+            ReflexError::Other("background load-init thread panicked".to_string())
+        })??;
 
         Ok(Model {
             device,
@@ -1297,9 +1297,11 @@ impl Model {
                 cfg.rmsnorm_eps,
             ),
             HybridFfn::Moe(w) => {
-                let moe_cfg = h.moe.as_ref().ok_or(
-                    "internal error: hybrid MoE layer without a HybridMoeConfig".to_string(),
-                )?;
+                let moe_cfg = h.moe.as_ref().ok_or_else(|| {
+                    ReflexError::Other(
+                        "internal error: hybrid MoE layer without a HybridMoeConfig".to_string(),
+                    )
+                })?;
                 self.forward_hybrid_moe_ffn(
                     post_mixer,
                     norm,
@@ -1339,9 +1341,11 @@ impl Model {
                 cfg.rmsnorm_eps,
             ),
             HybridFfn::Moe(w) => {
-                let moe_cfg = h.moe.as_ref().ok_or(
-                    "internal error: hybrid MoE layer without a HybridMoeConfig".to_string(),
-                )?;
+                let moe_cfg = h.moe.as_ref().ok_or_else(|| {
+                    ReflexError::Other(
+                        "internal error: hybrid MoE layer without a HybridMoeConfig".to_string(),
+                    )
+                })?;
                 self.forward_hybrid_moe_ffn_batched(
                     post_mixer,
                     norm,

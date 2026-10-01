@@ -241,7 +241,7 @@ impl Model {
 
         let token_embd_info = file
             .tensor_info("token_embd.weight")
-            .ok_or_else(|| "missing weight 'token_embd.weight'".to_string())?;
+            .ok_or_else(|| ReflexError::Gguf("missing weight 'token_embd.weight'".to_string()))?;
         let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
         let token_embd = LazyTokenEmbedding::new(
             token_embd_info.ggml_type,
@@ -279,9 +279,9 @@ impl Model {
             },
         };
 
-        let (tokenizer, cublas) = init
-            .join()
-            .map_err(|_| "background load-init thread panicked".to_string())??;
+        let (tokenizer, cublas) = init.join().map_err(|_| {
+            ReflexError::Other("background load-init thread panicked".to_string())
+        })??;
 
         Ok(Model {
             device,
