@@ -1,4 +1,5 @@
-//! Model configuration parsed from GGUF metadata: per-architecture layer/MoE/hybrid/MLA settings and the RoPE convention.
+//! Model configuration parsed from GGUF metadata: per-architecture layer, MoE,
+//! hybrid and MLA settings, and the RoPE convention.
 
 use super::*;
 

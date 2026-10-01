@@ -47,6 +47,14 @@
 //! llama.cpp's `qwen3moe.cpp`), and expert `e`'s `in_features * out_features`
 //! chunk is contiguous and already in that same 2-D layout -- see
 //! `Model::gemv_expert`.
+//!
+//! Layout: this file holds the `Model` struct, its public API and the dispatch to
+//! each architecture. `config` parses GGUF metadata into the config types,
+//! `loading` uploads and dequantizes weights, `kernels` wraps the AOT CUDA kernels
+//! and cuBLAS calls, and `dense` (dense and MoE Qwen3, Llama/Mistral), `hybrid`
+//! (Qwen3.5 Gated DeltaNet) and `mla` (DeepSeek-V2/V3) hold each architecture's
+//! loading and forward passes. All of them are `impl Model` blocks or types private
+//! to this module.
 
 use crate::aot::{self, AotKernel};
 use crate::dequant;
@@ -66,22 +74,25 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
+
 mod config;
-use self::config::*;
-mod loading;
-pub use self::config::{parse_model_config, LayerConfig, MoeMetaConfig, RopeType};
-use self::loading::*;
 mod dense;
-use self::dense::*;
 mod hybrid;
-use self::hybrid::*;
+mod kernels;
+mod loading;
 mod mla;
+
+use self::config::*;
+pub use self::config::{parse_model_config, LayerConfig, MoeMetaConfig, RopeType};
+use self::dense::*;
+use self::hybrid::*;
+use self::loading::*;
 use self::mla::*;
+
 #[cfg(test)]
 mod hybrid_batching_tests;
 #[cfg(test)]
 mod iq_dequant_host_vs_device_tests;
-mod kernels;
 #[cfg(test)]
 mod mla_batching_tests;
 #[cfg(test)]

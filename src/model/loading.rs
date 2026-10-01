@@ -1,4 +1,5 @@
-//! Weight loading: the pipelined H2D upload, on-device dequant, and lazy token embedding.
+//! Weight loading: the pipelined host-to-device upload, on-device dequant, and the
+//! lazy token embedding.
 
 use super::*;
 

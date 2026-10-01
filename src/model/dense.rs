@@ -1,4 +1,5 @@
-//! Dense and MoE transformer models (Qwen3, Qwen3-MoE, Llama/Mistral): loading and forward passes.
+//! Dense and MoE transformer models (Qwen3, Qwen3-MoE, Llama/Mistral): loading and
+//! forward passes.
 
 use super::*;
 

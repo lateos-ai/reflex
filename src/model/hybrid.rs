@@ -1,4 +1,5 @@
-//! Qwen3.5 hybrid models (Gated DeltaNet + gated attention, dense or routed-MoE FFN): loading and forward passes.
+//! Qwen3.5 hybrid models (Gated DeltaNet + gated attention, dense or routed-MoE
+//! FFN): loading and forward passes.
 
 use super::*;
 
