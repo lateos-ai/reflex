@@ -11,6 +11,7 @@ pub mod dequant_iq;
 pub mod dequant_iq_tables;
 pub mod diagnostics;
 pub mod energy;
+pub mod error;
 pub mod ffi;
 pub mod gated_deltanet;
 pub mod gguf;

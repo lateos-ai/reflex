@@ -23,29 +23,27 @@ pub const ATTN_MAX_POSITIONS: usize = 11264;
 /// maps it to `context_length_exceeded`) match on this, so don't reword it.
 pub const CONTEXT_LENGTH_EXCEEDED_PREFIX: &str = "context length exceeded";
 
+use crate::error::ReflexError;
+
 /// Errs if `imported + prompt + max_new` positions would exceed
 /// [`ATTN_MAX_POSITIONS`]. `imported` is a resumed KV cache's `seq_len`,
 /// `prompt` the encoded prompt length (including any inserted BOS), and
 /// `max_new` the extra cache headroom reserved past the prompt (generated
 /// tokens, or System1's multi-token candidate continuation). Overflow-safe:
 /// a sum that doesn't fit in `usize` is reported as exceeding the limit.
-pub fn check_positions(imported: usize, prompt: usize, max_new: usize) -> Result<(), String> {
+pub fn check_positions(imported: usize, prompt: usize, max_new: usize) -> Result<(), ReflexError> {
     let total = imported
         .checked_add(prompt)
         .and_then(|t| t.checked_add(max_new));
     match total {
         Some(total) if total <= ATTN_MAX_POSITIONS => Ok(()),
-        _ => {
-            let requested =
-                total.map_or_else(|| "more than usize::MAX".to_string(), |t| t.to_string());
-            Err(format!(
-                "{CONTEXT_LENGTH_EXCEEDED_PREFIX}: request needs {requested} positions \
-                 (imported KV {imported} + prompt {prompt} + generation headroom {max_new}), \
-                 but this engine's attention kernels support at most {ATTN_MAX_POSITIONS} \
-                 positions per sequence. This is a Reflex engine limit, not the model's \
-                 context length; shorten the prompt or lower max_tokens"
-            ))
-        }
+        requested => Err(ReflexError::ContextOverflow {
+            requested,
+            imported,
+            prompt,
+            max_new,
+            max: ATTN_MAX_POSITIONS,
+        }),
     }
 }
 
@@ -61,7 +59,9 @@ mod tests {
 
     #[test]
     fn one_over_limit_fails_with_stable_prefix_and_numbers() {
-        let err = check_positions(1000, ATTN_MAX_POSITIONS - 1100, 101).unwrap_err();
+        let err = check_positions(1000, ATTN_MAX_POSITIONS - 1100, 101)
+            .unwrap_err()
+            .to_string();
         assert!(err.starts_with(CONTEXT_LENGTH_EXCEEDED_PREFIX), "{err}");
         assert!(err.contains(&(ATTN_MAX_POSITIONS + 1).to_string()), "{err}");
         assert!(err.contains(&ATTN_MAX_POSITIONS.to_string()), "{err}");
@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn overflowing_sum_fails_instead_of_wrapping() {
-        let err = check_positions(usize::MAX, 1, 0).unwrap_err();
+        let err = check_positions(usize::MAX, 1, 0).unwrap_err().to_string();
         assert!(err.starts_with(CONTEXT_LENGTH_EXCEEDED_PREFIX), "{err}");
         assert!(check_positions(1, usize::MAX, usize::MAX).is_err());
         assert!(check_positions(0, 1, usize::MAX).is_err());
