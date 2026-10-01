@@ -27,10 +27,11 @@ include = [
   "ReflexErrorCode",
 ]
 
-# The context-length limit (src/limits.rs) is useful to C callers, but under a
-# prefixed name.
+# The context-length limits (src/limits.rs) are useful to C callers, but under
+# prefixed names.
 [export.rename]
 "ATTN_MAX_POSITIONS" = "REFLEX_ATTN_MAX_POSITIONS"
+"LEGACY_ATTN_MAX_POSITIONS" = "REFLEX_LEGACY_ATTN_MAX_POSITIONS"
 
 # C enumerators share one global namespace, so `ReflexErrorCode::Ok` must not
 # become a bare `Ok`: emit REFLEX_ERROR_CODE_OK, REFLEX_ERROR_CODE_GGUF, ...

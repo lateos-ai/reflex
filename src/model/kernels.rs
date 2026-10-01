@@ -3,7 +3,180 @@
 use super::*;
 use crate::error::ReflexError;
 
+/// Which attention kernels a model launches, read once at load time from the
+/// `REFLEX_ATTN_KERNEL` environment variable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AttnImpl {
+    /// `attention_online.cu` (the default): online softmax, warp-parallel over
+    /// positions, split-K for long decode contexts.
+    Online,
+    /// The original per-shape kernels (`attention.cu`, `attention_prefill.cu`,
+    /// `mla_attention*.cu`), kept for A/B comparison. Limited to
+    /// [`crate::limits::LEGACY_ATTN_MAX_POSITIONS`].
+    Legacy,
+}
+
+impl AttnImpl {
+    pub(super) fn from_env() -> Result<Self, ReflexError> {
+        match std::env::var("REFLEX_ATTN_KERNEL").as_deref() {
+            Err(_) | Ok("") | Ok("online") => Ok(AttnImpl::Online),
+            Ok("legacy") => Ok(AttnImpl::Legacy),
+            Ok(other) => Err(crate::reflex_err!(
+                InvalidInput,
+                "REFLEX_ATTN_KERNEL must be `online` (the default) or `legacy`, got {other:?}"
+            )),
+        }
+    }
+
+    /// The most sequence positions these kernels support.
+    pub(super) fn max_positions(self) -> usize {
+        match self {
+            AttnImpl::Online => crate::limits::ATTN_MAX_POSITIONS,
+            AttnImpl::Legacy => crate::limits::LEGACY_ATTN_MAX_POSITIONS,
+        }
+    }
+}
+
+/// `attention_online_kernel`'s scalar arguments. Must match `struct AttnParams` in
+/// `kernels_cuda/attention_online.cu` field for field.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct AttnParams {
+    k_pos_stride: u64,
+    k_head_stride: u64,
+    v_pos_stride: u64,
+    v_head_stride: u64,
+    num_q_heads: u32,
+    group_size: u32,
+    qk_dim: u32,
+    v_dim: u32,
+    start_pos: u32,
+    num_splits: u32,
+    split_len: u32,
+    scale: f32,
+}
+
+// SAFETY: a plain-old-data #[repr(C)] struct, passed to the kernel by value.
+unsafe impl DeviceRepr for AttnParams {}
+
+/// Shape and memory layout of one [`Model::attention_online`] call; see
+/// `kernels_cuda/attention_online.cu` for what each field means.
+pub(super) struct OnlineAttnShape {
+    pub(super) rows: usize,
+    pub(super) start_pos: usize,
+    pub(super) num_q_heads: usize,
+    pub(super) group_size: usize,
+    pub(super) qk_dim: usize,
+    pub(super) v_dim: usize,
+    pub(super) k_pos_stride: usize,
+    pub(super) k_head_stride: usize,
+    pub(super) v_pos_stride: usize,
+    pub(super) v_head_stride: usize,
+    pub(super) scale: f32,
+}
+
+/// `attention_online.cu`'s block size, in warps, and widest supported head.
+const ATTN_ONLINE_WARPS: usize = 8;
+const ATTN_ONLINE_MAX_DIM: usize = 1024;
+/// A decode step splits its positions across blocks once there are more than this
+/// many per block, up to `ATTN_ONLINE_MAX_SPLITS` blocks per head.
+const ATTN_ONLINE_SPLIT_POSITIONS: usize = 256;
+const ATTN_ONLINE_MAX_SPLITS: usize = 64;
+
 impl Model {
+    /// Runs `attention_online_kernel` (and, for a split decode, its combine kernel):
+    /// the default implementation behind [`Self::attention`],
+    /// [`Self::attention_prefill`], [`Self::mla_attention`] and
+    /// [`Self::mla_attention_prefill`]. Returns `[rows, num_q_heads, v_dim]`.
+    pub(super) fn attention_online(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaView<f32>,
+        v: &CudaView<f32>,
+        s: OnlineAttnShape,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        if s.qk_dim > ATTN_ONLINE_MAX_DIM || s.v_dim > ATTN_ONLINE_MAX_DIM {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "attention head dims qk={} v={} exceed the online attention kernel's limit of {ATTN_ONLINE_MAX_DIM}",
+                s.qk_dim,
+                s.v_dim
+            ));
+        }
+        // Prefill already has rows x heads blocks; only decode needs split-K.
+        let max_seq_len = s.start_pos + s.rows;
+        let num_splits = if s.rows == 1 {
+            (max_seq_len / ATTN_ONLINE_SPLIT_POSITIONS).clamp(1, ATTN_ONLINE_MAX_SPLITS)
+        } else {
+            1
+        };
+        let split_len = max_seq_len.div_ceil(num_splits);
+        let params = AttnParams {
+            k_pos_stride: s.k_pos_stride as u64,
+            k_head_stride: s.k_head_stride as u64,
+            v_pos_stride: s.v_pos_stride as u64,
+            v_head_stride: s.v_head_stride as u64,
+            num_q_heads: s.num_q_heads as u32,
+            group_size: s.group_size as u32,
+            qk_dim: s.qk_dim as u32,
+            v_dim: s.v_dim as u32,
+            start_pos: s.start_pos as u32,
+            num_splits: num_splits as u32,
+            split_len: split_len as u32,
+            scale: s.scale,
+        };
+        let cfg = LaunchConfig {
+            grid_dim: (s.rows as u32, s.num_q_heads as u32, num_splits as u32),
+            block_dim: ((ATTN_ONLINE_WARPS * 32) as u32, 1, 1),
+            shared_mem_bytes: ((s.qk_dim + ATTN_ONLINE_WARPS * (s.v_dim + 2))
+                * std::mem::size_of::<f32>()) as u32,
+        };
+        let mut out = self
+            .device
+            .alloc_zeros::<f32>(s.rows * s.num_q_heads * s.v_dim)
+            .map_err(|e| crate::gpu_err!(e, "attn_online alloc out: {e}"))?;
+        if num_splits == 1 {
+            unsafe {
+                self.attn_online_k
+                    .function
+                    .clone()
+                    .launch(cfg, (q, k, v, &mut out, params))
+                    .map_err(|e| crate::gpu_err!(e, "attn_online launch: {e}"))?;
+            }
+            return Ok(out);
+        }
+        let mut partial = self
+            .device
+            .alloc_zeros::<f32>(s.rows * s.num_q_heads * num_splits * (s.v_dim + 2))
+            .map_err(|e| crate::gpu_err!(e, "attn_online alloc partial: {e}"))?;
+        unsafe {
+            self.attn_online_k
+                .function
+                .clone()
+                .launch(cfg, (q, k, v, &mut partial, params))
+                .map_err(|e| crate::gpu_err!(e, "attn_online launch: {e}"))?;
+            self.attn_online_combine_k
+                .function
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (s.rows as u32, s.num_q_heads as u32, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        &partial,
+                        &mut out,
+                        s.num_q_heads as u32,
+                        s.v_dim as u32,
+                        num_splits as u32,
+                    ),
+                )
+                .map_err(|e| crate::gpu_err!(e, "attn_online_combine launch: {e}"))?;
+        }
+        Ok(out)
+    }
+
     /// `x` is already device-resident (Phase 2 round 2) -- unlike the
     /// pre-round-2 version, no `htod`/`dtoh` happens here; the caller chains
     /// this op's `CudaSlice` output straight into the next op.
@@ -797,6 +970,26 @@ impl Model {
         head_dim: usize,
         seq_len: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
+        if self.attn_impl == AttnImpl::Online {
+            return self.attention_online(
+                q,
+                k_cache,
+                v_cache,
+                OnlineAttnShape {
+                    rows: 1,
+                    start_pos: seq_len - 1,
+                    num_q_heads,
+                    group_size: num_q_heads / num_kv_heads,
+                    qk_dim: head_dim,
+                    v_dim: head_dim,
+                    k_pos_stride: num_kv_heads * head_dim,
+                    k_head_stride: head_dim,
+                    v_pos_stride: num_kv_heads * head_dim,
+                    v_head_stride: head_dim,
+                    scale: 1.0f32 / (head_dim as f32).sqrt(),
+                },
+            );
+        }
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(num_q_heads * head_dim)
@@ -852,6 +1045,26 @@ impl Model {
         start_pos: usize,
         rows: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
+        if self.attn_impl == AttnImpl::Online {
+            return self.attention_online(
+                q,
+                k_cache,
+                v_cache,
+                OnlineAttnShape {
+                    rows,
+                    start_pos,
+                    num_q_heads,
+                    group_size: num_q_heads / num_kv_heads,
+                    qk_dim: head_dim,
+                    v_dim: head_dim,
+                    k_pos_stride: num_kv_heads * head_dim,
+                    k_head_stride: head_dim,
+                    v_pos_stride: num_kv_heads * head_dim,
+                    v_head_stride: head_dim,
+                    scale: 1.0f32 / (head_dim as f32).sqrt(),
+                },
+            );
+        }
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(rows * num_q_heads * head_dim)
@@ -1114,6 +1327,28 @@ impl Model {
         seq_len: usize,
         scale: f32,
     ) -> Result<CudaSlice<f32>, ReflexError> {
+        if self.attn_impl == AttnImpl::Online {
+            // MQA: every query head reads the one shared compressed row, which is
+            // both K (all qk_dim) and V (its first v_dim).
+            return self.attention_online(
+                q,
+                kv_cache,
+                kv_cache,
+                OnlineAttnShape {
+                    rows: 1,
+                    start_pos: seq_len - 1,
+                    num_q_heads,
+                    group_size: num_q_heads,
+                    qk_dim,
+                    v_dim,
+                    k_pos_stride: qk_dim,
+                    k_head_stride: 0,
+                    v_pos_stride: qk_dim,
+                    v_head_stride: 0,
+                    scale,
+                },
+            );
+        }
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(num_q_heads * v_dim)
@@ -1168,6 +1403,26 @@ impl Model {
         rows: usize,
         scale: f32,
     ) -> Result<CudaSlice<f32>, ReflexError> {
+        if self.attn_impl == AttnImpl::Online {
+            return self.attention_online(
+                q,
+                kv_cache,
+                kv_cache,
+                OnlineAttnShape {
+                    rows,
+                    start_pos,
+                    num_q_heads,
+                    group_size: num_q_heads,
+                    qk_dim,
+                    v_dim,
+                    k_pos_stride: qk_dim,
+                    k_head_stride: 0,
+                    v_pos_stride: qk_dim,
+                    v_head_stride: 0,
+                    scale,
+                },
+            );
+        }
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(rows * num_q_heads * v_dim)

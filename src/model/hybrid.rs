@@ -338,6 +338,15 @@ impl Model {
             "attention_prefill",
             "attention_prefill_kernel",
         )?;
+        let mut attn_online_fns = aot::load_kernel_module(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ATTENTION_ONLINE")),
+            "attention_online",
+            &["attention_online_kernel", "attention_online_combine_kernel"],
+        )?;
+        let attn_online_combine_k = attn_online_fns.pop().expect("two kernels requested");
+        let attn_online_k = attn_online_fns.pop().expect("two kernels requested");
+        let attn_impl = AttnImpl::from_env()?;
         let mut elementwise_fns = aot::load_kernel_module(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ELEMENTWISE")),
@@ -530,6 +539,9 @@ impl Model {
             moe_scatter_add_k,
             attn_k,
             attn_prefill_k,
+            attn_online_k,
+            attn_online_combine_k,
+            attn_impl,
             add_k,
             split_qg_k,
             sigmoid_gate_k,
@@ -1617,7 +1629,12 @@ impl Model {
         rows: usize,
         extra_headroom: usize,
     ) -> Result<Vec<HybridLayerState>, ReflexError> {
-        crate::limits::check_positions(start_pos, rows, extra_headroom)?;
+        crate::limits::check_positions_up_to(
+            start_pos,
+            rows,
+            extra_headroom,
+            self.attn_impl.max_positions(),
+        )?;
         if let Some(cache) = imported {
             if cache.attn_num_kv_heads != h.attn_cfg.num_kv_heads
                 || cache.attn_head_dim != h.attn_cfg.head_dim

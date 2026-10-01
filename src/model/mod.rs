@@ -86,10 +86,13 @@ use self::config::*;
 pub use self::config::{parse_model_config, LayerConfig, MoeMetaConfig, RopeType};
 use self::dense::*;
 use self::hybrid::*;
+use self::kernels::*;
 use self::loading::*;
 use self::mla::*;
 use crate::error::ReflexError;
 
+#[cfg(test)]
+mod attention_online_tests;
 #[cfg(test)]
 mod hybrid_batching_tests;
 #[cfg(test)]
@@ -162,6 +165,13 @@ pub struct Model {
     /// causally masked to its own position, instead of one `attn_k` launch
     /// per row.
     attn_prefill_k: AotKernel,
+    /// `attention_online_kernel` and its split-K combine kernel
+    /// (`kernels_cuda/attention_online.cu`), the default attention implementation for
+    /// every architecture -- see `Model::attention_online`.
+    attn_online_k: AotKernel,
+    attn_online_combine_k: AotKernel,
+    /// Which attention kernels to launch: `REFLEX_ATTN_KERNEL` at load time.
+    attn_impl: AttnImpl,
     /// In-place residual add (`a[i] += b[i]`, see `kernels_cuda/elementwise.cu`)
     /// -- keeps residual-stream adds device-resident (Phase 2 round 2)
     /// instead of downloading both operands to host just to add two vectors.

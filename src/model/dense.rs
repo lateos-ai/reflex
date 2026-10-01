@@ -150,6 +150,15 @@ impl Model {
             "attention_prefill",
             "attention_prefill_kernel",
         )?;
+        let mut attn_online_fns = aot::load_kernel_module(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_ATTENTION_ONLINE")),
+            "attention_online",
+            &["attention_online_kernel", "attention_online_combine_kernel"],
+        )?;
+        let attn_online_combine_k = attn_online_fns.pop().expect("two kernels requested");
+        let attn_online_k = attn_online_fns.pop().expect("two kernels requested");
+        let attn_impl = AttnImpl::from_env()?;
         let mut elementwise_fns = aot::load_kernel_module(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ELEMENTWISE")),
@@ -298,6 +307,9 @@ impl Model {
             moe_scatter_add_k,
             attn_k,
             attn_prefill_k,
+            attn_online_k,
+            attn_online_combine_k,
+            attn_impl,
             add_k,
             split_qg_k,
             sigmoid_gate_k,
@@ -927,7 +939,12 @@ impl Model {
             ));
         }
 
-        crate::limits::check_positions(start_pos, ids.len(), extra_headroom)?;
+        crate::limits::check_positions_up_to(
+            start_pos,
+            ids.len(),
+            extra_headroom,
+            self.attn_impl.max_positions(),
+        )?;
         let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
         // Preallocated up front (Phase 2 round 2 sized this to exactly the
         // prompt's token count; round 2 of Phase 3 sizes it for the whole
@@ -1029,7 +1046,12 @@ impl Model {
             ));
         }
         let rows = ids.len();
-        crate::limits::check_positions(start_pos, rows, extra_headroom)?;
+        crate::limits::check_positions_up_to(
+            start_pos,
+            rows,
+            extra_headroom,
+            self.attn_impl.max_positions(),
+        )?;
 
         let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
         let total_len = start_pos + rows + extra_headroom;

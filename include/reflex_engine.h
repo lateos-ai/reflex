@@ -16,21 +16,32 @@
 #include <stdlib.h>
 
 /**
- * Maximum number of cached positions (imported + prompt + generation
- * headroom) the attention kernels can handle in one launch.
+ * Maximum number of cached positions (imported + prompt + generation headroom) in
+ * one sequence, with the default online-softmax attention kernels
+ * (`kernels_cuda/attention_online.cu`).
  *
- * All four attention kernels (`kernels_cuda/attention.cu`,
- * `attention_prefill.cu`, `mla_attention.cu`, `mla_attention_prefill.cu`)
- * keep the whole softmax score row in dynamic shared memory
- * (`extern __shared__ float scores[]`, `seq_len * 4` bytes) next to a static
- * `__shared__ float reduce_buf[1024]` (4 KiB). Nothing opts into more than
- * the default 48 KiB per-block limit
- * (`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`), so:
- * `(49152 - 4096) / 4 = 11264` positions.
+ * Those kernels no longer keep a score per position in shared memory (that capped
+ * the original kernels at [`LEGACY_ATTN_MAX_POSITIONS`]), and put query rows in
+ * `grid.x`, which allows 2^31 - 1 blocks. What binds now is CUDA's 65,535-block limit
+ * on `grid.y`/`grid.z`: MLA's batched prefill launches `gemv_per_head_batch` with one
+ * `grid.z` block per prompt row, so a prompt can't exceed 65,535 rows there. One
+ * engine-wide limit keeps the rule simple; it is above Qwen3's 40,960-token native
+ * context. Past it, the KV cache itself (VRAM) is the next constraint, and an
+ * allocation that doesn't fit fails with `ReflexError::OutOfMemory`.
  *
  * This is a Reflex engine limit, not the model's context length.
  */
-#define REFLEX_ATTN_MAX_POSITIONS 11264
+#define REFLEX_ATTN_MAX_POSITIONS 65535
+
+/**
+ * Maximum positions with the original attention kernels (`REFLEX_ATTN_KERNEL=legacy`:
+ * `attention.cu`, `attention_prefill.cu`, `mla_attention.cu`,
+ * `mla_attention_prefill.cu`). They keep the whole softmax score row in dynamic
+ * shared memory (`extern __shared__ float scores[]`, `seq_len * 4` bytes) next to a
+ * static `__shared__ float reduce_buf[1024]` (4 KiB), within the default 48 KiB
+ * per-block limit: `(49152 - 4096) / 4 = 11264` positions.
+ */
+#define REFLEX_LEGACY_ATTN_MAX_POSITIONS 11264
 
 /**
  * Stable machine-readable error categories, shared by the C FFI

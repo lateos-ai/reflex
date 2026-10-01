@@ -608,17 +608,38 @@ Each addition counts as done only after an independent-implementation comparison
 
 ### Context-length limit (all architectures)
 
-A single sequence can hold at most **11,264 positions** in total: any imported KV cache
+A single sequence can hold at most **65,535 positions** in total: any imported KV cache
 (`--import-kv`) + the encoded prompt + `--max-tokens` (or System1's longest candidate).
-This is an engine limit, not the model's: all four attention kernels keep one `f32`
-softmax score per position in shared memory, within the default 48 KiB per-block budget
-(`(49152 − 4096) / 4`; see `src/limits.rs`). Requests over it are rejected before any GPU
-allocation with an error starting `context length exceeded:` and category
+That covers Qwen3's 40,960-token native context. The bound is CUDA's 65,535-block limit
+on a launch's `y`/`z` grid dimension, which MLA's batched prefill uses per prompt row (see
+`src/limits.rs`). Past it, the KV cache's VRAM is the next constraint, and an allocation
+that doesn't fit fails as `out_of_memory`. Requests over the limit are rejected before
+any GPU allocation with an error starting `context length exceeded:` and category
 `context_overflow` (see [Error categories](#error-categories)) — from `reflex generate`/
 `system1`, the IPC `error`/`error_kind` fields, the C FFI's `reflex_last_error()`/
-`reflex_last_error_code()`, and as an HTTP `400` with code `context_length_exceeded` from
-the OpenAI sidecar. Qwen3 models advertise 32K+
-context, so long-context prompts hit this well before the model's own limit.
+`reflex_last_error_code()` (the limit is `REFLEX_ATTN_MAX_POSITIONS` in the header), and
+as an HTTP `400` with code `context_length_exceeded` from the OpenAI sidecar.
+
+The attention kernels behind this (`src/kernels_cuda/attention_online.cu`) use an online
+softmax: each warp scores its own positions with a running max and sum, so shared memory
+no longer grows with the sequence, and long decode contexts are split across blocks. The
+original kernels kept every score in shared memory, which capped a sequence at 11,264
+positions; they stay selectable with `REFLEX_ATTN_KERNEL=legacy` (and keep that limit)
+for comparison. Measured on a T4 (Qwen3-0.6B-Q4_K_M, 65 generated tokens, same binary,
+2026-09-30):
+
+| context | prefill, legacy → online | decode per token, legacy → online |
+|---|---|---|
+| ~128 tokens | 354 → 344 ms | 16.6 → 13.4 ms |
+| ~2K tokens | 6.52 → 2.86 s | 68.9 → 16.7 ms |
+| ~8K tokens | 363.7 → 45.4 s | 235.5 → 27.8 ms |
+| ~16.5K tokens | over the legacy limit | prefill 190 s (online only) |
+
+Greedy tokens are identical between the two on every tested model (dense, hybrid, MLA and
+both MoE fixtures) and first-token logits agree to within 2.2e-5. Prefill is still
+quadratic in prompt length and runs in plain `f32` without tensor-core tiling, so very
+long prompts remain slow; cold start, not long-context throughput, is what this engine
+optimizes.
 
 ## Non-goals
 
