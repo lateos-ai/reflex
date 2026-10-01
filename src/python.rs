@@ -16,8 +16,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-fn to_py_err(e: String) -> PyErr {
-    PyErr::new::<PyRuntimeError, _>(e)
+fn to_py_err(e: impl std::fmt::Display) -> PyErr {
+    PyErr::new::<PyRuntimeError, _>(e.to_string())
 }
 
 /// A loaded model, held for the Python object's whole lifetime. `PyModel(path)`

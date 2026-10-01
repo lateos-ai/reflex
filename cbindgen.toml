@@ -19,7 +19,24 @@ documentation_style = "doxy"
 style = "type"
 
 [export]
-include = ["ReflexModel", "ReflexGenerateResult", "ReflexSystem1Result", "ReflexSystem1CandidateResult"]
+include = [
+  "ReflexModel",
+  "ReflexGenerateResult",
+  "ReflexSystem1Result",
+  "ReflexSystem1CandidateResult",
+  "ReflexErrorCode",
+]
+
+# The context-length limit (src/limits.rs) is useful to C callers, but under a
+# prefixed name.
+[export.rename]
+"ATTN_MAX_POSITIONS" = "REFLEX_ATTN_MAX_POSITIONS"
+
+# C enumerators share one global namespace, so `ReflexErrorCode::Ok` must not
+# become a bare `Ok`: emit REFLEX_ERROR_CODE_OK, REFLEX_ERROR_CODE_GGUF, ...
+[enum]
+rename_variants = "ScreamingSnakeCase"
+prefix_with_name = true
 
 [parse]
 parse_deps = false

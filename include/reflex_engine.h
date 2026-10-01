@@ -16,6 +16,51 @@
 #include <stdlib.h>
 
 /**
+ * Maximum number of cached positions (imported + prompt + generation
+ * headroom) the attention kernels can handle in one launch.
+ *
+ * All four attention kernels (`kernels_cuda/attention.cu`,
+ * `attention_prefill.cu`, `mla_attention.cu`, `mla_attention_prefill.cu`)
+ * keep the whole softmax score row in dynamic shared memory
+ * (`extern __shared__ float scores[]`, `seq_len * 4` bytes) next to a static
+ * `__shared__ float reduce_buf[1024]` (4 KiB). Nothing opts into more than
+ * the default 48 KiB per-block limit
+ * (`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`), so:
+ * `(49152 - 4096) / 4 = 11264` positions.
+ *
+ * This is a Reflex engine limit, not the model's context length.
+ */
+#define REFLEX_ATTN_MAX_POSITIONS 11264
+
+/**
+ * Stable machine-readable error categories, shared by the C FFI
+ * (`reflex_last_error_code`) and the IPC protocol (`error_kind`). Values never change
+ * meaning; new categories are only ever appended.
+ */
+typedef enum {
+    /**
+     * No error.
+     */
+    REFLEX_ERROR_CODE_OK = 0,
+    REFLEX_ERROR_CODE_GGUF = 1,
+    REFLEX_ERROR_CODE_UNSUPPORTED_ARCHITECTURE = 2,
+    REFLEX_ERROR_CODE_CUDA = 3,
+    REFLEX_ERROR_CODE_CUBLAS = 4,
+    REFLEX_ERROR_CODE_OUT_OF_MEMORY = 5,
+    REFLEX_ERROR_CODE_TOKENIZER = 6,
+    REFLEX_ERROR_CODE_CONTEXT_OVERFLOW = 7,
+    REFLEX_ERROR_CODE_KV_CACHE = 8,
+    REFLEX_ERROR_CODE_LORA = 9,
+    REFLEX_ERROR_CODE_IO = 10,
+    REFLEX_ERROR_CODE_INVALID_INPUT = 11,
+    REFLEX_ERROR_CODE_OTHER = 12,
+    /**
+     * The engine panicked; only the C FFI reports this (it catches the panic).
+     */
+    REFLEX_ERROR_CODE_PANIC = 13,
+} ReflexErrorCode;
+
+/**
  * Opaque handle to a loaded model, obtained from `reflex_load` and freed
  * with `reflex_free`. C callers only ever see a pointer to this type --
  * never its layout.
@@ -79,6 +124,17 @@ typedef struct {
  * that.
  */
 const char *reflex_last_error(void);
+
+/**
+ * Returns the category of this thread's most recent `reflex_*` failure, or
+ * `REFLEX_ERROR_CODE_OK` (0) if the most recent call succeeded (or none has run
+ * yet on this thread). Use it to branch on *why* a call failed -- e.g. retry a
+ * smaller request on `REFLEX_ERROR_CODE_CONTEXT_OVERFLOW`, back off on
+ * `REFLEX_ERROR_CODE_OUT_OF_MEMORY` -- instead of matching `reflex_last_error`'s
+ * text. Codes are stable: existing values never change meaning, and new ones are
+ * only appended.
+ */
+ReflexErrorCode reflex_last_error_code(void);
 
 /**
  * Loads a GGUF model from `gguf_path` onto CUDA device 0, optionally
