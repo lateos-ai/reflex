@@ -24,6 +24,7 @@
 //! expected values against known input bytes (not just round-tripped
 //! through this module's own code).
 
+use crate::error::ReflexError;
 use crate::gguf::GgmlType;
 use half::{bf16, f16};
 
@@ -53,7 +54,7 @@ pub fn dequantize(
     ggml_type: GgmlType,
     bytes: &[u8],
     element_count: u64,
-) -> Result<Vec<f32>, String> {
+) -> Result<Vec<f32>, ReflexError> {
     let n = element_count as usize;
     let mut out = match ggml_type {
         GgmlType::F32 => bytes
@@ -132,7 +133,8 @@ pub fn dequantize(
             dequantize_blocks(bytes, 136, QK_K, crate::dequant_iq::dequantize_block_iq4_xs)
         }
         GgmlType::Unknown(t) => {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Gguf,
                 "unknown ggml_type={t}: no dequantizer known for it"
             ))
         }

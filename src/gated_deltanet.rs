@@ -10,6 +10,8 @@
 //!
 //! `head_dim` is shared by keys and values: llama.cpp asserts `S_k == S_v`
 //! (both 128 for every real Qwen3.5 release RustFeference inspected).
+
+use crate::error::ReflexError;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GatedDeltaNetConfig {
     pub hidden_size: usize,
@@ -44,25 +46,35 @@ impl GatedDeltaNetConfig {
         self.num_v_heads * self.head_dim * self.head_dim
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), ReflexError> {
         if self.hidden_size == 0
             || self.num_k_heads == 0
             || self.num_v_heads == 0
             || self.head_dim == 0
         {
-            return Err("GatedDeltaNetConfig has a zero dimension".to_string());
+            return Err(ReflexError::Other(
+                "GatedDeltaNetConfig has a zero dimension".to_string(),
+            ));
         }
         if !self.num_v_heads.is_multiple_of(self.num_k_heads) {
-            return Err(format!(
+            return Err(crate::reflex_err!(
+                Other,
                 "num_v_heads={} must be a multiple of num_k_heads={}",
-                self.num_v_heads, self.num_k_heads
+                self.num_v_heads,
+                self.num_k_heads
             ));
         }
         if self.conv_kernel_size == 0 {
-            return Err("conv_kernel_size must be >= 1".to_string());
+            return Err(ReflexError::Other(
+                "conv_kernel_size must be >= 1".to_string(),
+            ));
         }
         if self.eps < 0.0 || !self.eps.is_finite() {
-            return Err(format!("eps must be finite and >= 0, got {}", self.eps));
+            return Err(crate::reflex_err!(
+                Other,
+                "eps must be finite and >= 0, got {}",
+                self.eps
+            ));
         }
         Ok(())
     }

@@ -6,9 +6,11 @@
 //! see `Model::system1_evaluate`'s doc comment for why that distinction
 //! matters.
 
+use crate::error::ReflexError;
+
 /// Softmaxes `scores` (temperature `1.0`, a no-op). See
 /// [`softmax_scores_with_temperature`].
-pub fn softmax_scores(scores: &[f32]) -> Result<Vec<f32>, String> {
+pub fn softmax_scores(scores: &[f32]) -> Result<Vec<f32>, ReflexError> {
     softmax_scores_with_temperature(scores, 1.0)
 }
 
@@ -19,12 +21,15 @@ pub fn softmax_scores(scores: &[f32]) -> Result<Vec<f32>, String> {
 pub fn softmax_scores_with_temperature(
     scores: &[f32],
     temperature: f32,
-) -> Result<Vec<f32>, String> {
+) -> Result<Vec<f32>, ReflexError> {
     if scores.is_empty() {
-        return Err("softmax_scores: scores must not be empty".to_string());
+        return Err(ReflexError::InvalidInput(
+            "softmax_scores: scores must not be empty".to_string(),
+        ));
     }
     if !temperature.is_finite() || temperature <= 0.0 {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            InvalidInput,
             "softmax_scores: temperature must be positive and finite, got {temperature}"
         ));
     }
@@ -33,7 +38,8 @@ pub fn softmax_scores_with_temperature(
     let exps: Vec<f32> = scaled.iter().map(|&s| (s - max_s).exp()).collect();
     let sum: f32 = exps.iter().sum();
     if !sum.is_finite() || sum <= 0.0 {
-        return Err(format!(
+        return Err(crate::reflex_err!(
+            InvalidInput,
             "softmax_scores: softmax sum is non-finite or non-positive ({sum})"
         ));
     }
@@ -50,12 +56,16 @@ pub fn softmax_scores_with_temperature(
 /// non-finite entry) -- defensive, since this is a public function any caller
 /// could hand a hand-built distribution to, not just `system1_evaluate`'s own
 /// already-validated output.
-pub fn shannon_entropy(probabilities: &[f32]) -> Result<f32, String> {
+pub fn shannon_entropy(probabilities: &[f32]) -> Result<f32, ReflexError> {
     if probabilities.is_empty() {
-        return Err("shannon_entropy: probabilities must not be empty".to_string());
+        return Err(ReflexError::InvalidInput(
+            "shannon_entropy: probabilities must not be empty".to_string(),
+        ));
     }
     if probabilities.iter().any(|p| !p.is_finite()) {
-        return Err("shannon_entropy: probabilities must all be finite".to_string());
+        return Err(ReflexError::InvalidInput(
+            "shannon_entropy: probabilities must all be finite".to_string(),
+        ));
     }
     Ok(-probabilities
         .iter()

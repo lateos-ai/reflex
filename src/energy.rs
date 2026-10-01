@@ -65,6 +65,7 @@
 
 use std::time::Instant;
 
+use crate::error::ReflexError;
 #[cfg(feature = "nvml")]
 use std::sync::{Arc, Mutex};
 
@@ -284,7 +285,7 @@ impl EnergySampler {
 /// used by `reflex doctor` (see `src/bin/reflex/doctor.rs`) to report the
 /// method that would be used, or why neither is available, without starting
 /// any actual sampling.
-pub fn probe_availability(device_ordinal: usize) -> Result<EnergyMethod, String> {
+pub fn probe_availability(device_ordinal: usize) -> Result<EnergyMethod, ReflexError> {
     #[cfg(feature = "nvml")]
     {
         let nvml = nvml_wrapper::Nvml::init().map_err(|e| explain_nvml_error(&e))?;
@@ -297,14 +298,14 @@ pub fn probe_availability(device_ordinal: usize) -> Result<EnergyMethod, String>
         device
             .power_usage()
             .map(|_| EnergyMethod::PolledPower)
-            .map_err(|e| explain_nvml_error(&e))
+            .map_err(|e| ReflexError::Other(explain_nvml_error(&e)))
     }
     #[cfg(not(feature = "nvml"))]
     {
         let _ = device_ordinal;
-        Err(
+        Err(ReflexError::Other(
             "this binary was built without the `nvml` Cargo feature (rebuild with --features nvml)"
                 .to_string(),
-        )
+        ))
     }
 }

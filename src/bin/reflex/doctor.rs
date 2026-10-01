@@ -226,7 +226,7 @@ pub fn run(args: Vec<String>) {
         Err(reason) => checks.push(Check {
             name: "nvml_energy",
             status: Status::Warn,
-            detail: reason,
+            detail: reason.to_string(),
         }),
     }
 
