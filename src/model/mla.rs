@@ -321,10 +321,10 @@ impl Model {
         let token_embd_info = file
             .tensor_info("token_embd.weight")
             .ok_or_else(|| ReflexError::Gguf("missing weight 'token_embd.weight'".to_string()))?;
-        let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
+        let token_embd_bytes = file.tensor_bytes_shared(token_embd_info)?;
         let token_embd = LazyTokenEmbedding::new(
             token_embd_info.ggml_type,
-            token_embd_bytes.to_vec(),
+            token_embd_bytes,
             &token_embd_info.shape,
         )?;
 
@@ -346,10 +346,7 @@ impl Model {
                     info.element_count(),
                 )
                 .map_err(|e| e.rewrap(format!("load weight 'output.weight': {e}")))?;
-                LmHead::Resident(Weight {
-                    data,
-                    shape: info.shape.clone(),
-                })
+                LmHead::Resident(Weight::from_f32(data, info.shape.clone()))
             }
             None => {
                 let data = dequantize_tensor_to_device(
@@ -360,10 +357,7 @@ impl Model {
                     token_embd_info.element_count(),
                 )
                 .map_err(|e| e.rewrap(format!("load weight 'token_embd.weight': {e}")))?;
-                LmHead::Resident(Weight {
-                    data,
-                    shape: token_embd_info.shape.clone(),
-                })
+                LmHead::Resident(Weight::from_f32(data, token_embd_info.shape.clone()))
             }
         };
 
@@ -394,6 +388,10 @@ impl Model {
             silu_k,
             gemv_k,
             gemv_gather_k,
+            gemv_q4k_k: None,
+            dequant_q4k_coalesced_k: None,
+            gemv_q6k_k: None,
+            quant_scratch: RefCell::new(None),
             moe_gather_k,
             moe_scatter_add_k,
             attn_k,
@@ -464,7 +462,7 @@ impl Model {
         let eps = m.cfg.rmsnorm_eps;
         let hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
 
-        let normed = self.rmsnorm(&hidden, &self.output_norm.data, 1, hidden_size, eps)?;
+        let normed = self.rmsnorm(&hidden, self.output_norm.f32()?, 1, hidden_size, eps)?;
         let first_tokens: Vec<u32> = resolved.iter().map(|ids| ids[0]).collect();
         let mut scores = self.gemv_gather_lm_head(&normed, &first_tokens)?;
 
@@ -475,7 +473,7 @@ impl Model {
             for (position, w) in (base_position..).zip(ids.windows(2)) {
                 let (prev, next) = (w[0], w[1]);
                 let h = self.forward_one_token_mla(m, prev, position, &mut kv_caches)?;
-                let normed_step = self.rmsnorm(&h, &self.output_norm.data, 1, hidden_size, eps)?;
+                let normed_step = self.rmsnorm(&h, self.output_norm.f32()?, 1, hidden_size, eps)?;
                 scores[i] += self.gemv_gather_lm_head(&normed_step, &[next])?[0];
             }
         }
@@ -518,7 +516,7 @@ impl Model {
 
         let normed = self.rmsnorm(
             &hidden,
-            &w.attn_norm.data,
+            w.attn_norm.f32()?,
             1,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -566,7 +564,7 @@ impl Model {
         }
         let kv_cmpr_normed = self.rmsnorm(
             &kv_cmpr_owned,
-            &w.attn_kv_a_norm.data,
+            w.attn_kv_a_norm.f32()?,
             1,
             kv_lora,
             cfg.rmsnorm_eps,
@@ -620,7 +618,7 @@ impl Model {
             let q_nope_view = q.slice(h * n_embd_head_k_mla..h * n_embd_head_k_mla + qk_nope);
             let wk_b_view = w
                 .wk_b
-                .data
+                .f32()?
                 .slice(h * qk_nope * kv_lora..(h + 1) * qk_nope * kv_lora);
             let absorbed = self.gemv_view(&q_nope_view, &wk_b_view, qk_nope, kv_lora)?;
 
@@ -708,7 +706,7 @@ impl Model {
 
         let normed = self.rmsnorm(
             &hidden,
-            &w.attn_norm.data,
+            w.attn_norm.f32()?,
             rows,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -769,7 +767,7 @@ impl Model {
 
         let kv_cmpr_normed_batched = self.rmsnorm(
             &kv_cmpr_batched,
-            &w.attn_kv_a_norm.data,
+            w.attn_kv_a_norm.f32()?,
             rows,
             kv_lora,
             cfg.rmsnorm_eps,
@@ -981,7 +979,7 @@ impl Model {
             ));
         };
 
-        let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, 1, hidden_size, eps)?;
+        let ffn_normed = self.rmsnorm(&post_attn, layer.ffn_norm.f32()?, 1, hidden_size, eps)?;
 
         let router_logits_dev = self.gemv(&ffn_normed, ffn_gate_inp)?;
         let router_logits = self
@@ -1069,7 +1067,7 @@ impl Model {
             ));
         };
 
-        let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, rows, hidden_size, eps)?;
+        let ffn_normed = self.rmsnorm(&post_attn, layer.ffn_norm.f32()?, rows, hidden_size, eps)?;
 
         // Always-on shared expert(s), batched across every row with no routing --
         // seeds ffn_out; the routed experts below accumulate `+=` on top of it.

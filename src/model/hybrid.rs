@@ -474,10 +474,10 @@ impl Model {
         let token_embd_info = file
             .tensor_info("token_embd.weight")
             .ok_or_else(|| ReflexError::Gguf("missing weight 'token_embd.weight'".to_string()))?;
-        let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
+        let token_embd_bytes = file.tensor_bytes_shared(token_embd_info)?;
         let token_embd = LazyTokenEmbedding::new(
             token_embd_info.ggml_type,
-            token_embd_bytes.to_vec(),
+            token_embd_bytes,
             &token_embd_info.shape,
         )?;
 
@@ -499,10 +499,7 @@ impl Model {
                     info.element_count(),
                 )
                 .map_err(|e| e.rewrap(format!("load weight 'output.weight': {e}")))?;
-                LmHead::Resident(Weight {
-                    data,
-                    shape: info.shape.clone(),
-                })
+                LmHead::Resident(Weight::from_f32(data, info.shape.clone()))
             }
             None => {
                 let data = dequantize_tensor_to_device(
@@ -513,10 +510,7 @@ impl Model {
                     token_embd_info.element_count(),
                 )
                 .map_err(|e| e.rewrap(format!("load weight 'token_embd.weight': {e}")))?;
-                LmHead::Resident(Weight {
-                    data,
-                    shape: token_embd_info.shape.clone(),
-                })
+                LmHead::Resident(Weight::from_f32(data, token_embd_info.shape.clone()))
             }
         };
 
@@ -535,6 +529,10 @@ impl Model {
             silu_k,
             gemv_k,
             gemv_gather_k,
+            gemv_q4k_k: None,
+            dequant_q4k_coalesced_k: None,
+            gemv_q6k_k: None,
+            quant_scratch: RefCell::new(None),
             moe_gather_k,
             moe_scatter_add_k,
             attn_k,
@@ -615,7 +613,7 @@ impl Model {
         let eps = h.attn_cfg.rmsnorm_eps;
         let hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
 
-        let normed = self.rmsnorm(&hidden, &self.output_norm.data, 1, hidden_size, eps)?;
+        let normed = self.rmsnorm(&hidden, self.output_norm.f32()?, 1, hidden_size, eps)?;
         let first_tokens: Vec<u32> = resolved.iter().map(|ids| ids[0]).collect();
         let scores = self.gemv_gather_lm_head(&normed, &first_tokens)?;
 
@@ -863,7 +861,7 @@ impl Model {
         let key_dim = cfg.key_dim();
         let conv_dim = cfg.conv_dim();
 
-        let normed = self.rmsnorm(&x, &w.attn_norm.data, 1, h.attn_cfg.hidden_size, cfg.eps)?;
+        let normed = self.rmsnorm(&x, w.attn_norm.f32()?, 1, h.attn_cfg.hidden_size, cfg.eps)?;
         let qkv = self.gemv(&normed, &w.attn_qkv)?;
         let z = self.gemv(&normed, &w.attn_gate)?;
         let beta_raw = self.gemv(&normed, &w.ssm_beta)?;
@@ -873,11 +871,11 @@ impl Model {
             h,
             &alpha_raw,
             &beta_raw,
-            &w.ssm_dt.data,
-            &w.ssm_a.data,
+            w.ssm_dt.f32()?,
+            w.ssm_a.f32()?,
             cfg.num_v_heads,
         )?;
-        let mut conv_out = self.gdn_conv(h, &qkv, &w.ssm_conv1d.data, conv_state, conv_dim)?;
+        let mut conv_out = self.gdn_conv(h, &qkv, w.ssm_conv1d.f32()?, conv_state, conv_dim)?;
 
         // Split q/k, L2-normalize both (q additionally scaled), v left raw,
         // in place on the same device buffer `gdn_conv` just produced.
@@ -902,7 +900,7 @@ impl Model {
         )?;
 
         let o = self.gdn_delta(h, recurrent, &conv_out, key_dim, &beta, &decay)?;
-        let y = self.gdn_gated_norm(h, &o, &z, &w.ssm_norm.data, cfg.eps)?;
+        let y = self.gdn_gated_norm(h, &o, &z, w.ssm_norm.f32()?, cfg.eps)?;
         let out_proj = self.gemv(&y, &w.ssm_out)?;
         self.add_inplace(&mut x, &out_proj)?;
         Ok(x)
@@ -932,7 +930,7 @@ impl Model {
         let cfg = &h.attn_cfg;
         let normed = self.rmsnorm(
             &hidden,
-            &w.attn_norm.data,
+            w.attn_norm.f32()?,
             1,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -980,14 +978,14 @@ impl Model {
 
         q = self.rmsnorm(
             &q,
-            &w.attn_q_norm.data,
+            w.attn_q_norm.f32()?,
             cfg.num_q_heads,
             cfg.head_dim,
             cfg.rmsnorm_eps,
         )?;
         k = self.rmsnorm(
             &k,
-            &w.attn_k_norm.data,
+            w.attn_k_norm.f32()?,
             cfg.num_kv_heads,
             cfg.head_dim,
             cfg.rmsnorm_eps,
@@ -1087,7 +1085,7 @@ impl Model {
         let cfg = &h.attn_cfg;
         let normed = self.rmsnorm(
             &hidden,
-            &w.attn_norm.data,
+            w.attn_norm.f32()?,
             rows,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -1135,14 +1133,14 @@ impl Model {
 
         q = self.rmsnorm(
             &q,
-            &w.attn_q_norm.data,
+            w.attn_q_norm.f32()?,
             rows * cfg.num_q_heads,
             cfg.head_dim,
             cfg.rmsnorm_eps,
         )?;
         k = self.rmsnorm(
             &k,
-            &w.attn_k_norm.data,
+            w.attn_k_norm.f32()?,
             rows * cfg.num_kv_heads,
             cfg.head_dim,
             cfg.rmsnorm_eps,
@@ -1245,7 +1243,7 @@ impl Model {
         ffn_hidden_size: usize,
         eps: f32,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let normed = self.rmsnorm(&post_mixer, &norm.data, 1, hidden_size, eps)?;
+        let normed = self.rmsnorm(&post_mixer, norm.f32()?, 1, hidden_size, eps)?;
         let gate = self.gemv(&normed, ffn_gate)?;
         let up = self.gemv(&normed, ffn_up)?;
         let activated = self.silu_and_mul(&gate, &up, ffn_hidden_size)?;
@@ -1273,7 +1271,7 @@ impl Model {
         rows: usize,
         eps: f32,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let normed = self.rmsnorm(&post_mixer, &norm.data, rows, hidden_size, eps)?;
+        let normed = self.rmsnorm(&post_mixer, norm.f32()?, rows, hidden_size, eps)?;
         let gate = self.gemm(&normed, ffn_gate, rows)?;
         let up = self.gemm(&normed, ffn_up, rows)?;
         let activated = self.silu_and_mul(&gate, &up, rows * ffn_hidden_size)?;
@@ -1390,7 +1388,7 @@ impl Model {
         hidden_size: usize,
         eps: f32,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let ffn_normed = self.rmsnorm(&post_mixer, &norm.data, 1, hidden_size, eps)?;
+        let ffn_normed = self.rmsnorm(&post_mixer, norm.f32()?, 1, hidden_size, eps)?;
 
         let router_logits_dev = self.gemv(&ffn_normed, &w.ffn_gate_inp)?;
         let router_logits = self
@@ -1463,7 +1461,7 @@ impl Model {
         rows: usize,
         eps: f32,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let ffn_normed = self.rmsnorm(&post_mixer, &norm.data, rows, hidden_size, eps)?;
+        let ffn_normed = self.rmsnorm(&post_mixer, norm.f32()?, rows, hidden_size, eps)?;
 
         let router_logits_dev = self.gemm(&ffn_normed, &w.ffn_gate_inp, rows)?;
         let router_logits = self

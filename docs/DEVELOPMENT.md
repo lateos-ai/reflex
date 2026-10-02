@@ -143,7 +143,18 @@ machine, or see [gpu-ci.md](gpu-ci.md) for the nightly GPU workflow.
 ## Model loading: weights stay on the GPU
 
 `Model::load` dequantizes every weight tensor once and uploads it once, as a
-device-resident `f32` buffer. Rules that follow from measured regressions:
+device-resident `f32` buffer.
+
+**Opt-in exception: `REFLEX_QUANT_RESIDENT=1`** (dense Qwen3/Llama/Mistral path only;
+MoE, hybrid and MLA print a notice and keep `f32`). Q4_K matmul weights are uploaded
+as their raw GGUF blocks into one device arena and dequantized inside the matmul
+kernels (`gemv_q4k`, the fused multi-row prefill kernel), or, for longer prompts, into
+a reused device scratch buffer that cuBLAS then reads. A Q6_K LM head is kept as raw
+blocks too. Other formats and norms stay `f32`. The rules below still hold: the
+scratch path is device to device, so weights are never copied host-to-device per
+call. See [design/quantized-resident-weights.md](design/quantized-resident-weights.md).
+
+Rules that follow from measured regressions:
 
 - **Never copy weights host-to-device per call.** An early version re-uploaded weight
   buffers inside `gemv`/`rmsnorm` on every call and was about 4.3x slower than
@@ -155,6 +166,12 @@ device-resident `f32` buffer. Rules that follow from measured regressions:
   them. When the full vocabulary table is needed on the GPU (a tied LM head), it goes
   through the same on-device dequant path as every other tensor. A single-threaded host
   loop over the whole table once cost about 548 ms, most of model load.
+- **Keep the token-embedding table in the mmap; don't copy it out.**
+  `LazyTokenEmbedding` holds a `SharedBytes` handle into the GGUF mapping, and the model
+  keeps the file mapped for its lifetime, as llama.cpp does. Copying the table into an
+  owned `Vec` at load (127.6 MB for Qwen3-0.6B) was the largest single part of model
+  load, about 103 ms of 231 ms on a T4, mostly first-touch page faults on the new
+  allocation rather than file reads.
 - **Keep the pipelined upload.** `WeightLoadPipeline` double-buffers each tensor's raw
   bytes through pinned host memory and uploads on a separate stream, so tensor N+1's
   copy overlaps tensor N's dequant kernel. Replacing it with a blocking copy per tensor,

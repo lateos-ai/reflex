@@ -1,6 +1,8 @@
 # Design: keep weights quantized on the GPU
 
-**Status: proposal (2026-10-02). No code yet.**
+**Status: prototype built and measured on a T4 (2026-10-02), opt-in behind
+`REFLEX_QUANT_RESIDENT=1`. Results are in [Prototype results](#prototype-results); the
+sections before them are the original proposal, kept as written.**
 
 Today every weight tensor is dequantized once at load and kept on the GPU as an `f32`
 buffer (`Weight { data: CudaSlice<f32>, .. }` in `src/model/loading.rs`). This note
@@ -298,3 +300,129 @@ While it is opt-in, add a note that they describe the default path:
 - Code comments: `Weight`'s and `WeightLoadPipeline`'s doc comments in
   `src/model/loading.rs`, `gemv_kernel`'s header in `src/kernels_cuda/gemv.cu`,
   `expert_weight_view` (once MoE is converted), and `Model::apply_lora`'s doc comment.
+
+## Prototype results
+
+Measured 2026-10-02 on the `g4dn.xlarge` T4 (sm_75, driver 595.91.07, CUDA 13.2,
+`REFLEX_CUDA_ARCH=sm_75`), Qwen3-0.6B Q4_K_M unless stated. "master" is the build without
+the prototype; the prototype with the flag off matched it everywhere (same token ids and
+checksums, same phase timings within 1 ms).
+
+### Correctness
+
+- New GPU tests pass: per-tensor GEMV/GEMM against the `f32` path (decode, fused 2–13 rows,
+  scratch + cuBLAS; max relative difference < 1e-4) on Qwen3-0.6B, TinyLlama and Mistral
+  7B, and 16-token greedy generation identical with the flag on and off. The
+  batched-vs-sequential prefill oracle passes with the flag on. The full GPU suite passes
+  with the flag off (8 pass; 11 skipped for fixtures not on the instance).
+- `reflex check "The capital of France is" --max-tokens 8`: token ids identical to master
+  on Qwen3-0.6B and TinyLlama (both also match llama.cpp's `llama-simple` text). Logit
+  checksums move by ~1e-6 relative.
+- **Mistral 7B now loads on the T4** (master runs out of memory at layer 18) and fits in
+  7,756 MiB. Its greedy text does not match llama.cpp's (`" Paris
+
+The 1"` vs. `" a city
+  of many faces"`). The kernel matches the `f32` path on Mistral's own tensors, so this is
+  not the quantized path; Mistral could not run on this engine's test GPUs before, and the
+  difference is still open.
+
+### Where model load goes (step 0, `REFLEX_LOAD_PROFILE=1`, `system1`, n=5)
+
+| part of `model_load_ms` | f32 (today) | Q4_K resident |
+|---|---|---|
+| host: copy `token_embd` into an owned `Vec` | **~103 ms** | ~103 ms |
+| host: fill pinned staging (263 MB from the mmap) | ~54 ms | ~53 ms |
+| host: other weight-loop work (allocs, launches, waits) | ~10 ms | ~4 ms |
+| GPU: H2D copies (overlapped) | ~43 ms | ~43 ms |
+| GPU: dequant kernels (overlapped) | ~65 ms | ~27 ms (Q6_K only) |
+| module loads (+ the 263 MB arena alloc when on) | ~3.4 ms | ~14.8 ms |
+| tensors dequantized to `f32` / kept quantized | 196 / 0 | 28 / 168 |
+
+The load is **host-bound**: the GPU finishes its queued work before the host finishes
+enqueueing (the end-of-load drain measured 0 ms). The single largest cost is copying the
+127.6 MB `token_embd` out of the mmap (`LazyTokenEmbedding::new`'s `to_vec()`), which runs at
+~1.2 GB/s and so is probably dominated by first-touch page faults. It is independent of
+weight residency. The pinned fill (~4.8 GB/s) looks similar.
+
+### Cold start, VRAM, decode
+
+| | master (`f32`) | Q4_K resident |
+|---|---|---|
+| `system1` model load, p50 | 230.7–231.4 ms | 215.6–216.6 ms |
+| `system1` prompt eval, p50 (12-token prompt, fused path) | 39.2 ms | 49.4 ms |
+| `system1` total, p50 | 446.7–447.6 ms | **442.2–442.3 ms** |
+| `generate` total, p50 | 695.4–696.6 ms | 695.7–696.2 ms |
+| model-resident VRAM (`reflex bench`) | 1,708 MiB | **460 MiB** |
+| decode, ms/token (cold `check`, 128 tokens, n=3) | 12.5–12.8 | **9.2–9.3** |
+| warm prefill 29 / 113 / 449 tokens | 22.7 / 59.4 / 264.9 ms | 35.9 / 72.6 / 282.8 ms (scratch path) |
+
+(`system1`/`generate`: p50 of n=10, two interleaved rounds; ranges are the two rounds.)
+
+- Cold start improves by ~1% on `system1` and is unchanged on `generate`: the load saves
+  ~15 ms, and the short-prompt prefill gives back ~10 ms.
+- The fused kernel wins at 12 rows but loses badly at 29 (63.9 vs. 35.9 ms warm), because
+  each warp re-reads the activations per output row. Above the crossover, the scratch path
+  costs ~13–18 ms more than `f32` per prefill (dequantizing 1.5 GB per prompt). The default
+  crossover is 16 rows, between the two measured points.
+- The first kernel version (byte-wise, uncoalesced) was 2x slower than `f32` at decode;
+  coalesced 16-byte loads fixed that. The existing `dequantize_q4k_kernel` has the same
+  uncoalesced-write pattern (one thread per 256-element block), which made the first
+  scratch path cost ~41 ms per prefill; a one-thread-per-element version cut it to ~13 ms.
+
+### What this says about the next steps
+
+1. **The cold-start win is elsewhere.** Two costs that weight residency doesn't touch are
+   larger than anything it removed: the ~103 ms `token_embd` copy in model load, and, on
+   `generate`, prompt eval of 288 ms against `system1`'s 39 ms. That ~250 ms gap is most
+   likely the tied LM head being expanded to 622 MB of `f32` on the first token (not yet
+   profiled separately). Keeping the mmap alive instead of copying `token_embd`, and a
+   Q6_K LM head kept quantized, go straight at both.
+2. Q6_K kernels (layers and LM head) for the rest of the VRAM and decode gains.
+3. Coalesce the existing load-time dequant kernels; the GPU side of the load is hidden
+   behind the host today, but this matters once the host side shrinks.
+4. A multi-row kernel that reuses activations across output rows (tiling, as llama.cpp's
+   MMQ does) would make prefill faster than `f32`, not just close to it.
+
+### Follow-up: `token_embd` kept in the mmap, quantized LM head (2026-10-02)
+
+Two changes the step-0 profile pointed at:
+
+- **`token_embd` stays in the mmap.** `GgufFile` shares its mapping (`SharedBytes`), and
+  `LazyTokenEmbedding` keeps a handle instead of copying 127.6 MB out. This applies to every
+  architecture and to the default (`f32`) path. The model keeps the file mapped for its
+  lifetime, as llama.cpp does by default.
+- **Quantized LM head (flag on).** A tied Q6_K head is uploaded as raw blocks on its first
+  full-vocab use instead of being expanded to 622 MB of `f32`, and an untied Q6_K/Q4_K
+  `output.weight` goes into the arena at load. `gemv_q6k_kernel` reads Q6_K directly, with
+  the same decode expression as `dequantize_q6k_kernel`.
+
+Same T4 and model; p50 of n=10, two interleaved rounds (ranges are the two rounds):
+
+| | master | new, flag off (default) | new, flag on |
+|---|---|---|---|
+| `system1` model load | 235.8–236.3 ms | 200.4–205.0 ms | 202.6–202.7 ms |
+| `system1` total | 451.7–453.3 ms | **418.7–422.7 ms** | 428.1–429.2 ms |
+| `generate` model load | 233.2–239.5 ms | 200.6–202.2 ms | 200.4–204.5 ms |
+| `generate` prompt eval | 288.0–288.3 ms | 294.9–295.6 ms | **54.9–55.0 ms** |
+| `generate` total | 696.9–706.3 ms | 672.4–675.2 ms | **430.9–437.3 ms** |
+| decode, ms/token (n=3) | 12.9–13.0 | — | **7.73–7.80** |
+| model-resident VRAM | 1,708 MiB | — | 460 MiB |
+
+Mistral 7B with the flag on: 7,276 MiB resident (was 7,756 with an `f32` `output.weight`).
+
+- The `token_embd` change alone cuts ~30–35 ms of model load on every path. Reading the
+  file pages later, on `generate`'s first full-vocab use, costs only ~7 ms, so most of the
+  old ~103 ms was faulting in and zeroing the freshly allocated `Vec`, not reading the file.
+- With the flag on, `generate`'s first token no longer pays for an `f32` LM head:
+  prompt eval drops from ~295 ms to ~55 ms and the cold start falls 38% against master.
+  Decode improves 40%.
+- With the flag on, `system1` is now ~7–10 ms *slower* than with it off: the load-time
+  saving is gone (the load is host-bound and no longer copies `token_embd` either way),
+  while the short-prompt fused prefill still costs ~10 ms more than `f32`.
+
+Correctness: every token id is unchanged across master, flag off and flag on for Qwen3-0.6B,
+TinyLlama, Qwen3.5-0.8B (hybrid), the tiny MLA fixture and the tiny Qwen3-MoE fixture.
+Flag-off checksums are identical to master; flag-on checksums move ~1e-6 relative (the
+hybrid/MoE/MLA paths ignore the flag). New test `quant_resident_lm_head_matches_f32` passes on
+Qwen3-0.6B (tied) and Mistral 7B (untied). The GPU suite, now with the tiny fixtures
+present, gives 18 pass and 3 skip with the flag off.
