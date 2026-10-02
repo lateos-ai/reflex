@@ -104,6 +104,8 @@ mod moe_fixture_tests;
 #[cfg(test)]
 mod prefill_batching_tests;
 #[cfg(test)]
+mod quant_resident_tests;
+#[cfg(test)]
 mod rope_type_tests;
 #[cfg(test)]
 mod system1_tests;
@@ -148,6 +150,13 @@ pub struct Model {
     /// `Self::gemv_gather`/`Self::system1_evaluate`), never used by the
     /// ordinary dense/MoE/hybrid/MLA forward paths.
     gemv_gather_k: AotKernel,
+    /// `gemv_q4k_kernel` (`kernels_cuda/gemv_q4k.cu`), loaded only when the
+    /// dense path keeps weights quantized (`REFLEX_QUANT_RESIDENT=1`).
+    gemv_q4k_k: Option<AotKernel>,
+    /// Reused `f32` scratch for the quantized-resident prefill path above the
+    /// fused kernel's row threshold (dequantize one weight, then cuBLAS);
+    /// grown, never shrunk. See `Model::gemm`.
+    quant_scratch: RefCell<Option<CudaSlice<f32>>>,
     /// Grouped-GEMM MoE batching (`Self::forward_layer_moe_batched`,
     /// `Self::forward_mla_moe_ffn_batched`): gathers one expert's assigned rows out of
     /// a batched-prefill hidden buffer into a contiguous group before running that
@@ -339,6 +348,7 @@ impl Model {
         // `&self` method, would) while that borrow is still live.
         let device = self.device.clone();
         let add_fn = self.add_k.function.clone();
+        let q4k_dequant = self.dequant_kernels.q4k.function.clone();
 
         let mut applied = 0usize;
         for target in &adapter.targets {
@@ -377,7 +387,16 @@ impl Model {
                 ));
             }
 
-            let n = weight.data.len() as u32;
+            // A quantized-resident target becomes f32 first: the delta is
+            // added in place, as for every other weight.
+            materialize_f32(&device, &q4k_dequant, weight)?;
+            let WeightData::F32(weight_data) = &mut weight.data else {
+                return Err(ReflexError::Other(format!(
+                    "internal: LoRA target '{}' is still quantized after materialization",
+                    target.name
+                )));
+            };
+            let n = weight_data.len() as u32;
             let threads = 256u32;
             let blocks = n.div_ceil(threads).max(1);
             let launch_cfg = LaunchConfig {
@@ -388,7 +407,7 @@ impl Model {
             unsafe {
                 add_fn
                     .clone()
-                    .launch(launch_cfg, (&mut weight.data, &delta_dev, n))
+                    .launch(launch_cfg, (&mut *weight_data, &delta_dev, n))
                     .map_err(|e| {
                         crate::gpu_err!(e, "LoRA add launch for '{}': {e}", target.name)
                     })?;
@@ -860,7 +879,7 @@ impl Model {
         hidden_size: usize,
         eps: f32,
     ) -> Result<Vec<f32>, ReflexError> {
-        let normed = self.rmsnorm(hidden, &self.output_norm.data, 1, hidden_size, eps)?;
+        let normed = self.rmsnorm(hidden, self.output_norm.f32()?, 1, hidden_size, eps)?;
         let logits_dev = self.gemv(&normed, self.lm_head_resident()?)?;
         self.device
             .dtoh_sync_copy(&logits_dev)
@@ -902,10 +921,7 @@ impl Model {
                 .map_err(|e| {
                     e.rewrap(format!("upload weight 'token_embd.weight' to device: {e}"))
                 })?;
-                let _ = cell.set(Weight {
-                    data,
-                    shape: shape.clone(),
-                });
+                let _ = cell.set(Weight::from_f32(data, shape.clone()));
                 Ok(cell.get().expect("just set"))
             }
         }
@@ -954,10 +970,10 @@ impl Model {
             .device
             .htod_sync_copy(&compact)
             .map_err(|e| crate::gpu_err!(e, "gemv_gather_lm_head upload compact rows: {e}"))?;
-        let compact_w = Weight {
-            data: dev_compact,
-            shape: vec![hidden_size as u64, row_indices.len() as u64],
-        };
+        let compact_w = Weight::from_f32(
+            dev_compact,
+            vec![hidden_size as u64, row_indices.len() as u64],
+        );
         let trivial_indices: Vec<u32> = (0..row_indices.len() as u32).collect();
         self.gemv_gather(x, &compact_w, &trivial_indices)
     }

@@ -89,6 +89,8 @@ impl Model {
     ) -> Result<Self, ReflexError> {
         let (cfg, block_count, moe) = parse_model_config(file)?;
         let expert_used_count = moe.map(|m| m.expert_used_count);
+        let profile_on = load_profile_enabled();
+        let t_modules = std::time::Instant::now();
 
         let rmsnorm_k = aot::load_kernel(
             &device,
@@ -189,6 +191,46 @@ impl Model {
             .ok_or_else(|| ReflexError::Other("missing moe_scatter_add_kernel".to_string()))?;
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
+        if profile_on {
+            pipeline.profile = Some(LoadProfile::default());
+        }
+
+        // Quantized-resident weights (docs/design/quantized-resident-weights.md):
+        // dense (non-MoE) layers only for now; MoE keeps f32 and says so.
+        let quant_on = quant_resident_enabled();
+        if quant_on && expert_used_count.is_some() {
+            eprintln!("note: REFLEX_QUANT_RESIDENT=1 is not supported for MoE models yet; using f32 weights");
+        }
+        let mut arena = if quant_on && expert_used_count.is_none() {
+            let names: Vec<String> = (0..block_count)
+                .flat_map(|i| {
+                    [
+                        "attn_q",
+                        "attn_k",
+                        "attn_v",
+                        "attn_output",
+                        "ffn_gate",
+                        "ffn_up",
+                        "ffn_down",
+                    ]
+                    .map(|t| format!("blk.{i}.{t}.weight"))
+                })
+                .collect();
+            QuantArena::for_tensors(&device, file, &names)?
+        } else {
+            None
+        };
+        let gemv_q4k_k = match arena {
+            Some(_) => Some(aot::load_kernel(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_Q4K")),
+                "gemv_q4k",
+                "gemv_q4k_kernel",
+            )?),
+            None => None,
+        };
+        let modules_ms = t_modules.elapsed().as_secs_f64() * 1000.0;
+        let t_weights = std::time::Instant::now();
 
         // Dequantizes straight from the mmap'd GGUF bytes (on-device for
         // every format but the IQ family, Phase 2 round 3 + post-MVP
@@ -198,21 +240,28 @@ impl Model {
         // call re-uploads it (see `Weight`'s doc comment). Pipelined across
         // successive calls via `pipeline` (see `WeightLoadPipeline`'s doc
         // comment) instead of the old sequential blocking-H2D-copy path.
-        let mut load_weight = |name: &str| -> Result<Weight, ReflexError> {
-            load_weight_device(&mut pipeline, &dequant_kernels, file, name)
+        // `matmul` = an `nn.Linear` weight that may stay quantized; norms
+        // and everything else always go through the f32 path.
+        let mut load_weight_kind = |name: &str, matmul: bool| -> Result<Weight, ReflexError> {
+            match arena.as_mut() {
+                Some(a) if matmul => {
+                    load_weight_device_quant(&mut pipeline, &dequant_kernels, file, name, a)
+                }
+                _ => load_weight_device(&mut pipeline, &dequant_kernels, file, name),
+            }
         };
 
         let mut layers = Vec::with_capacity(block_count);
         for i in 0..block_count {
             eprint!("\rLoading weights: layer {}/{block_count}", i + 1);
-            let attn_norm = load_weight(&format!("blk.{i}.attn_norm.weight"))?;
-            let attn_q = load_weight(&format!("blk.{i}.attn_q.weight"))?;
-            let attn_k = load_weight(&format!("blk.{i}.attn_k.weight"))?;
-            let attn_v = load_weight(&format!("blk.{i}.attn_v.weight"))?;
-            let attn_output = load_weight(&format!("blk.{i}.attn_output.weight"))?;
-            let attn_q_norm = load_weight(&format!("blk.{i}.attn_q_norm.weight")).ok();
-            let attn_k_norm = load_weight(&format!("blk.{i}.attn_k_norm.weight")).ok();
-            let ffn_norm = load_weight(&format!("blk.{i}.ffn_norm.weight"))?;
+            let attn_norm = load_weight_kind(&format!("blk.{i}.attn_norm.weight"), false)?;
+            let attn_q = load_weight_kind(&format!("blk.{i}.attn_q.weight"), true)?;
+            let attn_k = load_weight_kind(&format!("blk.{i}.attn_k.weight"), true)?;
+            let attn_v = load_weight_kind(&format!("blk.{i}.attn_v.weight"), true)?;
+            let attn_output = load_weight_kind(&format!("blk.{i}.attn_output.weight"), true)?;
+            let attn_q_norm = load_weight_kind(&format!("blk.{i}.attn_q_norm.weight"), false).ok();
+            let attn_k_norm = load_weight_kind(&format!("blk.{i}.attn_k_norm.weight"), false).ok();
+            let ffn_norm = load_weight_kind(&format!("blk.{i}.ffn_norm.weight"), false)?;
 
             let layer = if expert_used_count.is_some() {
                 LayerWeights::Moe(MoeLayerWeights {
@@ -224,10 +273,16 @@ impl Model {
                     attn_q_norm,
                     attn_k_norm,
                     ffn_norm,
-                    ffn_gate_inp: load_weight(&format!("blk.{i}.ffn_gate_inp.weight"))?,
-                    ffn_gate_exps: load_weight(&format!("blk.{i}.ffn_gate_exps.weight"))?,
-                    ffn_up_exps: load_weight(&format!("blk.{i}.ffn_up_exps.weight"))?,
-                    ffn_down_exps: load_weight(&format!("blk.{i}.ffn_down_exps.weight"))?,
+                    ffn_gate_inp: load_weight_kind(&format!("blk.{i}.ffn_gate_inp.weight"), false)?,
+                    ffn_gate_exps: load_weight_kind(
+                        &format!("blk.{i}.ffn_gate_exps.weight"),
+                        false,
+                    )?,
+                    ffn_up_exps: load_weight_kind(&format!("blk.{i}.ffn_up_exps.weight"), false)?,
+                    ffn_down_exps: load_weight_kind(
+                        &format!("blk.{i}.ffn_down_exps.weight"),
+                        false,
+                    )?,
                 })
             } else {
                 LayerWeights::Dense(DenseLayerWeights {
@@ -239,15 +294,17 @@ impl Model {
                     attn_q_norm,
                     attn_k_norm,
                     ffn_norm,
-                    ffn_gate: load_weight(&format!("blk.{i}.ffn_gate.weight"))?,
-                    ffn_up: load_weight(&format!("blk.{i}.ffn_up.weight"))?,
-                    ffn_down: load_weight(&format!("blk.{i}.ffn_down.weight"))?,
+                    ffn_gate: load_weight_kind(&format!("blk.{i}.ffn_gate.weight"), true)?,
+                    ffn_up: load_weight_kind(&format!("blk.{i}.ffn_up.weight"), true)?,
+                    ffn_down: load_weight_kind(&format!("blk.{i}.ffn_down.weight"), true)?,
                 })
             };
             layers.push(layer);
         }
         eprintln!();
+        let weights_enqueue_ms = t_weights.elapsed().as_secs_f64() * 1000.0;
 
+        let t_embd = std::time::Instant::now();
         let token_embd_info = file
             .tensor_info("token_embd.weight")
             .ok_or_else(|| ReflexError::Gguf("missing weight 'token_embd.weight'".to_string()))?;
@@ -257,8 +314,9 @@ impl Model {
             token_embd_bytes.to_vec(),
             &token_embd_info.shape,
         )?;
+        let token_embd_ms = t_embd.elapsed().as_secs_f64() * 1000.0;
 
-        let output_norm = load_weight("output_norm.weight")?;
+        let output_norm = load_weight_kind("output_norm.weight", false)?;
 
         // Tied-embedding models have no separate `output.weight` tensor --
         // rather than eagerly re-uploading `token_embd`'s already-dequantized
@@ -277,10 +335,7 @@ impl Model {
                     info.element_count(),
                 )
                 .map_err(|e| e.rewrap(format!("load weight 'output.weight': {e}")))?;
-                LmHead::Resident(Weight {
-                    data,
-                    shape: info.shape.clone(),
-                })
+                LmHead::Resident(Weight::from_f32(data, info.shape.clone()))
             }
             None => LmHead::TiedLazy {
                 shape: token_embd_info.shape.clone(),
@@ -288,9 +343,38 @@ impl Model {
             },
         };
 
+        let t_join = std::time::Instant::now();
         let (tokenizer, cublas) = init.join().map_err(|_| {
             ReflexError::Other("background load-init thread panicked".to_string())
         })??;
+        let init_join_wait_ms = t_join.elapsed().as_secs_f64() * 1000.0;
+
+        if let Some(mut p) = pipeline.profile.take() {
+            // Drain everything queued so the GPU-side totals are complete.
+            // Profile mode only: the normal load never blocks here.
+            let t_drain = std::time::Instant::now();
+            device
+                .synchronize()
+                .map_err(|e| crate::gpu_err!(e, "load profile: synchronize: {e}"))?;
+            unsafe { result::stream::synchronize(pipeline.copy_stream) }
+                .map_err(|e| crate::gpu_err!(e, "load profile: sync copy stream: {e}"))?;
+            let drain_ms = t_drain.elapsed().as_secs_f64() * 1000.0;
+            let (h2d_gpu_ms, dequant_gpu_ms) = p.gpu_ms();
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "REFLEX_LOAD_PROFILE quant_resident={} modules_ms={modules_ms:.2} weights_enqueue_ms={weights_enqueue_ms:.2}                  pinned_wait_ms={:.2} pinned_fill_ms={:.2} staging_grow_ms={:.2} out_alloc_ms={:.2} launch_ms={:.2}                  h2d_gpu_ms={h2d_gpu_ms:.2} dequant_gpu_ms={dequant_gpu_ms:.2} token_embd_ms={token_embd_ms:.2}                  init_join_wait_ms={init_join_wait_ms:.2} drain_ms={drain_ms:.2} tensors_f32={} tensors_quant={}                  h2d_mb={:.1} f32_mb={:.1}",
+                arena.is_some(),
+                ms(p.pinned_wait),
+                ms(p.pinned_fill),
+                ms(p.staging_grow),
+                ms(p.out_alloc),
+                ms(p.launch),
+                p.tensors_f32,
+                p.tensors_quant,
+                p.h2d_bytes as f64 / 1e6,
+                p.f32_bytes as f64 / 1e6,
+            );
+        }
 
         Ok(Model {
             device,
@@ -303,6 +387,8 @@ impl Model {
             silu_k,
             gemv_k,
             gemv_gather_k,
+            gemv_q4k_k,
+            quant_scratch: RefCell::new(None),
             moe_gather_k,
             moe_scatter_add_k,
             attn_k,
@@ -354,7 +440,7 @@ impl Model {
         let cfg = &self.cfg;
         let normed = self.rmsnorm(
             &hidden,
-            &attn_norm.data,
+            attn_norm.f32()?,
             1,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -365,12 +451,18 @@ impl Model {
         let v = self.gemv(&normed, attn_v)?;
 
         if let Some(qn) = attn_q_norm {
-            q = self.rmsnorm(&q, &qn.data, cfg.num_q_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
+            q = self.rmsnorm(
+                &q,
+                qn.f32()?,
+                cfg.num_q_heads,
+                cfg.head_dim,
+                cfg.rmsnorm_eps,
+            )?;
         }
         if let Some(kn) = attn_k_norm {
             k = self.rmsnorm(
                 &k,
-                &kn.data,
+                kn.f32()?,
                 cfg.num_kv_heads,
                 cfg.head_dim,
                 cfg.rmsnorm_eps,
@@ -453,7 +545,7 @@ impl Model {
         let cfg = &self.cfg;
         let ffn_normed = self.rmsnorm(
             &post_attn,
-            &layer.ffn_norm.data,
+            layer.ffn_norm.f32()?,
             1,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -504,7 +596,7 @@ impl Model {
         let cfg = &self.cfg;
         let ffn_normed = self.rmsnorm(
             &post_attn,
-            &layer.ffn_norm.data,
+            layer.ffn_norm.f32()?,
             1,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -594,7 +686,7 @@ impl Model {
         let cfg = &self.cfg;
         let normed = self.rmsnorm(
             &hidden,
-            &attn_norm.data,
+            attn_norm.f32()?,
             rows,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -607,7 +699,7 @@ impl Model {
         if let Some(qn) = attn_q_norm {
             q = self.rmsnorm(
                 &q,
-                &qn.data,
+                qn.f32()?,
                 rows * cfg.num_q_heads,
                 cfg.head_dim,
                 cfg.rmsnorm_eps,
@@ -616,7 +708,7 @@ impl Model {
         if let Some(kn) = attn_k_norm {
             k = self.rmsnorm(
                 &k,
-                &kn.data,
+                kn.f32()?,
                 rows * cfg.num_kv_heads,
                 cfg.head_dim,
                 cfg.rmsnorm_eps,
@@ -710,7 +802,7 @@ impl Model {
         let cfg = &self.cfg;
         let ffn_normed = self.rmsnorm(
             &post_attn,
-            &layer.ffn_norm.data,
+            layer.ffn_norm.f32()?,
             rows,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -840,7 +932,7 @@ impl Model {
         let cfg = &self.cfg;
         let ffn_normed = self.rmsnorm(
             &post_attn,
-            &layer.ffn_norm.data,
+            layer.ffn_norm.f32()?,
             rows,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -1220,7 +1312,7 @@ impl Model {
         // single-token case (Yes/No, A-D, a 1-10 scale).
         let normed = self.rmsnorm(
             &hidden,
-            &self.output_norm.data,
+            self.output_norm.f32()?,
             1,
             self.cfg.hidden_size,
             self.cfg.rmsnorm_eps,
@@ -1242,7 +1334,7 @@ impl Model {
                     self.forward_one_token_dense(prev, position, &mut k_caches, &mut v_caches)?;
                 let normed_step = self.rmsnorm(
                     &h,
-                    &self.output_norm.data,
+                    self.output_norm.f32()?,
                     1,
                     self.cfg.hidden_size,
                     self.cfg.rmsnorm_eps,

@@ -4,16 +4,177 @@
 use super::*;
 use crate::error::ReflexError;
 
-/// A weight tensor, dequantized to `f32` once at load time and uploaded to
-/// device memory immediately after (see `Model::load`'s `load_weight`) so
-/// no forward-pass call re-uploads it -- kernels below take `&self.data`
-/// (or a zero-copy `CudaView` slice of it, for per-expert MoE tensors)
-/// directly. Shape is the original GGUF shape (`[in_features,
-/// out_features]` for a 2-D `nn.Linear`-style weight, `[hidden_size]` for a
-/// norm weight).
+/// A weight tensor, uploaded to device memory once at load time (see
+/// `Model::load`'s `load_weight`) so no forward-pass call re-uploads it.
+/// Shape is the original GGUF shape (`[in_features, out_features]` for a 2-D
+/// `nn.Linear`-style weight, `[hidden_size]` for a norm weight).
+///
+/// By default every tensor is dequantized to `f32` at load ([`WeightData::F32`]).
+/// With `REFLEX_QUANT_RESIDENT=1`, the dense path keeps Q4_K matmul weights as
+/// their raw GGUF blocks instead ([`WeightData::Q4K`]) and the GEMV/GEMM
+/// wrappers dequantize as they compute -- see
+/// docs/design/quantized-resident-weights.md. Paths that only handle `f32`
+/// weights go through [`Weight::f32`], which errors (never panics) on a
+/// quantized one.
 pub(super) struct Weight {
-    pub(super) data: CudaSlice<f32>,
+    pub(super) data: WeightData,
     pub(super) shape: Vec<u64>,
+}
+
+pub(super) enum WeightData {
+    F32(CudaSlice<f32>),
+    /// Raw Q4_K blocks at `offset..offset + len` in a shared [`QuantArena`]
+    /// buffer, byte-identical to the GGUF file.
+    Q4K {
+        arena: Arc<CudaSlice<u8>>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl Weight {
+    pub(super) fn from_f32(data: CudaSlice<f32>, shape: Vec<u64>) -> Self {
+        Self {
+            data: WeightData::F32(data),
+            shape,
+        }
+    }
+
+    /// The `f32` device buffer, for the code paths that only handle `f32`
+    /// weights (norms, MoE/MLA/hybrid projections, LoRA's in-place add).
+    pub(super) fn f32(&self) -> Result<&CudaSlice<f32>, ReflexError> {
+        match &self.data {
+            WeightData::F32(d) => Ok(d),
+            WeightData::Q4K { .. } => Err(ReflexError::Other(format!(
+                "internal: an f32-only code path got a quantized-resident (Q4_K) weight of shape {:?}",
+                self.shape
+            ))),
+        }
+    }
+
+    /// Device address of a quantized weight's first block, for kernel launches.
+    pub(super) fn quant_ptr(&self) -> Option<u64> {
+        match &self.data {
+            WeightData::F32(_) => None,
+            WeightData::Q4K { arena, offset, .. } => Some(*arena.device_ptr() + *offset as u64),
+        }
+    }
+}
+
+/// One device allocation holding every quantized-resident tensor's raw
+/// blocks (`REFLEX_QUANT_RESIDENT=1`), sized up front from the GGUF header so
+/// the load makes one `cuMemAlloc` instead of one per tensor. Offsets are
+/// 256-byte aligned.
+pub(super) struct QuantArena {
+    pub(super) buf: Arc<CudaSlice<u8>>,
+    pub(super) used: usize,
+}
+
+pub(super) const QUANT_ARENA_ALIGN: usize = 256;
+
+impl QuantArena {
+    /// `Ok(None)` when no tensor in `names` is Q4_K.
+    pub(super) fn for_tensors(
+        device: &Arc<CudaDevice>,
+        file: &GgufFile,
+        names: &[String],
+    ) -> Result<Option<Self>, ReflexError> {
+        let mut total = 0usize;
+        for name in names {
+            if let Some(info) = file.tensor_info(name) {
+                if info.ggml_type == GgmlType::Q4K {
+                    total += file
+                        .tensor_bytes(info)?
+                        .len()
+                        .next_multiple_of(QUANT_ARENA_ALIGN);
+                }
+            }
+        }
+        if total == 0 {
+            return Ok(None);
+        }
+        let buf = unsafe { device.alloc::<u8>(total) }
+            .map_err(|e| crate::gpu_err!(e, "alloc quantized weight arena ({total} bytes): {e}"))?;
+        Ok(Some(Self {
+            buf: Arc::new(buf),
+            used: 0,
+        }))
+    }
+
+    fn reserve(&mut self, len: usize) -> Result<usize, ReflexError> {
+        let offset = self.used;
+        let end = offset + len.next_multiple_of(QUANT_ARENA_ALIGN);
+        if end > self.buf.len() {
+            return Err(crate::reflex_err!(
+                Other,
+                "quantized weight arena overflow: need {end} bytes, have {}",
+                self.buf.len()
+            ));
+        }
+        self.used = end;
+        Ok(offset)
+    }
+}
+
+/// `REFLEX_QUANT_RESIDENT=1` turns on quantized-resident weights for the
+/// dense path (Q4_K only for now). Read once per load.
+pub(super) fn quant_resident_enabled() -> bool {
+    std::env::var("REFLEX_QUANT_RESIDENT").is_ok_and(|v| v == "1")
+}
+
+/// `REFLEX_LOAD_PROFILE=1` prints a `REFLEX_LOAD_PROFILE` line splitting
+/// `model_load_ms` into its parts (dense path). Off by default: it adds GPU
+/// timing events per tensor and a device sync at the end of the load.
+pub(super) fn load_profile_enabled() -> bool {
+    std::env::var("REFLEX_LOAD_PROFILE").is_ok_and(|v| v == "1")
+}
+
+/// Accumulators for `REFLEX_LOAD_PROFILE`. Host-side parts are wall time on
+/// the loading thread; `h2d`/`dequant` pairs are GPU timing events read back
+/// once at the end, so measuring them doesn't serialize the pipeline.
+#[derive(Default)]
+pub(super) struct LoadProfile {
+    pub(super) pinned_wait: std::time::Duration,
+    pub(super) pinned_fill: std::time::Duration,
+    pub(super) staging_grow: std::time::Duration,
+    pub(super) out_alloc: std::time::Duration,
+    pub(super) launch: std::time::Duration,
+    pub(super) h2d_events: Vec<(sys::CUevent, sys::CUevent)>,
+    pub(super) dequant_events: Vec<(sys::CUevent, sys::CUevent)>,
+    pub(super) tensors_f32: usize,
+    pub(super) tensors_quant: usize,
+    pub(super) h2d_bytes: usize,
+    pub(super) f32_bytes: usize,
+}
+
+impl LoadProfile {
+    fn timed_event() -> Result<sys::CUevent, ReflexError> {
+        result::event::create(sys::CUevent_flags::CU_EVENT_DEFAULT)
+            .map_err(|e| crate::gpu_err!(e, "create profile event: {e}"))
+    }
+
+    /// Sum of GPU time over event pairs, in ms. Call only after the device
+    /// has drained (every pair recorded and complete); destroys the events.
+    fn drain_ms(pairs: &mut Vec<(sys::CUevent, sys::CUevent)>) -> f64 {
+        let mut ms = 0f64;
+        for (a, b) in pairs.drain(..) {
+            unsafe {
+                ms += result::event::elapsed(a, b).unwrap_or(0.0) as f64;
+                let _ = result::event::destroy(a);
+                let _ = result::event::destroy(b);
+            }
+        }
+        ms
+    }
+
+    /// GPU sums `(h2d_ms, dequant_ms)`. The caller must have synchronized the
+    /// device and the pipeline's copy stream first.
+    pub(super) fn gpu_ms(&mut self) -> (f64, f64) {
+        (
+            Self::drain_ms(&mut self.h2d_events),
+            Self::drain_ms(&mut self.dequant_events),
+        )
+    }
 }
 
 /// `token_embd`, dequantized lazily one row at a time instead of eagerly
@@ -475,6 +636,8 @@ pub(super) struct WeightLoadPipeline {
     /// intent explicit rather than relying on that.
     pub(super) slot_used: [bool; 2],
     pub(super) next: usize,
+    /// `REFLEX_LOAD_PROFILE` accumulators; `None` (the default) adds no work.
+    pub(super) profile: Option<LoadProfile>,
 }
 
 impl WeightLoadPipeline {
@@ -495,6 +658,7 @@ impl WeightLoadPipeline {
             kernel_done: [None, None],
             slot_used: [false, false],
             next: 0,
+            profile: None,
         })
     }
 
@@ -513,6 +677,7 @@ impl WeightLoadPipeline {
         if len <= self.raw_cap[slot] {
             return Ok(());
         }
+        let t = std::time::Instant::now();
         let buf = unsafe { self.device.alloc::<u8>(len) }
             .map_err(|e| crate::gpu_err!(e, "alloc device staging buffer: {e}"))?;
         self.raw_dev[slot] = Some(buf);
@@ -520,6 +685,9 @@ impl WeightLoadPipeline {
         self.device
             .synchronize()
             .map_err(|e| crate::gpu_err!(e, "pipeline: sync after staging-buffer growth: {e}"))?;
+        if let Some(p) = &mut self.profile {
+            p.staging_grow += t.elapsed();
+        }
         Ok(())
     }
 
@@ -543,6 +711,7 @@ impl WeightLoadPipeline {
         // this, the CPU (which never blocks anywhere else in this method)
         // would overwrite or free a pinned buffer whose previous async H2D
         // transfer is still reading it.
+        let t_wait = std::time::Instant::now();
         if self.slot_used[slot] {
             unsafe { sys::lib().cuEventSynchronize(self.copy_done[slot]) }
                 .result()
@@ -567,9 +736,14 @@ impl WeightLoadPipeline {
             })?;
         }
 
+        let t_fill = std::time::Instant::now();
         unsafe {
             self.pinned[slot].ensure_capacity(bytes.len())?;
             self.pinned[slot].write(bytes);
+        }
+        if let Some(p) = &mut self.profile {
+            p.pinned_wait += t_fill - t_wait;
+            p.pinned_fill += t_fill.elapsed();
         }
         self.ensure_raw_capacity(slot, bytes.len())?;
 
@@ -577,30 +751,23 @@ impl WeightLoadPipeline {
             .as_ref()
             .expect("staging buffer set by ensure_raw_capacity")
             .device_ptr();
-        unsafe {
-            result::memcpy_htod_async(
-                raw_ptr,
-                self.pinned[slot].as_slice(bytes.len()),
-                self.copy_stream,
-            )
-        }
-        .map_err(|e| crate::gpu_err!(e, "pipeline: async H2D copy: {e}"))?;
-        unsafe { result::event::record(self.copy_done[slot], self.copy_stream) }
-            .map_err(|e| crate::gpu_err!(e, "pipeline: record copy_done: {e}"))?;
-        self.slot_used[slot] = true;
-        unsafe {
-            result::stream::wait_event(
-                compute_stream,
-                self.copy_done[slot],
-                sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
-            )
-        }
-        .map_err(|e| crate::gpu_err!(e, "pipeline: wait for copy_done: {e}"))?;
+        self.h2d_async(raw_ptr, slot, bytes.len())?;
 
         let num_blocks = bytes.len() / block_bytes;
         let out_len = num_blocks * block_elems;
+        let t_alloc = std::time::Instant::now();
         let mut dev_out = unsafe { self.device.alloc::<f32>(out_len) }
             .map_err(|e| crate::gpu_err!(e, "alloc dequant output: {e}"))?;
+        let t_launch = std::time::Instant::now();
+        let dq_start = match &self.profile {
+            Some(_) => {
+                let ev = LoadProfile::timed_event()?;
+                unsafe { result::event::record(ev, compute_stream) }
+                    .map_err(|e| crate::gpu_err!(e, "profile: record dequant start: {e}"))?;
+                Some(ev)
+            }
+            None => None,
+        };
 
         let threads = 256u32;
         let blocks = (num_blocks as u32).div_ceil(threads).max(1);
@@ -618,6 +785,16 @@ impl WeightLoadPipeline {
                 .clone()
                 .launch(launch_cfg, (raw, &mut dev_out, num_blocks as u32))
                 .map_err(|e| crate::gpu_err!(e, "dequant kernel launch: {e}"))?;
+        }
+        if let (Some(p), Some(start)) = (&mut self.profile, dq_start) {
+            let end = LoadProfile::timed_event()?;
+            unsafe { result::event::record(end, compute_stream) }
+                .map_err(|e| crate::gpu_err!(e, "profile: record dequant end: {e}"))?;
+            p.dequant_events.push((start, end));
+            p.out_alloc += t_launch - t_alloc;
+            p.launch += t_launch.elapsed();
+            p.tensors_f32 += 1;
+            p.f32_bytes += out_len * 4;
         }
 
         if self.kernel_done[slot].is_none() {
@@ -640,6 +817,90 @@ impl WeightLoadPipeline {
             .dtod_copy(&src, &mut truncated)
             .map_err(|e| crate::gpu_err!(e, "truncate dequant output: {e}"))?;
         Ok(truncated)
+    }
+}
+
+impl WeightLoadPipeline {
+    /// Steps 4-5 of the slot lifecycle (see the struct doc comment): async
+    /// copy of the first `len` bytes of pinned slot `slot` to `dst` on
+    /// `copy_stream`, record `copy_done[slot]`, and make the compute stream
+    /// wait for it. Shared by [`Self::dequantize`] and [`Self::upload_raw`].
+    fn h2d_async(
+        &mut self,
+        dst: sys::CUdeviceptr,
+        slot: usize,
+        len: usize,
+    ) -> Result<(), ReflexError> {
+        let compute_stream = *self.device.cu_stream();
+        let h2d_start = match &self.profile {
+            Some(_) => {
+                let ev = LoadProfile::timed_event()?;
+                unsafe { result::event::record(ev, self.copy_stream) }
+                    .map_err(|e| crate::gpu_err!(e, "profile: record h2d start: {e}"))?;
+                Some(ev)
+            }
+            None => None,
+        };
+        unsafe {
+            result::memcpy_htod_async(dst, self.pinned[slot].as_slice(len), self.copy_stream)
+        }
+        .map_err(|e| crate::gpu_err!(e, "pipeline: async H2D copy: {e}"))?;
+        if let (Some(p), Some(start)) = (&mut self.profile, h2d_start) {
+            let end = LoadProfile::timed_event()?;
+            unsafe { result::event::record(end, self.copy_stream) }
+                .map_err(|e| crate::gpu_err!(e, "profile: record h2d end: {e}"))?;
+            p.h2d_events.push((start, end));
+            p.h2d_bytes += len;
+        }
+        unsafe { result::event::record(self.copy_done[slot], self.copy_stream) }
+            .map_err(|e| crate::gpu_err!(e, "pipeline: record copy_done: {e}"))?;
+        self.slot_used[slot] = true;
+        unsafe {
+            result::stream::wait_event(
+                compute_stream,
+                self.copy_done[slot],
+                sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+        }
+        .map_err(|e| crate::gpu_err!(e, "pipeline: wait for copy_done: {e}"))
+    }
+
+    /// Quantized-resident counterpart of [`Self::dequantize`]: stages `bytes`
+    /// through the same pinned double buffer and copies them asynchronously
+    /// to their final place in `arena` -- no device staging buffer, no
+    /// dequant kernel. Step 1's host wait still guards the pinned slot; step
+    /// 2 doesn't apply (no device staging buffer is reused). The compute
+    /// stream waits on the copy, so any later kernel reading the arena sees
+    /// the bytes. Returns the tensor's `(offset, len)` in the arena.
+    pub(super) fn upload_raw(
+        &mut self,
+        arena: &mut QuantArena,
+        bytes: &[u8],
+    ) -> Result<(usize, usize), ReflexError> {
+        let slot = self.next % 2;
+        self.next += 1;
+        let t_wait = std::time::Instant::now();
+        if self.slot_used[slot] {
+            unsafe { sys::lib().cuEventSynchronize(self.copy_done[slot]) }
+                .result()
+                .map_err(|e| {
+                    crate::gpu_err!(e, "pipeline: await slot {slot}'s prior H2D copy: {e}")
+                })?;
+        }
+        let t_fill = std::time::Instant::now();
+        unsafe {
+            self.pinned[slot].ensure_capacity(bytes.len())?;
+            self.pinned[slot].write(bytes);
+        }
+        if let Some(p) = &mut self.profile {
+            p.pinned_wait += t_fill - t_wait;
+            p.pinned_fill += t_fill.elapsed();
+            p.tensors_quant += 1;
+        }
+        let offset = arena.reserve(bytes.len())?;
+        let dst = *arena.buf.device_ptr() + offset as u64;
+        self.h2d_async(dst, slot, bytes.len())?;
+        Ok((offset, bytes.len()))
     }
 }
 
@@ -811,8 +1072,67 @@ pub(super) fn load_weight_device(
         info.element_count(),
     )
     .map_err(|e| e.rewrap(format!("load weight '{name}': {e}")))?;
+    Ok(Weight::from_f32(data, info.shape.clone()))
+}
+
+/// [`load_weight_device`], but a 2-D Q4_K tensor is kept as raw blocks in
+/// `arena` instead of being dequantized (`REFLEX_QUANT_RESIDENT=1`, dense
+/// path). Every other tensor takes the `f32` path unchanged.
+pub(super) fn load_weight_device_quant(
+    pipeline: &mut WeightLoadPipeline,
+    kernels: &DequantKernels,
+    file: &GgufFile,
+    name: &str,
+    arena: &mut QuantArena,
+) -> Result<Weight, ReflexError> {
+    let info = file
+        .tensor_info(name)
+        .ok_or_else(|| crate::reflex_err!(Gguf, "missing weight '{name}'"))?;
+    if info.ggml_type != GgmlType::Q4K || info.shape.len() != 2 {
+        return load_weight_device(pipeline, kernels, file, name);
+    }
+    let bytes = file.tensor_bytes(info)?;
+    let (offset, len) = pipeline
+        .upload_raw(arena, bytes)
+        .map_err(|e| e.rewrap(format!("load weight '{name}': {e}")))?;
     Ok(Weight {
-        data,
+        data: WeightData::Q4K {
+            arena: arena.buf.clone(),
+            offset,
+            len,
+        },
         shape: info.shape.clone(),
     })
+}
+
+/// Dequantizes a quantized-resident weight into a fresh `f32` device buffer
+/// (reading the arena, no host traffic) and turns `w` into an `f32` weight --
+/// used by `Model::apply_lora`, whose in-place delta add needs `f32`. A no-op
+/// for an `f32` weight.
+pub(super) fn materialize_f32(
+    device: &Arc<CudaDevice>,
+    q4k_dequant: &cudarc::driver::CudaFunction,
+    w: &mut Weight,
+) -> Result<(), ReflexError> {
+    let WeightData::Q4K { len, .. } = &w.data else {
+        return Ok(());
+    };
+    let num_blocks = *len / Q4K_BLOCK_BYTES;
+    let ptr = w.quant_ptr().expect("Q4K weight has a device pointer");
+    let mut out = unsafe { device.alloc::<f32>(num_blocks * QK_K) }
+        .map_err(|e| crate::gpu_err!(e, "alloc materialized weight: {e}"))?;
+    let threads = 256u32;
+    let launch_cfg = LaunchConfig {
+        grid_dim: ((num_blocks as u32).div_ceil(threads).max(1), 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        q4k_dequant
+            .clone()
+            .launch(launch_cfg, (ptr, &mut out, num_blocks as u32))
+            .map_err(|e| crate::gpu_err!(e, "materialize dequant launch: {e}"))?;
+    }
+    w.data = WeightData::F32(out);
+    Ok(())
 }
