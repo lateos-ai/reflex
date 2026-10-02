@@ -24,6 +24,7 @@ use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
 const GGUF_MAGIC: u32 = 0x4655_4747; // bytes "GGUF" read little-endian as u32
 const DEFAULT_ALIGNMENT: u64 = 32;
@@ -180,7 +181,10 @@ impl GgufTensorInfo {
 /// A parsed GGUF file, backed by a memory-mapped byte range so tensor data
 /// is never copied wholesale into process memory.
 pub struct GgufFile {
-    mmap: Mmap,
+    /// Shared so a loaded model can keep borrowing tensor bytes (the lazily
+    /// dequantized token embedding) after the `GgufFile` itself is dropped,
+    /// without copying them out -- see [`Self::tensor_bytes_shared`].
+    mmap: Arc<Mmap>,
     pub version: u32,
     pub metadata: HashMap<String, GgufValue>,
     pub tensors: Vec<GgufTensorInfo>,
@@ -201,6 +205,7 @@ impl GgufFile {
     }
 
     fn parse(mmap: Mmap) -> Result<Self, ReflexError> {
+        let mmap = Arc::new(mmap);
         let mut cur = Cursor::new(&mmap);
 
         let magic = cur.read_u32()?;
@@ -272,21 +277,59 @@ impl GgufFile {
         self.tensors.iter().find(|t| t.name == name)
     }
 
+    /// Like [`Self::tensor_bytes`], but the returned handle keeps the mapping
+    /// alive on its own, so it can outlive this `GgufFile`. Still no copy:
+    /// pages are only read (and faulted in) when the bytes are touched.
+    ///
+    /// The same mmap caveat as [`Self::open`] applies for as long as the
+    /// handle lives: the file must not be truncated or rewritten in place.
+    pub fn tensor_bytes_shared(&self, info: &GgufTensorInfo) -> Result<SharedBytes, ReflexError> {
+        let range = self.tensor_byte_range(info)?;
+        Ok(SharedBytes {
+            mmap: self.mmap.clone(),
+            range,
+        })
+    }
+
     /// Raw bytes for a tensor, as a slice directly into the mmap — no copy.
     pub fn tensor_bytes(&self, info: &GgufTensorInfo) -> Result<&[u8], ReflexError> {
+        let range = self.tensor_byte_range(info)?;
+        Ok(&self.mmap[range])
+    }
+
+    fn tensor_byte_range(
+        &self,
+        info: &GgufTensorInfo,
+    ) -> Result<std::ops::Range<usize>, ReflexError> {
         let start = self.data_section_start + info.offset as usize;
         let nbytes = ggml_type_size_bytes(info.ggml_type, info.element_count())?;
         let end = start.checked_add(nbytes).ok_or_else(|| {
             crate::reflex_err!(Gguf, "tensor '{}' byte range overflows usize", info.name)
         })?;
-        self.mmap.get(start..end).ok_or_else(|| {
-            crate::reflex_err!(
+        if end > self.mmap.len() {
+            return Err(crate::reflex_err!(
                 Gguf,
                 "tensor '{}' range {start}..{end} exceeds file length {}",
                 info.name,
                 self.mmap.len()
-            )
-        })
+            ));
+        }
+        Ok(start..end)
+    }
+}
+
+/// A tensor's raw bytes inside a shared GGUF mmap (see
+/// [`GgufFile::tensor_bytes_shared`]). Derefs to `&[u8]`.
+#[derive(Clone)]
+pub struct SharedBytes {
+    mmap: Arc<Mmap>,
+    range: std::ops::Range<usize>,
+}
+
+impl std::ops::Deref for SharedBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.mmap[self.range.clone()]
     }
 }
 
