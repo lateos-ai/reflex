@@ -3,6 +3,15 @@
 What has been built, in order. Measurements live in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+## 2026-10-02
+
+- **Faster model load: the token embedding stays in the file mapping.** The table used to
+  be copied out of the mmap at load (127.6 MB for Qwen3-0.6B Q4_K_M), which took ~103 ms of
+  ~231 ms model load on a T4. Rows are now read straight from the mapping when used. On a
+  T4, `system1` cold start went from ~452 to ~421 ms and `generate` from ~700 to ~674 ms
+  (p50, n=10, two interleaved rounds); output is unchanged. The model keeps the GGUF file
+  mapped for its lifetime.
+
 ## 2026-10-01
 
 - **External energy measurement**: `reflex-energy` (built with `--features nvml`) measures
