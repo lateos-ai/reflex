@@ -382,3 +382,47 @@ weight residency. The pinned fill (~4.8 GB/s) looks similar.
    behind the host today, but this matters once the host side shrinks.
 4. A multi-row kernel that reuses activations across output rows (tiling, as llama.cpp's
    MMQ does) would make prefill faster than `f32`, not just close to it.
+
+### Follow-up: `token_embd` kept in the mmap, quantized LM head (2026-10-02)
+
+Two changes the step-0 profile pointed at:
+
+- **`token_embd` stays in the mmap.** `GgufFile` shares its mapping (`SharedBytes`), and
+  `LazyTokenEmbedding` keeps a handle instead of copying 127.6 MB out. This applies to every
+  architecture and to the default (`f32`) path. The model keeps the file mapped for its
+  lifetime, as llama.cpp does by default.
+- **Quantized LM head (flag on).** A tied Q6_K head is uploaded as raw blocks on its first
+  full-vocab use instead of being expanded to 622 MB of `f32`, and an untied Q6_K/Q4_K
+  `output.weight` goes into the arena at load. `gemv_q6k_kernel` reads Q6_K directly, with
+  the same decode expression as `dequantize_q6k_kernel`.
+
+Same T4 and model; p50 of n=10, two interleaved rounds (ranges are the two rounds):
+
+| | master | new, flag off (default) | new, flag on |
+|---|---|---|---|
+| `system1` model load | 235.8–236.3 ms | 200.4–205.0 ms | 202.6–202.7 ms |
+| `system1` total | 451.7–453.3 ms | **418.7–422.7 ms** | 428.1–429.2 ms |
+| `generate` model load | 233.2–239.5 ms | 200.6–202.2 ms | 200.4–204.5 ms |
+| `generate` prompt eval | 288.0–288.3 ms | 294.9–295.6 ms | **54.9–55.0 ms** |
+| `generate` total | 696.9–706.3 ms | 672.4–675.2 ms | **430.9–437.3 ms** |
+| decode, ms/token (n=3) | 12.9–13.0 | — | **7.73–7.80** |
+| model-resident VRAM | 1,708 MiB | — | 460 MiB |
+
+Mistral 7B with the flag on: 7,276 MiB resident (was 7,756 with an `f32` `output.weight`).
+
+- The `token_embd` change alone cuts ~30–35 ms of model load on every path. Reading the
+  file pages later, on `generate`'s first full-vocab use, costs only ~7 ms, so most of the
+  old ~103 ms was faulting in and zeroing the freshly allocated `Vec`, not reading the file.
+- With the flag on, `generate`'s first token no longer pays for an `f32` LM head:
+  prompt eval drops from ~295 ms to ~55 ms and the cold start falls 38% against master.
+  Decode improves 40%.
+- With the flag on, `system1` is now ~7–10 ms *slower* than with it off: the load-time
+  saving is gone (the load is host-bound and no longer copies `token_embd` either way),
+  while the short-prompt fused prefill still costs ~10 ms more than `f32`.
+
+Correctness: every token id is unchanged across master, flag off and flag on for Qwen3-0.6B,
+TinyLlama, Qwen3.5-0.8B (hybrid), the tiny MLA fixture and the tiny Qwen3-MoE fixture.
+Flag-off checksums are identical to master; flag-on checksums move ~1e-6 relative (the
+hybrid/MoE/MLA paths ignore the flag). New test `quant_resident_lm_head_matches_f32` passes on
+Qwen3-0.6B (tied) and Mistral 7B (untied). The GPU suite, now with the tiny fixtures
+present, gives 18 pass and 3 skip with the flag off.
