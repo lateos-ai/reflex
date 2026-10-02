@@ -30,7 +30,7 @@ fn activations(n: usize, seed: u64) -> Vec<f32> {
 /// exercising the 8-row chunking), and the dequantize-to-scratch + cuBLAS
 /// path (rows above the fused threshold). Weights are bit-identical by
 /// construction (same decode expression as `dequantize_q4k_kernel`), so only
-/// summation order differs. Run with:
+/// summation order differs. Run (single-threaded) with:
 /// `REFLEX_TEST_GGUF=<dense Q4_K_M gguf> cargo test --release -- --ignored quant_resident_gemv_matches_f32`
 #[test]
 #[ignore]
@@ -39,15 +39,16 @@ fn quant_resident_gemv_matches_f32() {
         .expect("set REFLEX_TEST_GGUF to a real local GGUF path to run this test");
     let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
     let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
-    let mut model = Model::load(device.clone(), &file).expect("failed to load model");
-    model.gemv_q4k_k = Some(
-        aot::load_kernel(
-            &device,
-            include_bytes!(env!("REFLEX_KERNEL_GEMV_Q4K")),
-            "gemv_q4k",
-            "gemv_q4k_kernel",
-        )
-        .expect("load gemv_q4k_kernel"),
+    // Loaded quantized-resident so a model too big for f32 (Mistral 7B on a
+    // 16 GB card) still fits; the f32 references below are loaded per tensor.
+    // Run single-threaded: this sets the env var for the load only.
+    std::env::set_var("REFLEX_QUANT_RESIDENT", "1");
+    let model = Model::load(device.clone(), &file);
+    std::env::remove_var("REFLEX_QUANT_RESIDENT");
+    let model = model.expect("failed to load model");
+    assert!(
+        model.gemv_q4k_k.is_some(),
+        "fixture must have Q4_K dense matmul weights"
     );
 
     let names: Vec<String> = (0..2)

@@ -5,21 +5,23 @@
 // (REFLEX_QUANT_RESIDENT=1, see docs/design/quantized-resident-weights.md).
 //
 // Same launch geometry as `gemv_kernel` (gemv.cu): one warp per output row,
-// lanes reduce with a warp shuffle. Within a row, the unit of work is one
-// 32-element Q4_K sub-block: a 144-byte super-block (`d: f16`, `dmin: f16`,
-// `scales[12]`, `qs[128]`) holds 8 of them, sub-block `s` taking the low
-// (s even) or high (s odd) nibbles of `qs[32*(s/2) .. 32*(s/2)+32]` with
-// scale/min pair `s`. Lane `lane` handles sub-blocks lane, lane+32, ...
+// lanes reduce with a warp shuffle. A 144-byte Q4_K super-block is `d: f16`,
+// `dmin: f16`, `scales[12]` (8 packed 6-bit scale/min pairs) and `qs[128]`;
+// `qs[32*g .. 32*g+32]` holds elements 64*g .. 64*g+64 of the block, low
+// nibbles first (scale pair 2g), then high nibbles (pair 2g+1).
+//
+// Memory layout per warp iteration: 8 lanes per super-block, 4 super-blocks
+// at a time. Lane chunk `c` (0..8) loads 16 contiguous bytes of `qs` with one
+// 16-byte load (8 lanes together read the block's 128 bytes), which hold 16
+// low-nibble and 16 high-nibble weights of group `c/2`. Those 32 weights are
+// decoded into registers once and reused for every input row; `x` is read
+// with float4 loads.
 //
 // Each weight is decoded with exactly the expression `dequantize_q4k_kernel`
 // (dequant.cu) uses, `d1 * (float)q - m1`, so every weight value matches the
 // f32-resident path bit for bit; only the order of the dot product's additions
 // differs (as it already does between gemv_kernel and cuBLAS). Activations
 // stay f32 -- no Q8_1 activation quantization.
-//
-// Several input rows share each decoded weight: the kernel keeps one
-// accumulator per row, so prefill reads the weight bytes once per
-// GEMV_Q4K_MAX_ROWS rows instead of once per row.
 
 #include <cuda_fp16.h>
 #include <cstring>
@@ -44,8 +46,20 @@ __device__ __forceinline__ void q4k_scale_min(unsigned int j, const unsigned cha
     }
 }
 
+__device__ __forceinline__ float dot16(const float* __restrict__ x, const float* w) {
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    float s = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        float4 v = x4[k];
+        s += v.x * w[4 * k] + v.y * w[4 * k + 1] + v.z * w[4 * k + 2] + v.w * w[4 * k + 3];
+    }
+    return s;
+}
+
 // x: [rows, in_features] f32, row-major. w: Q4_K blocks, out_features rows of
-// in_features/256 blocks each. y: [rows, out_features] f32, row-major.
+// in_features/256 blocks each (row starts 16-byte aligned: 144 is a multiple of
+// 16 and the arena is 256-byte aligned). y: [rows, out_features] f32.
 // in_features must be a multiple of 256 (ggml's own invariant for Q4_K rows).
 extern "C" __global__ void gemv_q4k_kernel(
     const float* __restrict__ x,
@@ -65,6 +79,9 @@ extern "C" __global__ void gemv_q4k_kernel(
 
     const unsigned int nb = in_features >> 8;
     const unsigned char* row_ptr = w + (unsigned long long)row * nb * 144ull;
+    const unsigned int c = lane & 7u;     // 16-byte chunk of qs
+    const unsigned int g = c >> 1;        // 64-element group
+    const unsigned int half = c & 1u;     // which 16 of the group's 32 bytes
 
     float acc[GEMV_Q4K_MAX_ROWS];
     #pragma unroll
@@ -72,33 +89,35 @@ extern "C" __global__ void gemv_q4k_kernel(
         acc[r] = 0.0f;
     }
 
-    const unsigned int units = nb * 8u;
-    for (unsigned int u = lane; u < units; u += 32u) {
-        const unsigned int b = u >> 3;
-        const unsigned int s = u & 7u;
+    for (unsigned int b = lane >> 3; b < nb; b += 4u) {
         const unsigned char* block = row_ptr + (unsigned long long)b * 144ull;
-
         const float d = q4k_le_f16(block);
         const float dmin = q4k_le_f16(block + 2);
         unsigned char sc, m;
-        q4k_scale_min(s, block + 4, &sc, &m);
+        q4k_scale_min(2u * g, block + 4, &sc, &m);
         const float d1 = d * (float)sc;
         const float m1 = dmin * (float)m;
+        q4k_scale_min(2u * g + 1u, block + 4, &sc, &m);
+        const float d2 = d * (float)sc;
+        const float m2 = dmin * (float)m;
 
-        const unsigned char* q = block + 16 + 32u * (s >> 1);
-        const unsigned int shift = (s & 1u) ? 4u : 0u;
-        // Element offset of this sub-block within the row:
-        // 256*b + 64*(s/2) + 32*(s&1).
-        const unsigned int x_off = (b << 8) + ((s >> 1) << 6) + ((s & 1u) << 5);
+        const uint4 qv = *reinterpret_cast<const uint4*>(block + 16 + 16u * c);
+        const unsigned char* q = reinterpret_cast<const unsigned char*>(&qv);
+        float wlo[16], whi[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            wlo[i] = d1 * (float)(q[i] & 0xF) - m1;
+            whi[i] = d2 * (float)(q[i] >> 4) - m2;
+        }
 
-        #pragma unroll 4
-        for (unsigned int l = 0; l < 32u; l++) {
-            const float wv = d1 * (float)((q[l] >> shift) & 0xF) - m1;
-            #pragma unroll
-            for (unsigned int r = 0; r < GEMV_Q4K_MAX_ROWS; r++) {
-                if (r < rows) {
-                    acc[r] += x[(unsigned long long)r * in_features + x_off + l] * wv;
-                }
+        // Element offsets of the low and high runs within the row.
+        const unsigned int e_lo = (b << 8) + (g << 6) + (half << 4);
+        const unsigned int e_hi = e_lo + 32u;
+        #pragma unroll
+        for (unsigned int r = 0; r < GEMV_Q4K_MAX_ROWS; r++) {
+            if (r < rows) {
+                const float* xr = x + (unsigned long long)r * in_features;
+                acc[r] += dot16(xr + e_lo, wlo) + dot16(xr + e_hi, whi);
             }
         }
     }
