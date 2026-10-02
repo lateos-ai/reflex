@@ -90,7 +90,7 @@ noted. The engine-vs-engine rows time `reflex generate` to its first token (0.83
 | Ollama | Reflex **2.6x faster** (0.83 s vs. ~2.1 s) | Cold daemon plus cold model |
 | vLLM | Reflex **48–150x faster** (0.83 s vs. 39.8–127.3 s) | CUDA-graph capture and `torch.compile` at startup; ran from safetensors |
 | vLLM on Runpod serverless | Reflex **~3.4x faster** (42–44 s vs. ~150 s) | Mostly platform provisioning; vLLM also downloaded `bf16` weights |
-| llama.cpp server on Runpod serverless | Engine load **~1.9x faster** (0.49 s vs. 0.95 s on an L4, n=5 vs. n=3); end-to-end inconclusive | Platform overhead (24–73 s even for Reflex) swamps the difference; [details](docs/runpod-llamacpp-comparison.md#results) |
+| llama.cpp server on Runpod serverless | Engine load **~1.9x faster** (0.49 s vs. 0.95 s on an L4, n=5 each); end-to-end inconclusive | Platform overhead (24–73 s even for Reflex) swamps the difference; [details](docs/runpod-llamacpp-comparison.md#results) |
 | TypeSafe Jev (managed API) | Reflex **1.1–2.0x slower** (0.63 s vs. 0.31–0.57 s) | Jev is always warm; Reflex starts a process each time |
 
 Methodology, per-run numbers and every caveat: [docs/benchmarks.md](docs/benchmarks.md).

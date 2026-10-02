@@ -3,6 +3,14 @@
 What has been built, in order. Measurements live in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+## 2026-10-02
+
+- **Runpod comparison against llama.cpp, finished**: two more llama.cpp cold runs bring
+  both engines to n=5 on the L4 (engine load 0.49 s vs. 0.95 s, ~1.9x; end-to-end still
+  inconclusive), and the `--no-warmup` variant (n=3, 0.92 s) shows llama-server's warmup
+  is not where its startup time goes. See
+  [docs/runpod-llamacpp-comparison.md](docs/runpod-llamacpp-comparison.md#results).
+
 ## 2026-10-01
 
 - **External energy measurement**: `reflex-energy` (built with `--features nvml`) measures
