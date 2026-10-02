@@ -1718,14 +1718,16 @@ pub(super) const GEMV_Q4K_MAX_ROWS: usize = 8;
 
 /// Largest prefill row count the quantized-resident path runs through the
 /// fused `gemv_q4k_kernel` before switching to dequantize-to-scratch + cuBLAS
-/// (`Model::gemm`). `REFLEX_QUANT_FUSED_MAX_ROWS` overrides it, for measuring
-/// the crossover; the default is a placeholder until that is measured.
+/// (`Model::gemm`). `REFLEX_QUANT_FUSED_MAX_ROWS` overrides it. Default 16: on
+/// a T4 (Qwen3-0.6B) the fused path won at 12 rows (system1 prompt eval 49.4
+/// vs 51.2 ms) and lost at 29 (warm prefill 63.9 vs 35.9 ms); 16 sits between
+/// those two measured points and has not been measured itself.
 pub(super) fn quant_fused_max_rows() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("REFLEX_QUANT_FUSED_MAX_ROWS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(32)
+            .unwrap_or(16)
     })
 }
