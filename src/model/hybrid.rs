@@ -474,10 +474,10 @@ impl Model {
         let token_embd_info = file
             .tensor_info("token_embd.weight")
             .ok_or_else(|| ReflexError::Gguf("missing weight 'token_embd.weight'".to_string()))?;
-        let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
+        let token_embd_bytes = file.tensor_bytes_shared(token_embd_info)?;
         let token_embd = LazyTokenEmbedding::new(
             token_embd_info.ggml_type,
-            token_embd_bytes.to_vec(),
+            token_embd_bytes,
             &token_embd_info.shape,
         )?;
 
@@ -531,6 +531,7 @@ impl Model {
             gemv_gather_k,
             gemv_q4k_k: None,
             dequant_q4k_coalesced_k: None,
+            gemv_q6k_k: None,
             quant_scratch: RefCell::new(None),
             moe_gather_k,
             moe_scatter_add_k,

@@ -23,9 +23,11 @@ pub(super) struct Weight {
 
 pub(super) enum WeightData {
     F32(CudaSlice<f32>),
-    /// Raw Q4_K blocks at `offset..offset + len` in a shared [`QuantArena`]
-    /// buffer, byte-identical to the GGUF file.
-    Q4K {
+    /// Raw GGUF blocks of type `ty` (Q4_K for layer weights, Q6_K for the LM
+    /// head) at `offset..offset + len` in a shared device buffer,
+    /// byte-identical to the file.
+    Quant {
+        ty: GgmlType,
         arena: Arc<CudaSlice<u8>>,
         offset: usize,
         len: usize,
@@ -45,8 +47,8 @@ impl Weight {
     pub(super) fn f32(&self) -> Result<&CudaSlice<f32>, ReflexError> {
         match &self.data {
             WeightData::F32(d) => Ok(d),
-            WeightData::Q4K { .. } => Err(ReflexError::Other(format!(
-                "internal: an f32-only code path got a quantized-resident (Q4_K) weight of shape {:?}",
+            WeightData::Quant { ty, .. } => Err(ReflexError::Other(format!(
+                "internal: an f32-only code path got a quantized-resident ({ty:?}) weight of shape {:?}",
                 self.shape
             ))),
         }
@@ -56,7 +58,7 @@ impl Weight {
     pub(super) fn quant_ptr(&self) -> Option<u64> {
         match &self.data {
             WeightData::F32(_) => None,
-            WeightData::Q4K { arena, offset, .. } => Some(*arena.device_ptr() + *offset as u64),
+            WeightData::Quant { arena, offset, .. } => Some(*arena.device_ptr() + *offset as u64),
         }
     }
 }
@@ -73,16 +75,18 @@ pub(super) struct QuantArena {
 pub(super) const QUANT_ARENA_ALIGN: usize = 256;
 
 impl QuantArena {
-    /// `Ok(None)` when no tensor in `names` is Q4_K.
+    /// Sized for the tensors in `names` that `keep(name, type)` accepts;
+    /// `Ok(None)` when it accepts none.
     pub(super) fn for_tensors(
         device: &Arc<CudaDevice>,
         file: &GgufFile,
         names: &[String],
+        keep: impl Fn(&str, GgmlType) -> bool,
     ) -> Result<Option<Self>, ReflexError> {
         let mut total = 0usize;
         for name in names {
             if let Some(info) = file.tensor_info(name) {
-                if info.ggml_type == GgmlType::Q4K {
+                if keep(name, info.ggml_type) {
                     total += file
                         .tensor_bytes(info)?
                         .len()
@@ -192,12 +196,15 @@ impl LoadProfile {
 /// cross-block state (decoding a row's blocks in isolation is the same
 /// computation as decoding them as part of the full tensor).
 ///
-/// `raw` is an owned copy of the tensor's raw quantized bytes (cheap --
-/// e.g. ~78MB for Qwen3-0.6B's Q4_K_M `token_embd`, vs. the ~623MB the
-/// eager `f32` materialization used to produce) since the source mmap
-/// doesn't outlive `Model::load`/`load_hybrid`/`load_mla`.
+/// `raw` points straight into the GGUF mmap, which it keeps alive
+/// ([`crate::gguf::SharedBytes`]). It used to be an owned copy, and that copy
+/// was the largest single part of model load: ~103 ms of ~231 ms for
+/// Qwen3-0.6B's 127.6 MB Q6_K `token_embd` on a T4 (`REFLEX_LOAD_PROFILE=1`),
+/// probably mostly first-touch page faults. Now pages are read only when a
+/// row (or the full table, for a tied LM head) is actually used. The model
+/// keeps the file mapped for its lifetime, as llama.cpp does by default.
 pub(super) struct LazyTokenEmbedding {
-    pub(super) raw: Vec<u8>,
+    pub(super) raw: crate::gguf::SharedBytes,
     pub(super) ggml_type: GgmlType,
     pub(super) hidden_size: usize,
     pub(super) vocab_size: usize,
@@ -220,7 +227,7 @@ impl LazyTokenEmbedding {
     /// vocab_size]` (row-major `(vocab_size, hidden_size)` flat data).
     pub(super) fn new(
         ggml_type: GgmlType,
-        raw: Vec<u8>,
+        raw: crate::gguf::SharedBytes,
         shape: &[u64],
     ) -> Result<Self, ReflexError> {
         let hidden_size = shape[0] as usize;
@@ -1075,20 +1082,22 @@ pub(super) fn load_weight_device(
     Ok(Weight::from_f32(data, info.shape.clone()))
 }
 
-/// [`load_weight_device`], but a 2-D Q4_K tensor is kept as raw blocks in
-/// `arena` instead of being dequantized (`REFLEX_QUANT_RESIDENT=1`, dense
-/// path). Every other tensor takes the `f32` path unchanged.
+/// [`load_weight_device`], but a 2-D tensor whose type is in `allowed` is kept
+/// as raw blocks in `arena` instead of being dequantized
+/// (`REFLEX_QUANT_RESIDENT=1`, dense path). Every other tensor takes the `f32`
+/// path unchanged.
 pub(super) fn load_weight_device_quant(
     pipeline: &mut WeightLoadPipeline,
     kernels: &DequantKernels,
     file: &GgufFile,
     name: &str,
     arena: &mut QuantArena,
+    allowed: &[GgmlType],
 ) -> Result<Weight, ReflexError> {
     let info = file
         .tensor_info(name)
         .ok_or_else(|| crate::reflex_err!(Gguf, "missing weight '{name}'"))?;
-    if info.ggml_type != GgmlType::Q4K || info.shape.len() != 2 {
+    if !allowed.contains(&info.ggml_type) || info.shape.len() != 2 {
         return load_weight_device(pipeline, kernels, file, name);
     }
     let bytes = file.tensor_bytes(info)?;
@@ -1096,7 +1105,8 @@ pub(super) fn load_weight_device_quant(
         .upload_raw(arena, bytes)
         .map_err(|e| e.rewrap(format!("load weight '{name}': {e}")))?;
     Ok(Weight {
-        data: WeightData::Q4K {
+        data: WeightData::Quant {
+            ty: info.ggml_type,
             arena: arena.buf.clone(),
             offset,
             len,
@@ -1114,8 +1124,19 @@ pub(super) fn materialize_f32(
     q4k_dequant: &cudarc::driver::CudaFunction,
     w: &mut Weight,
 ) -> Result<(), ReflexError> {
-    let WeightData::Q4K { len, .. } = &w.data else {
-        return Ok(());
+    let len = match &w.data {
+        WeightData::F32(_) => return Ok(()),
+        WeightData::Quant {
+            ty: GgmlType::Q4K,
+            len,
+            ..
+        } => len,
+        WeightData::Quant { ty, .. } => {
+            return Err(crate::reflex_err!(
+                Other,
+                "materializing a quantized-resident {ty:?} weight to f32 is not supported"
+            ))
+        }
     };
     let num_blocks = *len / Q4K_BLOCK_BYTES;
     let ptr = w.quant_ptr().expect("Q4K weight has a device pointer");

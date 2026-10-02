@@ -67,7 +67,7 @@ fn quant_resident_gemv_matches_f32() {
         .collect();
     let kernels = load_dequant_kernels(&device).expect("dequant kernels");
     let mut pipeline = WeightLoadPipeline::new(&device).expect("pipeline");
-    let mut arena = QuantArena::for_tensors(&device, &file, &names)
+    let mut arena = QuantArena::for_tensors(&device, &file, &names, |_, ty| ty == GgmlType::Q4K)
         .expect("arena")
         .expect("fixture must contain Q4_K matmul tensors");
 
@@ -78,8 +78,15 @@ fn quant_resident_gemv_matches_f32() {
             continue;
         }
         let wf = load_weight_device(&mut pipeline, &kernels, &file, name).expect("f32 weight");
-        let wq = load_weight_device_quant(&mut pipeline, &kernels, &file, name, &mut arena)
-            .expect("quant weight");
+        let wq = load_weight_device_quant(
+            &mut pipeline,
+            &kernels,
+            &file,
+            name,
+            &mut arena,
+            &[GgmlType::Q4K],
+        )
+        .expect("quant weight");
         assert!(
             wq.quant_ptr().is_some(),
             "{name} should be quantized-resident"
@@ -151,4 +158,56 @@ fn quant_resident_generate_matches_f32() {
         ids_q, ids_f32,
         "greedy ids differ between quantized-resident and f32"
     );
+}
+
+/// The quantized-resident LM head (`gemv_q6k_kernel` on the raw Q6_K
+/// `token_embd`/`output.weight` blocks) against the f32 path, full vocab, plus
+/// `gemv_gather` on it (full GEMV + host pick). Run single-threaded:
+/// `REFLEX_TEST_GGUF=<Q4_K_M gguf> cargo test --release -- --ignored --test-threads=1 quant_resident_lm_head`
+#[test]
+#[ignore]
+fn quant_resident_lm_head_matches_f32() {
+    let gguf_path = std::env::var("REFLEX_TEST_GGUF")
+        .expect("set REFLEX_TEST_GGUF to a real local GGUF path to run this test");
+    let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    std::env::set_var("REFLEX_QUANT_RESIDENT", "1");
+    let model = Model::load(device.clone(), &file);
+    std::env::remove_var("REFLEX_QUANT_RESIDENT");
+    let model = model.expect("failed to load model");
+
+    let lm = model.lm_head_resident().expect("lm head");
+    assert!(
+        lm.quant_ptr().is_some(),
+        "LM head should be quantized-resident"
+    );
+    let (in_f, vocab) = (lm.shape[0] as usize, lm.shape[1] as usize);
+
+    let name = if file.tensor_info("output.weight").is_some() {
+        "output.weight"
+    } else {
+        "token_embd.weight"
+    };
+    let kernels = load_dequant_kernels(&device).expect("dequant kernels");
+    let mut pipeline = WeightLoadPipeline::new(&device).expect("pipeline");
+    let wf = load_weight_device(&mut pipeline, &kernels, &file, name).expect("f32 LM head");
+
+    let x = device
+        .htod_sync_copy(&activations(in_f, 7))
+        .expect("upload x");
+    let yf = device
+        .dtoh_sync_copy(&model.gemv(&x, &wf).expect("f32 gemv"))
+        .expect("dtoh");
+    let yq = device
+        .dtoh_sync_copy(&model.gemv(&x, lm).expect("q6k gemv"))
+        .expect("dtoh");
+    assert_eq!(yq.len(), vocab);
+    let d = rel_max_diff(&yq, &yf);
+    assert!(d < 1e-4, "LM head relative max diff {d}");
+
+    let rows = [0u32, 1, (vocab / 2) as u32, (vocab - 1) as u32];
+    let gathered = model.gemv_gather(&x, lm, &rows).expect("gather");
+    for (g, &r) in gathered.iter().zip(&rows) {
+        assert_eq!(*g, yq[r as usize], "gather row {r}");
+    }
 }

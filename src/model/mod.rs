@@ -156,6 +156,8 @@ pub struct Model {
     /// `dequantize_q4k_coalesced_kernel` (same module), for the
     /// quantized-resident prefill path's scratch buffer.
     dequant_q4k_coalesced_k: Option<AotKernel>,
+    /// `gemv_q6k_kernel` (same module), for a quantized-resident LM head.
+    gemv_q6k_k: Option<AotKernel>,
     /// Reused `f32` scratch for the quantized-resident prefill path above the
     /// fused kernel's row threshold (dequantize one weight, then cuBLAS);
     /// grown, never shrunk. See `Model::gemm`.
@@ -914,6 +916,26 @@ impl Model {
                 }
                 let element_count =
                     self.token_embd.vocab_size as u64 * self.token_embd.hidden_size as u64;
+                if self.gemv_q6k_k.is_some() && self.token_embd.ggml_type == GgmlType::Q6K {
+                    // Quantized-resident (`REFLEX_QUANT_RESIDENT=1`): upload the
+                    // raw Q6_K blocks (~1/5 of the f32 size) and let
+                    // `gemv_q6k_kernel` read them directly.
+                    let raw: &[u8] = &self.token_embd.raw;
+                    let buf = self
+                        .device
+                        .htod_sync_copy(raw)
+                        .map_err(|e| crate::gpu_err!(e, "upload quantized LM head: {e}"))?;
+                    let _ = cell.set(Weight {
+                        data: WeightData::Quant {
+                            ty: GgmlType::Q6K,
+                            arena: Arc::new(buf),
+                            offset: 0,
+                            len: raw.len(),
+                        },
+                        shape: shape.clone(),
+                    });
+                    return Ok(cell.get().expect("just set"));
+                }
                 let data = dequantize_tensor_to_device(
                     &mut self.dequant_pipeline.borrow_mut(),
                     &self.dequant_kernels,

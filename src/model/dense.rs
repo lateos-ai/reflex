@@ -201,8 +201,12 @@ impl Model {
         if quant_on && expert_used_count.is_some() {
             eprintln!("note: REFLEX_QUANT_RESIDENT=1 is not supported for MoE models yet; using f32 weights");
         }
-        let mut arena = if quant_on && expert_used_count.is_none() {
-            let names: Vec<String> = (0..block_count)
+        // Layer matmuls stay quantized if Q4_K; an untied `output.weight` (the
+        // LM head) if Q6_K or Q4_K. A tied LM head is handled lazily in
+        // `Model::lm_head_resident`.
+        let quant_dense = quant_on && expert_used_count.is_none();
+        let mut arena = if quant_dense {
+            let mut names: Vec<String> = (0..block_count)
                 .flat_map(|i| {
                     [
                         "attn_q",
@@ -216,23 +220,30 @@ impl Model {
                     .map(|t| format!("blk.{i}.{t}.weight"))
                 })
                 .collect();
-            QuantArena::for_tensors(&device, file, &names)?
+            names.push("output.weight".to_string());
+            QuantArena::for_tensors(&device, file, &names, |name, ty| {
+                ty == GgmlType::Q4K || (name == "output.weight" && ty == GgmlType::Q6K)
+            })?
         } else {
             None
         };
-        let (gemv_q4k_k, dequant_q4k_coalesced_k) = match arena {
-            Some(_) => {
-                let mut fns = aot::load_kernel_module(
-                    &device,
-                    include_bytes!(env!("REFLEX_KERNEL_GEMV_Q4K")),
-                    "gemv_q4k",
-                    &["gemv_q4k_kernel", "dequantize_q4k_coalesced_kernel"],
-                )?;
-                let dq = fns.pop().expect("two kernels requested");
-                let gemv = fns.pop().expect("two kernels requested");
-                (Some(gemv), Some(dq))
-            }
-            None => (None, None),
+        let (gemv_q4k_k, dequant_q4k_coalesced_k, gemv_q6k_k) = if quant_dense {
+            let mut fns = aot::load_kernel_module(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_Q4K")),
+                "gemv_q4k",
+                &[
+                    "gemv_q4k_kernel",
+                    "dequantize_q4k_coalesced_kernel",
+                    "gemv_q6k_kernel",
+                ],
+            )?;
+            let q6 = fns.pop().expect("three kernels requested");
+            let dq = fns.pop().expect("three kernels requested");
+            let gemv = fns.pop().expect("three kernels requested");
+            (Some(gemv), Some(dq), Some(q6))
+        } else {
+            (None, None, None)
         };
         let modules_ms = t_modules.elapsed().as_secs_f64() * 1000.0;
         let t_weights = std::time::Instant::now();
@@ -249,9 +260,14 @@ impl Model {
         // and everything else always go through the f32 path.
         let mut load_weight_kind = |name: &str, matmul: bool| -> Result<Weight, ReflexError> {
             match arena.as_mut() {
-                Some(a) if matmul => {
-                    load_weight_device_quant(&mut pipeline, &dequant_kernels, file, name, a)
-                }
+                Some(a) if matmul => load_weight_device_quant(
+                    &mut pipeline,
+                    &dequant_kernels,
+                    file,
+                    name,
+                    a,
+                    &[GgmlType::Q4K],
+                ),
                 _ => load_weight_device(&mut pipeline, &dequant_kernels, file, name),
             }
         };
@@ -313,10 +329,10 @@ impl Model {
         let token_embd_info = file
             .tensor_info("token_embd.weight")
             .ok_or_else(|| ReflexError::Gguf("missing weight 'token_embd.weight'".to_string()))?;
-        let token_embd_bytes = file.tensor_bytes(token_embd_info)?;
+        let token_embd_bytes = file.tensor_bytes_shared(token_embd_info)?;
         let token_embd = LazyTokenEmbedding::new(
             token_embd_info.ggml_type,
-            token_embd_bytes.to_vec(),
+            token_embd_bytes,
             &token_embd_info.shape,
         )?;
         let token_embd_ms = t_embd.elapsed().as_secs_f64() * 1000.0;
@@ -330,6 +346,14 @@ impl Model {
         // see `LmHead`'s doc comment), defer that upload until something
         // actually needs the full matrix.
         let lm_head = match file.tensor_info("output.weight") {
+            Some(_) if arena.is_some() => LmHead::Resident(load_weight_device_quant(
+                &mut pipeline,
+                &dequant_kernels,
+                file,
+                "output.weight",
+                arena.as_mut().expect("checked by the guard"),
+                &[GgmlType::Q4K, GgmlType::Q6K],
+            )?),
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
                 let data = dequantize_tensor_to_device(
@@ -394,6 +418,7 @@ impl Model {
             gemv_gather_k,
             gemv_q4k_k,
             dequant_q4k_coalesced_k,
+            gemv_q6k_k,
             quant_scratch: RefCell::new(None),
             moe_gather_k,
             moe_scatter_add_k,

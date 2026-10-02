@@ -286,8 +286,69 @@ impl Model {
         let out_features = w.shape[1] as usize;
         match &w.data {
             WeightData::F32(d) => self.gemv_raw(x, d, in_features, out_features),
-            WeightData::Q4K { .. } => self.gemv_q4k(x, w, 1),
+            WeightData::Quant {
+                ty: GgmlType::Q4K, ..
+            } => self.gemv_q4k(x, w, 1),
+            WeightData::Quant {
+                ty: GgmlType::Q6K, ..
+            } => self.gemv_q6k(x, w),
+            WeightData::Quant { ty, .. } => Err(crate::reflex_err!(
+                Other,
+                "internal: no GEMV for quantized-resident {ty:?}"
+            )),
         }
+    }
+
+    /// One-row GEMV straight from a quantized-resident Q6_K weight
+    /// (`gemv_q6k_kernel`) -- the LM head when `REFLEX_QUANT_RESIDENT=1`.
+    pub(super) fn gemv_q6k(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let in_features = w.shape[0] as usize;
+        let out_features = w.shape[1] as usize;
+        let kernel = self.gemv_q6k_k.as_ref().ok_or_else(|| {
+            ReflexError::Other("internal: Q6_K weight but gemv_q6k_kernel not loaded".to_string())
+        })?;
+        let w_ptr = w
+            .quant_ptr()
+            .ok_or_else(|| ReflexError::Other("internal: gemv_q6k on an f32 weight".to_string()))?;
+        if x.len() != in_features || !in_features.is_multiple_of(QK_K) {
+            return Err(crate::reflex_err!(
+                Other,
+                "gemv_q6k: x.len()={} in_features={in_features} (must match, a multiple of {QK_K})",
+                x.len()
+            ));
+        }
+        let mut dev_y = self
+            .device
+            .alloc_zeros::<f32>(out_features)
+            .map_err(|e| crate::gpu_err!(e, "gemv_q6k alloc y: {e}"))?;
+        let threads = 256u32;
+        let warps_per_block = threads / WARP_SIZE;
+        let launch_cfg = LaunchConfig {
+            grid_dim: ((out_features as u32).div_ceil(warps_per_block).max(1), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            kernel
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (
+                        x,
+                        w_ptr,
+                        &mut dev_y,
+                        in_features as u32,
+                        out_features as u32,
+                    ),
+                )
+                .map_err(|e| crate::gpu_err!(e, "gemv_q6k launch: {e}"))?;
+        }
+        Ok(dev_y)
     }
 
     /// `y[rows, out_features] = x[rows, in_features] @ w^T` straight from a
@@ -393,7 +454,13 @@ impl Model {
         }
         let w_data = match &w.data {
             WeightData::F32(d) => d,
-            WeightData::Q4K { len, .. } => {
+            WeightData::Quant { ty, .. } if *ty != GgmlType::Q4K => {
+                return Err(crate::reflex_err!(
+                    Other,
+                    "internal: batched GEMM on a quantized-resident {ty:?} weight is not supported"
+                ))
+            }
+            WeightData::Quant { len, .. } => {
                 // Quantized-resident weight: up to the threshold, the fused
                 // kernel reads the Q4_K bytes once per 8 rows; above it,
                 // dequantize the weight into a reused scratch buffer on the
@@ -682,6 +749,16 @@ impl Model {
                 Other,
                 "gemv_gather: row index {bad} out of range (out_features={out_features})"
             ));
+        }
+        if let WeightData::Quant { .. } = &w.data {
+            // A quantized-resident LM head has no row-gather kernel: run the
+            // full-vocab GEMV (it reads ~1/5 of the f32 bytes) and pick the
+            // requested logits on the host.
+            let all = self
+                .device
+                .dtoh_sync_copy(&self.gemv(x, w)?)
+                .map_err(|e| crate::gpu_err!(e, "gemv_gather (quantized) dtoh: {e}"))?;
+            return Ok(row_indices.iter().map(|&r| all[r as usize]).collect());
         }
         let num_rows = row_indices.len();
         let dev_indices = self
