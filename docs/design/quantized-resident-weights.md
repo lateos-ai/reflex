@@ -314,7 +314,7 @@ checksums, same phase timings within 1 ms).
   scratch + cuBLAS; max relative difference < 1e-4) on Qwen3-0.6B, TinyLlama and Mistral
   7B, and 16-token greedy generation identical with the flag on and off. The
   batched-vs-sequential prefill oracle passes with the flag on. The full GPU suite passes
-  with the flag off (11 tests; 13 skipped for missing fixtures).
+  with the flag off (8 pass; 11 skipped for fixtures not on the instance).
 - `reflex check "The capital of France is" --max-tokens 8`: token ids identical to master
   on Qwen3-0.6B and TinyLlama (both also match llama.cpp's `llama-simple` text). Logit
   checksums move by ~1e-6 relative.
@@ -373,10 +373,10 @@ weight residency. The pinned fill (~4.8 GB/s) looks similar.
 
 1. **The cold-start win is elsewhere.** Two costs that weight residency doesn't touch are
    larger than anything it removed: the ~103 ms `token_embd` copy in model load, and, on
-   `generate`, the ~250 ms of prompt eval spent expanding the tied LM head to 622 MB of
-   `f32` (`generate`'s prompt eval is 288 ms vs. `system1`'s 39 ms on the same prompt
-   path). Keeping the mmap alive instead of copying `token_embd`, and a Q6_K LM head
-   kept quantized, go straight at both.
+   `generate`, prompt eval of 288 ms against `system1`'s 39 ms. That ~250 ms gap is most
+   likely the tied LM head being expanded to 622 MB of `f32` on the first token (not yet
+   profiled separately). Keeping the mmap alive instead of copying `token_embd`, and a
+   Q6_K LM head kept quantized, go straight at both.
 2. Q6_K kernels (layers and LM head) for the rest of the VRAM and decode gains.
 3. Coalesce the existing load-time dequant kernels; the GPU side of the load is hidden
    behind the host today, but this matters once the host side shrinks.
