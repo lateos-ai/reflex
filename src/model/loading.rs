@@ -31,12 +31,16 @@ pub(super) struct Weight {
 /// cross-block state (decoding a row's blocks in isolation is the same
 /// computation as decoding them as part of the full tensor).
 ///
-/// `raw` is an owned copy of the tensor's raw quantized bytes (cheap --
-/// e.g. ~78MB for Qwen3-0.6B's Q4_K_M `token_embd`, vs. the ~623MB the
-/// eager `f32` materialization used to produce) since the source mmap
-/// doesn't outlive `Model::load`/`load_hybrid`/`load_mla`.
+/// `raw` points straight into the GGUF mmap, which it keeps alive
+/// ([`crate::gguf::SharedBytes`]). It used to be an owned copy, and that copy
+/// was the largest single part of model load: ~103 ms of ~231 ms for
+/// Qwen3-0.6B's 127.6 MB Q6_K `token_embd` on a T4, mostly faulting in the
+/// freshly allocated `Vec` (reading the same file pages later, on a tied LM
+/// head's first full-vocab use, costs only ~7 ms). Pages are now read only
+/// when a row (or the full table) is actually used. The model keeps the file
+/// mapped for its lifetime, as llama.cpp does by default.
 pub(super) struct LazyTokenEmbedding {
-    pub(super) raw: Vec<u8>,
+    pub(super) raw: crate::gguf::SharedBytes,
     pub(super) ggml_type: GgmlType,
     pub(super) hidden_size: usize,
     pub(super) vocab_size: usize,
@@ -59,7 +63,7 @@ impl LazyTokenEmbedding {
     /// vocab_size]` (row-major `(vocab_size, hidden_size)` flat data).
     pub(super) fn new(
         ggml_type: GgmlType,
-        raw: Vec<u8>,
+        raw: crate::gguf::SharedBytes,
         shape: &[u64],
     ) -> Result<Self, ReflexError> {
         let hidden_size = shape[0] as usize;
