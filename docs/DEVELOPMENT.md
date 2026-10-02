@@ -143,7 +143,18 @@ machine, or see [gpu-ci.md](gpu-ci.md) for the nightly GPU workflow.
 ## Model loading: weights stay on the GPU
 
 `Model::load` dequantizes every weight tensor once and uploads it once, as a
-device-resident `f32` buffer. Rules that follow from measured regressions:
+device-resident `f32` buffer.
+
+**Opt-in exception: `REFLEX_QUANT_RESIDENT=1`** (dense Qwen3/Llama/Mistral path only;
+MoE, hybrid and MLA print a notice and keep `f32`). Q4_K matmul weights are uploaded
+as their raw GGUF blocks into one device arena and dequantized inside the matmul
+kernels (`gemv_q4k`, the fused multi-row prefill kernel), or, for longer prompts, into
+a reused device scratch buffer that cuBLAS then reads. A Q6_K LM head is kept as raw
+blocks too. Other formats and norms stay `f32`. The rules below still hold: the
+scratch path is device to device, so weights are never copied host-to-device per
+call. See [design/quantized-resident-weights.md](design/quantized-resident-weights.md).
+
+Rules that follow from measured regressions:
 
 - **Never copy weights host-to-device per call.** An early version re-uploaded weight
   buffers inside `gemv`/`rmsnorm` on every call and was about 4.3x slower than
