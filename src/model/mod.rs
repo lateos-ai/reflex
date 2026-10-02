@@ -153,6 +153,9 @@ pub struct Model {
     /// `gemv_q4k_kernel` (`kernels_cuda/gemv_q4k.cu`), loaded only when the
     /// dense path keeps weights quantized (`REFLEX_QUANT_RESIDENT=1`).
     gemv_q4k_k: Option<AotKernel>,
+    /// `dequantize_q4k_coalesced_kernel` (same module), for the
+    /// quantized-resident prefill path's scratch buffer.
+    dequant_q4k_coalesced_k: Option<AotKernel>,
     /// Reused `f32` scratch for the quantized-resident prefill path above the
     /// fused kernel's row threshold (dequantize one weight, then cuBLAS);
     /// grown, never shrunk. See `Model::gemm`.

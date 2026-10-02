@@ -411,17 +411,20 @@ impl Model {
                 }
                 let buf = scratch.as_mut().expect("just ensured");
                 let num_blocks = *len / Q4K_BLOCK_BYTES;
-                let threads = 256u32;
                 let launch_cfg = LaunchConfig {
-                    grid_dim: ((num_blocks as u32).div_ceil(threads).max(1), 1, 1),
-                    block_dim: (threads, 1, 1),
+                    grid_dim: (num_blocks as u32, 1, 1),
+                    block_dim: (QK_K as u32, 1, 1),
                     shared_mem_bytes: 0,
                 };
                 let w_ptr = w.quant_ptr().expect("Q4K weight has a device pointer");
+                let dq = self.dequant_q4k_coalesced_k.as_ref().ok_or_else(|| {
+                    ReflexError::Other(
+                        "internal: Q4_K weight but dequantize_q4k_coalesced_kernel not loaded"
+                            .to_string(),
+                    )
+                })?;
                 unsafe {
-                    self.dequant_kernels
-                        .q4k
-                        .function
+                    dq.function
                         .clone()
                         .launch(launch_cfg, (w_ptr, &mut *buf, num_blocks as u32))
                         .map_err(|e| crate::gpu_err!(e, "quant scratch dequant launch: {e}"))?;

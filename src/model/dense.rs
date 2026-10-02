@@ -220,14 +220,19 @@ impl Model {
         } else {
             None
         };
-        let gemv_q4k_k = match arena {
-            Some(_) => Some(aot::load_kernel(
-                &device,
-                include_bytes!(env!("REFLEX_KERNEL_GEMV_Q4K")),
-                "gemv_q4k",
-                "gemv_q4k_kernel",
-            )?),
-            None => None,
+        let (gemv_q4k_k, dequant_q4k_coalesced_k) = match arena {
+            Some(_) => {
+                let mut fns = aot::load_kernel_module(
+                    &device,
+                    include_bytes!(env!("REFLEX_KERNEL_GEMV_Q4K")),
+                    "gemv_q4k",
+                    &["gemv_q4k_kernel", "dequantize_q4k_coalesced_kernel"],
+                )?;
+                let dq = fns.pop().expect("two kernels requested");
+                let gemv = fns.pop().expect("two kernels requested");
+                (Some(gemv), Some(dq))
+            }
+            None => (None, None),
         };
         let modules_ms = t_modules.elapsed().as_secs_f64() * 1000.0;
         let t_weights = std::time::Instant::now();
@@ -388,6 +393,7 @@ impl Model {
             gemv_k,
             gemv_gather_k,
             gemv_q4k_k,
+            dequant_q4k_coalesced_k,
             quant_scratch: RefCell::new(None),
             moe_gather_k,
             moe_scatter_add_k,

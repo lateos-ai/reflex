@@ -136,3 +136,34 @@ extern "C" __global__ void gemv_q4k_kernel(
         }
     }
 }
+
+// Q4_K -> f32, one CUDA block per 256-element super-block and one thread per
+// element, so consecutive threads write consecutive floats (dequant.cu's
+// `dequantize_q4k_kernel` gives each thread a whole block, which writes 1 KB
+// apart per thread and runs far below memory bandwidth). Same decode
+// expression, so the output is bit-identical to `dequantize_q4k_kernel`'s.
+// Used by the quantized-resident prefill path that feeds cuBLAS from a scratch
+// buffer (`Model::gemm`). Launch with grid = num_blocks, block = 256.
+extern "C" __global__ void dequantize_q4k_coalesced_kernel(
+    const unsigned char* __restrict__ blocks,
+    float* __restrict__ y,
+    unsigned int num_blocks
+) {
+    const unsigned int bi = blockIdx.x;
+    if (bi >= num_blocks) {
+        return;
+    }
+    const unsigned int j = threadIdx.x;          // element within the block
+    const unsigned char* block = blocks + (unsigned long long)bi * 144ull;
+    const unsigned int g = j >> 6;               // 64-element group
+    const unsigned int hi = (j >> 5) & 1u;       // high nibbles?
+    const unsigned int l = j & 31u;
+    const float d = q4k_le_f16(block);
+    const float dmin = q4k_le_f16(block + 2);
+    unsigned char sc, m;
+    q4k_scale_min(2u * g + hi, block + 4, &sc, &m);
+    const float d1 = d * (float)sc;
+    const float m1 = dmin * (float)m;
+    const unsigned char q = block[16 + 32u * g + l];
+    y[(unsigned long long)bi * 256ull + j] = d1 * (float)(hi ? (q >> 4) : (q & 0xF)) - m1;
+}
