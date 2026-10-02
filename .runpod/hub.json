@@ -8,7 +8,7 @@
     "runsOn": "GPU",
     "containerDiskInGb": 10,
     "gpuCount": 1,
-    "gpuIds": "AMPERE_16,-NVIDIA RTX 2000 Ada Generation,-NVIDIA RTX 4000 Ada Generation",
+    "gpuIds": "AMPERE_16",
     "allowedCudaVersions": ["12.4", "12.8", "13.0"],
     "env": []
   }
