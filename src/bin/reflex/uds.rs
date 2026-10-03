@@ -19,7 +19,6 @@
 #[cfg(unix)]
 mod imp {
     use reflex_engine::gguf::GgufFile;
-    use reflex_engine::model::Model;
     use reflex_engine::{diagnostics, ipc};
     use std::io::{BufReader, BufWriter};
     use std::os::unix::net::UnixListener;

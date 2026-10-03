@@ -169,6 +169,7 @@ pub fn run(args: Vec<String>) {
         )
         .unwrap_or_else(|e| exit_usage_error(&format!("generate failed: {e}")));
     let token_texts = model.decode_tokens(&token_ids);
+    crate::report_f16_activation_stats(&model);
     let vocab_size = first_logits.len();
     let logit_checksum: f64 = first_logits.iter().map(|&x| x as f64).sum();
     let top1_logit = first_logits

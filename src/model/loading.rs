@@ -21,7 +21,7 @@ pub enum WeightsDtype {
 impl WeightsDtype {
     /// What a model loads with when neither `--weights` nor `REFLEX_WEIGHTS`
     /// says otherwise.
-    pub const DEFAULT: WeightsDtype = WeightsDtype::F32;
+    pub const DEFAULT: WeightsDtype = WeightsDtype::F16;
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -72,6 +72,18 @@ impl std::fmt::Display for WeightsDtype {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// What `--weights f16` prefill fed its f16 GEMMs so far
+/// ([`Model::f16_activation_stats`]). Activations are cast to f16 for
+/// `cublasGemmEx`; f16's largest finite value is 65504, and the cast saturates
+/// there instead of producing inf.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct F16ActivationStats {
+    /// Largest |activation| cast so far (NaN if a NaN was cast).
+    pub max_abs: f32,
+    /// How many activation values exceeded 65504 and were clamped.
+    pub saturated: u32,
 }
 
 /// Options for [`Model::load_with_options`].
@@ -160,6 +172,22 @@ impl Weight {
                 "weight of shape {:?} is stored as f16, but this op reads it as f32",
                 self.shape
             )),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn dtype(&self) -> WeightsDtype {
+        match &self.data {
+            WeightData::F32(_) => WeightsDtype::F32,
+            WeightData::F16(_) => WeightsDtype::F16,
+        }
+    }
+
+    /// The whole weight as a [`WeightView`].
+    pub(super) fn full_view(&self) -> WeightView<'_> {
+        match &self.data {
+            WeightData::F32(s) => WeightView::F32(s.slice(..)),
+            WeightData::F16(s) => WeightView::F16(s.slice(..)),
         }
     }
 
@@ -469,6 +497,9 @@ pub(super) struct DequantKernels {
     pub(super) f16_roundtrip: AotKernel,
     pub(super) f32_to_f16: AotKernel,
     pub(super) f16_to_f32: AotKernel,
+    /// `cast_act_f16_kernel`: prefill activations into an f16 GEMM operand
+    /// (`Model::gemm_view`'s f16 path).
+    pub(super) cast_act_f16: AotKernel,
 }
 
 /// Loads every on-device dequant and conversion kernel, one module load per
@@ -511,6 +542,7 @@ pub(super) fn load_dequant_kernels(
             "f16_roundtrip_kernel",
             "f32_to_f16_kernel",
             "f16_to_f32_kernel",
+            "cast_act_f16_kernel",
         ],
     )?
     .into_iter();
@@ -525,6 +557,7 @@ pub(super) fn load_dequant_kernels(
         f16_roundtrip: next()?,
         f32_to_f16: next()?,
         f16_to_f32: next()?,
+        cast_act_f16: next()?,
     })
 }
 

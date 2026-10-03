@@ -1,3 +1,4 @@
+use super::prefill_batching_tests::assert_prefill_hidden_close;
 use super::*;
 use crate::gguf::GgufFile;
 use cudarc::driver::CudaDevice;
@@ -55,12 +56,7 @@ fn prefill_hybrid_batched_matches_sequential() {
         .dtoh_sync_copy(&batch_last_row)
         .expect("batch hidden dtoh failed");
     assert_eq!(seq_host.len(), batch_host.len());
-    for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
-        assert!(
-            (a - b).abs() < 1e-3,
-            "hidden[{i}]: sequential={a}, batched={b}"
-        );
-    }
+    assert_prefill_hidden_close(&seq_host, &batch_host, model.weights_dtype(), "hidden");
 
     let eps = h.attn_cfg.rmsnorm_eps;
     let seq_argmax = model

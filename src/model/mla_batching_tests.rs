@@ -1,3 +1,4 @@
+use super::prefill_batching_tests::assert_prefill_hidden_close;
 use super::*;
 use crate::gguf::GgufFile;
 use cudarc::driver::CudaDevice;
@@ -120,12 +121,7 @@ fn prefill_mla_batched_matches_sequential() {
         .dtoh_sync_copy(&batch_last_row)
         .expect("batch hidden dtoh failed");
     assert_eq!(seq_host.len(), batch_host.len());
-    for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
-        assert!(
-            (a - b).abs() < 1e-3,
-            "hidden[{i}]: sequential={a}, batched={b}"
-        );
-    }
+    assert_prefill_hidden_close(&seq_host, &batch_host, model.weights_dtype(), "hidden");
 
     let eps = m.cfg.rmsnorm_eps;
     let seq_argmax = model
@@ -198,12 +194,7 @@ fn prefill_mla_batched_matches_sequential_real_moe_checkpoint() {
         .dtoh_sync_copy(&batch_last_row)
         .expect("batch hidden dtoh failed");
     assert_eq!(seq_host.len(), batch_host.len());
-    for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
-        assert!(
-            (a - b).abs() < 1e-3,
-            "hidden[{i}]: sequential={a}, batched={b}"
-        );
-    }
+    assert_prefill_hidden_close(&seq_host, &batch_host, model.weights_dtype(), "hidden");
 
     let eps = m.cfg.rmsnorm_eps;
     let seq_argmax = model
@@ -271,10 +262,10 @@ fn prefill_mla_batched_import_kv_resume_matches_sequential() {
         .dtoh_sync_copy(&batch_last_row)
         .expect("batch hidden dtoh failed");
     assert_eq!(seq_host.len(), batch_host.len());
-    for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
-        assert!(
-            (a - b).abs() < 1e-3,
-            "resumed hidden[{i}]: sequential={a}, batched={b}"
-        );
-    }
+    assert_prefill_hidden_close(
+        &seq_host,
+        &batch_host,
+        model.weights_dtype(),
+        "resumed hidden",
+    );
 }

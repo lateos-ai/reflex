@@ -62,6 +62,33 @@ pub fn make_rng(seed: Option<u64>) -> StdRng {
     }
 }
 
+/// `REFLEX_TOP2_TRACE=1`: a numerics diagnostic that prints, to stderr, the
+/// two highest logits of every generated position (`REFLEX_TOP2 top1_id=..
+/// top1_logit=.. top2_id=.. top2_logit=..`, one line per position, in order).
+/// Comparing two runs' traces gives the margin the greedy choice had where they
+/// diverge, e.g. `--weights f32` against `--weights f16`.
+fn top2_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("REFLEX_TOP2_TRACE").is_ok_and(|v| !v.is_empty() && v != "0"))
+}
+
+fn trace_top2(logits: &[f32]) {
+    let (mut top1, mut top2) = ((0usize, f32::NEG_INFINITY), (0usize, f32::NEG_INFINITY));
+    for (i, &v) in logits.iter().enumerate() {
+        if v > top1.1 {
+            top2 = top1;
+            top1 = (i, v);
+        } else if v > top2.1 {
+            top2 = (i, v);
+        }
+    }
+    eprintln!(
+        "REFLEX_TOP2 top1_id={} top1_logit={} top2_id={} top2_logit={}",
+        top1.0, top1.1, top2.0, top2.1
+    );
+}
+
 /// Samples one token id from `logits` given `params`. Greedy
 /// (`params.is_greedy()`) delegates straight to
 /// [`Model::argmax`](crate::model::Model::argmax) -- no RNG draw, no
@@ -80,6 +107,9 @@ pub fn sample(
         return Err(ReflexError::InvalidInput(
             "sample: logits must not be empty".to_string(),
         ));
+    }
+    if top2_trace_enabled() {
+        trace_top2(logits);
     }
     if params.is_greedy() {
         return crate::model::Model::argmax(logits);
