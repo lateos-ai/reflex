@@ -316,17 +316,17 @@ impl Model {
             "silu_and_mul",
             "silu_and_mul_kernel",
         )?;
-        let gemv_k = aot::load_kernel(
+        let [gemv_k, gemv_f16_k] = load_kernel_pair(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_GEMV")),
             "gemv",
-            "gemv_kernel",
+            ["gemv_kernel", "gemv_f16_kernel"],
         )?;
-        let gemv_gather_k = aot::load_kernel(
+        let [gemv_gather_k, gemv_gather_f16_k] = load_kernel_pair(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_GEMV_GATHER")),
             "gemv_gather",
-            "gemv_gather_kernel",
+            ["gemv_gather_kernel", "gemv_gather_f16_kernel"],
         )?;
         let attn_k = aot::load_kernel(
             &device,
@@ -538,7 +538,9 @@ impl Model {
             rope_norm_batch_k: None,
             silu_k,
             gemv_k,
+            gemv_f16_k,
             gemv_gather_k,
+            gemv_gather_f16_k,
             moe_gather_k,
             moe_scatter_add_k,
             attn_k,

@@ -428,7 +428,7 @@ impl FormatKernels {
     /// The kernel for `ggml_type` with its block size in bytes and elements,
     /// or `None` for a type with no on-device kernel (F32/F16/BF16, which go
     /// through the host fallback).
-    fn for_type(&self, ggml_type: GgmlType) -> Option<(&AotKernel, usize, usize)> {
+    pub(super) fn for_type(&self, ggml_type: GgmlType) -> Option<(&AotKernel, usize, usize)> {
         Some(match ggml_type {
             GgmlType::Q4K => (&self.q4k, Q4K_BLOCK_BYTES, QK_K),
             GgmlType::Q5K => (&self.q5k, Q5K_BLOCK_BYTES, QK_K),
