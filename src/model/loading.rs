@@ -233,6 +233,8 @@ pub(super) struct DequantKernels {
     pub(super) iq1s: AotKernel,
     pub(super) iq1m: AotKernel,
     pub(super) iq4xs: AotKernel,
+    /// `f16_roundtrip_kernel` (`kernels_cuda/convert.cu`), see [`f16_roundtrip_enabled`].
+    pub(super) f16_roundtrip: AotKernel,
 }
 
 /// Loads every on-device dequant kernel from the AOT-compiled `dequant`
@@ -331,7 +333,83 @@ pub(super) fn load_dequant_kernels(
         iq4xs: fns
             .next()
             .ok_or_else(|| ReflexError::Other("missing dequantize_iq4xs_kernel".to_string()))?,
+        f16_roundtrip: aot::load_kernel(
+            device,
+            include_bytes!(env!("REFLEX_KERNEL_CONVERT")),
+            "convert",
+            "f16_roundtrip_kernel",
+        )?,
     })
+}
+
+/// Whether weight `name` (GGUF shape `shape`) is a matrix that only the
+/// matmul kernels (`gemv`/`gemm` and their per-expert/per-head/gather
+/// variants) read. These are the tensors `REFLEX_F16_ROUNDTRIP` rounds.
+/// Everything else stays `f32`: 1-D norms, biases and decay vectors, the
+/// Gated DeltaNet `ssm_conv1d` kernel (2-D, but read by the conv kernel), and
+/// the MoE routers (`ffn_gate_inp`, `ffn_gate_inp_shexp`), which are tiny and
+/// feed a discrete top-k choice where a rounding-induced near-tie flip would
+/// change which experts run.
+pub(super) fn is_matrix_weight(name: &str, shape: &[u64]) -> bool {
+    if shape.len() < 2 {
+        return false;
+    }
+    let base = name.strip_suffix(".weight").unwrap_or(name);
+    let suffix = base.rsplit('.').next().unwrap_or(base);
+    !matches!(
+        suffix,
+        "ssm_conv1d" | "ffn_gate_inp" | "ffn_gate_inp_shexp" | "token_embd"
+    )
+}
+
+/// `REFLEX_F16_ROUNDTRIP=1`: a numerics probe that rounds every matrix weight
+/// (see [`is_matrix_weight`]) to f16 and back right after its f32 dequant, so
+/// a run measures what f16 weight storage alone does to the output.
+pub(super) fn f16_roundtrip_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("REFLEX_F16_ROUNDTRIP").is_ok_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
+/// Launches `f16_roundtrip_kernel` over all of `data`, on the default stream
+/// (the same one the dequant kernel that produced `data` ran on).
+pub(super) fn f16_roundtrip_in_place(
+    kernels: &DequantKernels,
+    data: &mut CudaSlice<f32>,
+) -> Result<(), ReflexError> {
+    let n = data.len() as u64;
+    let threads = 256u32;
+    let blocks = (n.div_ceil(threads as u64) as u32).max(1);
+    let cfg = LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        kernels
+            .f16_roundtrip
+            .function
+            .clone()
+            .launch(cfg, (data, n))
+            .map_err(|e| crate::gpu_err!(e, "f16_roundtrip launch: {e}"))
+    }
+}
+
+/// [`dequantize_tensor_to_device`] for a matrix weight: also applies the
+/// `REFLEX_F16_ROUNDTRIP` probe when it's on.
+pub(super) fn dequantize_matrix_to_device(
+    pipeline: &mut WeightLoadPipeline,
+    kernels: &DequantKernels,
+    ggml_type: GgmlType,
+    bytes: &[u8],
+    element_count: u64,
+) -> Result<CudaSlice<f32>, ReflexError> {
+    let mut data = dequantize_tensor_to_device(pipeline, kernels, ggml_type, bytes, element_count)?;
+    if f16_roundtrip_enabled() {
+        f16_roundtrip_in_place(kernels, &mut data)?;
+    }
+    Ok(data)
 }
 
 /// One pinned (page-locked) host staging buffer for [`WeightLoadPipeline`],
@@ -807,7 +885,12 @@ pub(super) fn load_weight_device(
         .tensor_info(name)
         .ok_or_else(|| crate::reflex_err!(Gguf, "missing weight '{name}'"))?;
     let bytes = file.tensor_bytes(info)?;
-    let data = dequantize_tensor_to_device(
+    let to_device = if is_matrix_weight(name, &info.shape) {
+        dequantize_matrix_to_device
+    } else {
+        dequantize_tensor_to_device
+    };
+    let data = to_device(
         pipeline,
         kernels,
         info.ggml_type,
