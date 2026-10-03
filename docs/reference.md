@@ -5,7 +5,7 @@ How to build and run Reflex, and the contracts its outputs follow. The
 measurements; [DEVELOPMENT.md](DEVELOPMENT.md) is for contributors.
 
 Contents: [Subcommands](#subcommands) · [Build features](#build-features) ·
-[Kernel build modes](#kernel-build-modes) · [Examples](#examples) ·
+[Kernel build modes](#kernel-build-modes) · [Weight storage](#weight-storage) · [Examples](#examples) ·
 [Context-length limit](#context-length-limit) · [`--json` output contract](#--json-output-contract) ·
 [Error categories](#error-categories) · [Host-side building blocks](#host-side-building-blocks) ·
 [Docker](#docker) · [Runpod](#runpod) · [Kubernetes](#kubernetes)
@@ -95,6 +95,38 @@ generation. `reflex doctor` reports the build's `kernel_format` and, for a fatbi
 whether the detected GPU gets a native (zero-JIT) image or falls back to the embedded
 PTX.
 
+## Weight storage
+
+Matrix weights are dequantized once at load and stored on the GPU as `f16` by default:
+about 2 bytes per parameter of VRAM, and half the weight bytes read per decoded token.
+`f32` keeps the exact reference values at about 4 bytes per parameter. Norms, MoE
+routers, activations and the KV cache are `f32` either way.
+
+| how | applies to |
+|---|---|
+| `--weights f16` / `--weights f32` | `generate`, `system1`, `bench`, `check`, `stdio`, `uds`; wins over the env var |
+| `REFLEX_WEIGHTS=f16` / `f32` | the same subcommands, the C FFI's `reflex_load` and Python's `PyModel` |
+| `PyModel(path, weights="f32")` | the Python bindings |
+| `--weights` on `reflex-openai-adapter` | passed through to its `reflex stdio` child |
+
+With neither set the default is `f16`, except `reflex check`, which defaults to `f32`
+because its byte-exact comparison is defined on the exact dequantized weights. Every
+model-loading subcommand reports the mode as an additive `weights_dtype=` field on its
+`REFLEX_*_OK` lines (and in `--json`), and on `stdio`/`uds`'s `READY` line.
+
+f16 decode reads f16 weights and accumulates in f32. Prefill casts each GEMM's activations
+to f16 for `cublasGemmEx`. f16's largest finite value is 65504; the cast saturates there
+instead of producing inf. `generate`/`system1`/`bench`/`check` print a warning on stderr
+if anything was clamped. `REFLEX_F16_ACT_STATS=1` prints `REFLEX_F16_ACT_STATS max_abs=..
+saturated=..` after every run. If you see the warning, use `--weights f32`.
+
+LoRA adapters given with `--lora` are merged in f32: their target weights load as `f32`,
+take the delta, and are rounded to f16 once.
+
+Diagnostics: `REFLEX_F16_ROUNDTRIP=1` with `--weights f32` rounds matrix weights to f16
+and back while keeping every f32 kernel, to separate weight rounding from the f16 kernels.
+`REFLEX_TOP2_TRACE=1` prints the top two logits of every generated position.
+
 ## Examples
 
 ### Download a model from Hugging Face, then run a System1 test
@@ -180,7 +212,8 @@ objects also carry a **`schema_version`** field so a consumer can detect a shape
 {"schema_version":"1.0.0","process_start_to_first_token_ms":456.4,"gguf_open_ms":37.3,...}
 ```
 
-- **Current version: `1.0.0`** (`SCHEMA_VERSION` in `src/cli_output.rs`).
+- **Current version: `1.1.0`** (`SCHEMA_VERSION` in `src/cli_output.rs`). 1.1.0 added
+  `weights_dtype` to the `generate`, `system1`, `bench` and `check` result objects.
 - The four versioned objects are `generate`'s `REFLEX_GENERATE_OK` result, `system1`'s
   `REFLEX_SYSTEM1_OK` result, `smoke`'s `REFLEX_SMOKE_OK` result, and each additive
   `REFLEX_PHASE_OK` phase object. Per-item lines (`REFLEX_SYSTEM1_CANDIDATE_OK`,
