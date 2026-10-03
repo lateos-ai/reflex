@@ -28,21 +28,25 @@ mod imp {
         let mut gguf_path: Option<String> = None;
         let mut socket_path: Option<String> = None;
         let mut lora_path: Option<String> = None;
+        let mut weights_flag: Option<String> = None;
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--lora" => lora_path = Some(args.next().expect("--lora requires a file path")),
+                "--weights" => {
+                    weights_flag = Some(args.next().expect("--weights requires `f16` or `f32`"))
+                }
                 _ if gguf_path.is_none() => gguf_path = Some(arg),
                 _ if socket_path.is_none() => socket_path = Some(arg),
                 other => panic!("unexpected argument: {other}"),
             }
         }
         let gguf_path = gguf_path.unwrap_or_else(|| {
-            panic!("usage: reflex uds <path-to-gguf> <socket-path> [--lora <adapter.gguf>]")
+            panic!("usage: reflex uds <path-to-gguf> <socket-path> [--lora <adapter.gguf>] [--weights f16|f32]")
         });
         let socket_path = socket_path.unwrap_or_else(|| {
-            panic!("usage: reflex uds <path-to-gguf> <socket-path> [--lora <adapter.gguf>]")
+            panic!("usage: reflex uds <path-to-gguf> <socket-path> [--lora <adapter.gguf>] [--weights f16|f32]")
         });
 
         let file = GgufFile::open(&gguf_path)
@@ -51,7 +55,14 @@ mod imp {
         if let Ok(diag) = diagnostics::probe(&device) {
             eprintln!("{diag}");
         }
-        let mut model = Model::load(device, &file).expect("failed to load model");
+        let mut model = crate::load_model(
+            device,
+            &file,
+            weights_flag.as_deref(),
+            reflex_engine::model::WeightsDtype::DEFAULT,
+            lora_path.as_deref(),
+        )
+        .expect("failed to load model");
 
         if let Some(lora_path) = &lora_path {
             let applied = model
@@ -72,7 +83,10 @@ mod imp {
         }
         let listener = UnixListener::bind(&socket_path)
             .unwrap_or_else(|e| panic!("failed to bind UDS at {socket_path:?}: {e}"));
-        eprintln!("REFLEX_UDS_READY path={gguf_path:?} socket={socket_path:?}");
+        eprintln!(
+            "REFLEX_UDS_READY path={gguf_path:?} socket={socket_path:?} weights_dtype={}",
+            model.weights_dtype()
+        );
 
         for stream in listener.incoming() {
             match stream {

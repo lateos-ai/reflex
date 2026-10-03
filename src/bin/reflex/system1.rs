@@ -52,7 +52,7 @@ use crate::phase::{energy_suffix, print_phase_report};
 use reflex_engine::diagnostics;
 use reflex_engine::energy;
 use reflex_engine::gguf::GgufFile;
-use reflex_engine::model::{Model, System1Candidate};
+use reflex_engine::model::System1Candidate;
 use std::time::Instant;
 
 fn print_lora_ok(json: bool, path: &str, tensors_applied: usize) {
@@ -78,6 +78,7 @@ pub fn run(args: Vec<String>) {
     let mut candidate_texts: Vec<String> = Vec::new();
     let mut temperature: f32 = 1.0;
     let mut lora_path: Option<String> = None;
+    let mut weights_flag: Option<String> = None;
     let mut json = false;
 
     let mut args = args.into_iter();
@@ -86,6 +87,9 @@ pub fn run(args: Vec<String>) {
             "--json" => json = true,
             "--candidate" => candidate_texts.push(args.next().expect("--candidate requires text")),
             "--lora" => lora_path = Some(args.next().expect("--lora requires a file path")),
+            "--weights" => {
+                weights_flag = Some(args.next().expect("--weights requires `f16` or `f32`"))
+            }
             "--temperature" => {
                 let raw = args.next().expect("--temperature requires a number");
                 temperature = raw.parse().unwrap_or_else(|_| {
@@ -100,7 +104,7 @@ pub fn run(args: Vec<String>) {
     let gguf_path = gguf_path.unwrap_or_else(|| {
         panic!(
             "usage: reflex system1 <path-to-gguf> <prompt> --candidate <text> [--candidate <text> ...] \
-             [--temperature T] [--lora <adapter.gguf>]"
+             [--temperature T] [--lora <adapter.gguf>] [--weights f16|f32]"
         )
     });
     let prompt = prompt.unwrap_or_else(|| panic!("a prompt is required"));
@@ -118,7 +122,15 @@ pub fn run(args: Vec<String>) {
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }
-    let mut model = Model::load(device, &file).expect("failed to load model");
+    let mut model = crate::load_model(
+        device,
+        &file,
+        weights_flag.as_deref(),
+        reflex_engine::model::WeightsDtype::DEFAULT,
+        lora_path.as_deref(),
+    )
+    .expect("failed to load model");
+    let weights_dtype = model.weights_dtype().as_str();
     let model_load_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms - cuda_init_ms;
     let e_model_load = sampler.measure();
     let model_ready_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -207,12 +219,13 @@ pub fn run(args: Vec<String>) {
             entropy: response.entropy,
             joules: energy_measurement.as_ref().map(|m| m.joules),
             energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
+            weights_dtype,
         });
         #[cfg(not(feature = "json-output"))]
         json_output_unavailable();
     } else {
         println!(
-            "REFLEX_SYSTEM1_OK process_start_to_result_ms={process_start_to_result_ms:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} num_candidates={} best_idx={best_idx} best_text={:?} entropy={:.6}{}",
+            "REFLEX_SYSTEM1_OK process_start_to_result_ms={process_start_to_result_ms:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} num_candidates={} best_idx={best_idx} best_text={:?} entropy={:.6}{} weights_dtype={weights_dtype}",
             response.results.len(),
             best.text,
             response.entropy,

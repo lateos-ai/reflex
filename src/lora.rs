@@ -103,6 +103,20 @@ pub struct LoraAdapter {
     pub targets: Vec<LoraTarget>,
 }
 
+/// The base-tensor names an adapter targets (`blk.3.attn_q.weight`, ...),
+/// read from the GGUF header only: no tensor data is touched and no delta is
+/// computed. `Model::load_with_options` uses this to load those base weights
+/// as `f32`, so [`load`]'s deltas are added before any f16 rounding.
+pub fn target_names(path: &Path) -> Result<Vec<String>, ReflexError> {
+    let file = GgufFile::open(path)
+        .map_err(|e| crate::reflex_err!(Io, "failed to open LoRA adapter {path:?}: {e}"))?;
+    Ok(file
+        .tensors
+        .iter()
+        .filter_map(|info| info.name.strip_suffix(".lora_a").map(str::to_string))
+        .collect())
+}
+
 /// Parses `path` as a llama.cpp-format LoRA adapter GGUF and computes every
 /// targeted tensor's delta. Pure host-side work (dequantizes `lora_a`/
 /// `lora_b` via the existing `dequant::dequantize` host path -- these are

@@ -88,6 +88,7 @@ use self::dense::*;
 use self::hybrid::*;
 use self::kernels::*;
 use self::loading::*;
+pub use self::loading::{LoadOptions, WeightsDtype};
 use self::mla::*;
 use crate::error::ReflexError;
 
@@ -210,6 +211,9 @@ pub struct Model {
     dequant_pipeline: RefCell<WeightLoadPipeline>,
     output_norm: Weight,
     lm_head: LmHead,
+    /// Element type of the matrix weights (`LoadOptions::weights`). The tied
+    /// LM head's lazy upload and System1's compact row gather follow it too.
+    weights_dtype: WeightsDtype,
     tokenizer: Tokenizer,
     /// `Some` iff this is a Qwen3.5 hybrid model (see `Self::load_hybrid`);
     /// `cfg`/`layers`/`expert_used_count` above are unused garbage in that
@@ -339,6 +343,13 @@ impl Model {
         // `&self` method, would) while that borrow is still live.
         let device = self.device.clone();
         let add_fn = self.add_k.function.clone();
+        let to_f16 = AotKernel {
+            function: self.dequant_kernels.f32_to_f16.function.clone(),
+        };
+        let to_f32 = AotKernel {
+            function: self.dequant_kernels.f16_to_f32.function.clone(),
+        };
+        let target_dtype = self.weights_dtype;
 
         let mut applied = 0usize;
         for target in &adapter.targets {
@@ -377,7 +388,19 @@ impl Model {
                 ));
             }
 
-            let n = weight.data.len() as u32;
+            // The add always happens in f32. A target loaded as f32 for this
+            // (`LoadOptions::lora_adapter`) is merged, then rounded to f16
+            // once. One that is already f16 (an adapter the load wasn't told
+            // about) is widened exactly, merged, and rounded again.
+            let data = &mut weight.data;
+            if let WeightData::F16(w16) = data {
+                let widened = f16_to_f32_on_device(&device, &to_f32, w16)?;
+                *data = WeightData::F32(widened);
+            }
+            let WeightData::F32(w32) = data else {
+                unreachable!("widened to f32 above")
+            };
+            let n = w32.len() as u32;
             let threads = 256u32;
             let blocks = n.div_ceil(threads).max(1);
             let launch_cfg = LaunchConfig {
@@ -388,10 +411,14 @@ impl Model {
             unsafe {
                 add_fn
                     .clone()
-                    .launch(launch_cfg, (&mut weight.data, &delta_dev, n))
+                    .launch(launch_cfg, (&mut *w32, &delta_dev, n))
                     .map_err(|e| {
                         crate::gpu_err!(e, "LoRA add launch for '{}': {e}", target.name)
                     })?;
+            }
+            if target_dtype == WeightsDtype::F16 {
+                let narrowed = f32_to_f16_on_device(&device, &to_f16, w32)?;
+                *data = WeightData::F16(narrowed);
             }
             applied += 1;
         }
@@ -482,7 +509,26 @@ impl Model {
         }
     }
 
+    /// [`Self::load_with_options`] with the weights dtype from `REFLEX_WEIGHTS`
+    /// (or [`WeightsDtype::DEFAULT`]) and no LoRA adapter.
     pub fn load(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, ReflexError> {
+        let opts = LoadOptions {
+            weights: WeightsDtype::resolve(None)?,
+            lora_adapter: None,
+        };
+        Self::load_with_options(device, file, &opts)
+    }
+
+    /// Loads `file` with matrix weights stored as `opts.weights`. When
+    /// `opts.lora_adapter` names the adapter the caller is about to pass to
+    /// [`Self::apply_lora`], the weights it targets are loaded as `f32`, so the
+    /// merge happens in f32 and is rounded to f16 once, afterwards.
+    pub fn load_with_options(
+        device: Arc<CudaDevice>,
+        file: &GgufFile,
+        opts: &LoadOptions,
+    ) -> Result<Self, ReflexError> {
+        let policy = WeightPolicy::from_options(opts)?;
         diagnostics::check_kernel_compute_capability(&device)?;
         let architecture = file
             .metadata
@@ -490,13 +536,18 @@ impl Model {
             .and_then(GgufValue::as_str)
             .unwrap_or("");
         if architecture == "qwen35" || architecture == "qwen35moe" {
-            return Self::load_hybrid(device, file);
+            return Self::load_hybrid(device, file, &policy);
         }
         if architecture == "deepseek2" {
-            return Self::load_mla(device, file);
+            return Self::load_mla(device, file, &policy);
         }
 
-        Self::load_dense(device, file)
+        Self::load_dense(device, file, &policy)
+    }
+
+    /// The element type this model's matrix weights are stored in.
+    pub fn weights_dtype(&self) -> WeightsDtype {
+        self.weights_dtype
     }
 
     /// Builds the `Tokenizer` and the cuBLAS handle (with `CUBLAS_PEDANTIC_MATH`
@@ -860,7 +911,7 @@ impl Model {
         hidden_size: usize,
         eps: f32,
     ) -> Result<Vec<f32>, ReflexError> {
-        let normed = self.rmsnorm(hidden, &self.output_norm.data, 1, hidden_size, eps)?;
+        let normed = self.rmsnorm(hidden, self.output_norm.f32()?, 1, hidden_size, eps)?;
         let logits_dev = self.gemv(&normed, self.lm_head_resident()?)?;
         self.device
             .dtoh_sync_copy(&logits_dev)
@@ -895,6 +946,7 @@ impl Model {
                 let data = dequantize_matrix_to_device(
                     &mut self.dequant_pipeline.borrow_mut(),
                     &self.dequant_kernels,
+                    self.weights_dtype,
                     self.token_embd.ggml_type,
                     &self.token_embd.raw,
                     element_count,
@@ -950,17 +1002,26 @@ impl Model {
         for &r in row_indices {
             compact.extend_from_slice(&self.token_embd.row(r)?);
         }
-        if f16_roundtrip_enabled() {
-            for v in &mut compact {
-                *v = half::f16::from_f32(*v).to_f32();
+        // The same element values the fully resident LM head would hold, so a
+        // System1 score doesn't depend on whether something forced it first.
+        let upload_err = |e| crate::gpu_err!(e, "gemv_gather_lm_head upload compact rows: {e}");
+        let data = match self.weights_dtype {
+            WeightsDtype::F16 => {
+                let compact: Vec<half::f16> =
+                    compact.into_iter().map(half::f16::from_f32).collect();
+                WeightData::F16(self.device.htod_sync_copy(&compact).map_err(upload_err)?)
             }
-        }
-        let dev_compact = self
-            .device
-            .htod_sync_copy(&compact)
-            .map_err(|e| crate::gpu_err!(e, "gemv_gather_lm_head upload compact rows: {e}"))?;
+            WeightsDtype::F32 => {
+                if f16_roundtrip_enabled() {
+                    for v in &mut compact {
+                        *v = half::f16::from_f32(*v).to_f32();
+                    }
+                }
+                WeightData::F32(self.device.htod_sync_copy(&compact).map_err(upload_err)?)
+            }
+        };
         let compact_w = Weight {
-            data: dev_compact,
+            data,
             shape: vec![hidden_size as u64, row_indices.len() as u64],
         };
         let trivial_indices: Vec<u32> = (0..row_indices.len() as u32).collect();

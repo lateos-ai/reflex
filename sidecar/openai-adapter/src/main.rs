@@ -8,7 +8,7 @@
 //! lives in its own crate/process rather than inside the core engine.
 //!
 //! Usage: `reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host
-//! <addr>] [--port <port>] [--lora <adapter.gguf>] [--model-name <name>]
+//! <addr>] [--port <port>] [--lora <adapter.gguf>] [--weights f16|f32] [--model-name <name>]
 //! [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>]
 //! [--owned-by <name>] [--pricing-prompt <str>] [--pricing-completion <str>]
 //! [--region <str>] [--max-tokens-cap <n>] [--max-prompt-bytes <n>]
@@ -109,6 +109,9 @@ struct Opts {
     gguf_path: String,
     reflex_bin: String,
     lora_path: Option<String>,
+    /// Passed through to the child as `reflex stdio --weights <dtype>`; `None`
+    /// leaves it to the child's own default (or its inherited `REFLEX_WEIGHTS`).
+    weights: Option<String>,
     host: String,
     port: u16,
     model_label: Option<String>,
@@ -127,6 +130,7 @@ impl Opts {
         let mut gguf_path: Option<String> = None;
         let mut reflex_bin = "reflex".to_string();
         let mut lora_path: Option<String> = None;
+        let mut weights: Option<String> = None;
         let mut host = "127.0.0.1".to_string();
         let mut port: u16 = 8000;
         let mut model_label: Option<String> = None;
@@ -147,6 +151,13 @@ impl Opts {
                 }
                 "--lora" => {
                     lora_path = Some(args.next().ok_or("--lora requires a file path")?);
+                }
+                "--weights" => {
+                    let raw = args.next().ok_or("--weights requires `f16` or `f32`")?;
+                    if raw != "f16" && raw != "f32" {
+                        return Err(format!("--weights must be `f16` or `f32`, got {raw:?}"));
+                    }
+                    weights = Some(raw);
                 }
                 "--host" => {
                     host = args.next().ok_or("--host requires an address")?;
@@ -214,7 +225,7 @@ impl Opts {
 
         let gguf_path = gguf_path.ok_or(
             "usage: reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host <addr>] \
-             [--port <port>] [--lora <adapter.gguf>] [--model-name <name>] \
+             [--port <port>] [--lora <adapter.gguf>] [--weights f16|f32] [--model-name <name>] \
              [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>] \
              [--owned-by <name>] [--pricing-prompt <str>] [--pricing-completion <str>] \
              [--region <str>] [--max-tokens-cap <n>] [--max-prompt-bytes <n>] \
@@ -238,6 +249,7 @@ impl Opts {
             gguf_path,
             reflex_bin,
             lora_path,
+            weights,
             host,
             port,
             model_label,
@@ -291,6 +303,7 @@ async fn main() {
         &opts.reflex_bin,
         &opts.gguf_path,
         opts.lora_path.as_deref(),
+        opts.weights.as_deref(),
         opts.limits.max_queue_depth,
     )
     .await

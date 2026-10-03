@@ -106,6 +106,8 @@ pub struct GenerateResultJson {
     pub joules: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub energy_method: Option<&'static str>,
+    /// `f16` or `f32`: the element type matrix weights were stored in.
+    pub weights_dtype: &'static str,
 }
 
 /// `REFLEX_SYSTEM1_CANDIDATE_OK`.
@@ -135,6 +137,8 @@ pub struct System1ResultJson {
     pub joules: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub energy_method: Option<&'static str>,
+    /// `f16` or `f32`: the element type matrix weights were stored in.
+    pub weights_dtype: &'static str,
 }
 
 /// `REFLEX_SMOKE_OK`.
@@ -173,6 +177,8 @@ pub struct BenchVramJson {
     pub model_resident_mib: usize,
     pub free_before_load_mib: usize,
     pub free_after_load_mib: usize,
+    /// `f16` or `f32`: the element type matrix weights were stored in.
+    pub weights_dtype: &'static str,
 }
 
 /// `REFLEX_BENCH_WARM_OK`/`REFLEX_BENCH_SYSTEM1_OK` (identical shape, `kind`
@@ -188,6 +194,8 @@ pub struct BenchStatsJson {
     pub p99_ms: f64,
     pub min_ms: f64,
     pub max_ms: f64,
+    /// `f16` or `f32`: the element type matrix weights were stored in.
+    pub weights_dtype: &'static str,
 }
 
 /// `REFLEX_BENCH_THROUGHPUT_OK`.
@@ -199,6 +207,8 @@ pub struct BenchThroughputJson {
     pub iters: usize,
     pub tokens_per_sec: f64,
     pub ms_per_token: f64,
+    /// `f16` or `f32`: the element type matrix weights were stored in.
+    pub weights_dtype: &'static str,
 }
 
 /// `REFLEX_BENCH_ENERGY_OK`.
@@ -209,6 +219,8 @@ pub struct BenchEnergyJson {
     pub total_joules: f64,
     pub joules_per_forward_pass: f64,
     pub energy_method: &'static str,
+    /// `f16` or `f32`: the element type matrix weights were stored in.
+    pub weights_dtype: &'static str,
 }
 
 /// `REFLEX_CHECK` plus its outcome -- see this module's doc comment's
@@ -221,6 +233,8 @@ pub struct CheckJson {
     pub logit_checksum: f64,
     pub top1_logit: f32,
     pub vocab_size: usize,
+    /// `f16` or `f32`: the element type matrix weights were stored in.
+    pub weights_dtype: &'static str,
     /// `None` when `--reference` wasn't passed (nothing to compare against).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pass: Option<bool>,

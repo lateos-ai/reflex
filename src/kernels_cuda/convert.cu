@@ -17,3 +17,30 @@ extern "C" __global__ void f16_roundtrip_kernel(float* __restrict__ w, unsigned 
         w[i] = __half2float(__float2half_rn(w[i]));
     }
 }
+
+// `out[i] = (f16)in[i]`: narrows a LoRA merge target, merged in f32, to the
+// f16 it is stored as.
+extern "C" __global__ void f32_to_f16_kernel(
+    const float* __restrict__ in,
+    __half* __restrict__ out,
+    unsigned long long n
+) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __float2half_rn(in[i]);
+    }
+}
+
+// `out[i] = (f32)in[i]`, exact. Widens an f16 weight back to f32 so a LoRA
+// adapter applied after load is still added in f32 (`Model::apply_lora` on a
+// weight that was not loaded in f32 for it).
+extern "C" __global__ void f16_to_f32_kernel(
+    const __half* __restrict__ in,
+    float* __restrict__ out,
+    unsigned long long n
+) {
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __half2float(in[i]);
+    }
+}

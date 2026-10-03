@@ -8,27 +8,31 @@
 //! subprocess orchestration (MCP tool integrations, shell agents, other-language
 //! callers that don't want a network socket).
 //!
-//! Usage: `reflex stdio <path-to-gguf> [--lora <adapter.gguf>]`
+//! Usage: `reflex stdio <path-to-gguf> [--lora <adapter.gguf>] [--weights f16|f32]`
 //! (requires `cargo build --features ipc`)
 
 use reflex_engine::gguf::GgufFile;
-use reflex_engine::model::Model;
 use reflex_engine::{diagnostics, ipc};
 
 pub fn run(args: Vec<String>) {
     let mut gguf_path: Option<String> = None;
     let mut lora_path: Option<String> = None;
+    let mut weights_flag: Option<String> = None;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--lora" => lora_path = Some(args.next().expect("--lora requires a file path")),
+            "--weights" => {
+                weights_flag = Some(args.next().expect("--weights requires `f16` or `f32`"))
+            }
             _ if gguf_path.is_none() => gguf_path = Some(arg),
             other => panic!("unexpected argument: {other}"),
         }
     }
-    let gguf_path = gguf_path
-        .unwrap_or_else(|| panic!("usage: reflex stdio <path-to-gguf> [--lora <adapter.gguf>]"));
+    let gguf_path = gguf_path.unwrap_or_else(|| {
+        panic!("usage: reflex stdio <path-to-gguf> [--lora <adapter.gguf>] [--weights f16|f32]")
+    });
 
     let file =
         GgufFile::open(&gguf_path).unwrap_or_else(|e| panic!("failed to open {gguf_path}: {e}"));
@@ -36,7 +40,14 @@ pub fn run(args: Vec<String>) {
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }
-    let mut model = Model::load(device, &file).expect("failed to load model");
+    let mut model = crate::load_model(
+        device,
+        &file,
+        weights_flag.as_deref(),
+        reflex_engine::model::WeightsDtype::DEFAULT,
+        lora_path.as_deref(),
+    )
+    .expect("failed to load model");
 
     if let Some(lora_path) = &lora_path {
         let applied = model
@@ -45,6 +56,9 @@ pub fn run(args: Vec<String>) {
         eprintln!("REFLEX_STDIO_LORA_OK path={lora_path:?} tensors_applied={applied}");
     }
 
-    eprintln!("REFLEX_STDIO_READY path={gguf_path:?}");
+    eprintln!(
+        "REFLEX_STDIO_READY path={gguf_path:?} weights_dtype={}",
+        model.weights_dtype()
+    );
     ipc::run_stdio_loop(&model).unwrap_or_else(|e| panic!("{e}"));
 }

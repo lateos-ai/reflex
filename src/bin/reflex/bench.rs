@@ -39,7 +39,7 @@ use crate::phase::{phase_energy_delta, print_phase_ok};
 use reflex_engine::diagnostics;
 use reflex_engine::energy;
 use reflex_engine::gguf::GgufFile;
-use reflex_engine::model::{Model, System1Candidate};
+use reflex_engine::model::System1Candidate;
 use std::time::Instant;
 
 /// Approximate token-count buckets this bench reports latency for. Built by
@@ -86,6 +86,7 @@ fn print_stats(
     warmup: usize,
     iters: usize,
     mut samples_ms: Vec<f64>,
+    weights_dtype: &'static str,
 ) {
     // `kind` is only read from the `#[cfg(feature = "json-output")]` branch
     // below -- referenced here too so a build without that feature doesn't
@@ -100,7 +101,7 @@ fn print_stats(
     if !json {
         println!(
             "{prefix} prompt_tokens={prompt_tokens} warmup={warmup} iters={iters} \
-             p50_ms={p50_ms:.3} p90_ms={p90_ms:.3} p99_ms={p99_ms:.3} min_ms={min_ms:.3} max_ms={max_ms:.3}"
+             p50_ms={p50_ms:.3} p90_ms={p90_ms:.3} p99_ms={p99_ms:.3} min_ms={min_ms:.3} max_ms={max_ms:.3} weights_dtype={weights_dtype}"
         );
         return;
     }
@@ -115,6 +116,7 @@ fn print_stats(
         p99_ms,
         min_ms,
         max_ms,
+        weights_dtype,
     });
     #[cfg(not(feature = "json-output"))]
     json_output_unavailable();
@@ -128,6 +130,7 @@ pub fn run(args: Vec<String>) {
     let mut iters: usize = 50;
     let mut candidate_texts: Vec<String> = Vec::new();
     let mut lora_path: Option<String> = None;
+    let mut weights_flag: Option<String> = None;
     let mut json = false;
 
     let mut args = args.into_iter();
@@ -136,6 +139,9 @@ pub fn run(args: Vec<String>) {
             "--json" => json = true,
             "--candidate" => candidate_texts.push(args.next().expect("--candidate requires text")),
             "--lora" => lora_path = Some(args.next().expect("--lora requires a file path")),
+            "--weights" => {
+                weights_flag = Some(args.next().expect("--weights requires `f16` or `f32`"))
+            }
             "--warmup" => {
                 let raw = args.next().expect("--warmup requires a number");
                 warmup = raw.parse().unwrap_or_else(|_| {
@@ -153,7 +159,7 @@ pub fn run(args: Vec<String>) {
         }
     }
     let gguf_path =
-        gguf_path.unwrap_or_else(|| panic!("usage: reflex bench <path-to-gguf> [--warmup N] [--iters N] [--candidate <text> ...] [--lora <adapter.gguf>] [--json]"));
+        gguf_path.unwrap_or_else(|| panic!("usage: reflex bench <path-to-gguf> [--warmup N] [--iters N] [--candidate <text> ...] [--lora <adapter.gguf>] [--weights f16|f32] [--json]"));
     if iters == 0 {
         panic!("--iters must be at least 1");
     }
@@ -173,7 +179,15 @@ pub fn run(args: Vec<String>) {
     // allocator-tracked peak (that would need NVML polling, out of scope here).
     let vram_before = diagnostics::probe(&device).ok();
     let device_for_vram = device.clone();
-    let mut model = Model::load(device, &file).expect("failed to load model");
+    let mut model = crate::load_model(
+        device,
+        &file,
+        weights_flag.as_deref(),
+        reflex_engine::model::WeightsDtype::DEFAULT,
+        lora_path.as_deref(),
+    )
+    .expect("failed to load model");
+    let weights_dtype = model.weights_dtype().as_str();
     let model_load_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms - cuda_init_ms;
     let e_model_load = sampler.measure();
     if let Some(before) = vram_before {
@@ -189,13 +203,14 @@ pub fn run(args: Vec<String>) {
                         model_resident_mib,
                         free_before_load_mib,
                         free_after_load_mib,
+                        weights_dtype,
                     },
                 );
                 #[cfg(not(feature = "json-output"))]
                 json_output_unavailable();
             } else {
                 println!(
-                    "REFLEX_BENCH_VRAM_OK model_resident_mib={model_resident_mib} free_before_load_mib={free_before_load_mib} free_after_load_mib={free_after_load_mib}"
+                    "REFLEX_BENCH_VRAM_OK model_resident_mib={model_resident_mib} free_before_load_mib={free_before_load_mib} free_after_load_mib={free_after_load_mib} weights_dtype={weights_dtype}"
                 );
             }
         }
@@ -256,13 +271,14 @@ pub fn run(args: Vec<String>) {
                         total_joules: m.joules,
                         joules_per_forward_pass,
                         energy_method: m.method.as_str(),
+                        weights_dtype,
                     },
                 );
                 #[cfg(not(feature = "json-output"))]
                 json_output_unavailable();
             } else {
                 println!(
-                    "REFLEX_BENCH_ENERGY_OK prompt_tokens={prompt_tokens} iters={iters} total_joules={:.3} joules_per_forward_pass={joules_per_forward_pass:.6} energy_method={}",
+                    "REFLEX_BENCH_ENERGY_OK prompt_tokens={prompt_tokens} iters={iters} total_joules={:.3} joules_per_forward_pass={joules_per_forward_pass:.6} energy_method={} weights_dtype={weights_dtype}",
                     m.joules,
                     m.method.as_str(),
                 );
@@ -276,6 +292,7 @@ pub fn run(args: Vec<String>) {
             warmup,
             iters,
             samples_ms,
+            weights_dtype,
         );
 
         // Decode throughput: `generate` past the first token measures pure per-token
@@ -330,6 +347,7 @@ pub fn run(args: Vec<String>) {
                         iters,
                         tokens_per_sec,
                         ms_per_token,
+                        weights_dtype,
                     },
                 );
                 #[cfg(not(feature = "json-output"))]
@@ -337,7 +355,7 @@ pub fn run(args: Vec<String>) {
             } else {
                 println!(
                     "REFLEX_BENCH_THROUGHPUT_OK prompt_tokens={prompt_tokens} decode_tokens={DECODE_STEPS} warmup={warmup} iters={iters} \
-                     tokens_per_sec={tokens_per_sec:.3} ms_per_token={ms_per_token:.3}"
+                     tokens_per_sec={tokens_per_sec:.3} ms_per_token={ms_per_token:.3} weights_dtype={weights_dtype}"
                 );
             }
         }
@@ -364,6 +382,7 @@ pub fn run(args: Vec<String>) {
                 warmup,
                 iters,
                 samples_ms,
+                weights_dtype,
             );
         }
     }
