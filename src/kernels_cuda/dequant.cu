@@ -98,15 +98,36 @@ __device__ __forceinline__ float sign_of(bool cond) {
     return cond ? -1.0f : 1.0f;
 }
 
+// Output-element store shared by every dequant kernel below: each kernel body
+// is a template over its output type and exists as two AOT entry points (see
+// `DEQUANT_ENTRY_POINTS` at the end of this file), `dequantize_<fmt>_kernel`
+// writing f32 and `dequantize_<fmt>_f16_kernel` writing f16. The value is
+// always computed in f32 exactly as before; the f16 variant rounds it once,
+// to nearest even, on the store, so it equals `__float2half_rn` of what the
+// f32 kernel writes.
+template <typename OutT>
+__device__ __forceinline__ OutT store_out(float v);
+
+template <>
+__device__ __forceinline__ float store_out<float>(float v) {
+    return v;
+}
+
+template <>
+__device__ __forceinline__ __half store_out<__half>(float v) {
+    return __float2half_rn(v);
+}
+
 // `IQ1S_DELTA`/`IQ1M_DELTA` in the reference (`ggml-common.h`); matches
 // `dequant_iq.rs::IQ1S_DELTA`.
 #define IQ1S_DELTA 0.125f
 
 // Port of `dequantize_row_q4_K`. Block layout (144 bytes): `d: f16`,
 // `dmin: f16`, `scales[12]`, `qs[128]`.
-extern "C" __global__ void dequantize_q4k_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_q4k_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -114,7 +135,7 @@ extern "C" __global__ void dequantize_q4k_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 144;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     float d = le_f16(block);
     float dmin = le_f16(block + 2);
@@ -135,10 +156,10 @@ extern "C" __global__ void dequantize_q4k_kernel(
         float m2 = dmin * (float)m;
 
         for (unsigned int l = 0; l < 32; l++) {
-            yb[y_off + l] = d1 * (float)(q[q_off + l] & 0xF) - m1;
+            yb[y_off + l] = store_out<OutT>(d1 * (float)(q[q_off + l] & 0xF) - m1);
         }
         for (unsigned int l = 0; l < 32; l++) {
-            yb[y_off + 32 + l] = d2 * (float)(q[q_off + l] >> 4) - m2;
+            yb[y_off + 32 + l] = store_out<OutT>(d2 * (float)(q[q_off + l] >> 4) - m2);
         }
         q_off += 32;
         is += 2;
@@ -149,9 +170,10 @@ extern "C" __global__ void dequantize_q4k_kernel(
 
 // Port of `dequantize_row_q5_K`. Block layout (176 bytes): `d: f16`,
 // `dmin: f16`, `scales[12]`, `qh[32]`, `qs[128]`.
-extern "C" __global__ void dequantize_q5k_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_q5k_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -159,7 +181,7 @@ extern "C" __global__ void dequantize_q5k_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 176;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     float d = le_f16(block);
     float dmin = le_f16(block + 2);
@@ -184,11 +206,11 @@ extern "C" __global__ void dequantize_q5k_kernel(
 
         for (unsigned int l = 0; l < 32; l++) {
             unsigned int hi = (qh[l] & u1) ? 16 : 0;
-            yb[y_off + l] = d1 * (float)((ql[ql_off + l] & 0xF) + hi) - m1;
+            yb[y_off + l] = store_out<OutT>(d1 * (float)((ql[ql_off + l] & 0xF) + hi) - m1);
         }
         for (unsigned int l = 0; l < 32; l++) {
             unsigned int hi = (qh[l] & u2) ? 16 : 0;
-            yb[y_off + 32 + l] = d2 * (float)((ql[ql_off + l] >> 4) + hi) - m2;
+            yb[y_off + 32 + l] = store_out<OutT>(d2 * (float)((ql[ql_off + l] >> 4) + hi) - m2);
         }
         ql_off += 32;
         is += 2;
@@ -201,9 +223,10 @@ extern "C" __global__ void dequantize_q5k_kernel(
 
 // Port of `dequantize_row_q6_K`. Block layout (210 bytes): `ql[128]`,
 // `qh[64]`, `scales[16]` (i8), `d: f16`.
-extern "C" __global__ void dequantize_q6k_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_q6k_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -211,7 +234,7 @@ extern "C" __global__ void dequantize_q6k_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 210;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     const unsigned char* ql_all = block;
     const unsigned char* qh_all = block + 128;
@@ -231,10 +254,10 @@ extern "C" __global__ void dequantize_q6k_kernel(
             int q2 = (int)((ql_all[ql_off + l + 32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32;
             int q3 = (int)((ql_all[ql_off + l] >> 4) | (((qh >> 4) & 3) << 4)) - 32;
             int q4 = (int)((ql_all[ql_off + l + 32] >> 4) | (((qh >> 6) & 3) << 4)) - 32;
-            yb[y_off + l] = d * (float)sc_all[sc_off + is] * (float)q1;
-            yb[y_off + l + 32] = d * (float)sc_all[sc_off + is + 2] * (float)q2;
-            yb[y_off + l + 64] = d * (float)sc_all[sc_off + is + 4] * (float)q3;
-            yb[y_off + l + 96] = d * (float)sc_all[sc_off + is + 6] * (float)q4;
+            yb[y_off + l] = store_out<OutT>(d * (float)sc_all[sc_off + is] * (float)q1);
+            yb[y_off + l + 32] = store_out<OutT>(d * (float)sc_all[sc_off + is + 2] * (float)q2);
+            yb[y_off + l + 64] = store_out<OutT>(d * (float)sc_all[sc_off + is + 4] * (float)q3);
+            yb[y_off + l + 96] = store_out<OutT>(d * (float)sc_all[sc_off + is + 6] * (float)q4);
         }
         y_off += 128;
         ql_off += 64;
@@ -245,9 +268,10 @@ extern "C" __global__ void dequantize_q6k_kernel(
 }
 
 // Port of `dequantize_row_q4_0`. Block layout (18 bytes): `d: f16`, `qs[16]`.
-extern "C" __global__ void dequantize_q4_0_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_q4_0_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -255,23 +279,24 @@ extern "C" __global__ void dequantize_q4_0_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 18;
-    float* yb = y + (unsigned long long)bi * 32;
+    OutT* yb = y + (unsigned long long)bi * 32;
 
     float d = le_f16(block);
     const unsigned char* qs = block + 2;
     for (unsigned int j = 0; j < 16; j++) {
         int x0 = (int)(qs[j] & 0x0F) - 8;
         int x1 = (int)(qs[j] >> 4) - 8;
-        yb[j] = (float)x0 * d;
-        yb[j + 16] = (float)x1 * d;
+        yb[j] = store_out<OutT>((float)x0 * d);
+        yb[j + 16] = store_out<OutT>((float)x1 * d);
     }
 }
 
 // Port of `dequantize_row_q4_1`. Block layout (20 bytes): `d: f16`, `m: f16`,
 // `qs[16]`.
-extern "C" __global__ void dequantize_q4_1_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_q4_1_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -279,7 +304,7 @@ extern "C" __global__ void dequantize_q4_1_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 20;
-    float* yb = y + (unsigned long long)bi * 32;
+    OutT* yb = y + (unsigned long long)bi * 32;
 
     float d = le_f16(block);
     float m = le_f16(block + 2);
@@ -287,16 +312,17 @@ extern "C" __global__ void dequantize_q4_1_kernel(
     for (unsigned int j = 0; j < 16; j++) {
         float x0 = (float)(qs[j] & 0x0F);
         float x1 = (float)(qs[j] >> 4);
-        yb[j] = x0 * d + m;
-        yb[j + 16] = x1 * d + m;
+        yb[j] = store_out<OutT>(x0 * d + m);
+        yb[j + 16] = store_out<OutT>(x1 * d + m);
     }
 }
 
 // Port of `dequantize_row_q5_0`. Block layout (22 bytes): `d: f16`,
 // `qh: u32`, `qs[16]`.
-extern "C" __global__ void dequantize_q5_0_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_q5_0_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -304,7 +330,7 @@ extern "C" __global__ void dequantize_q5_0_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 22;
-    float* yb = y + (unsigned long long)bi * 32;
+    OutT* yb = y + (unsigned long long)bi * 32;
 
     float d = le_f16(block);
     unsigned int qh = (unsigned int)block[2] | ((unsigned int)block[3] << 8) | ((unsigned int)block[4] << 16) | ((unsigned int)block[5] << 24);
@@ -314,16 +340,17 @@ extern "C" __global__ void dequantize_q5_0_kernel(
         unsigned int xh_1 = (qh >> (j + 12)) & 0x10;
         int x0 = (int)((unsigned int)(qs[j] & 0x0F) | xh_0) - 16;
         int x1 = (int)((unsigned int)(qs[j] >> 4) | xh_1) - 16;
-        yb[j] = (float)x0 * d;
-        yb[j + 16] = (float)x1 * d;
+        yb[j] = store_out<OutT>((float)x0 * d);
+        yb[j + 16] = store_out<OutT>((float)x1 * d);
     }
 }
 
 // Port of `dequantize_row_q5_1`. Block layout (24 bytes): `d: f16`,
 // `m: f16`, `qh: u32`, `qs[16]`.
-extern "C" __global__ void dequantize_q5_1_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_q5_1_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -331,7 +358,7 @@ extern "C" __global__ void dequantize_q5_1_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 24;
-    float* yb = y + (unsigned long long)bi * 32;
+    OutT* yb = y + (unsigned long long)bi * 32;
 
     float d = le_f16(block);
     float m = le_f16(block + 2);
@@ -342,16 +369,17 @@ extern "C" __global__ void dequantize_q5_1_kernel(
         unsigned int xh_1 = (qh >> (j + 12)) & 0x10;
         unsigned int x0 = (unsigned int)(qs[j] & 0x0F) | xh_0;
         unsigned int x1 = (unsigned int)(qs[j] >> 4) | xh_1;
-        yb[j] = (float)x0 * d + m;
-        yb[j + 16] = (float)x1 * d + m;
+        yb[j] = store_out<OutT>((float)x0 * d + m);
+        yb[j + 16] = store_out<OutT>((float)x1 * d + m);
     }
 }
 
 // Port of `dequantize_row_q8_0`. Block layout (34 bytes): `d: f16`,
 // `qs[32]` (i8).
-extern "C" __global__ void dequantize_q8_0_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_q8_0_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -359,12 +387,12 @@ extern "C" __global__ void dequantize_q8_0_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 34;
-    float* yb = y + (unsigned long long)bi * 32;
+    OutT* yb = y + (unsigned long long)bi * 32;
 
     float d = le_f16(block);
     const signed char* qs = (const signed char*)(block + 2);
     for (unsigned int j = 0; j < 32; j++) {
-        yb[j] = (float)qs[j] * d;
+        yb[j] = store_out<OutT>((float)qs[j] * d);
     }
 }
 
@@ -373,9 +401,10 @@ extern "C" __global__ void dequantize_q8_0_kernel(
 // exists, but `x = d*q` is the same as Q8_0 -- the `s` field at bytes 2..4 is
 // a precomputed dot-product helper, not part of value reconstruction).
 // Block layout (36 bytes): `d: f16`, `s: f16`, `qs[32]` (i8).
-extern "C" __global__ void dequantize_q8_1_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_q8_1_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -383,20 +412,21 @@ extern "C" __global__ void dequantize_q8_1_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 36;
-    float* yb = y + (unsigned long long)bi * 32;
+    OutT* yb = y + (unsigned long long)bi * 32;
 
     float d = le_f16(block);
     const signed char* qs = (const signed char*)(block + 4);
     for (unsigned int j = 0; j < 32; j++) {
-        yb[j] = (float)qs[j] * d;
+        yb[j] = store_out<OutT>((float)qs[j] * d);
     }
 }
 
 // Port of `dequantize_row_q2_K`. Block layout (84 bytes): `scales[16]`,
 // `qs[64]`, `d: f16`, `dmin: f16`.
-extern "C" __global__ void dequantize_q2k_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_q2k_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -404,7 +434,7 @@ extern "C" __global__ void dequantize_q2k_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 84;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     const unsigned char* scales = block;
     const unsigned char* q = block + 16;
@@ -424,7 +454,7 @@ extern "C" __global__ void dequantize_q2k_kernel(
             float dl = d * (float)(sc & 0xF);
             float ml = dmin * (float)(sc >> 4);
             for (unsigned int l = 0; l < 16; l++) {
-                yb[y_off + l] = dl * (float)((q[q_off + l] >> shift) & 3) - ml;
+                yb[y_off + l] = store_out<OutT>(dl * (float)((q[q_off + l] >> shift) & 3) - ml);
             }
 
             sc = scales[is];
@@ -432,7 +462,7 @@ extern "C" __global__ void dequantize_q2k_kernel(
             dl = d * (float)(sc & 0xF);
             ml = dmin * (float)(sc >> 4);
             for (unsigned int l = 0; l < 16; l++) {
-                yb[y_off + 16 + l] = dl * (float)((q[q_off + l + 16] >> shift) & 3) - ml;
+                yb[y_off + 16 + l] = store_out<OutT>(dl * (float)((q[q_off + l + 16] >> shift) & 3) - ml);
             }
             y_off += 32;
         }
@@ -443,9 +473,10 @@ extern "C" __global__ void dequantize_q2k_kernel(
 
 // Port of `dequantize_row_q3_K`. Block layout (110 bytes): `hmask[32]`,
 // `qs[64]`, `scales[12]`, `d: f16`.
-extern "C" __global__ void dequantize_q3k_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_q3k_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -453,7 +484,7 @@ extern "C" __global__ void dequantize_q3k_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 110;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     const unsigned char* hmask = block;
     const unsigned char* q = block + 32;
@@ -494,7 +525,7 @@ extern "C" __global__ void dequantize_q3k_kernel(
             is++;
             for (unsigned int l = 0; l < 16; l++) {
                 int bit = (hmask[l] & m) ? 0 : 4;
-                yb[y_off + l] = dl * (float)((int)((q[q_off + l] >> shift) & 3) - bit);
+                yb[y_off + l] = store_out<OutT>(dl * (float)((int)((q[q_off + l] >> shift) & 3) - bit));
             }
             y_off += 16;
 
@@ -502,7 +533,7 @@ extern "C" __global__ void dequantize_q3k_kernel(
             is++;
             for (unsigned int l = 0; l < 16; l++) {
                 int bit = (hmask[l + 16] & m) ? 0 : 4;
-                yb[y_off + l] = dl * (float)((int)((q[q_off + l + 16] >> shift) & 3) - bit);
+                yb[y_off + l] = store_out<OutT>(dl * (float)((int)((q[q_off + l + 16] >> shift) & 3) - bit));
             }
             y_off += 16;
 
@@ -517,9 +548,10 @@ extern "C" __global__ void dequantize_q3k_kernel(
 // Port of `dequantize_row_q8_K`. Block layout (292 bytes): `d: f32`,
 // `qs[256]` (i8), `bsums[16]` (i16, unused for dequant -- see `dequant.rs`'s
 // doc comment on `dequantize_block_q8_k`).
-extern "C" __global__ void dequantize_q8k_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_q8k_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -527,20 +559,21 @@ extern "C" __global__ void dequantize_q8k_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 292;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     float d = le_f32(block);
     const signed char* qs = (const signed char*)(block + 4);
     for (unsigned int j = 0; j < 256; j++) {
-        yb[j] = (float)qs[j] * d;
+        yb[j] = store_out<OutT>((float)qs[j] * d);
     }
 }
 
 // Port of `dequantize_block_iq2_xxs` (dequant_iq.rs). Block layout (66
 // bytes): `d: f16`, `qs: u16[32]`.
-extern "C" __global__ void dequantize_iq2xxs_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_iq2xxs_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -548,7 +581,7 @@ extern "C" __global__ void dequantize_iq2xxs_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 66;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     float d = le_f16(block);
     const unsigned char* qs = block + 2;
@@ -569,7 +602,7 @@ extern "C" __global__ void dequantize_iq2xxs_kernel(
             unsigned long long grid = IQ2XXS_GRID[aux8[l]];
             unsigned char signs = KSIGNS_IQ2XS[(aux32_1 >> (7 * l)) & 127];
             for (unsigned int j = 0; j < 8; j++) {
-                yb[y_off + j] = db * (float)grid_u64_byte(grid, j) * sign_of((signs & KMASK_IQ2XS[j]) != 0);
+                yb[y_off + j] = store_out<OutT>(db * (float)grid_u64_byte(grid, j) * sign_of((signs & KMASK_IQ2XS[j]) != 0));
             }
             y_off += 8;
         }
@@ -578,9 +611,10 @@ extern "C" __global__ void dequantize_iq2xxs_kernel(
 
 // Port of `dequantize_block_iq2_xs` (dequant_iq.rs). Block layout (74
 // bytes): `d: f16`, `qs: u16[32]`, `scales: u8[8]`.
-extern "C" __global__ void dequantize_iq2xs_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_iq2xs_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -588,7 +622,7 @@ extern "C" __global__ void dequantize_iq2xs_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 74;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     float d = le_f16(block);
     const unsigned char* qs = block + 2;
@@ -605,7 +639,7 @@ extern "C" __global__ void dequantize_iq2xs_kernel(
             unsigned char signs = KSIGNS_IQ2XS[qv >> 9];
             float dl = (l / 2 == 0) ? db0 : db1;
             for (unsigned int j = 0; j < 8; j++) {
-                yb[y_off + j] = dl * (float)grid_u64_byte(grid, j) * sign_of((signs & KMASK_IQ2XS[j]) != 0);
+                yb[y_off + j] = store_out<OutT>(dl * (float)grid_u64_byte(grid, j) * sign_of((signs & KMASK_IQ2XS[j]) != 0));
             }
             y_off += 8;
         }
@@ -616,9 +650,10 @@ extern "C" __global__ void dequantize_iq2xs_kernel(
 // `d: f16`, `qs: u8[64]`, `qh: u8[8]`, `scales: u8[8]`. `signs` aliases the
 // second half of `qs` (bytes `[32..64]` of the `qs` field), not a separate
 // struct member.
-extern "C" __global__ void dequantize_iq2s_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_iq2s_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -626,7 +661,7 @@ extern "C" __global__ void dequantize_iq2s_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 82;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     float d = le_f16(block);
     const unsigned char* qs = block + 2;
@@ -645,7 +680,7 @@ extern "C" __global__ void dequantize_iq2s_kernel(
             unsigned long long grid = IQ2S_GRID[idx];
             unsigned char sg = signs[4 * ib32 + l];
             for (unsigned int j = 0; j < 8; j++) {
-                yb[y_off + j] = dl * (float)grid_u64_byte(grid, j) * sign_of((sg & KMASK_IQ2XS[j]) != 0);
+                yb[y_off + j] = store_out<OutT>(dl * (float)grid_u64_byte(grid, j) * sign_of((sg & KMASK_IQ2XS[j]) != 0));
             }
             y_off += 8;
         }
@@ -655,9 +690,10 @@ extern "C" __global__ void dequantize_iq2s_kernel(
 // Port of `dequantize_block_iq3_xxs` (dequant_iq.rs). Block layout (98
 // bytes): `d: f16`, `qs: u8[96]`, where `scales_and_signs` aliases
 // `qs[64..96]`.
-extern "C" __global__ void dequantize_iq3xxs_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_iq3xxs_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -665,7 +701,7 @@ extern "C" __global__ void dequantize_iq3xxs_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 98;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     float d = le_f16(block);
     const unsigned char* qs = block + 2;
@@ -680,8 +716,8 @@ extern "C" __global__ void dequantize_iq3xxs_kernel(
             unsigned int grid1 = IQ3XXS_GRID[qs[8 * ib32 + 2 * l]];
             unsigned int grid2 = IQ3XXS_GRID[qs[8 * ib32 + 2 * l + 1]];
             for (unsigned int j = 0; j < 4; j++) {
-                yb[y_off + j] = db * (float)grid_u32_byte(grid1, j) * sign_of((signs & KMASK_IQ2XS[j]) != 0);
-                yb[y_off + j + 4] = db * (float)grid_u32_byte(grid2, j) * sign_of((signs & KMASK_IQ2XS[j + 4]) != 0);
+                yb[y_off + j] = store_out<OutT>(db * (float)grid_u32_byte(grid1, j) * sign_of((signs & KMASK_IQ2XS[j]) != 0));
+                yb[y_off + j + 4] = store_out<OutT>(db * (float)grid_u32_byte(grid2, j) * sign_of((signs & KMASK_IQ2XS[j + 4]) != 0));
             }
             y_off += 8;
         }
@@ -691,9 +727,10 @@ extern "C" __global__ void dequantize_iq3xxs_kernel(
 // Port of `dequantize_block_iq3_s` (dequant_iq.rs). Block layout (110
 // bytes): `d: f16`, `qs: u8[64]`, `qh: u8[8]`, `signs: u8[32]`,
 // `scales: u8[4]`.
-extern "C" __global__ void dequantize_iq3s_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_iq3s_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -701,7 +738,7 @@ extern "C" __global__ void dequantize_iq3s_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 110;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     float d = le_f16(block);
     const unsigned char* qs = block + 2;
@@ -726,8 +763,8 @@ extern "C" __global__ void dequantize_iq3s_kernel(
             unsigned int grid2 = IQ3S_GRID[idx2];
             unsigned char sg = signs[8 * k + l];
             for (unsigned int j = 0; j < 4; j++) {
-                yb[y_off + j] = db1 * (float)grid_u32_byte(grid1, j) * sign_of((sg & KMASK_IQ2XS[j]) != 0);
-                yb[y_off + j + 4] = db1 * (float)grid_u32_byte(grid2, j) * sign_of((sg & KMASK_IQ2XS[j + 4]) != 0);
+                yb[y_off + j] = store_out<OutT>(db1 * (float)grid_u32_byte(grid1, j) * sign_of((sg & KMASK_IQ2XS[j]) != 0));
+                yb[y_off + j + 4] = store_out<OutT>(db1 * (float)grid_u32_byte(grid2, j) * sign_of((sg & KMASK_IQ2XS[j + 4]) != 0));
             }
             y_off += 8;
         }
@@ -741,8 +778,8 @@ extern "C" __global__ void dequantize_iq3s_kernel(
             unsigned int grid2 = IQ3S_GRID[idx2];
             unsigned char sg = signs[8 * k + 4 + l];
             for (unsigned int j = 0; j < 4; j++) {
-                yb[y_off + j] = db2 * (float)grid_u32_byte(grid1, j) * sign_of((sg & KMASK_IQ2XS[j]) != 0);
-                yb[y_off + j + 4] = db2 * (float)grid_u32_byte(grid2, j) * sign_of((sg & KMASK_IQ2XS[j + 4]) != 0);
+                yb[y_off + j] = store_out<OutT>(db2 * (float)grid_u32_byte(grid1, j) * sign_of((sg & KMASK_IQ2XS[j]) != 0));
+                yb[y_off + j + 4] = store_out<OutT>(db2 * (float)grid_u32_byte(grid2, j) * sign_of((sg & KMASK_IQ2XS[j + 4]) != 0));
             }
             y_off += 8;
         }
@@ -753,9 +790,10 @@ extern "C" __global__ void dequantize_iq3s_kernel(
 
 // Port of `dequantize_block_iq1_s` (dequant_iq.rs). Block layout (50 bytes):
 // `d: f16`, `qs: u8[32]`, `qh: u16[8]`.
-extern "C" __global__ void dequantize_iq1s_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_iq1s_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -763,7 +801,7 @@ extern "C" __global__ void dequantize_iq1s_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 50;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     float d = le_f16(block);
     const unsigned char* qs = block + 2;
@@ -778,7 +816,7 @@ extern "C" __global__ void dequantize_iq1s_kernel(
             unsigned int idx = (unsigned int)qs[4 * ib + l] | (((unsigned int)((qh_ib >> (3 * l)) & 7)) << 8);
             unsigned long long grid = IQ1S_GRID[idx];
             for (unsigned int j = 0; j < 8; j++) {
-                yb[y_off + j] = dl * ((float)grid_u64_i8(grid, j) + delta);
+                yb[y_off + j] = store_out<OutT>(dl * ((float)grid_u64_i8(grid, j) + delta));
             }
             y_off += 8;
         }
@@ -788,9 +826,10 @@ extern "C" __global__ void dequantize_iq1s_kernel(
 // Port of `dequantize_block_iq1_m` (dequant_iq.rs). Block layout (56 bytes):
 // `qs: u8[32]`, `qh: u8[16]`, `scales: u8[8]` (read as `u16[4]`; the
 // super-scale is bit-packed across the four, not a standalone `d` field).
-extern "C" __global__ void dequantize_iq1m_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_iq1m_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -798,7 +837,7 @@ extern "C" __global__ void dequantize_iq1m_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 56;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     const unsigned char* qs = block;
     const unsigned char* qh = block + 32;
@@ -837,7 +876,7 @@ extern "C" __global__ void dequantize_iq1m_kernel(
             float dl = (l < 2) ? dl1 : dl2;
             unsigned long long grid = IQ1S_GRID[idx[l]];
             for (unsigned int j = 0; j < 8; j++) {
-                yb[y_off + j] = dl * ((float)grid_u64_i8(grid, j) + delta[l]);
+                yb[y_off + j] = store_out<OutT>(dl * ((float)grid_u64_i8(grid, j) + delta[l]));
             }
             y_off += 8;
         }
@@ -846,9 +885,10 @@ extern "C" __global__ void dequantize_iq1m_kernel(
 
 // Port of `dequantize_block_iq4_xs` (dequant_iq.rs). Block layout (136
 // bytes): `d: f16`, `scales_h: u16`, `scales_l: u8[4]`, `qs: u8[128]`.
-extern "C" __global__ void dequantize_iq4xs_kernel(
+template <typename OutT>
+__device__ __forceinline__ void dequantize_iq4xs_impl(
     const unsigned char* __restrict__ blocks,
-    float* __restrict__ y,
+    OutT* __restrict__ y,
     unsigned int num_blocks
 ) {
     unsigned int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -856,7 +896,7 @@ extern "C" __global__ void dequantize_iq4xs_kernel(
         return;
     }
     const unsigned char* block = blocks + (unsigned long long)bi * 136;
-    float* yb = y + (unsigned long long)bi * 256;
+    OutT* yb = y + (unsigned long long)bi * 256;
 
     float d = le_f16(block);
     unsigned short scales_h = le_u16_at(block, 2);
@@ -869,9 +909,34 @@ extern "C" __global__ void dequantize_iq4xs_kernel(
                         | (((unsigned int)((scales_h >> (2 * ib)) & 3)) << 4));
         float dl = d * (float)(ls - 32);
         for (unsigned int j = 0; j < 16; j++) {
-            yb[y_off + j] = dl * (float)KVALUES_IQ4NL[qs[16 * ib + j] & 0xf];
-            yb[y_off + j + 16] = dl * (float)KVALUES_IQ4NL[qs[16 * ib + j] >> 4];
+            yb[y_off + j] = store_out<OutT>(dl * (float)KVALUES_IQ4NL[qs[16 * ib + j] & 0xf]);
+            yb[y_off + j + 16] = store_out<OutT>(dl * (float)KVALUES_IQ4NL[qs[16 * ib + j] >> 4]);
         }
         y_off += 32;
     }
 }
+
+// The AOT entry points: one f32-output and one f16-output kernel per format,
+// both instantiating the same templated body above.
+#define DEQUANT_ENTRY_POINTS(name)                                                         extern "C" __global__ void dequantize_##name##_kernel(                                     const unsigned char* __restrict__ blocks, float* __restrict__ y,                       unsigned int num_blocks) {                                                             dequantize_##name##_impl<float>(blocks, y, num_blocks);                            }                                                                                      extern "C" __global__ void dequantize_##name##_f16_kernel(                                 const unsigned char* __restrict__ blocks, __half* __restrict__ y,                      unsigned int num_blocks) {                                                             dequantize_##name##_impl<__half>(blocks, y, num_blocks);                           }
+
+DEQUANT_ENTRY_POINTS(q4k)
+DEQUANT_ENTRY_POINTS(q5k)
+DEQUANT_ENTRY_POINTS(q6k)
+DEQUANT_ENTRY_POINTS(q4_0)
+DEQUANT_ENTRY_POINTS(q4_1)
+DEQUANT_ENTRY_POINTS(q5_0)
+DEQUANT_ENTRY_POINTS(q5_1)
+DEQUANT_ENTRY_POINTS(q8_0)
+DEQUANT_ENTRY_POINTS(q8_1)
+DEQUANT_ENTRY_POINTS(q2k)
+DEQUANT_ENTRY_POINTS(q3k)
+DEQUANT_ENTRY_POINTS(q8k)
+DEQUANT_ENTRY_POINTS(iq2xxs)
+DEQUANT_ENTRY_POINTS(iq2xs)
+DEQUANT_ENTRY_POINTS(iq2s)
+DEQUANT_ENTRY_POINTS(iq3xxs)
+DEQUANT_ENTRY_POINTS(iq3s)
+DEQUANT_ENTRY_POINTS(iq1s)
+DEQUANT_ENTRY_POINTS(iq1m)
+DEQUANT_ENTRY_POINTS(iq4xs)

@@ -120,17 +120,22 @@ impl Model {
     /// the scope this supports. `cfg`/`layers`/`expert_used_count` below are
     /// unused garbage (matching the `hybrid` path's own convention) --
     /// `forward_prompt` branches on `self.mla` before touching them.
-    pub(super) fn load_mla(device: Arc<CudaDevice>, file: &GgufFile) -> Result<Self, ReflexError> {
+    pub(super) fn load_mla(
+        device: Arc<CudaDevice>,
+        file: &GgufFile,
+        policy: &WeightPolicy,
+    ) -> Result<Self, ReflexError> {
         std::thread::scope(|scope| {
             let init_device = device.clone();
             let init = scope.spawn(move || Self::load_background_init(file, init_device));
-            Self::load_mla_inner(device, file, init)
+            Self::load_mla_inner(device, file, policy, init)
         })
     }
 
     pub(super) fn load_mla_inner<'scope>(
         device: Arc<CudaDevice>,
         file: &GgufFile,
+        policy: &WeightPolicy,
         init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), ReflexError>>,
     ) -> Result<Self, ReflexError> {
         let (mla_cfg, block_count, leading_dense) = parse_mla_config(file)?;
@@ -279,7 +284,7 @@ impl Model {
         let mut pipeline = WeightLoadPipeline::new(&device)?;
 
         let mut load_weight = |name: &str| -> Result<Weight, ReflexError> {
-            load_weight_device(&mut pipeline, &dequant_kernels, file, name)
+            load_weight_device(&mut pipeline, &dequant_kernels, policy, file, name)
         };
 
         let mut layers = Vec::with_capacity(block_count);
@@ -341,6 +346,7 @@ impl Model {
                 let data = dequantize_matrix_to_device(
                     &mut pipeline,
                     &dequant_kernels,
+                    policy.matrix_dtype,
                     info.ggml_type,
                     bytes,
                     info.element_count(),
@@ -355,6 +361,7 @@ impl Model {
                 let data = dequantize_matrix_to_device(
                     &mut pipeline,
                     &dequant_kernels,
+                    policy.matrix_dtype,
                     token_embd.ggml_type,
                     &token_embd.raw,
                     token_embd_info.element_count(),
@@ -412,6 +419,7 @@ impl Model {
             dequant_pipeline: RefCell::new(pipeline),
             output_norm,
             lm_head,
+            weights_dtype: policy.matrix_dtype,
             tokenizer,
             hybrid: None,
             mla: Some(MlaModel {
@@ -464,7 +472,7 @@ impl Model {
         let eps = m.cfg.rmsnorm_eps;
         let hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
 
-        let normed = self.rmsnorm(&hidden, &self.output_norm.data, 1, hidden_size, eps)?;
+        let normed = self.rmsnorm(&hidden, self.output_norm.f32()?, 1, hidden_size, eps)?;
         let first_tokens: Vec<u32> = resolved.iter().map(|ids| ids[0]).collect();
         let mut scores = self.gemv_gather_lm_head(&normed, &first_tokens)?;
 
@@ -475,7 +483,7 @@ impl Model {
             for (position, w) in (base_position..).zip(ids.windows(2)) {
                 let (prev, next) = (w[0], w[1]);
                 let h = self.forward_one_token_mla(m, prev, position, &mut kv_caches)?;
-                let normed_step = self.rmsnorm(&h, &self.output_norm.data, 1, hidden_size, eps)?;
+                let normed_step = self.rmsnorm(&h, self.output_norm.f32()?, 1, hidden_size, eps)?;
                 scores[i] += self.gemv_gather_lm_head(&normed_step, &[next])?[0];
             }
         }
@@ -518,7 +526,7 @@ impl Model {
 
         let normed = self.rmsnorm(
             &hidden,
-            &w.attn_norm.data,
+            w.attn_norm.f32()?,
             1,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -566,7 +574,7 @@ impl Model {
         }
         let kv_cmpr_normed = self.rmsnorm(
             &kv_cmpr_owned,
-            &w.attn_kv_a_norm.data,
+            w.attn_kv_a_norm.f32()?,
             1,
             kv_lora,
             cfg.rmsnorm_eps,
@@ -620,9 +628,8 @@ impl Model {
             let q_nope_view = q.slice(h * n_embd_head_k_mla..h * n_embd_head_k_mla + qk_nope);
             let wk_b_view = w
                 .wk_b
-                .data
-                .slice(h * qk_nope * kv_lora..(h + 1) * qk_nope * kv_lora);
-            let absorbed = self.gemv_view(&q_nope_view, &wk_b_view, qk_nope, kv_lora)?;
+                .view(h * qk_nope * kv_lora..(h + 1) * qk_nope * kv_lora);
+            let absorbed = self.gemv_view(&q_nope_view, wk_b_view, qk_nope, kv_lora)?;
 
             let mut dst_nope = qcur.slice_mut(h * qk_dim..h * qk_dim + kv_lora);
             self.device
@@ -708,7 +715,7 @@ impl Model {
 
         let normed = self.rmsnorm(
             &hidden,
-            &w.attn_norm.data,
+            w.attn_norm.f32()?,
             rows,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -769,7 +776,7 @@ impl Model {
 
         let kv_cmpr_normed_batched = self.rmsnorm(
             &kv_cmpr_batched,
-            &w.attn_kv_a_norm.data,
+            w.attn_kv_a_norm.f32()?,
             rows,
             kv_lora,
             cfg.rmsnorm_eps,
@@ -981,7 +988,7 @@ impl Model {
             ));
         };
 
-        let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, 1, hidden_size, eps)?;
+        let ffn_normed = self.rmsnorm(&post_attn, layer.ffn_norm.f32()?, 1, hidden_size, eps)?;
 
         let router_logits_dev = self.gemv(&ffn_normed, ffn_gate_inp)?;
         let router_logits = self
@@ -1069,7 +1076,7 @@ impl Model {
             ));
         };
 
-        let ffn_normed = self.rmsnorm(&post_attn, &layer.ffn_norm.data, rows, hidden_size, eps)?;
+        let ffn_normed = self.rmsnorm(&post_attn, layer.ffn_norm.f32()?, rows, hidden_size, eps)?;
 
         // Always-on shared expert(s), batched across every row with no routing --
         // seeds ffn_out; the routed experts below accumulate `+=` on top of it.

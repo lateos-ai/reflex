@@ -39,7 +39,7 @@
 
 use crate::error::{ReflexError, ReflexErrorCode};
 use crate::gguf::GgufFile;
-use crate::model::{Model, System1Candidate};
+use crate::model::{LoadOptions, Model, System1Candidate, WeightsDtype};
 use cudarc::driver::CudaDevice;
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, CStr, CString};
@@ -133,6 +133,10 @@ pub extern "C" fn reflex_last_error_code() -> ReflexErrorCode {
 /// which architectures/tensors are accepted; DeepSeek-V2/V3 MLA rejects any
 /// LoRA path).
 ///
+/// Matrix weights are stored in the dtype `REFLEX_WEIGHTS` names (`f16` or
+/// `f32`), or `WeightsDtype::DEFAULT` when it is unset -- this entry point
+/// takes no options struct, so the environment is how a C host picks f32.
+///
 /// Returns an opaque handle to free with `reflex_free`, or NULL on
 /// failure (call `reflex_last_error` for why). `gguf_path` must be
 /// non-NULL; `lora_path` may be NULL. Both, when non-NULL, must be
@@ -178,7 +182,11 @@ pub unsafe extern "C" fn reflex_load(
         })?;
         let device = CudaDevice::new(0)
             .map_err(|e| crate::gpu_err!(e, "reflex_load: failed to init CUDA device 0: {e}"))?;
-        let mut model = Model::load(device, &file)?;
+        let opts = LoadOptions {
+            weights: WeightsDtype::resolve(None)?,
+            lora_adapter: lora_path_str.map(std::path::PathBuf::from),
+        };
+        let mut model = Model::load_with_options(device, &file, &opts)?;
         if let Some(lora_path_str) = lora_path_str {
             model.apply_lora(Path::new(lora_path_str))?;
         }

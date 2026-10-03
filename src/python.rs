@@ -11,7 +11,7 @@
 
 use crate::diagnostics;
 use crate::gguf::GgufFile;
-use crate::model::{Model, System1Candidate};
+use crate::model::{LoadOptions, Model, System1Candidate, WeightsDtype};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -31,11 +31,15 @@ struct PyModel {
 #[pymethods]
 impl PyModel {
     #[new]
-    #[pyo3(signature = (gguf_path, lora_path=None))]
-    fn load(gguf_path: &str, lora_path: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (gguf_path, lora_path=None, weights=None))]
+    fn load(gguf_path: &str, lora_path: Option<&str>, weights: Option<&str>) -> PyResult<Self> {
+        let opts = LoadOptions {
+            weights: WeightsDtype::resolve(weights).map_err(to_py_err)?,
+            lora_adapter: lora_path.map(std::path::PathBuf::from),
+        };
         let file = GgufFile::open(gguf_path).map_err(to_py_err)?;
         let device = diagnostics::init_device_with_diagnostics(0).map_err(to_py_err)?;
-        let mut model = Model::load(device, &file).map_err(to_py_err)?;
+        let mut model = Model::load_with_options(device, &file, &opts).map_err(to_py_err)?;
         if let Some(lora_path) = lora_path {
             model
                 .apply_lora(std::path::Path::new(lora_path))

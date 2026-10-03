@@ -16,7 +16,13 @@
 //! expected, comma-separated token ids; an optional line 2 is the expected
 //! `logit_checksum` as a single `f64`.
 //!
-//! Usage: `reflex check <path-to-gguf> <prompt> [--max-tokens N] [--reference <file>] [--tolerance F] [--json]`
+//! Usage: `reflex check <path-to-gguf> <prompt> [--max-tokens N] [--reference <file>] [--tolerance F] [--weights f16|f32] [--json]`
+//!
+//! Weights default to `f32` here, not the engine-wide `f16`: the byte-exact
+//! comparison against llama.cpp is defined on the exact dequantized f32
+//! weights. `--weights f16` (or `REFLEX_WEIGHTS=f16`) checks the f16 mode
+//! instead, where token agreement is expected but logit checksums move by
+//! roughly f16's rounding of each weight.
 //!
 //! Exit codes: `0` = pass, `1` = mismatch, `2` = internal error (bad args, load/
 //! generate failure, malformed reference file) -- scriptable for CI. Uses
@@ -31,7 +37,7 @@
 
 use reflex_engine::diagnostics;
 use reflex_engine::gguf::GgufFile;
-use reflex_engine::model::Model;
+use reflex_engine::model::WeightsDtype;
 
 struct Reference {
     token_ids: Vec<u32>,
@@ -82,6 +88,7 @@ pub fn run(args: Vec<String>) {
     let mut max_tokens: usize = 1;
     let mut reference_path: Option<String> = None;
     let mut tolerance: f64 = 1e-2;
+    let mut weights_flag: Option<String> = None;
     let mut json = false;
 
     let mut args = args.into_iter();
@@ -104,6 +111,12 @@ pub fn run(args: Vec<String>) {
                         .unwrap_or_else(|| exit_usage_error("--reference requires a file path")),
                 )
             }
+            "--weights" => {
+                weights_flag = Some(
+                    args.next()
+                        .unwrap_or_else(|| exit_usage_error("--weights requires `f16` or `f32`")),
+                )
+            }
             "--tolerance" => {
                 let raw = args
                     .next()
@@ -118,7 +131,7 @@ pub fn run(args: Vec<String>) {
         }
     }
     let gguf_path = gguf_path.unwrap_or_else(|| {
-        exit_usage_error("usage: reflex check <path-to-gguf> <prompt> [--max-tokens N] [--reference <file>] [--tolerance F]")
+        exit_usage_error("usage: reflex check <path-to-gguf> <prompt> [--max-tokens N] [--reference <file>] [--tolerance F] [--weights f16|f32]")
     });
     let prompt = prompt.unwrap_or_else(|| exit_usage_error("a prompt is required"));
     if max_tokens == 0 {
@@ -132,8 +145,17 @@ pub fn run(args: Vec<String>) {
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }
-    let model = Model::load(device, &file)
-        .unwrap_or_else(|e| exit_usage_error(&format!("failed to load model: {e}")));
+    // The reference methodology is defined on exact f32 weights, so `check`
+    // falls back to f32 rather than the engine-wide f16 default.
+    let model = crate::load_model(
+        device,
+        &file,
+        weights_flag.as_deref(),
+        WeightsDtype::F32,
+        None,
+    )
+    .unwrap_or_else(|e| exit_usage_error(&format!("failed to load model: {e}")));
+    let weights_dtype = model.weights_dtype().as_str();
 
     let mut first_logits: Vec<f32> = Vec::new();
     let (token_ids, _text) = model
@@ -157,7 +179,7 @@ pub fn run(args: Vec<String>) {
     if !json {
         let token_ids_str: Vec<String> = token_ids.iter().map(|t| t.to_string()).collect();
         println!(
-            "REFLEX_CHECK token_ids=[{}] token_texts={:?} logit_checksum={logit_checksum:.6} top1_logit={top1_logit:.6} vocab_size={vocab_size}",
+            "REFLEX_CHECK token_ids=[{}] token_texts={:?} logit_checksum={logit_checksum:.6} top1_logit={top1_logit:.6} vocab_size={vocab_size} weights_dtype={weights_dtype}",
             token_ids_str.join(","),
             token_texts,
         );
@@ -172,6 +194,7 @@ pub fn run(args: Vec<String>) {
                 logit_checksum,
                 top1_logit,
                 vocab_size,
+                weights_dtype,
                 pass: None,
                 fail_reason: None,
             });
@@ -231,6 +254,7 @@ pub fn run(args: Vec<String>) {
             logit_checksum,
             top1_logit,
             vocab_size,
+            weights_dtype,
             pass: Some(ok),
             fail_reason,
         });

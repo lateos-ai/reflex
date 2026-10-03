@@ -21,7 +21,7 @@ fn prefill_hybrid_batched_matches_sequential() {
 
     let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
     let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
-    let model = Model::load_hybrid(device, &file).expect("failed to load hybrid model");
+    let model = Model::load(device, &file).expect("failed to load hybrid model");
     let h = model.hybrid.as_ref().expect("loaded model is not hybrid");
 
     let (seq_ids, seq_hidden, _, seq_position) = model

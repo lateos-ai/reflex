@@ -75,7 +75,7 @@ use reflex_engine::diagnostics;
 use reflex_engine::energy;
 use reflex_engine::gguf::GgufFile;
 use reflex_engine::kv_io;
-use reflex_engine::model::{ArchitectureKind, Model};
+use reflex_engine::model::ArchitectureKind;
 use std::time::Instant;
 
 fn print_lora_ok(json: bool, path: &str, tensors_applied: usize) {
@@ -153,6 +153,7 @@ pub fn run(args: Vec<String>) {
     let mut import_kv: Option<String> = None;
     let mut max_tokens: usize = 1;
     let mut lora_path: Option<String> = None;
+    let mut weights_flag: Option<String> = None;
     let mut model_spec: Option<String> = None;
     let mut quickstart = false;
     let mut temperature: f32 = 0.0;
@@ -172,6 +173,9 @@ pub fn run(args: Vec<String>) {
                 import_kv = Some(args.next().expect("--import-kv requires a file path"))
             }
             "--lora" => lora_path = Some(args.next().expect("--lora requires a file path")),
+            "--weights" => {
+                weights_flag = Some(args.next().expect("--weights requires `f16` or `f32`"))
+            }
             "--model" => {
                 model_spec = Some(
                     args.next()
@@ -229,7 +233,7 @@ pub fn run(args: Vec<String>) {
         None => {
             let gguf_path = positional.next().unwrap_or_else(|| {
                 panic!(
-                    "usage: reflex generate <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>] [--lora <adapter.gguf>] | \
+                    "usage: reflex generate <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>] [--lora <adapter.gguf>] [--weights f16|f32] | \
                      reflex generate --model <org/repo:file.gguf> [prompt] | reflex generate --quickstart [prompt]"
                 )
             });
@@ -257,7 +261,15 @@ pub fn run(args: Vec<String>) {
     if let Ok(diag) = diagnostics::probe(&device) {
         eprintln!("{diag}");
     }
-    let mut model = Model::load(device, &file).expect("failed to load model");
+    let mut model = crate::load_model(
+        device,
+        &file,
+        weights_flag.as_deref(),
+        reflex_engine::model::WeightsDtype::DEFAULT,
+        lora_path.as_deref(),
+    )
+    .expect("failed to load model");
+    let weights_dtype = model.weights_dtype().as_str();
     let model_load_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms - cuda_init_ms;
     let e_model_load = sampler.measure();
     let model_ready_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -347,13 +359,14 @@ pub fn run(args: Vec<String>) {
                     token_text: text,
                     joules: energy_measurement.as_ref().map(|m| m.joules),
                     energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
+                    weights_dtype,
                 },
             );
             #[cfg(not(feature = "json-output"))]
             json_output_unavailable();
         } else {
             println!(
-                "REFLEX_GENERATE_OK process_start_to_first_token_ms={process_start_to_first_token_ms:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} token_id={token_id} token_text={text:?}{}",
+                "REFLEX_GENERATE_OK process_start_to_first_token_ms={process_start_to_first_token_ms:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} token_id={token_id} token_text={text:?}{} weights_dtype={weights_dtype}",
                 energy_suffix(energy_measurement.as_ref()),
             );
         }
@@ -412,6 +425,7 @@ pub fn run(args: Vec<String>) {
                 token_text: text,
                 joules: energy_measurement.as_ref().map(|m| m.joules),
                 energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
+                weights_dtype,
             },
         );
         #[cfg(not(feature = "json-output"))]
@@ -419,7 +433,7 @@ pub fn run(args: Vec<String>) {
     } else {
         let token_ids: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
         println!(
-            "REFLEX_GENERATE_OK process_start_to_first_token_ms={:.3} process_start_to_last_token_ms={:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} num_generated={} token_id={} token_ids=[{}] token_text={text:?}{}",
+            "REFLEX_GENERATE_OK process_start_to_first_token_ms={:.3} process_start_to_last_token_ms={:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} num_generated={} token_id={} token_ids=[{}] token_text={text:?}{} weights_dtype={weights_dtype}",
             first_token_ms.unwrap_or(total_ms),
             total_ms,
             tokens.len(),
