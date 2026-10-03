@@ -37,7 +37,7 @@ struct InFlightPermit(Arc<AtomicUsize>);
 impl InFlightPermit {
     fn try_acquire(counter: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
         counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n < max).then_some(n + 1)
             })
             .ok()

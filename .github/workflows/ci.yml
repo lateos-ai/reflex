@@ -44,6 +44,8 @@ jobs:
         # between pyo3's `#[pyclass]` bound and `WeightLoadPipeline`'s `*mut u8`
         # pinned-host pointer). The four features below are the ones the deploy Dockerfiles
         # actually use, and must keep building independently.
+        # `shell: bash`: the loop is bash syntax, and windows-latest defaults to pwsh.
+        shell: bash
         run: |
           for feature in ipc json-output download nvml; do
             cargo check --locked --features "$feature"
