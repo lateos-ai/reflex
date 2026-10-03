@@ -46,7 +46,7 @@ cargo build --release
 
 ```
 reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host <addr>]
-  [--port <port>] [--lora <adapter.gguf>] [--model-name <name>]
+  [--port <port>] [--lora <adapter.gguf>] [--weights f16|f32] [--model-name <name>]
   [--default-max-tokens <n>] [--no-chat-template] [--chat-template-file <path>]
   [--owned-by <name>] [--pricing-prompt <str>] [--pricing-completion <str>]
   [--region <str>] [--max-tokens-cap <n>] [--max-prompt-bytes <n>]
@@ -55,6 +55,9 @@ reflex-openai-adapter <path-to-gguf> [--reflex-bin <path>] [--host <addr>]
 
 - `--lora <adapter.gguf>` is forwarded straight through to `reflex stdio`'s own
   `--lora` flag (see Phase 4/Embeddability in the root `README.md`).
+- `--weights f16|f32` is forwarded to `reflex stdio --weights`: how the engine stores
+  matrix weights on the GPU (`f16`, its default, or the exact `f32` reference mode). Left
+  out, the child uses its own default or an inherited `REFLEX_WEIGHTS`.
 - `--model-name` sets the `model` field returned in responses when a request doesn't
   specify one of its own; defaults to the GGUF file's stem.
 - `--default-max-tokens` (default `256`) is used when a request omits `max_tokens`.

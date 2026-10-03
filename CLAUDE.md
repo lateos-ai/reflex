@@ -91,7 +91,11 @@ output modes).
 whether `<arch>.expert_count` is present and nonzero in the GGUF metadata (not a
 hardcoded architecture-string check). Every weight tensor is dequantized once
 (`src/dequant.rs`/`dequant_iq.rs`, byte-exact vs. `gguf-py`) and uploaded to the GPU
-once as a `CudaSlice<f32>` inside `Weight` — **do not** reintroduce per-call
+once inside `Weight` (`WeightData::F16` for matrix weights by default, `WeightData::F32`
+with `--weights f32`/`REFLEX_WEIGHTS=f32` and for every norm/router/`ssm_*` tensor --
+`is_matrix_weight` decides; see docs/DEVELOPMENT.md's model-loading section and
+`docs/reference.md`'s "Weight storage" for the f16 kernels, the 65504 activation-cast
+saturation, and LoRA's f32 merge) — **do not** reintroduce per-call
 `htod_sync_copy` of weight buffers inside `gemv`/`gemv_expert`/`rmsnorm`; that was a real
 regression (see README's "Phase 2, round 1" section) that made the engine ~4.3x slower
 than llama.cpp until fixed. Only the token embedding table's *raw quantized* bytes stay

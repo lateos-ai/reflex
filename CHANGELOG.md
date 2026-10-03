@@ -11,6 +11,16 @@ What has been built, in order. Measurements live in
   T4, `system1` cold start went from ~452 to ~421 ms and `generate` from ~700 to ~674 ms
   (p50, n=10, two interleaved rounds); output is unchanged. The model keeps the GGUF file
   mapped for its lifetime.
+- **f16 weight storage, the new default**: matrix weights are dequantized straight to
+  `f16` on the GPU (every dequant kernel has an `_f16` twin), halving weight VRAM to about
+  2 bytes per parameter. Decode uses f16-weight GEMV kernels with f32 accumulation;
+  prefill uses `cublasGemmEx` (f16 inputs, f32 compute), with an activation cast that
+  saturates at 65504 instead of overflowing and reports what it clamped. `--weights f32`
+  / `REFLEX_WEIGHTS=f32` keeps the exact reference mode, and `reflex check` defaults to
+  it. LoRA merges stay in f32. Result lines gain `weights_dtype` (`--json` schema
+  `1.1.0`). **Not yet verified on a GPU**: correctness, cold-start, memory and decode
+  numbers are pending `scripts/verify_f16_weights.sh` (see
+  [docs/benchmarks.md](docs/benchmarks.md#f16-weight-storage)).
 
 ## 2026-10-01
 
