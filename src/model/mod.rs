@@ -892,7 +892,7 @@ impl Model {
                 }
                 let element_count =
                     self.token_embd.vocab_size as u64 * self.token_embd.hidden_size as u64;
-                let data = dequantize_tensor_to_device(
+                let data = dequantize_matrix_to_device(
                     &mut self.dequant_pipeline.borrow_mut(),
                     &self.dequant_kernels,
                     self.token_embd.ggml_type,
@@ -949,6 +949,11 @@ impl Model {
         let mut compact = Vec::with_capacity(row_indices.len() * hidden_size);
         for &r in row_indices {
             compact.extend_from_slice(&self.token_embd.row(r)?);
+        }
+        if f16_roundtrip_enabled() {
+            for v in &mut compact {
+                *v = half::f16::from_f32(*v).to_f32();
+            }
         }
         let dev_compact = self
             .device

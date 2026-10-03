@@ -269,7 +269,7 @@ impl Model {
         let lm_head = match file.tensor_info("output.weight") {
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
-                let data = dequantize_tensor_to_device(
+                let data = dequantize_matrix_to_device(
                     &mut pipeline,
                     &dequant_kernels,
                     info.ggml_type,
