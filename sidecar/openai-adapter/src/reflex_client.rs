@@ -71,7 +71,8 @@ pub struct ReflexClient {
 }
 
 impl ReflexClient {
-    /// Spawns `<reflex_bin> stdio <gguf_path> [--lora <lora_path>]` and a background
+    /// Spawns `<reflex_bin> stdio <gguf_path> [--lora <lora_path>] [--weights <weights>]`
+    /// and a background
     /// worker task that owns its stdin/stdout for the lifetime of the process. The
     /// child's stderr (its `REFLEX_STDIO_READY`/diagnostic lines) is forwarded to
     /// this process's own stderr, prefixed, so it's visible in the sidecar's logs.
@@ -81,12 +82,16 @@ impl ReflexClient {
         reflex_bin: &str,
         gguf_path: &str,
         lora_path: Option<&str>,
+        weights: Option<&str>,
         max_in_flight: usize,
     ) -> Result<Self> {
         let mut cmd = Command::new(reflex_bin);
         cmd.arg("stdio").arg(gguf_path);
         if let Some(lora) = lora_path {
             cmd.arg("--lora").arg(lora);
+        }
+        if let Some(weights) = weights {
+            cmd.arg("--weights").arg(weights);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())

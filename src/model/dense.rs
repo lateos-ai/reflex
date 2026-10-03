@@ -74,17 +74,19 @@ impl Model {
     pub(super) fn load_dense(
         device: Arc<CudaDevice>,
         file: &GgufFile,
+        policy: &WeightPolicy,
     ) -> Result<Self, ReflexError> {
         std::thread::scope(|scope| {
             let init_device = device.clone();
             let init = scope.spawn(move || Self::load_background_init(file, init_device));
-            Self::load_dense_inner(device, file, init)
+            Self::load_dense_inner(device, file, policy, init)
         })
     }
 
     pub(super) fn load_dense_inner<'scope>(
         device: Arc<CudaDevice>,
         file: &GgufFile,
+        policy: &WeightPolicy,
         init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), ReflexError>>,
     ) -> Result<Self, ReflexError> {
         let (cfg, block_count, moe) = parse_model_config(file)?;
@@ -199,7 +201,7 @@ impl Model {
         // successive calls via `pipeline` (see `WeightLoadPipeline`'s doc
         // comment) instead of the old sequential blocking-H2D-copy path.
         let mut load_weight = |name: &str| -> Result<Weight, ReflexError> {
-            load_weight_device(&mut pipeline, &dequant_kernels, file, name)
+            load_weight_device(&mut pipeline, &dequant_kernels, policy, file, name)
         };
 
         let mut layers = Vec::with_capacity(block_count);
@@ -272,6 +274,7 @@ impl Model {
                 let data = dequantize_matrix_to_device(
                     &mut pipeline,
                     &dequant_kernels,
+                    policy.matrix_dtype,
                     info.ggml_type,
                     bytes,
                     info.element_count(),
@@ -321,6 +324,7 @@ impl Model {
             dequant_pipeline: RefCell::new(pipeline),
             output_norm,
             lm_head,
+            weights_dtype: policy.matrix_dtype,
             tokenizer,
             hybrid: None,
             mla: None,
@@ -354,7 +358,7 @@ impl Model {
         let cfg = &self.cfg;
         let normed = self.rmsnorm(
             &hidden,
-            &attn_norm.data,
+            attn_norm.f32()?,
             1,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -365,12 +369,18 @@ impl Model {
         let v = self.gemv(&normed, attn_v)?;
 
         if let Some(qn) = attn_q_norm {
-            q = self.rmsnorm(&q, &qn.data, cfg.num_q_heads, cfg.head_dim, cfg.rmsnorm_eps)?;
+            q = self.rmsnorm(
+                &q,
+                qn.f32()?,
+                cfg.num_q_heads,
+                cfg.head_dim,
+                cfg.rmsnorm_eps,
+            )?;
         }
         if let Some(kn) = attn_k_norm {
             k = self.rmsnorm(
                 &k,
-                &kn.data,
+                kn.f32()?,
                 cfg.num_kv_heads,
                 cfg.head_dim,
                 cfg.rmsnorm_eps,
@@ -453,7 +463,7 @@ impl Model {
         let cfg = &self.cfg;
         let ffn_normed = self.rmsnorm(
             &post_attn,
-            &layer.ffn_norm.data,
+            layer.ffn_norm.f32()?,
             1,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -504,7 +514,7 @@ impl Model {
         let cfg = &self.cfg;
         let ffn_normed = self.rmsnorm(
             &post_attn,
-            &layer.ffn_norm.data,
+            layer.ffn_norm.f32()?,
             1,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -594,7 +604,7 @@ impl Model {
         let cfg = &self.cfg;
         let normed = self.rmsnorm(
             &hidden,
-            &attn_norm.data,
+            attn_norm.f32()?,
             rows,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -607,7 +617,7 @@ impl Model {
         if let Some(qn) = attn_q_norm {
             q = self.rmsnorm(
                 &q,
-                &qn.data,
+                qn.f32()?,
                 rows * cfg.num_q_heads,
                 cfg.head_dim,
                 cfg.rmsnorm_eps,
@@ -616,7 +626,7 @@ impl Model {
         if let Some(kn) = attn_k_norm {
             k = self.rmsnorm(
                 &k,
-                &kn.data,
+                kn.f32()?,
                 rows * cfg.num_kv_heads,
                 cfg.head_dim,
                 cfg.rmsnorm_eps,
@@ -710,7 +720,7 @@ impl Model {
         let cfg = &self.cfg;
         let ffn_normed = self.rmsnorm(
             &post_attn,
-            &layer.ffn_norm.data,
+            layer.ffn_norm.f32()?,
             rows,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -840,7 +850,7 @@ impl Model {
         let cfg = &self.cfg;
         let ffn_normed = self.rmsnorm(
             &post_attn,
-            &layer.ffn_norm.data,
+            layer.ffn_norm.f32()?,
             rows,
             cfg.hidden_size,
             cfg.rmsnorm_eps,
@@ -1220,7 +1230,7 @@ impl Model {
         // single-token case (Yes/No, A-D, a 1-10 scale).
         let normed = self.rmsnorm(
             &hidden,
-            &self.output_norm.data,
+            self.output_norm.f32()?,
             1,
             self.cfg.hidden_size,
             self.cfg.rmsnorm_eps,
@@ -1242,7 +1252,7 @@ impl Model {
                     self.forward_one_token_dense(prev, position, &mut k_caches, &mut v_caches)?;
                 let normed_step = self.rmsnorm(
                     &h,
-                    &self.output_norm.data,
+                    self.output_norm.f32()?,
                     1,
                     self.cfg.hidden_size,
                     self.cfg.rmsnorm_eps,

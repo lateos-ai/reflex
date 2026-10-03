@@ -52,6 +52,26 @@ pub(crate) fn fail(context: &str, err: impl std::fmt::Display) -> ! {
     reflex_engine::fast_exit(1)
 }
 
+/// Loads `file` the way every model-loading subcommand does: matrix weights in
+/// the dtype `--weights` names (`weights_flag`), else `REFLEX_WEIGHTS`, else
+/// `default_weights`; and, when `--lora` was given, with that adapter's target
+/// weights kept `f32` until the caller's `apply_lora` merges them (see
+/// `LoadOptions::lora_adapter`).
+pub(crate) fn load_model(
+    device: std::sync::Arc<cudarc::driver::CudaDevice>,
+    file: &reflex_engine::gguf::GgufFile,
+    weights_flag: Option<&str>,
+    default_weights: reflex_engine::model::WeightsDtype,
+    lora_path: Option<&str>,
+) -> Result<reflex_engine::model::Model, reflex_engine::error::ReflexError> {
+    let weights = reflex_engine::model::WeightsDtype::resolve_or(weights_flag, default_weights)?;
+    let opts = reflex_engine::model::LoadOptions {
+        weights,
+        lora_adapter: lora_path.map(std::path::PathBuf::from),
+    };
+    reflex_engine::model::Model::load_with_options(device, file, &opts)
+}
+
 fn main() {
     let mut args = std::env::args();
     let _program = args.next();

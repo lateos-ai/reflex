@@ -83,6 +83,14 @@ const ATTN_ONLINE_MAX_DIM: usize = 1024;
 const ATTN_ONLINE_SPLIT_POSITIONS: usize = 256;
 const ATTN_ONLINE_MAX_SPLITS: usize = 64;
 
+/// Error for an f16 weight reaching a matmul wrapper that has no f16 kernel.
+fn f16_kernel_missing(op: &str) -> ReflexError {
+    crate::reflex_err!(
+        UnsupportedArchitecture,
+        "{op}: no f16-weight kernel yet; load with --weights f32 (REFLEX_WEIGHTS=f32)"
+    )
+}
+
 impl Model {
     /// Runs `attention_online_kernel` (and, for a split decode, its combine kernel):
     /// the default implementation behind [`Self::attention`],
@@ -222,9 +230,8 @@ impl Model {
     }
 
     /// `x` and `w_dev` are both already device-resident (Phase 2 round 2) --
-    /// `w_dev` is either `&self.data` on a whole [`Weight`] (a
-    /// `&CudaSlice<f32>`) or a zero-copy `CudaView` slice of one (see
-    /// `Self::gemv_expert`).
+    /// `w_dev` is either a whole f32 [`Weight`]'s buffer (a `&CudaSlice<f32>`)
+    /// or a zero-copy `CudaView` slice of one (see `Self::gemv_view`).
     pub(super) fn gemv_raw<W: DeviceRepr>(
         &self,
         x: &CudaSlice<f32>,
@@ -284,7 +291,10 @@ impl Model {
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let in_features = w.shape[0] as usize;
         let out_features = w.shape[1] as usize;
-        self.gemv_raw(x, &w.data, in_features, out_features)
+        match &w.data {
+            WeightData::F32(data) => self.gemv_raw(x, data, in_features, out_features),
+            WeightData::F16(_) => Err(f16_kernel_missing("gemv")),
+        }
     }
 
     /// Batched linear projection: `y[rows, out_features] = x[rows, in_features]
@@ -341,9 +351,12 @@ impl Model {
             beta: 0.0f32,
             ldc: out_features as i32,
         };
+        let WeightData::F32(data) = &w.data else {
+            return Err(f16_kernel_missing("gemm"));
+        };
         unsafe {
             self.cublas
-                .gemm(cfg, &w.data, x, &mut dev_y)
+                .gemm(cfg, data, x, &mut dev_y)
                 .map_err(|e| crate::gpu_err!(e, "gemm launch: {e:?}"))?;
         }
         Ok(dev_y)
@@ -361,10 +374,10 @@ impl Model {
     /// `gemm`'s `&Weight` signature. No length assertion on `x` (unlike `gemm`) -- a
     /// generic view type isn't cheaply length-checked here, so correctness relies on
     /// the caller passing consistent `rows`/`in_features`.
-    pub(super) fn gemm_view<X: DevicePtr<f32>, W: DevicePtr<f32>>(
+    pub(super) fn gemm_view<X: DevicePtr<f32>>(
         &self,
         x: &X,
-        w: &W,
+        w: &WeightView,
         in_features: usize,
         out_features: usize,
         rows: usize,
@@ -384,6 +397,9 @@ impl Model {
             ldb: in_features as i32,
             beta: 0.0f32,
             ldc: out_features as i32,
+        };
+        let WeightView::F32(w) = w else {
+            return Err(f16_kernel_missing("gemm_view"));
         };
         unsafe {
             self.cublas
@@ -405,7 +421,7 @@ impl Model {
     pub(super) fn expert_weight_view<'a>(
         w: &'a Weight,
         expert_idx: usize,
-    ) -> Result<(CudaView<'a, f32>, usize, usize), ReflexError> {
+    ) -> Result<(WeightView<'a>, usize, usize), ReflexError> {
         let (in_features, out_features, expert_count) = match w.shape.as_slice() {
             [i, o, e] => (*i as usize, *o as usize, *e as usize),
             other => {
@@ -420,11 +436,7 @@ impl Model {
         }
         let expert_len = in_features * out_features;
         let start = expert_idx * expert_len;
-        Ok((
-            w.data.slice(start..start + expert_len),
-            in_features,
-            out_features,
-        ))
+        Ok((w.view(start..start + expert_len), in_features, out_features))
     }
 
     /// GEMV against expert `expert_idx`'s slice of a per-expert-stacked 3-D MoE tensor
@@ -444,7 +456,7 @@ impl Model {
         expert_idx: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let (view, in_features, out_features) = Self::expert_weight_view(w, expert_idx)?;
-        self.gemv_view(x, &view, in_features, out_features)
+        self.gemv_view(x, view, in_features, out_features)
     }
 
     /// Grouped-GEMM MoE batching's gather step (`moe_gather_kernel`,
@@ -591,6 +603,9 @@ impl Model {
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
+        let WeightData::F32(data) = &w.data else {
+            return Err(f16_kernel_missing("gemv_gather"));
+        };
         unsafe {
             self.gemv_gather_k
                 .function
@@ -599,7 +614,7 @@ impl Model {
                     launch_cfg,
                     (
                         x,
-                        &w.data,
+                        data,
                         &dev_indices,
                         &mut dev_y,
                         in_features as u32,
@@ -1136,13 +1151,16 @@ impl Model {
     /// buffer. No length assertion (unlike `gemv_raw`) -- a generic view type isn't
     /// cheaply length-checked here, so correctness relies on the caller passing
     /// consistent `in_features`/`out_features`.
-    pub(super) fn gemv_view<X: DeviceRepr, W: DeviceRepr>(
+    pub(super) fn gemv_view<X: DeviceRepr>(
         &self,
         x: X,
-        w_dev: W,
+        w: WeightView,
         in_features: usize,
         out_features: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
+        let WeightView::F32(w_dev) = w else {
+            return Err(f16_kernel_missing("gemv_view"));
+        };
         let mut dev_y = self
             .device
             .alloc_zeros::<f32>(out_features)
@@ -1166,7 +1184,7 @@ impl Model {
                     launch_cfg,
                     (
                         x,
-                        w_dev,
+                        &w_dev,
                         &mut dev_y,
                         in_features as u32,
                         out_features as u32,
@@ -1213,11 +1231,10 @@ impl Model {
             .alloc_zeros::<f32>(n_head * out_features)
             .map_err(|e| crate::gpu_err!(e, "gemv_per_head alloc: {e}"))?;
         for h in 0..n_head {
-            let w_view = w
-                .data
-                .slice(h * in_features * out_features..(h + 1) * in_features * out_features);
+            let w_view =
+                w.view(h * in_features * out_features..(h + 1) * in_features * out_features);
             let x_view = x.slice(h * in_features..(h + 1) * in_features);
-            let y = self.gemv_view(&x_view, &w_view, in_features, out_features)?;
+            let y = self.gemv_view(&x_view, w_view, in_features, out_features)?;
             let mut dst = out.slice_mut(h * out_features..(h + 1) * out_features);
             self.device
                 .dtod_copy(&y, &mut dst)
@@ -1278,6 +1295,9 @@ impl Model {
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
+        let WeightData::F32(data) = &w.data else {
+            return Err(f16_kernel_missing("gemv_per_head_batch"));
+        };
         unsafe {
             m.gemv_per_head_batch_k
                 .function
@@ -1286,7 +1306,7 @@ impl Model {
                     launch_cfg,
                     (
                         x,
-                        &w.data,
+                        data,
                         &mut out,
                         rows as u32,
                         n_head as u32,

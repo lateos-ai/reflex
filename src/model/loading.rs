@@ -4,16 +4,172 @@
 use super::*;
 use crate::error::ReflexError;
 
-/// A weight tensor, dequantized to `f32` once at load time and uploaded to
-/// device memory immediately after (see `Model::load`'s `load_weight`) so
-/// no forward-pass call re-uploads it -- kernels below take `&self.data`
-/// (or a zero-copy `CudaView` slice of it, for per-expert MoE tensors)
+/// Element type matrix weights are stored in on the device (`--weights`,
+/// `REFLEX_WEIGHTS`). Only matrix weights (see [`is_matrix_weight`]) follow it;
+/// norms, biases, routers and every activation and KV-cache buffer are `f32`
+/// in both modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightsDtype {
+    /// Half the VRAM and half the per-token weight traffic of `F32`. Matmul
+    /// kernels read f16 weights and accumulate in f32.
+    F16,
+    /// The exact reference mode: every weight is the f32 the dequant produced,
+    /// bit for bit what `reflex check`'s llama.cpp comparison was built on.
+    F32,
+}
+
+impl WeightsDtype {
+    /// What a model loads with when neither `--weights` nor `REFLEX_WEIGHTS`
+    /// says otherwise.
+    pub const DEFAULT: WeightsDtype = WeightsDtype::F32;
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WeightsDtype::F16 => "f16",
+            WeightsDtype::F32 => "f32",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, ReflexError> {
+        match s {
+            "f16" => Ok(WeightsDtype::F16),
+            "f32" => Ok(WeightsDtype::F32),
+            other => Err(crate::reflex_err!(
+                InvalidInput,
+                "weights dtype must be `f16` or `f32`, got {other:?}"
+            )),
+        }
+    }
+
+    /// `flag` (a subcommand's `--weights` value) if given, else
+    /// `REFLEX_WEIGHTS` if set and non-empty, else [`Self::DEFAULT`].
+    pub fn resolve(flag: Option<&str>) -> Result<Self, ReflexError> {
+        Self::resolve_or(flag, Self::DEFAULT)
+    }
+
+    /// [`Self::resolve`] with a caller-chosen fallback in place of
+    /// [`Self::DEFAULT`] (`reflex check` falls back to `F32`).
+    pub fn resolve_or(flag: Option<&str>, default: Self) -> Result<Self, ReflexError> {
+        if let Some(f) = flag {
+            return Self::parse(f);
+        }
+        match std::env::var("REFLEX_WEIGHTS") {
+            Ok(v) if !v.is_empty() => {
+                Self::parse(&v).map_err(|e| e.rewrap(format!("REFLEX_WEIGHTS: {e}")))
+            }
+            _ => Ok(default),
+        }
+    }
+}
+
+impl Default for WeightsDtype {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl std::fmt::Display for WeightsDtype {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Options for [`Model::load_with_options`].
+#[derive(Clone, Debug, Default)]
+pub struct LoadOptions {
+    pub weights: WeightsDtype,
+    /// The LoRA adapter the caller will pass to [`Model::apply_lora`] right
+    /// after loading, if any. Only its tensor names are read here: the base
+    /// weights it targets are loaded as `f32`, so `apply_lora` adds the delta
+    /// to the exact dequantized values and rounds to f16 once, afterwards.
+    pub lora_adapter: Option<std::path::PathBuf>,
+}
+
+/// Which element type each loaded tensor gets: [`LoadOptions`] resolved
+/// against the adapter's target names, threaded through the `load_*` paths.
+pub(super) struct WeightPolicy {
+    pub(super) matrix_dtype: WeightsDtype,
+    /// Matrix weights a LoRA adapter will be merged into: loaded `f32`
+    /// regardless of `matrix_dtype` (see [`LoadOptions::lora_adapter`]).
+    pub(super) keep_f32: std::collections::HashSet<String>,
+}
+
+impl WeightPolicy {
+    pub(super) fn from_options(opts: &LoadOptions) -> Result<Self, ReflexError> {
+        let keep_f32 = match &opts.lora_adapter {
+            Some(path) => lora::target_names(path)?.into_iter().collect(),
+            None => std::collections::HashSet::new(),
+        };
+        Ok(Self {
+            matrix_dtype: opts.weights,
+            keep_f32,
+        })
+    }
+
+    /// `Some(dtype)` for a matrix weight, `None` for a tensor that always
+    /// stays `f32` (see [`is_matrix_weight`]).
+    fn matrix_dtype_for(&self, name: &str, shape: &[u64]) -> Option<WeightsDtype> {
+        if !is_matrix_weight(name, shape) {
+            return None;
+        }
+        if self.keep_f32.contains(name) {
+            return Some(WeightsDtype::F32);
+        }
+        Some(self.matrix_dtype)
+    }
+}
+
+/// A weight tensor's device buffer. `F32` is every tensor in `--weights f32`
+/// mode and the non-matrix tensors in both modes; `F16` is a matrix weight in
+/// `--weights f16` mode. A future block-quantized variant (raw GGUF blocks
+/// read by quantized matmul kernels) slots in here as a third arm; every
+/// matmul wrapper in `kernels.rs` already dispatches on this enum.
+pub(super) enum WeightData {
+    F32(CudaSlice<f32>),
+    F16(CudaSlice<half::f16>),
+}
+
+/// A zero-copy view of part of a [`Weight`] (one MoE expert's or one MLA
+/// head's slice of a stacked 3-D tensor), with the same element type.
+pub(super) enum WeightView<'a> {
+    F32(CudaView<'a, f32>),
+    F16(CudaView<'a, half::f16>),
+}
+
+/// A weight tensor, dequantized once at load time and uploaded to device
+/// memory immediately after (see `Model::load`'s `load_weight`) so no
+/// forward-pass call re-uploads it -- kernels below read `self.data` (or a
+/// zero-copy [`WeightView`] slice of it, for per-expert MoE tensors)
 /// directly. Shape is the original GGUF shape (`[in_features,
 /// out_features]` for a 2-D `nn.Linear`-style weight, `[hidden_size]` for a
 /// norm weight).
 pub(super) struct Weight {
-    pub(super) data: CudaSlice<f32>,
+    pub(super) data: WeightData,
     pub(super) shape: Vec<u64>,
+}
+
+impl Weight {
+    /// The `f32` buffer of a tensor that is always `f32` (a norm, bias or
+    /// state-space vector, see [`is_matrix_weight`]). Errors on an f16 matrix
+    /// weight instead of handing an f32 kernel the wrong element type.
+    pub(super) fn f32(&self) -> Result<&CudaSlice<f32>, ReflexError> {
+        match &self.data {
+            WeightData::F32(s) => Ok(s),
+            WeightData::F16(_) => Err(crate::reflex_err!(
+                Other,
+                "weight of shape {:?} is stored as f16, but this op reads it as f32",
+                self.shape
+            )),
+        }
+    }
+
+    /// Elements `range` of this weight's flat buffer, without copying.
+    pub(super) fn view(&self, range: std::ops::Range<usize>) -> WeightView<'_> {
+        match &self.data {
+            WeightData::F32(s) => WeightView::F32(s.slice(range)),
+            WeightData::F16(s) => WeightView::F16(s.slice(range)),
+        }
+    }
 }
 
 /// `token_embd`, dequantized lazily one row at a time instead of eagerly
@@ -207,12 +363,9 @@ pub(super) const IQ1M_BLOCK_BYTES: usize = 56;
 
 pub(super) const IQ4XS_BLOCK_BYTES: usize = 136;
 
-/// Every on-device dequant kernel (`src/kernels_cuda/dequant.cu`), loaded
-/// once at model-load time and threaded through `Model::load`/`load_hybrid`/
-/// `load_mla`'s `load_weight` closures. Bundled into one struct rather than
-/// growing `dequantize_tensor_to_device`/`load_weight_device`'s parameter
-/// list by one `&AotKernel` per newly-ported format.
-pub(super) struct DequantKernels {
+/// One output type's set of on-device dequant kernels
+/// (`src/kernels_cuda/dequant.cu`), one per block-quantized GGUF format.
+pub(super) struct FormatKernels {
     pub(super) q4k: AotKernel,
     pub(super) q5k: AotKernel,
     pub(super) q6k: AotKernel,
@@ -233,120 +386,154 @@ pub(super) struct DequantKernels {
     pub(super) iq1s: AotKernel,
     pub(super) iq1m: AotKernel,
     pub(super) iq4xs: AotKernel,
-    /// `f16_roundtrip_kernel` (`kernels_cuda/convert.cu`), see [`f16_roundtrip_enabled`].
-    pub(super) f16_roundtrip: AotKernel,
 }
 
-/// Loads every on-device dequant kernel from the AOT-compiled `dequant`
-/// module in one call -- shared by `Model::load`/`load_hybrid`/`load_mla`,
-/// which each used to repeat this loading boilerplate individually.
+/// The formats in [`FormatKernels`]' field order, as their `dequant.cu`
+/// kernel-name stems.
+const DEQUANT_FORMATS: [&str; 20] = [
+    "q4k", "q5k", "q6k", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q8_1", "q2k", "q3k", "q8k",
+    "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", "iq1s", "iq1m", "iq4xs",
+];
+
+impl FormatKernels {
+    fn from_iter(fns: &mut impl Iterator<Item = AotKernel>) -> Result<Self, ReflexError> {
+        let mut next = || {
+            fns.next()
+                .ok_or_else(|| ReflexError::Other("missing dequant kernel".to_string()))
+        };
+        Ok(Self {
+            q4k: next()?,
+            q5k: next()?,
+            q6k: next()?,
+            q4_0: next()?,
+            q4_1: next()?,
+            q5_0: next()?,
+            q5_1: next()?,
+            q8_0: next()?,
+            q8_1: next()?,
+            q2k: next()?,
+            q3k: next()?,
+            q8k: next()?,
+            iq2xxs: next()?,
+            iq2xs: next()?,
+            iq2s: next()?,
+            iq3xxs: next()?,
+            iq3s: next()?,
+            iq1s: next()?,
+            iq1m: next()?,
+            iq4xs: next()?,
+        })
+    }
+
+    /// The kernel for `ggml_type` with its block size in bytes and elements,
+    /// or `None` for a type with no on-device kernel (F32/F16/BF16, which go
+    /// through the host fallback).
+    fn for_type(&self, ggml_type: GgmlType) -> Option<(&AotKernel, usize, usize)> {
+        Some(match ggml_type {
+            GgmlType::Q4K => (&self.q4k, Q4K_BLOCK_BYTES, QK_K),
+            GgmlType::Q5K => (&self.q5k, Q5K_BLOCK_BYTES, QK_K),
+            GgmlType::Q6K => (&self.q6k, Q6K_BLOCK_BYTES, QK_K),
+            GgmlType::Q4_0 => (&self.q4_0, Q4_0_BLOCK_BYTES, QK_LEGACY),
+            GgmlType::Q4_1 => (&self.q4_1, Q4_1_BLOCK_BYTES, QK_LEGACY),
+            GgmlType::Q5_0 => (&self.q5_0, Q5_0_BLOCK_BYTES, QK_LEGACY),
+            GgmlType::Q5_1 => (&self.q5_1, Q5_1_BLOCK_BYTES, QK_LEGACY),
+            GgmlType::Q8_0 => (&self.q8_0, Q8_0_BLOCK_BYTES, QK_LEGACY),
+            GgmlType::Q8_1 => (&self.q8_1, Q8_1_BLOCK_BYTES, QK_LEGACY),
+            GgmlType::Q2K => (&self.q2k, Q2K_BLOCK_BYTES, QK_K),
+            GgmlType::Q3K => (&self.q3k, Q3K_BLOCK_BYTES, QK_K),
+            GgmlType::Q8K => (&self.q8k, Q8K_BLOCK_BYTES, QK_K),
+            GgmlType::IQ2XXS => (&self.iq2xxs, IQ2XXS_BLOCK_BYTES, QK_K),
+            GgmlType::IQ2XS => (&self.iq2xs, IQ2XS_BLOCK_BYTES, QK_K),
+            GgmlType::IQ2S => (&self.iq2s, IQ2S_BLOCK_BYTES, QK_K),
+            GgmlType::IQ3XXS => (&self.iq3xxs, IQ3XXS_BLOCK_BYTES, QK_K),
+            GgmlType::IQ3S => (&self.iq3s, IQ3S_BLOCK_BYTES, QK_K),
+            GgmlType::IQ1S => (&self.iq1s, IQ1S_BLOCK_BYTES, QK_K),
+            GgmlType::IQ1M => (&self.iq1m, IQ1M_BLOCK_BYTES, QK_K),
+            GgmlType::IQ4XS => (&self.iq4xs, IQ4XS_BLOCK_BYTES, QK_K),
+            _ => return None,
+        })
+    }
+}
+
+/// Every on-device dequant kernel (`src/kernels_cuda/dequant.cu`) in both
+/// output types, plus the f32/f16 conversion kernels
+/// (`src/kernels_cuda/convert.cu`), loaded once at model-load time and
+/// threaded through `Model::load`/`load_hybrid`/`load_mla`'s `load_weight`
+/// closures. Bundled into one struct rather than growing
+/// `dequantize_tensor_to_device`/`load_weight_device`'s parameter list by one
+/// `&AotKernel` per format.
+pub(super) struct DequantKernels {
+    pub(super) f32: FormatKernels,
+    pub(super) f16: FormatKernels,
+    /// `f16_roundtrip_kernel`, see [`f16_roundtrip_enabled`].
+    pub(super) f16_roundtrip: AotKernel,
+    pub(super) f32_to_f16: AotKernel,
+    pub(super) f16_to_f32: AotKernel,
+}
+
+/// Loads every on-device dequant and conversion kernel, one module load per
+/// `.cu` file -- shared by `Model::load`/`load_hybrid`/`load_mla`, which each
+/// used to repeat this loading boilerplate individually. Both output types
+/// come from the one `dequant` module, so the f16 variants cost function
+/// lookups, not a second module load.
 pub(super) fn load_dequant_kernels(
     device: &Arc<CudaDevice>,
 ) -> Result<DequantKernels, ReflexError> {
-    let names = [
-        "dequantize_q4k_kernel",
-        "dequantize_q5k_kernel",
-        "dequantize_q6k_kernel",
-        "dequantize_q4_0_kernel",
-        "dequantize_q4_1_kernel",
-        "dequantize_q5_0_kernel",
-        "dequantize_q5_1_kernel",
-        "dequantize_q8_0_kernel",
-        "dequantize_q8_1_kernel",
-        "dequantize_q2k_kernel",
-        "dequantize_q3k_kernel",
-        "dequantize_q8k_kernel",
-        "dequantize_iq2xxs_kernel",
-        "dequantize_iq2xs_kernel",
-        "dequantize_iq2s_kernel",
-        "dequantize_iq3xxs_kernel",
-        "dequantize_iq3s_kernel",
-        "dequantize_iq1s_kernel",
-        "dequantize_iq1m_kernel",
-        "dequantize_iq4xs_kernel",
-    ];
+    // `load_kernel_module` wants `&'static str`s; the 40 names are built once
+    // per process and leaked (a few hundred bytes).
+    static NAMES: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        let f32_names = DEQUANT_FORMATS
+            .iter()
+            .map(|f| format!("dequantize_{f}_kernel"));
+        let f16_names = DEQUANT_FORMATS
+            .iter()
+            .map(|f| format!("dequantize_{f}_f16_kernel"));
+        f32_names
+            .chain(f16_names)
+            .map(|n| &*Box::leak(n.into_boxed_str()))
+            .collect()
+    });
     let mut fns = aot::load_kernel_module(
         device,
         include_bytes!(env!("REFLEX_KERNEL_DEQUANT")),
         "dequant",
-        &names,
+        names,
     )?
     .into_iter();
-    Ok(DequantKernels {
-        q4k: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_q4k_kernel".to_string()))?,
-        q5k: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_q5k_kernel".to_string()))?,
-        q6k: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_q6k_kernel".to_string()))?,
-        q4_0: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_q4_0_kernel".to_string()))?,
-        q4_1: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_q4_1_kernel".to_string()))?,
-        q5_0: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_q5_0_kernel".to_string()))?,
-        q5_1: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_q5_1_kernel".to_string()))?,
-        q8_0: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_q8_0_kernel".to_string()))?,
-        q8_1: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_q8_1_kernel".to_string()))?,
-        q2k: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_q2k_kernel".to_string()))?,
-        q3k: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_q3k_kernel".to_string()))?,
-        q8k: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_q8k_kernel".to_string()))?,
-        iq2xxs: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_iq2xxs_kernel".to_string()))?,
-        iq2xs: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_iq2xs_kernel".to_string()))?,
-        iq2s: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_iq2s_kernel".to_string()))?,
-        iq3xxs: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_iq3xxs_kernel".to_string()))?,
-        iq3s: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_iq3s_kernel".to_string()))?,
-        iq1s: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_iq1s_kernel".to_string()))?,
-        iq1m: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_iq1m_kernel".to_string()))?,
-        iq4xs: fns
-            .next()
-            .ok_or_else(|| ReflexError::Other("missing dequantize_iq4xs_kernel".to_string()))?,
-        f16_roundtrip: aot::load_kernel(
-            device,
-            include_bytes!(env!("REFLEX_KERNEL_CONVERT")),
-            "convert",
+    let f32 = FormatKernels::from_iter(&mut fns)?;
+    let f16 = FormatKernels::from_iter(&mut fns)?;
+    let mut convert = aot::load_kernel_module(
+        device,
+        include_bytes!(env!("REFLEX_KERNEL_CONVERT")),
+        "convert",
+        &[
             "f16_roundtrip_kernel",
-        )?,
+            "f32_to_f16_kernel",
+            "f16_to_f32_kernel",
+        ],
+    )?
+    .into_iter();
+    let mut next = || {
+        convert
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing convert kernel".to_string()))
+    };
+    Ok(DequantKernels {
+        f32,
+        f16,
+        f16_roundtrip: next()?,
+        f32_to_f16: next()?,
+        f16_to_f32: next()?,
     })
 }
 
 /// Whether weight `name` (GGUF shape `shape`) is a matrix that only the
 /// matmul kernels (`gemv`/`gemm` and their per-expert/per-head/gather
-/// variants) read. These are the tensors `REFLEX_F16_ROUNDTRIP` rounds.
-/// Everything else stays `f32`: 1-D norms, biases and decay vectors, the
-/// Gated DeltaNet `ssm_conv1d` kernel (2-D, but read by the conv kernel), and
+/// variants) read: the tensors `--weights f16` stores as f16 (and
+/// `REFLEX_F16_ROUNDTRIP` rounds in f32 mode). Everything else stays `f32`:
+/// 1-D norms, biases and decay vectors, the Gated DeltaNet `ssm_conv1d`
+/// kernel (2-D, but read by the conv kernel), and
 /// the MoE routers (`ffn_gate_inp`, `ffn_gate_inp_shexp`), which are tiny and
 /// feed a discrete top-k choice where a rounding-induced near-tie flip would
 /// change which experts run.
@@ -378,38 +565,95 @@ pub(super) fn f16_roundtrip_in_place(
     kernels: &DequantKernels,
     data: &mut CudaSlice<f32>,
 ) -> Result<(), ReflexError> {
-    let n = data.len() as u64;
-    let threads = 256u32;
-    let blocks = (n.div_ceil(threads as u64) as u32).max(1);
-    let cfg = LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let n = data.len();
     unsafe {
         kernels
             .f16_roundtrip
             .function
             .clone()
-            .launch(cfg, (data, n))
+            .launch(elementwise_launch_cfg(n), (data, n as u64))
             .map_err(|e| crate::gpu_err!(e, "f16_roundtrip launch: {e}"))
     }
 }
 
-/// [`dequantize_tensor_to_device`] for a matrix weight: also applies the
-/// `REFLEX_F16_ROUNDTRIP` probe when it's on.
+/// Dequantizes a matrix weight (see [`is_matrix_weight`]) to `dtype`: straight
+/// to f16 through the `_f16` dequant kernels, or to f32 (with the
+/// `REFLEX_F16_ROUNDTRIP` probe applied when it's on).
 pub(super) fn dequantize_matrix_to_device(
     pipeline: &mut WeightLoadPipeline,
     kernels: &DequantKernels,
+    dtype: WeightsDtype,
     ggml_type: GgmlType,
     bytes: &[u8],
     element_count: u64,
-) -> Result<CudaSlice<f32>, ReflexError> {
-    let mut data = dequantize_tensor_to_device(pipeline, kernels, ggml_type, bytes, element_count)?;
-    if f16_roundtrip_enabled() {
-        f16_roundtrip_in_place(kernels, &mut data)?;
+) -> Result<WeightData, ReflexError> {
+    match dtype {
+        WeightsDtype::F16 => Ok(WeightData::F16(dequantize_tensor_to_device_f16(
+            pipeline,
+            kernels,
+            ggml_type,
+            bytes,
+            element_count,
+        )?)),
+        WeightsDtype::F32 => {
+            let mut data =
+                dequantize_tensor_to_device(pipeline, kernels, ggml_type, bytes, element_count)?;
+            if f16_roundtrip_enabled() {
+                f16_roundtrip_in_place(kernels, &mut data)?;
+            }
+            Ok(WeightData::F32(data))
+        }
     }
-    Ok(data)
+}
+
+/// Narrows an f32 buffer to a new f16 one on the device (round to nearest
+/// even). Used after a LoRA merge, which happens in f32.
+pub(super) fn f32_to_f16_on_device(
+    device: &Arc<CudaDevice>,
+    kernel: &AotKernel,
+    src: &CudaSlice<f32>,
+) -> Result<CudaSlice<half::f16>, ReflexError> {
+    let n = src.len();
+    let mut out = unsafe { device.alloc::<half::f16>(n) }
+        .map_err(|e| crate::gpu_err!(e, "alloc f16 weight: {e}"))?;
+    unsafe {
+        kernel
+            .function
+            .clone()
+            .launch(elementwise_launch_cfg(n), (src, &mut out, n as u64))
+            .map_err(|e| crate::gpu_err!(e, "f32_to_f16 launch: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// Widens an f16 buffer to a new f32 one on the device (exact).
+pub(super) fn f16_to_f32_on_device(
+    device: &Arc<CudaDevice>,
+    kernel: &AotKernel,
+    src: &CudaSlice<half::f16>,
+) -> Result<CudaSlice<f32>, ReflexError> {
+    let n = src.len();
+    let mut out = unsafe { device.alloc::<f32>(n) }
+        .map_err(|e| crate::gpu_err!(e, "alloc f32 weight: {e}"))?;
+    unsafe {
+        kernel
+            .function
+            .clone()
+            .launch(elementwise_launch_cfg(n), (src, &mut out, n as u64))
+            .map_err(|e| crate::gpu_err!(e, "f16_to_f32 launch: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// One thread per element, 256 per block, for the `convert.cu` kernels.
+fn elementwise_launch_cfg(n: usize) -> LaunchConfig {
+    let threads = 256u32;
+    let blocks = ((n as u64).div_ceil(threads as u64) as u32).max(1);
+    LaunchConfig {
+        grid_dim: (blocks, 1, 1),
+        block_dim: (threads, 1, 1),
+        shared_mem_bytes: 0,
+    }
 }
 
 /// One pinned (page-locked) host staging buffer for [`WeightLoadPipeline`],
@@ -608,15 +852,16 @@ impl WeightLoadPipeline {
     /// Pipelined replacement for the old sequential `htod_sync_copy` +
     /// kernel-launch (see the struct doc comment for the full slot
     /// lifecycle) -- same truncation behavior as before if the last block
-    /// is only partially used.
-    pub(super) fn dequantize(
+    /// is only partially used. `T` is the dequant kernel's output element
+    /// type (`f32` or `half::f16`); `kernel` must be the matching variant.
+    pub(super) fn dequantize<T: DeviceRepr>(
         &mut self,
         kernel: &AotKernel,
         block_bytes: usize,
         block_elems: usize,
         bytes: &[u8],
         element_count: u64,
-    ) -> Result<CudaSlice<f32>, ReflexError> {
+    ) -> Result<CudaSlice<T>, ReflexError> {
         let slot = self.next % 2;
         self.next += 1;
         let compute_stream = *self.device.cu_stream();
@@ -681,7 +926,7 @@ impl WeightLoadPipeline {
 
         let num_blocks = bytes.len() / block_bytes;
         let out_len = num_blocks * block_elems;
-        let mut dev_out = unsafe { self.device.alloc::<f32>(out_len) }
+        let mut dev_out = unsafe { self.device.alloc::<T>(out_len) }
             .map_err(|e| crate::gpu_err!(e, "alloc dequant output: {e}"))?;
 
         let threads = 256u32;
@@ -715,7 +960,7 @@ impl WeightLoadPipeline {
             return Ok(dev_out);
         }
         let n = element_count as usize;
-        let mut truncated = unsafe { self.device.alloc::<f32>(n) }
+        let mut truncated = unsafe { self.device.alloc::<T>(n) }
             .map_err(|e| crate::gpu_err!(e, "alloc truncated dequant output: {e}"))?;
         let src = dev_out.slice(0..n);
         self.device
@@ -749,10 +994,10 @@ impl Drop for WeightLoadPipeline {
 /// (codebook/non-uniform) family, dequantizes on-device via
 /// `src/kernels_cuda/dequant.cu` -- no host `f32` copy is ever materialized
 /// for any of them, closing the gap with llama.cpp's CUDA backend, which
-/// never materializes one either. The `other` arm below is unreachable for every
-/// `GgmlType` this project's `gguf.rs` parses, but stays as the fallback to
-/// the host `dequant::dequantize` path (`src/dequant.rs`/`dequant_iq.rs`)
-/// rather than a `match` that would need updating for every future format.
+/// never materializes one either. Types with no on-device kernel (F32, F16,
+/// BF16) fall back to the host `dequant::dequantize` path
+/// (`src/dequant.rs`/`dequant_iq.rs`), which needs no `match` update for a
+/// future format.
 pub(super) fn dequantize_tensor_to_device(
     pipeline: &mut WeightLoadPipeline,
     kernels: &DequantKernels,
@@ -760,124 +1005,48 @@ pub(super) fn dequantize_tensor_to_device(
     bytes: &[u8],
     element_count: u64,
 ) -> Result<CudaSlice<f32>, ReflexError> {
-    match ggml_type {
-        GgmlType::Q4K => {
-            pipeline.dequantize(&kernels.q4k, Q4K_BLOCK_BYTES, QK_K, bytes, element_count)
-        }
-        GgmlType::Q5K => {
-            pipeline.dequantize(&kernels.q5k, Q5K_BLOCK_BYTES, QK_K, bytes, element_count)
-        }
-        GgmlType::Q6K => {
-            pipeline.dequantize(&kernels.q6k, Q6K_BLOCK_BYTES, QK_K, bytes, element_count)
-        }
-        GgmlType::Q4_0 => pipeline.dequantize(
-            &kernels.q4_0,
-            Q4_0_BLOCK_BYTES,
-            QK_LEGACY,
-            bytes,
-            element_count,
-        ),
-        GgmlType::Q4_1 => pipeline.dequantize(
-            &kernels.q4_1,
-            Q4_1_BLOCK_BYTES,
-            QK_LEGACY,
-            bytes,
-            element_count,
-        ),
-        GgmlType::Q5_0 => pipeline.dequantize(
-            &kernels.q5_0,
-            Q5_0_BLOCK_BYTES,
-            QK_LEGACY,
-            bytes,
-            element_count,
-        ),
-        GgmlType::Q5_1 => pipeline.dequantize(
-            &kernels.q5_1,
-            Q5_1_BLOCK_BYTES,
-            QK_LEGACY,
-            bytes,
-            element_count,
-        ),
-        GgmlType::Q8_0 => pipeline.dequantize(
-            &kernels.q8_0,
-            Q8_0_BLOCK_BYTES,
-            QK_LEGACY,
-            bytes,
-            element_count,
-        ),
-        GgmlType::Q8_1 => pipeline.dequantize(
-            &kernels.q8_1,
-            Q8_1_BLOCK_BYTES,
-            QK_LEGACY,
-            bytes,
-            element_count,
-        ),
-        GgmlType::Q2K => {
-            pipeline.dequantize(&kernels.q2k, Q2K_BLOCK_BYTES, QK_K, bytes, element_count)
-        }
-        GgmlType::Q3K => {
-            pipeline.dequantize(&kernels.q3k, Q3K_BLOCK_BYTES, QK_K, bytes, element_count)
-        }
-        GgmlType::Q8K => {
-            pipeline.dequantize(&kernels.q8k, Q8K_BLOCK_BYTES, QK_K, bytes, element_count)
-        }
-        GgmlType::IQ2XXS => pipeline.dequantize(
-            &kernels.iq2xxs,
-            IQ2XXS_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        GgmlType::IQ2XS => pipeline.dequantize(
-            &kernels.iq2xs,
-            IQ2XS_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        GgmlType::IQ2S => {
-            pipeline.dequantize(&kernels.iq2s, IQ2S_BLOCK_BYTES, QK_K, bytes, element_count)
-        }
-        GgmlType::IQ3XXS => pipeline.dequantize(
-            &kernels.iq3xxs,
-            IQ3XXS_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        GgmlType::IQ3S => {
-            pipeline.dequantize(&kernels.iq3s, IQ3S_BLOCK_BYTES, QK_K, bytes, element_count)
-        }
-        GgmlType::IQ1S => {
-            pipeline.dequantize(&kernels.iq1s, IQ1S_BLOCK_BYTES, QK_K, bytes, element_count)
-        }
-        GgmlType::IQ1M => {
-            pipeline.dequantize(&kernels.iq1m, IQ1M_BLOCK_BYTES, QK_K, bytes, element_count)
-        }
-        GgmlType::IQ4XS => pipeline.dequantize(
-            &kernels.iq4xs,
-            IQ4XS_BLOCK_BYTES,
-            QK_K,
-            bytes,
-            element_count,
-        ),
-        other => {
-            let host = dequant::dequantize(other, bytes, element_count)?;
-            pipeline
-                .device
-                .htod_sync_copy(&host)
-                .map_err(|e| crate::gpu_err!(e, "upload weight to device: {e}"))
-        }
+    if let Some((kernel, block_bytes, block_elems)) = kernels.f32.for_type(ggml_type) {
+        return pipeline.dequantize(kernel, block_bytes, block_elems, bytes, element_count);
     }
+    let host = dequant::dequantize(ggml_type, bytes, element_count)?;
+    pipeline
+        .device
+        .htod_sync_copy(&host)
+        .map_err(|e| crate::gpu_err!(e, "upload weight to device: {e}"))
 }
 
-/// Loads and dequantizes weight `name` straight to a device-resident `f32`
-/// buffer -- shared by `Model::load`/`load_hybrid`/`load_mla`'s own
-/// `load_weight` closures (see [`dequantize_tensor_to_device`] for the
-/// on-device-vs-host dispatch).
+/// [`dequantize_tensor_to_device`] with f16 output: the same pipelined upload
+/// feeding the `_f16` dequant kernel, which rounds each value once on store.
+/// The host fallback narrows on the host (`half::f16::from_f32`, also round
+/// to nearest even) and uploads half the bytes.
+pub(super) fn dequantize_tensor_to_device_f16(
+    pipeline: &mut WeightLoadPipeline,
+    kernels: &DequantKernels,
+    ggml_type: GgmlType,
+    bytes: &[u8],
+    element_count: u64,
+) -> Result<CudaSlice<half::f16>, ReflexError> {
+    if let Some((kernel, block_bytes, block_elems)) = kernels.f16.for_type(ggml_type) {
+        return pipeline.dequantize(kernel, block_bytes, block_elems, bytes, element_count);
+    }
+    let host: Vec<half::f16> = dequant::dequantize(ggml_type, bytes, element_count)?
+        .into_iter()
+        .map(half::f16::from_f32)
+        .collect();
+    pipeline
+        .device
+        .htod_sync_copy(&host)
+        .map_err(|e| crate::gpu_err!(e, "upload weight to device: {e}"))
+}
+
+/// Loads and dequantizes weight `name` straight to device memory -- shared
+/// by `Model::load`/`load_hybrid`/`load_mla`'s own `load_weight` closures.
+/// `policy` picks the element type: a matrix weight gets the requested
+/// `--weights` dtype, everything else `f32` (see [`is_matrix_weight`]).
 pub(super) fn load_weight_device(
     pipeline: &mut WeightLoadPipeline,
     kernels: &DequantKernels,
+    policy: &WeightPolicy,
     file: &GgufFile,
     name: &str,
 ) -> Result<Weight, ReflexError> {
@@ -885,21 +1054,74 @@ pub(super) fn load_weight_device(
         .tensor_info(name)
         .ok_or_else(|| crate::reflex_err!(Gguf, "missing weight '{name}'"))?;
     let bytes = file.tensor_bytes(info)?;
-    let to_device = if is_matrix_weight(name, &info.shape) {
-        dequantize_matrix_to_device
-    } else {
-        dequantize_tensor_to_device
-    };
-    let data = to_device(
-        pipeline,
-        kernels,
-        info.ggml_type,
-        bytes,
-        info.element_count(),
-    )
+    let data = match policy.matrix_dtype_for(name, &info.shape) {
+        Some(dtype) => dequantize_matrix_to_device(
+            pipeline,
+            kernels,
+            dtype,
+            info.ggml_type,
+            bytes,
+            info.element_count(),
+        ),
+        None => dequantize_tensor_to_device(
+            pipeline,
+            kernels,
+            info.ggml_type,
+            bytes,
+            info.element_count(),
+        )
+        .map(WeightData::F32),
+    }
     .map_err(|e| e.rewrap(format!("load weight '{name}': {e}")))?;
     Ok(Weight {
         data,
         shape: info.shape.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weights_dtype_parses_and_flag_wins() {
+        assert_eq!(WeightsDtype::parse("f16").unwrap(), WeightsDtype::F16);
+        assert_eq!(WeightsDtype::parse("f32").unwrap(), WeightsDtype::F32);
+        assert!(WeightsDtype::parse("bf16").is_err());
+        assert!(WeightsDtype::parse("F16").is_err());
+        // An explicit flag never consults REFLEX_WEIGHTS or the fallback.
+        assert_eq!(
+            WeightsDtype::resolve_or(Some("f16"), WeightsDtype::F32).unwrap(),
+            WeightsDtype::F16
+        );
+        assert_eq!(
+            WeightsDtype::resolve_or(Some("f32"), WeightsDtype::F16).unwrap(),
+            WeightsDtype::F32
+        );
+        assert_eq!(WeightsDtype::F16.to_string(), "f16");
+    }
+
+    #[test]
+    fn matrix_weights_are_the_matmul_operands_only() {
+        assert!(is_matrix_weight("blk.0.attn_q.weight", &[1024, 2048]));
+        assert!(is_matrix_weight(
+            "blk.0.ffn_down_exps.weight",
+            &[768, 2048, 128]
+        ));
+        assert!(is_matrix_weight("blk.3.attn_k_b.weight", &[128, 512, 16]));
+        assert!(is_matrix_weight("output.weight", &[1024, 151936]));
+        assert!(is_matrix_weight("blk.0.ssm_out.weight", &[2048, 1024]));
+        // 1-D tensors.
+        assert!(!is_matrix_weight("blk.0.attn_norm.weight", &[1024]));
+        assert!(!is_matrix_weight("blk.0.ssm_dt.bias", &[32]));
+        assert!(!is_matrix_weight("blk.0.ssm_a", &[32]));
+        // 2-D, but not read by a matmul kernel, or a router.
+        assert!(!is_matrix_weight("blk.0.ssm_conv1d.weight", &[4, 6144]));
+        assert!(!is_matrix_weight("blk.0.ffn_gate_inp.weight", &[2048, 128]));
+        assert!(!is_matrix_weight(
+            "blk.0.ffn_gate_inp_shexp.weight",
+            &[2048, 1]
+        ));
+        assert!(!is_matrix_weight("token_embd.weight", &[1024, 151936]));
+    }
 }

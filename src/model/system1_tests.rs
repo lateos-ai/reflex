@@ -26,7 +26,7 @@ fn gemv_gather_matches_full_vocab_gemv_at_matching_rows() {
     let normed = model
         .rmsnorm(
             &hidden,
-            &model.output_norm.data,
+            model.output_norm.f32().expect("output_norm is f32"),
             1,
             model.cfg.hidden_size,
             model.cfg.rmsnorm_eps,
@@ -94,7 +94,7 @@ fn gemv_gather_lm_head_matches_full_vocab_gemv_while_still_lazy() {
     let normed = model
         .rmsnorm(
             &hidden,
-            &model.output_norm.data,
+            model.output_norm.f32().expect("output_norm is f32"),
             1,
             model.cfg.hidden_size,
             model.cfg.rmsnorm_eps,
