@@ -386,5 +386,6 @@ pub fn run(args: Vec<String>) {
             );
         }
     }
+    crate::report_f16_activation_stats(&model);
     reflex_engine::fast_exit(0);
 }

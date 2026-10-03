@@ -103,14 +103,6 @@ pub(super) fn load_kernel_pair(
     }
 }
 
-/// Error for an f16 weight reaching a matmul wrapper that has no f16 kernel.
-fn f16_kernel_missing(op: &str) -> ReflexError {
-    crate::reflex_err!(
-        UnsupportedArchitecture,
-        "{op}: no f16-weight kernel yet; load with --weights f32 (REFLEX_WEIGHTS=f32)"
-    )
-}
-
 impl Model {
     /// Runs `attention_online_kernel` (and, for a split decode, its combine kernel):
     /// the default implementation behind [`Self::attention`],
@@ -351,6 +343,10 @@ impl Model {
     /// the batched-prefill path to get a silently-wrong, non-crashing result,
     /// so verify it against `Self::gemv_raw` row-by-row before trusting it
     /// (`prefill_batching_tests::prefill_dense_batched_matches_sequential_prefill` does this).
+    ///
+    /// An f16 weight (`--weights f16`) goes through `cublasGemmEx` instead, with
+    /// `x` cast to f16 first (see [`Self::gemm_ex_f16`]); the layout trick is
+    /// the same.
     pub(super) fn gemm(
         &self,
         x: &CudaSlice<f32>,
@@ -368,32 +364,7 @@ impl Model {
             ));
         }
 
-        let mut dev_y = self
-            .device
-            .alloc_zeros::<f32>(rows * out_features)
-            .map_err(|e| crate::gpu_err!(e, "gemm alloc y: {e}"))?;
-
-        let cfg = GemmConfig {
-            transa: cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-            transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-            m: out_features as i32,
-            n: rows as i32,
-            k: in_features as i32,
-            alpha: 1.0f32,
-            lda: in_features as i32,
-            ldb: in_features as i32,
-            beta: 0.0f32,
-            ldc: out_features as i32,
-        };
-        let WeightData::F32(data) = &w.data else {
-            return Err(f16_kernel_missing("gemm"));
-        };
-        unsafe {
-            self.cublas
-                .gemm(cfg, data, x, &mut dev_y)
-                .map_err(|e| crate::gpu_err!(e, "gemm launch: {e:?}"))?;
-        }
-        Ok(dev_y)
+        self.gemm_view(x, &w.full_view(), in_features, out_features, rows)
     }
 
     /// Like [`Self::gemm`], but generic over both operands being any device-resident
@@ -432,15 +403,111 @@ impl Model {
             beta: 0.0f32,
             ldc: out_features as i32,
         };
-        let WeightView::F32(w) = w else {
-            return Err(f16_kernel_missing("gemm_view"));
-        };
-        unsafe {
-            self.cublas
-                .gemm(cfg, w, x, &mut dev_y)
-                .map_err(|e| crate::gpu_err!(e, "gemm_view launch: {e:?}"))?;
+        match w {
+            WeightView::F32(w) => unsafe {
+                self.cublas
+                    .gemm(cfg, w, x, &mut dev_y)
+                    .map_err(|e| crate::gpu_err!(e, "gemm_view launch: {e:?}"))?;
+            },
+            WeightView::F16(w) => {
+                let x16 = self.cast_activations_f16(*x.device_ptr(), rows * in_features)?;
+                self.gemm_ex_f16(
+                    *w.device_ptr(),
+                    &x16,
+                    &mut dev_y,
+                    out_features,
+                    rows,
+                    in_features,
+                )?;
+            }
         }
         Ok(dev_y)
+    }
+
+    /// Casts `n` f32 activations at `x` into a new f16 buffer for
+    /// [`Self::gemm_ex_f16`] (`cast_act_f16_kernel`: round to nearest even,
+    /// saturating at +-65504, range folded into `self.f16_act_stats`).
+    fn cast_activations_f16(
+        &self,
+        x: sys::CUdeviceptr,
+        n: usize,
+    ) -> Result<CudaSlice<half::f16>, ReflexError> {
+        let mut x16 = unsafe { self.device.alloc::<half::f16>(n) }
+            .map_err(|e| crate::gpu_err!(e, "alloc f16 activations: {e}"))?;
+        let threads = 256u32;
+        let blocks = ((n as u64).div_ceil(threads as u64) as u32).max(1);
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.dequant_kernels
+                .cast_act_f16
+                .function
+                .clone()
+                .launch(cfg, (x, &mut x16, n as u64, &self.f16_act_stats))
+                .map_err(|e| crate::gpu_err!(e, "cast_act_f16 launch: {e}"))?;
+        }
+        Ok(x16)
+    }
+
+    /// `y[rows, out_features] = x16[rows, in_features] @ w^T` for an f16 weight
+    /// at `w` (row-major `[out_features, in_features]`), through
+    /// `cublasGemmEx` with f16 A and B, an f32 C and f32 compute
+    /// (`CUBLAS_COMPUTE_32F`): products of f16 values are exact in f32 and
+    /// accumulate in f32. Same row-major-as-column-major transpose trick and
+    /// leading dimensions as the Sgemm path in [`Self::gemm_view`].
+    ///
+    /// The handle is pinned to `CUBLAS_PEDANTIC_MATH` for the f32 path (see
+    /// `Model::cublas`); this call switches it to `CUBLAS_DEFAULT_MATH` so the
+    /// f16 inputs can use tensor cores, and back afterwards. With an explicit
+    /// `CUBLAS_COMPUTE_32F` the default mode still accumulates in f32 (no
+    /// f16 or TF32 down-conversion); it only frees the summation order.
+    fn gemm_ex_f16(
+        &self,
+        w: sys::CUdeviceptr,
+        x16: &CudaSlice<half::f16>,
+        y: &mut CudaSlice<f32>,
+        out_features: usize,
+        rows: usize,
+        in_features: usize,
+    ) -> Result<(), ReflexError> {
+        let handle = *self.cublas.handle();
+        let set_math = |mode| unsafe {
+            cublas_sys::lib()
+                .cublasSetMathMode(handle, mode)
+                .result()
+                .map_err(|e| crate::gpu_err!(e, "cublasSetMathMode: {e:?}"))
+        };
+        let alpha = 1.0f32;
+        let beta = 0.0f32;
+        set_math(cublas_sys::cublasMath_t::CUBLAS_DEFAULT_MATH)?;
+        let launched = unsafe {
+            cudarc::cublas::result::gemm_ex(
+                handle,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                out_features as i32,
+                rows as i32,
+                in_features as i32,
+                (&alpha) as *const f32 as *const core::ffi::c_void,
+                w as *const core::ffi::c_void,
+                cublas_sys::cudaDataType::CUDA_R_16F,
+                in_features as i32,
+                *x16.device_ptr() as *const core::ffi::c_void,
+                cublas_sys::cudaDataType::CUDA_R_16F,
+                in_features as i32,
+                (&beta) as *const f32 as *const core::ffi::c_void,
+                *y.device_ptr() as *mut core::ffi::c_void,
+                cublas_sys::cudaDataType::CUDA_R_32F,
+                out_features as i32,
+                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        };
+        set_math(cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH)?;
+        launched.map_err(|e| crate::gpu_err!(e, "gemm_ex_f16 launch: {e:?}"))
     }
 
     /// Shared shape-validation/slicing logic behind [`Self::gemv_expert`] and grouped-

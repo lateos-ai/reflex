@@ -72,6 +72,35 @@ pub(crate) fn load_model(
     reflex_engine::model::Model::load_with_options(device, file, &opts)
 }
 
+/// After a run on an f16 model: warns on stderr if any prefill activation
+/// exceeded f16's range and was clamped (the output then differs from what f32
+/// weights give), and prints `REFLEX_F16_ACT_STATS max_abs=<x> saturated=<n>`
+/// when `REFLEX_F16_ACT_STATS` is set. Synchronizes the device for an 8-byte
+/// read, so it's called after every timed phase has been reported.
+pub(crate) fn report_f16_activation_stats(model: &reflex_engine::model::Model) {
+    let stats = match model.f16_activation_stats() {
+        Ok(Some(stats)) => stats,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("warning: could not read f16 activation stats: {e}");
+            return;
+        }
+    };
+    if std::env::var_os("REFLEX_F16_ACT_STATS").is_some() {
+        eprintln!(
+            "REFLEX_F16_ACT_STATS max_abs={} saturated={}",
+            stats.max_abs, stats.saturated
+        );
+    }
+    if stats.saturated > 0 {
+        eprintln!(
+            "warning: {} prefill activation value(s) exceeded f16's range (max |x| = {}) and \
+             were clamped to +-65504; this output may differ from --weights f32",
+            stats.saturated, stats.max_abs
+        );
+    }
+}
+
 fn main() {
     let mut args = std::env::args();
     let _program = args.next();
