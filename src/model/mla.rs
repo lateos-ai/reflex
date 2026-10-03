@@ -102,6 +102,8 @@ pub(super) struct MlaModel {
     /// applies MLA's per-head-stacked `wk_b`/`wv_b` weights to every head of every
     /// batched row in one launch. See `Model::gemv_per_head_batch`.
     pub(super) gemv_per_head_batch_k: AotKernel,
+    /// `gemv_per_head_batch_kernel` for f16 `wk_b`/`wv_b` (`--weights f16`).
+    pub(super) gemv_per_head_batch_f16_k: AotKernel,
     /// Extracts a per-head sub-slice out of a wider batched per-head buffer in one
     /// launch (`mla_extract_batch_kernel`, `kernels_cuda/elementwise.cu`) -- used for
     /// q_pe/k_pe/kv_cmpr extraction ahead of RoPE/RMSNorm in
@@ -165,17 +167,17 @@ impl Model {
             "silu_and_mul",
             "silu_and_mul_kernel",
         )?;
-        let gemv_k = aot::load_kernel(
+        let [gemv_k, gemv_f16_k] = load_kernel_pair(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_GEMV")),
             "gemv",
-            "gemv_kernel",
+            ["gemv_kernel", "gemv_f16_kernel"],
         )?;
-        let gemv_gather_k = aot::load_kernel(
+        let [gemv_gather_k, gemv_gather_f16_k] = load_kernel_pair(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_GEMV_GATHER")),
             "gemv_gather",
-            "gemv_gather_kernel",
+            ["gemv_gather_kernel", "gemv_gather_f16_kernel"],
         )?;
         let attn_k = aot::load_kernel(
             &device,
@@ -274,11 +276,14 @@ impl Model {
         let rope_norm_yarn_batch_k = rope_norm_fns
             .next()
             .ok_or_else(|| ReflexError::Other("missing rope_norm_yarn_batch_kernel".to_string()))?;
-        let gemv_per_head_batch_k = aot::load_kernel(
+        let [gemv_per_head_batch_k, gemv_per_head_batch_f16_k] = load_kernel_pair(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_GEMV_PER_HEAD_BATCH")),
             "gemv_per_head_batch",
-            "gemv_per_head_batch_kernel",
+            [
+                "gemv_per_head_batch_kernel",
+                "gemv_per_head_batch_f16_kernel",
+            ],
         )?;
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
@@ -400,7 +405,9 @@ impl Model {
             rope_norm_batch_k: None,
             silu_k,
             gemv_k,
+            gemv_f16_k,
             gemv_gather_k,
+            gemv_gather_f16_k,
             moe_gather_k,
             moe_scatter_add_k,
             attn_k,
@@ -432,6 +439,7 @@ impl Model {
                 rope_norm_batch_k,
                 rope_norm_yarn_batch_k,
                 gemv_per_head_batch_k,
+                gemv_per_head_batch_f16_k,
                 mla_extract_batch_k,
                 mla_concat_qcur_batch_k,
                 mla_write_kv_cache_batch_k,

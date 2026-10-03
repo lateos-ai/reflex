@@ -83,6 +83,26 @@ const ATTN_ONLINE_MAX_DIM: usize = 1024;
 const ATTN_ONLINE_SPLIT_POSITIONS: usize = 256;
 const ATTN_ONLINE_MAX_SPLITS: usize = 64;
 
+/// Loads a kernel and its f16-weight variant from one AOT module (one module
+/// load, two function lookups).
+pub(super) fn load_kernel_pair(
+    device: &Arc<CudaDevice>,
+    kernel_bytes: &'static [u8],
+    module_name: &'static str,
+    names: [&'static str; 2],
+) -> Result<[AotKernel; 2], ReflexError> {
+    let mut fns = aot::load_kernel_module(device, kernel_bytes, module_name, &names)?;
+    let f16 = fns.pop();
+    let f32 = fns.pop();
+    match (f32, f16) {
+        (Some(a), Some(b)) => Ok([a, b]),
+        _ => Err(crate::reflex_err!(
+            Cuda,
+            "missing kernel in module {module_name}"
+        )),
+    }
+}
+
 /// Error for an f16 weight reaching a matmul wrapper that has no f16 kernel.
 fn f16_kernel_missing(op: &str) -> ReflexError {
     crate::reflex_err!(
@@ -293,7 +313,21 @@ impl Model {
         let out_features = w.shape[1] as usize;
         match &w.data {
             WeightData::F32(data) => self.gemv_raw(x, data, in_features, out_features),
-            WeightData::F16(_) => Err(f16_kernel_missing("gemv")),
+            WeightData::F16(data) => {
+                if x.len() != in_features {
+                    return Err(crate::reflex_err!(
+                        Other,
+                        "gemv: x.len()={} != in_features={in_features}",
+                        x.len()
+                    ));
+                }
+                self.gemv_view(
+                    x,
+                    WeightView::F16(data.slice(..)),
+                    in_features,
+                    out_features,
+                )
+            }
         }
     }
 
@@ -603,26 +637,22 @@ impl Model {
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
-        let WeightData::F32(data) = &w.data else {
-            return Err(f16_kernel_missing("gemv_gather"));
-        };
-        unsafe {
-            self.gemv_gather_k
-                .function
-                .clone()
-                .launch(
+        let (in_u32, rows_u32) = (in_features as u32, num_rows as u32);
+        let launched = match &w.data {
+            WeightData::F32(data) => unsafe {
+                self.gemv_gather_k.function.clone().launch(
                     launch_cfg,
-                    (
-                        x,
-                        data,
-                        &dev_indices,
-                        &mut dev_y,
-                        in_features as u32,
-                        num_rows as u32,
-                    ),
+                    (x, data, &dev_indices, &mut dev_y, in_u32, rows_u32),
                 )
-                .map_err(|e| crate::gpu_err!(e, "gemv_gather launch: {e}"))?;
-        }
+            },
+            WeightData::F16(data) => unsafe {
+                self.gemv_gather_f16_k.function.clone().launch(
+                    launch_cfg,
+                    (x, data, &dev_indices, &mut dev_y, in_u32, rows_u32),
+                )
+            },
+        };
+        launched.map_err(|e| crate::gpu_err!(e, "gemv_gather launch: {e}"))?;
         self.device
             .dtoh_sync_copy(&dev_y)
             .map_err(|e| crate::gpu_err!(e, "gemv_gather dtoh: {e}"))
@@ -1158,9 +1188,6 @@ impl Model {
         in_features: usize,
         out_features: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let WeightView::F32(w_dev) = w else {
-            return Err(f16_kernel_missing("gemv_view"));
-        };
         let mut dev_y = self
             .device
             .alloc_zeros::<f32>(out_features)
@@ -1176,22 +1203,33 @@ impl Model {
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe {
-            self.gemv_k
-                .function
-                .clone()
-                .launch(
+        let launched = match &w {
+            WeightView::F32(w_dev) => unsafe {
+                self.gemv_k.function.clone().launch(
                     launch_cfg,
                     (
                         x,
-                        &w_dev,
+                        w_dev,
                         &mut dev_y,
                         in_features as u32,
                         out_features as u32,
                     ),
                 )
-                .map_err(|e| crate::gpu_err!(e, "gemv_view launch: {e}"))?;
-        }
+            },
+            WeightView::F16(w_dev) => unsafe {
+                self.gemv_f16_k.function.clone().launch(
+                    launch_cfg,
+                    (
+                        x,
+                        w_dev,
+                        &mut dev_y,
+                        in_features as u32,
+                        out_features as u32,
+                    ),
+                )
+            },
+        };
+        launched.map_err(|e| crate::gpu_err!(e, "gemv_view launch: {e}"))?;
         Ok(dev_y)
     }
 
@@ -1295,30 +1333,31 @@ impl Model {
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
-        let WeightData::F32(data) = &w.data else {
-            return Err(f16_kernel_missing("gemv_per_head_batch"));
+        // Every launch argument after the three buffers, shared by both arms.
+        let (d0, d1, d2, d3, d4, d5, d6) = (
+            rows as u32,
+            n_head as u32,
+            in_features as u32,
+            out_features as u32,
+            x_row_stride as u32,
+            x_head_stride as u32,
+            x_head_offset as u32,
+        );
+        let launched = match &w.data {
+            WeightData::F32(data) => unsafe {
+                m.gemv_per_head_batch_k
+                    .function
+                    .clone()
+                    .launch(launch_cfg, (x, data, &mut out, d0, d1, d2, d3, d4, d5, d6))
+            },
+            WeightData::F16(data) => unsafe {
+                m.gemv_per_head_batch_f16_k
+                    .function
+                    .clone()
+                    .launch(launch_cfg, (x, data, &mut out, d0, d1, d2, d3, d4, d5, d6))
+            },
         };
-        unsafe {
-            m.gemv_per_head_batch_k
-                .function
-                .clone()
-                .launch(
-                    launch_cfg,
-                    (
-                        x,
-                        data,
-                        &mut out,
-                        rows as u32,
-                        n_head as u32,
-                        in_features as u32,
-                        out_features as u32,
-                        x_row_stride as u32,
-                        x_head_stride as u32,
-                        x_head_offset as u32,
-                    ),
-                )
-                .map_err(|e| crate::gpu_err!(e, "gemv_per_head_batch launch: {e}"))?;
-        }
+        launched.map_err(|e| crate::gpu_err!(e, "gemv_per_head_batch launch: {e}"))?;
         Ok(out)
     }
 
