@@ -49,3 +49,29 @@ extern "C" __global__ void gemv_gather_kernel(
         y[j] = sum;
     }
 }
+
+#include "gemv_f16.cuh"
+
+// `gemv_gather_kernel` for an f16 weight matrix: the same gathered rows, read
+// through gemv_f16.cuh's warp dot product.
+extern "C" __global__ void gemv_gather_f16_kernel(
+    const float* __restrict__ x,
+    const __half* __restrict__ w,
+    const unsigned int* __restrict__ row_indices,
+    float* __restrict__ y,
+    unsigned int in_features,
+    unsigned int num_rows
+) {
+    const unsigned int warps_per_block = blockDim.x >> 5;
+    const unsigned int warp_id = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int j = blockIdx.x * warps_per_block + warp_id;
+    if (j >= num_rows) {
+        return;
+    }
+    const __half* row_ptr = w + (unsigned long long)row_indices[j] * in_features;
+    const float sum = warp_dot_f16(x, row_ptr, in_features, lane);
+    if (lane == 0u) {
+        y[j] = sum;
+    }
+}

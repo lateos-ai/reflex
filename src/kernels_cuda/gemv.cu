@@ -64,3 +64,28 @@ extern "C" __global__ void gemv_kernel(
         y[row] = sum;
     }
 }
+
+#include "gemv_f16.cuh"
+
+// `gemv_kernel` for an f16 weight matrix (`--weights f16`): same launch
+// geometry (one warp per output row), f32 `x` and `y`, f32 accumulation. See
+// gemv_f16.cuh for the load widths.
+extern "C" __global__ void gemv_f16_kernel(
+    const float* __restrict__ x,
+    const __half* __restrict__ w,
+    float* __restrict__ y,
+    unsigned int in_features,
+    unsigned int out_features
+) {
+    const unsigned int warps_per_block = blockDim.x >> 5;
+    const unsigned int warp_id = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int row = blockIdx.x * warps_per_block + warp_id;
+    if (row >= out_features) {
+        return;
+    }
+    const float sum = warp_dot_f16(x, w + (unsigned long long)row * in_features, in_features, lane);
+    if (lane == 0u) {
+        y[row] = sum;
+    }
+}

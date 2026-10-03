@@ -95,6 +95,8 @@ use crate::error::ReflexError;
 #[cfg(test)]
 mod attention_online_tests;
 #[cfg(test)]
+mod f16_kernel_tests;
+#[cfg(test)]
 mod hybrid_batching_tests;
 #[cfg(test)]
 mod iq_dequant_host_vs_device_tests;
@@ -144,11 +146,15 @@ pub struct Model {
     rope_norm_batch_k: Option<AotKernel>,
     silu_k: AotKernel,
     gemv_k: AotKernel,
+    /// `gemv_k` for an f16 weight matrix (`gemv_f16_kernel`, same module).
+    gemv_f16_k: AotKernel,
     /// Gathers only caller-chosen output rows of a GEMV instead of every row
     /// -- System1's candidate-subset LM-head scoring (see
     /// `Self::gemv_gather`/`Self::system1_evaluate`), never used by the
     /// ordinary dense/MoE/hybrid/MLA forward paths.
     gemv_gather_k: AotKernel,
+    /// `gemv_gather_k` for an f16 weight matrix (`gemv_gather_f16_kernel`).
+    gemv_gather_f16_k: AotKernel,
     /// Grouped-GEMM MoE batching (`Self::forward_layer_moe_batched`,
     /// `Self::forward_mla_moe_ffn_batched`): gathers one expert's assigned rows out of
     /// a batched-prefill hidden buffer into a contiguous group before running that

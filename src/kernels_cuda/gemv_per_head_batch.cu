@@ -47,3 +47,38 @@ extern "C" __global__ void gemv_per_head_batch_kernel(
         out[((unsigned long long)row * n_head + head) * out_features + j] = sum;
     }
 }
+
+#include <cuda_fp16.h>
+
+// `gemv_per_head_batch_kernel` for an f16 weight tensor: the same
+// thread-per-output-element structure and strictly sequential f32 sum, with
+// each weight converted to f32 exactly before its multiply.
+extern "C" __global__ void gemv_per_head_batch_f16_kernel(
+    const float* __restrict__ x,
+    const __half* __restrict__ w,
+    float* __restrict__ out,
+    unsigned int rows,
+    unsigned int n_head,
+    unsigned int in_features,
+    unsigned int out_features,
+    unsigned int x_row_stride,
+    unsigned int x_head_stride,
+    unsigned int x_head_offset
+) {
+    unsigned int row = blockIdx.z;
+    unsigned int head = blockIdx.y;
+    unsigned int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    const float* x_row_head =
+        x + (unsigned long long)row * x_row_stride + (unsigned long long)head * x_head_stride + x_head_offset;
+    const __half* w_head = w + (unsigned long long)head * in_features * out_features;
+
+    for (unsigned int j = global_tid; j < out_features; j += gridDim.x * blockDim.x) {
+        const __half* w_row = w_head + (unsigned long long)j * in_features;
+        float sum = 0.0f;
+        for (unsigned int i = 0; i < in_features; i++) {
+            sum += x_row_head[i] * __half2float(w_row[i]);
+        }
+        out[((unsigned long long)row * n_head + head) * out_features + j] = sum;
+    }
+}
