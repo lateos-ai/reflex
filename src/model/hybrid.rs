@@ -528,6 +528,9 @@ impl Model {
             ReflexError::Other("background load-init thread panicked".to_string())
         })??;
 
+        let f16_act_stats = device
+            .alloc_zeros::<u32>(2)
+            .map_err(|e| crate::gpu_err!(e, "alloc f16 activation stats: {e}"))?;
         Ok(Model {
             device,
             cublas,
@@ -560,6 +563,7 @@ impl Model {
             output_norm,
             lm_head,
             weights_dtype: policy.matrix_dtype,
+            f16_act_stats,
             tokenizer,
             hybrid: Some(HybridModel {
                 attn_cfg,

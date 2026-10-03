@@ -88,7 +88,7 @@ use self::dense::*;
 use self::hybrid::*;
 use self::kernels::*;
 use self::loading::*;
-pub use self::loading::{LoadOptions, WeightsDtype};
+pub use self::loading::{F16ActivationStats, LoadOptions, WeightsDtype};
 use self::mla::*;
 use crate::error::ReflexError;
 
@@ -126,7 +126,9 @@ pub struct Model {
     /// cuBLAS's summation order can be trusted not to silently drift from
     /// `gemv_kernel`'s naive per-row dot product via a TF32/reduced-precision
     /// tensor-core path. Only prefill (`rows > 1`) uses this; the per-token
-    /// decode loop still uses `gemv_k` (a GEMM with n=1 buys nothing).
+    /// decode loop still uses `gemv_k` (a GEMM with n=1 buys nothing). The
+    /// f16-weight GEMM switches it to default math for its own call only
+    /// (`Self::gemm_ex_f16`).
     cublas: CudaBlas,
     rmsnorm_k: AotKernel,
     rope_k: AotKernel,
@@ -220,6 +222,9 @@ pub struct Model {
     /// Element type of the matrix weights (`LoadOptions::weights`). The tied
     /// LM head's lazy upload and System1's compact row gather follow it too.
     weights_dtype: WeightsDtype,
+    /// Two `u32`s the f16 activation cast folds into: max |x| (as f32 bits)
+    /// and the saturated-element count. See [`Self::f16_activation_stats`].
+    f16_act_stats: CudaSlice<u32>,
     tokenizer: Tokenizer,
     /// `Some` iff this is a Qwen3.5 hybrid model (see `Self::load_hybrid`);
     /// `cfg`/`layers`/`expert_used_count` above are unused garbage in that
@@ -554,6 +559,25 @@ impl Model {
     /// The element type this model's matrix weights are stored in.
     pub fn weights_dtype(&self) -> WeightsDtype {
         self.weights_dtype
+    }
+
+    /// The range of every prefill activation cast to f16 for a GEMM since
+    /// load, or `None` for an f32 model. Reading it synchronizes the device,
+    /// so call it after the timed work. `saturated > 0` means some values
+    /// exceeded f16's range and were clamped to +-65504: the output is then not
+    /// what f32 weights would give, and `--weights f32` is the fix.
+    pub fn f16_activation_stats(&self) -> Result<Option<F16ActivationStats>, ReflexError> {
+        if self.weights_dtype != WeightsDtype::F16 {
+            return Ok(None);
+        }
+        let raw = self
+            .device
+            .dtoh_sync_copy(&self.f16_act_stats)
+            .map_err(|e| crate::gpu_err!(e, "read f16 activation stats: {e}"))?;
+        Ok(Some(F16ActivationStats {
+            max_abs: f32::from_bits(raw[0]),
+            saturated: raw[1],
+        }))
     }
 
     /// Builds the `Tokenizer` and the cuBLAS handle (with `CUBLAS_PEDANTIC_MATH`

@@ -370,6 +370,7 @@ pub fn run(args: Vec<String>) {
                 energy_suffix(energy_measurement.as_ref()),
             );
         }
+        crate::report_f16_activation_stats(&model);
         reflex_engine::fast_exit(0);
     }
 
@@ -442,5 +443,6 @@ pub fn run(args: Vec<String>) {
             energy_suffix(energy_measurement.as_ref()),
         );
     }
+    crate::report_f16_activation_stats(&model);
     reflex_engine::fast_exit(0);
 }

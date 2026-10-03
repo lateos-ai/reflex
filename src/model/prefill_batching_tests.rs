@@ -2,6 +2,53 @@ use super::*;
 use crate::gguf::GgufFile;
 use cudarc::driver::CudaDevice;
 
+/// Compares a sequential-prefill hidden state against the batched-prefill one
+/// for the same position. With f32 weights the two paths differ only in
+/// summation order, so every element must agree to 1e-3. With f16 weights the
+/// batched path also rounds each GEMM's activations to f16 (`cublasGemmEx`)
+/// while the sequential path's gemv reads them in f32, so the states differ by
+/// accumulated activation rounding, not just order: that mode checks the
+/// relative L2 error instead, against `F16_REL_L2_TOL`. Both modes print the
+/// measured error.
+pub(super) fn assert_prefill_hidden_close(
+    seq: &[f32],
+    batch: &[f32],
+    dtype: WeightsDtype,
+    label: &str,
+) {
+    // Estimated, not measured: f16 rounding (2^-11 relative) of every GEMM
+    // input across a few dozen layers. Confirm or correct it on a GPU run.
+    const F16_REL_L2_TOL: f64 = 2e-2;
+    assert_eq!(seq.len(), batch.len());
+    let max_abs = seq
+        .iter()
+        .zip(batch)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let diff_sq: f64 = seq
+        .iter()
+        .zip(batch)
+        .map(|(a, b)| ((a - b) as f64).powi(2))
+        .sum();
+    let norm_sq: f64 = seq.iter().map(|&a| (a as f64).powi(2)).sum();
+    let rel_l2 = (diff_sq / norm_sq.max(f64::MIN_POSITIVE)).sqrt();
+    eprintln!("{label} ({dtype}): max_abs_diff={max_abs:e} rel_l2={rel_l2:e}");
+    match dtype {
+        WeightsDtype::F32 => {
+            for (i, (a, b)) in seq.iter().zip(batch).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-3,
+                    "{label}[{i}]: sequential={a}, batched={b}"
+                );
+            }
+        }
+        WeightsDtype::F16 => assert!(
+            rel_l2 < F16_REL_L2_TOL,
+            "{label}: relative L2 error {rel_l2:e} >= {F16_REL_L2_TOL:e} (max abs diff {max_abs:e})"
+        ),
+    }
+}
+
 /// Byte-exact-ish cross-check of `prefill_dense_batched` (cuBLAS GEMM +
 /// batched RoPE/attention) against `prefill_dense` (the original
 /// sequential per-token loop) on the same prompt/weights -- this is the
@@ -56,12 +103,7 @@ fn prefill_dense_batched_matches_sequential_prefill() {
         .dtoh_sync_copy(&batch_last_row)
         .expect("batch hidden dtoh failed");
     assert_eq!(seq_host.len(), batch_host.len());
-    for (i, (a, b)) in seq_host.iter().zip(batch_host.iter()).enumerate() {
-        assert!(
-            (a - b).abs() < 1e-3,
-            "hidden[{i}]: sequential={a}, batched={b}"
-        );
-    }
+    assert_prefill_hidden_close(&seq_host, &batch_host, model.weights_dtype(), "hidden");
 
     let seq_argmax = model
         .lm_head_argmax(&seq_hidden, hidden_size, model.cfg.rmsnorm_eps)

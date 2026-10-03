@@ -261,3 +261,87 @@ fn f16_gemv_per_head_batch_matches_host_reference() {
         }
     }
 }
+
+/// The f16 prefill GEMM (`cast_act_f16_kernel` + `cublasGemmEx`) against
+/// row-by-row `gemv_f16_kernel` on a real dense/MoE model's layer-0 `attn_q`,
+/// loaded with `--weights f16`. The reference rows are pre-rounded to f16 on
+/// the host, so both paths multiply identical values and may differ only in
+/// summation order: a transposed or mis-strided GemmEx call fails this by
+/// orders of magnitude. Then a single out-of-range activation must show up in
+/// `f16_activation_stats` as saturated.
+/// `REFLEX_TEST_GGUF=<dense or MoE GGUF> cargo test --release -- --ignored f16_gemm_ex`
+#[test]
+#[ignore]
+fn f16_gemm_ex_matches_rowwise_gemv_and_reports_saturation() {
+    let gguf_path = std::env::var("REFLEX_TEST_GGUF")
+        .expect("set REFLEX_TEST_GGUF to a dense or MoE GGUF to run this test");
+    let file = crate::gguf::GgufFile::open(&gguf_path).expect("open REFLEX_TEST_GGUF");
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let opts = LoadOptions {
+        weights: WeightsDtype::F16,
+        lora_adapter: None,
+    };
+    let model = Model::load_with_options(device.clone(), &file, &opts).expect("load f16");
+    assert!(
+        model.hybrid.is_none() && model.mla.is_none(),
+        "needs a dense/MoE model"
+    );
+    let attn_q = match &model.layers[0] {
+        LayerWeights::Dense(l) => &l.attn_q,
+        LayerWeights::Moe(l) => &l.attn_q,
+    };
+    assert_eq!(attn_q.dtype(), WeightsDtype::F16);
+    let (in_f, out_f) = (attn_q.shape[0] as usize, attn_q.shape[1] as usize);
+
+    let rows = 7;
+    let mut rng = rng();
+    let x: Vec<f32> = (0..rows * in_f)
+        .map(|_| half::f16::from_f32(rng.gen_range(-4.0..4.0)).to_f32())
+        .collect();
+    let x_dev = device.htod_sync_copy(&x).expect("htod x");
+    let y = device
+        .dtoh_sync_copy(&model.gemm(&x_dev, attn_q, rows).expect("gemm"))
+        .expect("dtoh y");
+    for r in 0..rows {
+        let row_dev = device
+            .htod_sync_copy(&x[r * in_f..(r + 1) * in_f])
+            .expect("htod row");
+        let want = device
+            .dtoh_sync_copy(&model.gemv(&row_dev, attn_q).expect("gemv"))
+            .expect("dtoh row");
+        for j in 0..out_f {
+            let (a, b) = (y[r * out_f + j], want[j]);
+            assert!(
+                (a - b).abs() <= 1e-3 * b.abs().max(1.0),
+                "row {r} out {j}: gemm_ex {a} vs gemv {b}"
+            );
+        }
+    }
+    let before = model
+        .f16_activation_stats()
+        .expect("stats")
+        .expect("f16 model");
+    assert_eq!(before.saturated, 0, "in-range inputs must not saturate");
+    assert!(
+        before.max_abs <= 4.0 && before.max_abs > 3.0,
+        "max_abs {}",
+        before.max_abs
+    );
+
+    let mut hot = x.clone();
+    hot[3] = 1.0e5;
+    let hot_dev = device.htod_sync_copy(&hot).expect("htod hot");
+    let y_hot = device
+        .dtoh_sync_copy(&model.gemm(&hot_dev, attn_q, rows).expect("gemm hot"))
+        .expect("dtoh hot");
+    assert!(
+        y_hot.iter().all(|v| v.is_finite()),
+        "saturating cast must not produce inf"
+    );
+    let after = model
+        .f16_activation_stats()
+        .expect("stats")
+        .expect("f16 model");
+    assert_eq!(after.saturated, 1);
+    assert_eq!(after.max_abs, 1.0e5);
+}
