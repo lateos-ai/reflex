@@ -8,7 +8,9 @@ JIT-compiled when the process starts.
 **~483 ms cold start, p50**: `reflex system1` from process start to its scored result
 (the engine's own timer), Tesla T4, `Qwen3-0.6B-Q4_K_M`, `n=10`. Measured from outside
 the process, including the ~110 ms the OS spends launching it, that is ~0.6 s wall clock.
-[Phase breakdown](docs/benchmarks.md#cold-start-phase-breakdown).
+[Phase breakdown](docs/benchmarks.md#cold-start-phase-breakdown). Measured with `f32`
+weights, before `f16` weight storage became the default; not yet re-measured (see
+[f16 weight storage](docs/benchmarks.md#f16-weight-storage)).
 
 > **Architectural boundary.** Reflex is a local execution engine for single-tenant
 > decisions: one request at a time, no scheduler, no batching, no network server inside
@@ -69,8 +71,11 @@ Each architecture counted as supported only after its generated tokens matched a
 independent implementation (llama.cpp, or a CPU reference) on real hardware.
 
 - **GGUF only.** Convert other checkpoints with llama.cpp's `convert_hf_to_gguf.py`.
-- **Weights are held as `f32` on the GPU**, dequantized once at load: VRAM is about 4 bytes
-  per parameter whatever the file's quantization.
+- **Weights are held as `f16` on the GPU by default**, dequantized once at load: VRAM is
+  about 2 bytes per parameter whatever the file's quantization. `--weights f32` (or
+  `REFLEX_WEIGHTS=f32`) keeps the exact `f32` reference mode, about 4 bytes per parameter.
+  Only matrix weights change type; norms, MoE routers, activations and the KV cache are
+  `f32` in both modes. `reflex check` defaults to `f32`.
 - **Context**: up to 65,535 positions per sequence (prompt + generated tokens + any
   imported KV cache); longer requests fail with a clear `context_overflow` error.
 - **`system1`** works on every architecture; on the Qwen3.5 hybrid models each candidate
@@ -82,6 +87,7 @@ independent implementation (llama.cpp, or a CPU reference) on real hardware.
 Cold starts measured from outside the process, Tesla T4, `Qwen3-0.6B-Q4_K_M`, unless
 noted. The engine-vs-engine rows time `reflex generate` to its first token (0.83 s p50,
 `n=30`), the metric every engine shares; the headline above times `system1` scoring.
+Every Reflex figure here was measured with `f32` weights, before `f16` became the default.
 
 | vs. | Result | Caveat |
 |---|---|---|

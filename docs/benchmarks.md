@@ -312,6 +312,27 @@ a real forward pass launches for the first time. That first-real-inference tax i
 currently broken out as its own phase; doing so is a plausible future refinement of this
 breakdown, not scoped here.
 
+## f16 weight storage
+
+`f16` became the default weight storage on 2026-10-02 (see [reference](reference.md#weight-storage)).
+**Every other figure on this page was measured with `f32` weights** and stays as
+measured. Each will get a note pointing at its `f16` replacement once that's measured,
+rather than being overwritten.
+
+**Status: no `f16` measurement exists yet.** The implementation was built and type-checked
+on a machine without an NVIDIA GPU. [`scripts/verify_f16_weights.sh`](../scripts/verify_f16_weights.sh)
+produces every number this section needs, on one GPU in one session:
+
+| what | method |
+|---|---|
+| Numerics gate | `REFLEX_F16_ROUNDTRIP=1` (f16-rounded weights, f32 kernels) vs. `--weights f32`, 32 greedy tokens, three prompts, every supported architecture: matched/total, first divergence, top-2 logit gap there |
+| f32 regression | `--weights f32` vs. a `master` build: `reflex check` token ids and logit checksum, `system1` scores, must be identical |
+| f16 correctness | `--weights f16` vs. `f32` (and vs. llama.cpp `llama-simple` text when given), system1 max abs score difference, max prefill activation per model |
+| Cold start | `bench_cold_start_phases_system1.sh` and `bench_cold_start_phases.sh`, n=10 each, `master` vs. `f32` vs. `f16`, p50/p95 per phase. `master` vs. `f32` isolates the larger dequant kernel module (304 KB → 525 KB of PTX) in `model_load_ms` |
+| Memory, decode | `reflex bench` resident VRAM and decode ms/token, plus nvidia-smi peak during a 64-token generate, Qwen3-0.6B and a larger model, `f32` vs. `f16` |
+
+Results go here, with the GPU, driver and date, once measured.
+
 ## Energy
 
 **Energy instrumentation *and* measured energy numbers (real T4; see the phase table

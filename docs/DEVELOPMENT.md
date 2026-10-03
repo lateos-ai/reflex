@@ -143,7 +143,25 @@ machine, or see [gpu-ci.md](gpu-ci.md) for the nightly GPU workflow.
 ## Model loading: weights stay on the GPU
 
 `Model::load` dequantizes every weight tensor once and uploads it once, as a
-device-resident `f32` buffer. Rules that follow from measured regressions:
+device-resident buffer. Matrix weights (the operands of the matmul kernels:
+`is_matrix_weight` in `src/model/loading.rs`) are stored as `f16` by default and as
+`f32` with `--weights f32` / `REFLEX_WEIGHTS=f32`. Everything else is always `f32`:
+norms, biases, the Gated DeltaNet `ssm_*` tensors, the MoE routers, activations and the
+KV cache. `Weight.data` is a `WeightData` enum, and every matmul wrapper in
+`src/model/kernels.rs` dispatches on it, so a future quantized variant slots in there.
+
+- **The f16 path reads f16 weights and accumulates in f32.** Decode GEMVs
+  (`gemv_f16_kernel` and friends) widen each weight exactly and multiply by the f32
+  activation. Prefill casts activations to f16 and calls `cublasGemmEx` with
+  `CUBLAS_COMPUTE_32F`. That cast saturates at f16's 65504 rather than producing inf, and
+  counts what it clamped (`Model::f16_activation_stats`).
+- **`--weights f32` is the reference mode.** Its dequant kernels compile to the same
+  PTX instructions as before f16 existed. `reflex check` and llama.cpp comparisons
+  default to it.
+- **LoRA merges happen in f32.** `LoadOptions::lora_adapter` loads the adapter's target
+  weights as `f32`; `apply_lora` adds the delta and then rounds to f16 once.
+
+Rules that follow from measured regressions:
 
 - **Never copy weights host-to-device per call.** An early version re-uploaded weight
   buffers inside `gemv`/`rmsnorm` on every call and was about 4.3x slower than
@@ -165,7 +183,12 @@ device-resident `f32` buffer. Rules that follow from measured regressions:
   bytes through pinned host memory and uploads on a separate stream, so tensor N+1's
   copy overlaps tensor N's dequant kernel. Replacing it with a blocking copy per tensor,
   or allocating the staging buffers per tensor, reintroduces a host/device race or
-  serializes the pipeline.
+  serializes the pipeline. The f16 dequant kernels go through the same pipeline; only
+  the output element type differs.
+- **Numerics probes.** `REFLEX_F16_ROUNDTRIP=1` (with `--weights f32`) rounds every
+  matrix weight to f16 and back, which isolates weight rounding from the f16 kernels.
+  `REFLEX_TOP2_TRACE=1` prints each generated position's top-2 logits.
+  [`scripts/verify_f16_weights.sh`](../scripts/verify_f16_weights.sh) uses both.
 
 ## GGUF metadata conventions
 
