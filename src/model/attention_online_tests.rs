@@ -179,11 +179,24 @@ fn online_attention_matches_legacy_kernels_mla() {
 /// greedy tokens from the legacy and online kernels must be identical, and the
 /// first-token logits must agree to within 1e-4. The prompt is long enough that
 /// decode crosses the split-K path.
+///
+/// Always loads `f32` weights, whatever `REFLEX_WEIGHTS` says: the attention
+/// kernels read f32 Q/K/V either way, but with f16 weights every prefill GEMM
+/// rounds its input to f16, which turns the kernels' ~1e-6 summation-order
+/// difference into whole f16 ulps downstream. Measured on a T4 with Qwen3-0.6B
+/// (541 tokens): legacy vs. online 2.1e-5 with f32 weights, 8.2e-3 with f16,
+/// where f16 vs. f32 weights alone already differ by 1.3e-2.
 #[test]
 #[ignore]
 fn online_attention_matches_legacy_end_to_end() {
     let path = std::env::var("REFLEX_TEST_GGUF").expect("set REFLEX_TEST_GGUF to any GGUF");
-    let mut model = load(&path);
+    let file = GgufFile::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let opts = LoadOptions {
+        weights: WeightsDtype::F32,
+        lora_adapter: None,
+    };
+    let mut model = Model::load_with_options(device, &file, &opts).expect("failed to load model");
     let prompt =
         "The quick brown fox jumps over the lazy dog while the river runs past the old mill. "
             .repeat(30);
