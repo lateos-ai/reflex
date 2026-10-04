@@ -369,16 +369,17 @@ echo "model_load_ms: master vs. branch-f32 isolates the larger dequant module (b
 
 # ---- step 4: memory and decode ------------------------------------------------------------
 section "Step 4 -- memory and decode"
-{ echo "| model | weights | resident MiB (load delta) | nvidia-smi peak MiB over idle | decode ms/token (p50, 16 tokens) | tokens/s |"
-  echo "|---|---|---|---|---|---|"; } >>"$SUMMARY"
+{ echo "\`reflex bench\` runs three prompt buckets, one row each. Warm prompt p50: first-token"
+  echo "latency of an already-loaded model (prefill + LM head). Decode: the 16 tokens after it."
+  echo
+  echo "| model | weights | resident MiB (load delta) | nvidia-smi peak MiB over idle | prompt tokens | warm prompt p50 ms | decode ms/token | tokens/s |"
+  echo "|---|---|---|---|---|---|---|---|"; } >>"$SUMMARY"
 mkdir -p "$OUT_DIR/step4"
 for path in "$DENSE_GGUF" ${LARGE_GGUF:+"$LARGE_GGUF"}; do
   for w in f32 f16; do
     base="$OUT_DIR/step4/$(slug "$(basename "$path")")_$w"
     "$BIN" bench "$path" --warmup 3 --iters 20 --weights $w >"$base.bench" 2>"$base.bench.err"
     res=$(grep -o 'model_resident_mib=[0-9]*' "$base.bench" | cut -d= -f2)
-    mspt=$(grep -o 'ms_per_token=[0-9.]*' "$base.bench" | cut -d= -f2)
-    tps=$(grep -o 'tokens_per_sec=[0-9.]*' "$base.bench" | cut -d= -f2)
     idle=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 | head -1)
     nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 -lms 20 >"$base.smi" 2>/dev/null &
     smi_pid=$!
@@ -386,8 +387,19 @@ for path in "$DENSE_GGUF" ${LARGE_GGUF:+"$LARGE_GGUF"}; do
     kill "$smi_pid" 2>/dev/null; wait "$smi_pid" 2>/dev/null
     peak=$(sort -n "$base.smi" | tail -1)
     over=$(( ${peak:-0} - ${idle:-0} ))
-    echo "| $(basename "$path") | $w | ${res:-n/a} | $over | ${mspt:-n/a} | ${tps:-n/a} |" >>"$SUMMARY"
-    [[ -z "$res" || -z "$mspt" ]] && fail "bench failed: $(basename "$path") $w (see $base.bench.err)"
+    # One REFLEX_BENCH_WARM_OK and one REFLEX_BENCH_THROUGHPUT_OK line per prompt bucket.
+    rows=$(awk -v m="$(basename "$path")" -v w="$w" -v r="${res:-n/a}" -v o="$over" '
+      function f(k,  i) { for (i = 1; i <= NF; i++) if (index($i, k "=") == 1) return substr($i, length(k) + 2) }
+      /^REFLEX_BENCH_WARM_OK / { warm[f("prompt_tokens")] = f("p50_ms") }
+      /^REFLEX_BENCH_THROUGHPUT_OK / { pt = f("prompt_tokens")
+        printf "| %s | %s | %s | %s | %s | %s | %s | %s |\n", m, w, r, o, pt, warm[pt], f("ms_per_token"), f("tokens_per_sec") }
+    ' "$base.bench")
+    if [[ -z "$res" || -z "$rows" ]]; then
+      echo "| $(basename "$path") | $w | ${res:-n/a} | $over | n/a | n/a | n/a | n/a |" >>"$SUMMARY"
+      fail "bench failed: $(basename "$path") $w (see $base.bench.err)"
+    else
+      echo "$rows" >>"$SUMMARY"
+    fi
   done
 done
 
