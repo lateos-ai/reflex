@@ -186,7 +186,8 @@ a phase to measure.
 
 This table is `f32` weights. The `f16` default was measured on 2026-10-04 in a different
 build mode, so the two don't compare row by row. See [f16 weight storage](#f16-weight-storage)
-(same-session `system1` total: 451.0 ms `f32` vs. 441.3 ms `f16`).
+(same-session `system1` total: 448.6 ms `f32` vs. 415–423 ms `f16` with its cuBLAS
+warm-up).
 
 The joules column is exactly as measured, not cleaned up: the ~39 ms scoring pass and the
 ~64 ms GGUF parse both round to `0.000 J` at the counter's granularity, and the per-phase
@@ -363,15 +364,20 @@ saturation anywhere:
 | model | max abs | headroom to 65504 |
 |---|---|---|
 | **Qwen3-1.7B** | **15,420** | **4.2x** |
+| Qwen3-4B (`f16` only) | 3,975 | 16x |
 | Qwen3-0.6B | 3,644 | 18x |
 | TinyLlama-1.1B | 161 | 400x |
 | Qwen3.5-0.8B | 34 | 1,900x |
 
-Qwen3's activations grow with model size: from 0.6B to 1.7B the maximum went up about
-4x. Qwen3-1.7B already sits within 10x of the f16 limit, and nothing here measured
-Qwen3-4B or larger. The cast saturates rather than overflowing, and the run warns when it
-clamps. A larger Qwen3 should still be checked with `REFLEX_F16_ACT_STATS=1` before
-relying on `f16`.
+Activation size doesn't track model size: Qwen3-1.7B peaks about 4x higher than both
+Qwen3-0.6B and Qwen3-4B. It is the only model within 10x of the f16 limit. The cast
+saturates rather than overflowing, and the run warns when it clamps, so a model this
+table doesn't cover should be checked with `REFLEX_F16_ACT_STATS=1`.
+
+Qwen3-4B was measured on the same T4 on the same day, but in `f16` only: its `f32`
+weights (~16 GB) don't fit. Its text matched llama.cpp's `llama-simple -n 32` on p0. On
+p1 and p2 it forked at near-ties where llama.cpp picked Reflex's second choice: a top-2
+gap of 0.004 at position 17 on p1, and 0.031 at position 29 on p2.
 
 **Cold start**, Qwen3-0.6B, n=10 each, p50 (p95 within 1.5% everywhere):
 
@@ -389,10 +395,35 @@ relying on `f16`.
   with the driver's JIT cache warm after the first run.
 - **`f16` overall:** about 6% less model load, and a shorter total: −2.1% for `system1`,
   −4.2% for `generate`.
-- **One regression:** `system1`'s single scoring pass is **4.9 ms slower in `f16`** (39.1
-  → 44.0 ms). The same comparison on an already-loaded model goes the other way (see the
-  warm prompt column below). That suggests a first-call cost in the cuBLAS `f16` path,
-  but it has not been diagnosed.
+- **One regression, since fixed:** in the table above, `system1`'s single scoring pass
+  is **4.9 ms slower in `f16`** (39.1 → 44.0 ms). The cause is the first prefill GEMM of
+  the process. With temporary per-call timing in a cold run, the first call took
+  34.7 ms with `f16` (`cublasGemmEx`) and 21.1 ms with `f32` (`Sgemm`). Every later call
+  took 0.043 ms (`f16`) or 0.080 ms (`f32`). `CUDA_MODULE_LOADING=EAGER` didn't remove
+  the gap (scoring pass 29.4 vs. 19.5 ms), so it is cuBLAS's first-launch cost, not only
+  lazy module loading.
+
+**cuBLAS warm-up.** With `f16` weights, the load's worker thread (the one that already
+builds the tokenizer and the cuBLAS handle) now runs one tiny `cublasGemmEx`, overlapped
+with the weight load. Interleaved A/B with prebuilt binaries, same T4, same day, n=10:
+
+| cold, Qwen3-0.6B, p50 | without warm-up | with warm-up |
+|---|---|---|
+| `f16` `system1` model load | 216.9 / 215.1 ms | 233.5 / 227.2 ms |
+| `f16` `system1` scoring pass | 44.0 / 43.8 ms | **9.8 / 9.8 ms** |
+| `f16` `system1` total | 439.0 / 436.2 ms | **422.7 / 415.2 ms** |
+| `f16` `generate` total | 670.2 ms | **646.7 ms** |
+| `f32` `system1` total (reference) | 448.6 ms | n/a (no `f32` warm-up) |
+| `f32` `generate` total (reference) | 699.8 ms | n/a (no `f32` warm-up) |
+
+- **Trade-off:** model load grows by about 14 ms and the scoring pass shrinks by 34 ms.
+- **Against `f32`:** cold `f16` is now 7% faster to a `system1` result and 8% faster
+  to a first token than `f32`.
+- **Final build:** a run of the committed code gave the same picture: `f16` `system1`
+  total 416.6 ms with a 9.8 ms scoring pass, `f32` 448.8 ms.
+- **Why no `f32` warm-up:** a tiny `Sgemm` didn't shorten `f32`'s first call (scoring
+  39.1 → 37.7 ms, total unchanged), so `f32` doesn't get one. Its 21 ms first call is
+  still open.
 
 **Memory and decode** (`reflex bench`, warmup 3, 20 iterations). Resident is the
 model-load delta in free VRAM. Peak is the `nvidia-smi` maximum over idle during a
