@@ -184,6 +184,10 @@ a phase to measure.
 | scoring pass (single forward pass) | 39.2 | 39.5 | 0.000 |
 | **total** (`process_start_to_result_ms`) | **485.4** | **494.0** | **20.324** |
 
+This table is `f32` weights. The `f16` default was measured on 2026-10-04 in a different
+build mode, so the two don't compare row by row. See [f16 weight storage](#f16-weight-storage)
+(same-session `system1` total: 451.0 ms `f32` vs. 441.3 ms `f16`).
+
 The joules column is exactly as measured, not cleaned up: the ~39 ms scoring pass and the
 ~64 ms GGUF parse both round to `0.000 J` at the counter's granularity, and the per-phase
 joules need not add to the total (counter quantization can place a phase's joules in the
@@ -319,9 +323,8 @@ breakdown, not scoped here.
 measured. Each will get a note pointing at its `f16` replacement once that's measured,
 rather than being overwritten.
 
-**Status: no `f16` measurement exists yet.** The implementation was built and type-checked
-on a machine without an NVIDIA GPU. [`scripts/verify_f16_weights.sh`](../scripts/verify_f16_weights.sh)
-produces every number this section needs, on one GPU in one session:
+[`scripts/verify_f16_weights.sh`](../scripts/verify_f16_weights.sh) produces every number
+in this section, on one GPU in one session:
 
 | what | method |
 |---|---|
@@ -331,7 +334,104 @@ produces every number this section needs, on one GPU in one session:
 | Cold start | `bench_cold_start_phases_system1.sh` and `bench_cold_start_phases.sh`, n=10 each, `master` vs. `f32` vs. `f16`, p50/p95 per phase. `master` vs. `f32` isolates the larger dequant kernel module (304 KB → 525 KB of PTX) in `model_load_ms` |
 | Memory, decode | `reflex bench` resident VRAM and decode ms/token, plus nvidia-smi peak during a 64-token generate, Qwen3-0.6B and a larger model, `f32` vs. `f16` |
 
-Results go here, with the GPU, driver and date, once measured.
+**Measured 2026-10-04 on a dedicated AWS `g4dn.xlarge` (Tesla T4, 15 GB, driver
+595.91.07, CUDA 13.2).** Both binaries were built from source on the box in the default
+portable-PTX mode, so these figures compare with each other, not with the `sm_75`-cubin
+figures elsewhere on this page. `master` is `3e4265a`. Models: Qwen3-0.6B-Q4_K_M,
+Qwen3-1.7B-Q4_K_M, TinyLlama-1.1B, Qwen3.5-0.8B, and the random-weight `tiny-qwen3moe`,
+`tiny-qwen35moe` and `deepseek-tiny-mla` fixtures. DeepSeek-V2-Lite was not run: its `f32`
+side needs an 80 GB GPU.
+
+**Correctness.**
+
+- **Numerics gate:** f16-rounded weights alone (`REFLEX_F16_ROUNDTRIP=1`) matched `f32` for
+  32/32 greedy tokens on every model and prompt (18 of 18 runs).
+- **`--weights f32` vs. `master`:** identical on every model. That covers the `reflex
+  check` token ids and logit checksum for all three prompts, and the `system1` scores.
+- **`--weights f16` vs. `f32`:** 32/32 tokens on all 18 runs, plus 3/3 more runs on
+  Qwen3-1.7B. The `system1` max abs score difference was 0.0035 (Qwen3-0.6B), 0.0032
+  (TinyLlama), 0.0120 (Qwen3.5-0.8B) and ≤ 0.00013 on the fixtures. The best candidate
+  was the same in every case.
+- **Against llama.cpp:** compared with `llama-simple -n 32` (llama.cpp `22bdcc4`, built for
+  `sm_75`), `f16` and `f32` produce the same text on every prompt. Three of the nine
+  differ from llama.cpp at a near-tie fork 13–30 tokens in (Qwen3-0.6B p0; Qwen3.5-0.8B
+  p1, p2). Since `f32` is identical to `master`, those differences predate `f16`.
+
+Largest |activation| cast to f16 for a prefill GEMM (`REFLEX_F16_ACT_STATS`), with no
+saturation anywhere:
+
+| model | max abs | headroom to 65504 |
+|---|---|---|
+| **Qwen3-1.7B** | **15,420** | **4.2x** |
+| Qwen3-0.6B | 3,644 | 18x |
+| TinyLlama-1.1B | 161 | 400x |
+| Qwen3.5-0.8B | 34 | 1,900x |
+
+Qwen3's activations grow with model size: from 0.6B to 1.7B the maximum went up about
+4x. Qwen3-1.7B already sits within 10x of the f16 limit, and nothing here measured
+Qwen3-4B or larger. The cast saturates rather than overflowing, and the run warns when it
+clamps. A larger Qwen3 should still be checked with `REFLEX_F16_ACT_STATS=1` before
+relying on `f16`.
+
+**Cold start**, Qwen3-0.6B, n=10 each, p50 (p95 within 1.5% everywhere):
+
+| | `master` | branch `f32` | branch `f16` |
+|---|---|---|---|
+| `system1` model load | 232.7 ms | 234.6 ms | 220.4 ms |
+| `system1` scoring pass | 39.1 ms | 39.1 ms | **44.0 ms** |
+| `system1` total (internal) | 448.1 ms | 451.0 ms | 441.3 ms |
+| `generate` model load | 235.6 ms | 237.6 ms | 222.2 ms |
+| `generate` prompt eval (first token) | 289.6 ms | 289.6 ms | 277.1 ms |
+| `generate` total (internal) | 703.4 ms | 706.0 ms | 676.5 ms |
+
+- **Larger dequant module:** compare `master` with branch `f32`, which load the same
+  `f32` weights. It costs about +2 ms of model load. In PTX mode that cost is measured
+  with the driver's JIT cache warm after the first run.
+- **`f16` overall:** about 6% less model load, and a shorter total: −2.1% for `system1`,
+  −4.2% for `generate`.
+- **One regression:** `system1`'s single scoring pass is **4.9 ms slower in `f16`** (39.1
+  → 44.0 ms). The same comparison on an already-loaded model goes the other way (see the
+  warm prompt column below). That suggests a first-call cost in the cuBLAS `f16` path,
+  but it has not been diagnosed.
+
+**Memory and decode** (`reflex bench`, warmup 3, 20 iterations). Resident is the
+model-load delta in free VRAM. Peak is the `nvidia-smi` maximum over idle during a
+64-token `generate`.
+
+| model | weights | resident MiB | peak MiB | prompt tokens | warm prompt p50 ms | decode ms/token |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B | f32 | 1,708 | 2,549 | 29 / 113 / 449 | 22.8 / 59.5 / 265.4 | 12.64 / 13.49 / 15.80 |
+| Qwen3-0.6B | f16 | **876** | **1,429** | 29 / 113 / 449 | 14.1 / 34.3 / 186.5 | **8.13** / 8.85 / 11.26 |
+| Qwen3-1.7B | f32 | 5,452 | 6,997 | 29 / 113 / 449 | 58.4 / 162.2 / 616.2 | 30.66 / 31.32 / 33.70 |
+| Qwen3-1.7B | f16 | **2,732** | **3,703** | 29 / 113 / 449 | 35.4 / 84.6 / 365.4 | **17.82** / 18.46 / 20.80 |
+
+- **VRAM:** `f16` halves resident weights (−49% and −50%).
+- **Decode:** at the 29-token bucket, decode drops 36% (0.6B) and 42% (1.7B) per token.
+- **Warm prefill:** `cublasGemmEx` prefill is faster than `f32` at every prompt length,
+  by 30–48%.
+
+**Tests.** Host tests passed (106) and sidecar tests passed (13). The `#[ignore]`d GPU
+tests pass in both modes: 19 pass and 2 are skipped (no IQ GGUF and no
+DeepSeek-V2-Lite on the box).
+
+- **Fixed during the run:** `online_attention_matches_legacy_end_to_end` failed in `f16`
+  mode at 8.2e-3 against its 1e-4 bound. Its greedy tokens still matched.
+- **Cause:** the `f16` activation rounding amplifies the two kernels' 2.1e-5 difference.
+  The `f16`-vs-`f32` gap on the same prompt is 1.3e-2, so 8.2e-3 is below the noise
+  floor. It is not a kernel bug.
+- **Fix:** the test now always loads `f32` weights and keeps its 1e-4 bound.
+
+Measured hidden-state error of the batched-vs-sequential prefill tests, against the
+`f16` tolerance of `rel_l2 < 2e-2` (which was an estimate):
+
+| test | f32 rel_l2 | f16 rel_l2 | f16 max abs |
+|---|---|---|---|
+| dense (Qwen3-0.6B) | 1.2e-6 | 5.6e-4 | 2.8e-2 |
+| hybrid (Qwen3.5-0.8B) | 5.3e-7 | 2.2e-4 | 5.9e-4 |
+| MLA fixture | 5.4e-8 | 1.2e-5 | 5.1e-7 |
+| MLA fixture, resumed | 6.4e-8 | 7.3e-6 | 2.9e-7 |
+
+The largest measured value is 36x below the estimated tolerance.
 
 ## Energy
 
