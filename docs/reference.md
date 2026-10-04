@@ -118,7 +118,10 @@ f16 decode reads f16 weights and accumulates in f32. Prefill casts each GEMM's a
 to f16 for `cublasGemmEx`. f16's largest finite value is 65504; the cast saturates there
 instead of producing inf. `generate`/`system1`/`bench`/`check` print a warning on stderr
 if anything was clamped. `REFLEX_F16_ACT_STATS=1` prints `REFLEX_F16_ACT_STATS max_abs=..
-saturated=..` after every run. If you see the warning, use `--weights f32`.
+saturated=..` after every run. If you see the warning, use `--weights f32`. Qwen3's
+activations grow with size: the measured maximum was 3,644 for Qwen3-0.6B and 15,420 for
+Qwen3-1.7B. Check larger Qwen3 models with `REFLEX_F16_ACT_STATS=1`
+([measurements](benchmarks.md#f16-weight-storage)).
 
 LoRA adapters given with `--lora` are merged in f32: their target weights load as `f32`,
 take the delta, and are rounded to f16 once.

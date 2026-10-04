@@ -9,8 +9,9 @@ JIT-compiled when the process starts.
 (the engine's own timer), Tesla T4, `Qwen3-0.6B-Q4_K_M`, `n=10`. Measured from outside
 the process, including the ~110 ms the OS spends launching it, that is ~0.6 s wall clock.
 [Phase breakdown](docs/benchmarks.md#cold-start-phase-breakdown). Measured with `f32`
-weights, before `f16` weight storage became the default; not yet re-measured (see
-[f16 weight storage](docs/benchmarks.md#f16-weight-storage)).
+weights, before `f16` weight storage became the default. A same-session T4 comparison
+of the two weight types puts `f16` 2% faster here, with half the VRAM and 36–42% faster
+decode ([f16 weight storage](docs/benchmarks.md#f16-weight-storage)).
 
 > **Architectural boundary.** Reflex is a local execution engine for single-tenant
 > decisions: one request at a time, no scheduler, no batching, no network server inside
@@ -88,6 +89,8 @@ Cold starts measured from outside the process, Tesla T4, `Qwen3-0.6B-Q4_K_M`, un
 noted. The engine-vs-engine rows time `reflex generate` to its first token (0.83 s p50,
 `n=30`), the metric every engine shares; the headline above times `system1` scoring.
 Every Reflex figure here was measured with `f32` weights, before `f16` became the default.
+In a same-session comparison of the two weight types, `f16`'s first token was 4% sooner
+([f16 weight storage](docs/benchmarks.md#f16-weight-storage)).
 
 | vs. | Result | Caveat |
 |---|---|---|
