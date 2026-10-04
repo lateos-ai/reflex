@@ -352,7 +352,8 @@ cold() {  # cold <label> <dir-with-scripts> <REFLEX_WEIGHTS or empty>
     local script="$dir/scripts/bench_cold_start_phases_system1.sh"
     [[ $which == generate ]] && script="$dir/scripts/bench_cold_start_phases.sh"
     echo "### $label -- $which" >>"$SUMMARY"
-    if REFLEX_WEIGHTS="$w" "$script" "$DENSE_GGUF" "$N_RUNS" \
+    # Via bash: bench_cold_start_phases.sh is not executable in git (mode 100644, on master too).
+    if REFLEX_WEIGHTS="$w" bash "$script" "$DENSE_GGUF" "$N_RUNS" \
          >"$OUT_DIR/step3/${label}_$which.md" 2>"$OUT_DIR/step3/${label}_$which.err"; then
       sed -n '/^| phase/,$p' "$OUT_DIR/step3/${label}_$which.md" >>"$SUMMARY"
     else
