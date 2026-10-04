@@ -16,9 +16,9 @@ pub(super) fn assert_prefill_hidden_close(
     dtype: WeightsDtype,
     label: &str,
 ) {
-    // Estimated, not measured: f16 rounding (2^-11 relative) of every GEMM
-    // input across a few dozen layers. Confirm or correct it on a GPU run.
-    const F16_REL_L2_TOL: f64 = 2e-2;
+    // Measured on a T4 (2026-10-04): 5.6e-4 dense Qwen3-0.6B, 2.2e-4 hybrid
+    // Qwen3.5-0.8B, 1.2e-5 MLA fixture. ~9x headroom over the largest.
+    const F16_REL_L2_TOL: f64 = 5e-3;
     assert_eq!(seq.len(), batch.len());
     let max_abs = seq
         .iter()
