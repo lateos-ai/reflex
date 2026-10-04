@@ -27,7 +27,8 @@
 #   HYBRID_GGUF       optional  Qwen3.5 hybrid GGUF (README: Qwen3.5-0.8B)
 #   MLA_REAL_GGUF     optional  real DeepSeek-V2-Lite GGUF (~17 GB). Its f32 runs need an 80 GB
 #                               GPU (~63 GB of f32 weights); f16 should need about half
-#   LARGE_GGUF        optional  a bigger model for step 4 (e.g. Qwen3-1.7B or Qwen3-4B)
+#   LARGE_GGUF        optional  a bigger model, run in steps 0-2 and 4 (e.g. Qwen3-1.7B). Its f32
+#                               weights must fit the GPU (Qwen3-4B needs ~16 GB, too big for a T4)
 #   test-data/{tiny-qwen3moe,tiny-qwen35moe,deepseek-tiny-mla}.gguf
 #                     optional  random-weight fixtures: run, reported, never gate
 #   LLAMA_SIMPLE      optional  path to llama.cpp's llama-simple for step 2's text match
@@ -65,6 +66,7 @@ fail() { failures=$((failures + 1)); echo "**FAIL:** $*" >>"$SUMMARY"; log "FAIL
 # ---- models -------------------------------------------------------------------------
 # "name|path|real" -- real=1 models gate Phase 0; real=0 are random-weight fixtures.
 models=("qwen3-dense|$DENSE_GGUF|1")
+[[ -n "$LARGE_GGUF" ]] && models+=("large|$LARGE_GGUF|1")
 [[ -n "$LLAMA_GGUF" ]] && models+=("llama|$LLAMA_GGUF|1")
 [[ -n "$HYBRID_GGUF" ]] && models+=("qwen35-hybrid|$HYBRID_GGUF|1")
 [[ -n "$MLA_REAL_GGUF" ]] && models+=("deepseek-v2-lite|$MLA_REAL_GGUF|1")
