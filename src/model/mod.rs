@@ -590,10 +590,11 @@ impl Model {
     fn load_background_init(
         file: &GgufFile,
         device: Arc<CudaDevice>,
+        weights: WeightsDtype,
     ) -> Result<(Tokenizer, CudaBlas), ReflexError> {
         let tokenizer = Tokenizer::from_gguf(file)?;
-        let cublas =
-            CudaBlas::new(device).map_err(|e| crate::gpu_err!(e, "cublas handle: {e:?}"))?;
+        let cublas = CudaBlas::new(device.clone())
+            .map_err(|e| crate::gpu_err!(e, "cublas handle: {e:?}"))?;
         unsafe {
             cublas_sys::lib()
                 .cublasSetMathMode(
@@ -603,7 +604,36 @@ impl Model {
                 .result()
                 .map_err(|e| crate::gpu_err!(e, "cublasSetMathMode: {e:?}"))?;
         }
+        Self::warm_cublas(&device, &cublas, weights)?;
         Ok((tokenizer, cublas))
+    }
+
+    /// With f16 weights, one tiny `cublasGemmEx` (the call f16 prefill makes), so
+    /// cuBLAS's one-time first-launch cost for it is paid here, overlapped with the
+    /// weight load, instead of inside the first prefill. On a T4 with Qwen3-0.6B the
+    /// first GemmEx took 34.7 ms (every later call < 0.1 ms); with this warm-up the
+    /// cold `system1` scoring pass went 44.0 -> 9.8 ms for +14 ms of model load.
+    /// f32 gets none: a tiny `Sgemm` didn't shorten its 21 ms first call
+    /// (scoring 39.1 -> 37.7 ms), so it would only add load time.
+    fn warm_cublas(
+        device: &Arc<CudaDevice>,
+        cublas: &CudaBlas,
+        weights: WeightsDtype,
+    ) -> Result<(), ReflexError> {
+        if weights != WeightsDtype::F16 {
+            return Ok(());
+        }
+        const M: usize = 64;
+        const N: usize = 8;
+        const K: usize = 64;
+        let alloc_err = |e| crate::gpu_err!(e, "warm_cublas alloc: {e}");
+        let w = device.alloc_zeros::<half::f16>(M * K).map_err(alloc_err)?;
+        let x = device.alloc_zeros::<half::f16>(K * N).map_err(alloc_err)?;
+        let mut y = device.alloc_zeros::<f32>(M * N).map_err(alloc_err)?;
+        kernels::gemm_ex_f16_raw(cublas, *w.device_ptr(), &x, &mut y, M, N, K)?;
+        device
+            .synchronize()
+            .map_err(|e| crate::gpu_err!(e, "warm_cublas sync: {e}"))
     }
 
     /// Encodes `prompt`, runs it through every layer one position at a time
