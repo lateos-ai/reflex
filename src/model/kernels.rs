@@ -473,41 +473,7 @@ impl Model {
         rows: usize,
         in_features: usize,
     ) -> Result<(), ReflexError> {
-        let handle = *self.cublas.handle();
-        let set_math = |mode| unsafe {
-            cublas_sys::lib()
-                .cublasSetMathMode(handle, mode)
-                .result()
-                .map_err(|e| crate::gpu_err!(e, "cublasSetMathMode: {e:?}"))
-        };
-        let alpha = 1.0f32;
-        let beta = 0.0f32;
-        set_math(cublas_sys::cublasMath_t::CUBLAS_DEFAULT_MATH)?;
-        let launched = unsafe {
-            cudarc::cublas::result::gemm_ex(
-                handle,
-                cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-                cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                out_features as i32,
-                rows as i32,
-                in_features as i32,
-                (&alpha) as *const f32 as *const core::ffi::c_void,
-                w as *const core::ffi::c_void,
-                cublas_sys::cudaDataType::CUDA_R_16F,
-                in_features as i32,
-                *x16.device_ptr() as *const core::ffi::c_void,
-                cublas_sys::cudaDataType::CUDA_R_16F,
-                in_features as i32,
-                (&beta) as *const f32 as *const core::ffi::c_void,
-                *y.device_ptr() as *mut core::ffi::c_void,
-                cublas_sys::cudaDataType::CUDA_R_32F,
-                out_features as i32,
-                cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-            )
-        };
-        set_math(cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH)?;
-        launched.map_err(|e| crate::gpu_err!(e, "gemm_ex_f16 launch: {e:?}"))
+        gemm_ex_f16_raw(&self.cublas, w, x16, y, out_features, rows, in_features)
     }
 
     /// Shared shape-validation/slicing logic behind [`Self::gemv_expert`] and grouped-
@@ -1726,4 +1692,53 @@ impl Model {
         }
         Ok(())
     }
+}
+
+/// The body of `Model::gemm_ex_f16`, callable without a `Model` (the load-time
+/// cuBLAS warm-up in `Model::warm_cublas` runs exactly this call). See that method
+/// for the layout and math-mode contract.
+pub(super) fn gemm_ex_f16_raw(
+    cublas: &CudaBlas,
+    w: sys::CUdeviceptr,
+    x16: &CudaSlice<half::f16>,
+    y: &mut CudaSlice<f32>,
+    out_features: usize,
+    rows: usize,
+    in_features: usize,
+) -> Result<(), ReflexError> {
+    let handle = *cublas.handle();
+    let set_math = |mode| unsafe {
+        cublas_sys::lib()
+            .cublasSetMathMode(handle, mode)
+            .result()
+            .map_err(|e| crate::gpu_err!(e, "cublasSetMathMode: {e:?}"))
+    };
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    set_math(cublas_sys::cublasMath_t::CUBLAS_DEFAULT_MATH)?;
+    let launched = unsafe {
+        cudarc::cublas::result::gemm_ex(
+            handle,
+            cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+            out_features as i32,
+            rows as i32,
+            in_features as i32,
+            (&alpha) as *const f32 as *const core::ffi::c_void,
+            w as *const core::ffi::c_void,
+            cublas_sys::cudaDataType::CUDA_R_16F,
+            in_features as i32,
+            *x16.device_ptr() as *const core::ffi::c_void,
+            cublas_sys::cudaDataType::CUDA_R_16F,
+            in_features as i32,
+            (&beta) as *const f32 as *const core::ffi::c_void,
+            *y.device_ptr() as *mut core::ffi::c_void,
+            cublas_sys::cudaDataType::CUDA_R_32F,
+            out_features as i32,
+            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        )
+    };
+    set_math(cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH)?;
+    launched.map_err(|e| crate::gpu_err!(e, "gemm_ex_f16 launch: {e:?}"))
 }

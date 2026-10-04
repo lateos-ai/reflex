@@ -178,7 +178,8 @@ impl Model {
     ) -> Result<Self, ReflexError> {
         std::thread::scope(|scope| {
             let init_device = device.clone();
-            let init = scope.spawn(move || Self::load_background_init(file, init_device));
+            let warm = policy.matrix_dtype;
+            let init = scope.spawn(move || Self::load_background_init(file, init_device, warm));
             Self::load_hybrid_inner(device, file, policy, init)
         })
     }
