@@ -72,8 +72,9 @@ for t in "${tests[@]}"; do
   fi
   log="$LOG_DIR/${t//::/__}.log"
   start=$(date +%s)
+  # --nocapture: keep what passing tests print (measured errors such as rel_l2=) in the log.
   REFLEX_TEST_GGUF="$model" cargo test "${cargo_flags[@]}" --lib -- --ignored --exact "$t" \
-    --test-threads=1 >"$log" 2>&1
+    --test-threads=1 --nocapture >"$log" 2>&1
   status=$?
   secs=$(( $(date +%s) - start ))
   # Exactly one test must have run: a filter that matches nothing also "passes".
