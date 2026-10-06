@@ -437,3 +437,66 @@ Flag-off checksums are identical to master; flag-on checksums move ~1e-6 relativ
 hybrid/MoE/MLA paths ignore the flag). New test `quant_resident_lm_head_matches_f32` passes on
 Qwen3-0.6B (tied) and Mistral 7B (untied). The GPU suite, now with the tiny fixtures
 present, gives 18 pass and 3 skip with the flag off.
+
+### On top of `f16` weight storage (2026-10-06)
+
+Rebuilt on the `f16` default (see the status note at the top) and re-measured on the same
+dedicated T4 (`g4dn.xlarge`, driver 595.91.07), portable-PTX builds, Qwen3 Q4_K_M files.
+
+**Correctness.**
+
+- **Flag off:** identical to master on 56 of 56 comparisons. That's `reflex check` token ids
+  plus first-token logit checksum, and `system1` scores, across seven models and fixtures,
+  three prompts, `--weights f32` and `f16`.
+- **GPU suite:** 22 pass, 2 skip in both `--weights` modes. That includes the three
+  quantized-resident tests, which now cover the `f16` scratch path.
+  `quant_resident_gemv_matches_f32` and `quant_resident_lm_head_matches_f32` also pass on
+  Mistral 7B.
+- **Flag on, greedy tokens:** 32 greedy tokens match plain `--weights f32` on every prompt for
+  Qwen3-0.6B, Qwen3-1.7B and TinyLlama, with either `--weights` mode.
+- **Mistral 7B:** can't load as plain `f32` on a 16 GB card; its flag-on `f32` and `f16`
+  runs agree with each other. They do not match llama.cpp, and the text is garbled
+  (`", ithin ithis ithland, ithere ithwas"`). That looks like the known Mistral mismatch,
+  which points at the tokenizer or detokenizer rather than these kernels. It has not been
+  confirmed with the flag off, which needs ~14.5 GB in `f16`.
+
+**Cold start**, Qwen3-0.6B, `--weights f16`, n=10, two interleaved rounds, p50:
+
+| | flag off | flag on |
+|---|---|---|
+| `system1` model load | 235.2 / 237.3 ms | 236.1 / 233.4 ms |
+| `system1` scoring pass | 9.9 / 9.9 ms | **27.9 / 27.9 ms** |
+| `system1` total | 420.9 / 425.1 ms | 441.9 / 438.1 ms |
+| `generate` prompt eval | 247.4 / 247.2 ms | **46.6 / 46.6 ms** |
+| `generate` total | 661.3 / 659.9 ms | **461.3 / 459.6 ms** |
+
+**Memory and decode** (`reflex bench`, warmup 3, 20 iterations; prompt buckets 29 / 113 / 449):
+
+| model | flag | weights | resident MiB | model load ms | decode ms/token | warm prompt p50 ms |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B | off | f32 | 1,708 | 202 | 12.7 / 13.6 / 15.9 | 23.5 / 61.4 / 274.9 |
+| Qwen3-0.6B | off | f16 | 876 | 237 | 8.19 / 8.94 / 11.33 | 14.4 / 35.4 / 192.0 |
+| Qwen3-0.6B | on | f32 | 460 | 213 | 7.89 / 8.83 / 11.01 | 35.6 / 74.2 / 282.3 |
+| Qwen3-0.6B | on | f16 | **364** | 236 | **7.28** / 8.22 / 10.42 | 25.9 / 47.8 / 204.9 |
+| Qwen3-1.7B | off | f32 | 5,452 | 699 | 30.9 / 31.5 / 33.9 | 60.0 / 169.2 / 640.0 |
+| Qwen3-1.7B | off | f16 | 2,732 | 499 | 18.0 / 18.6 / 21.0 | 36.1 / 86.8 / 376.3 |
+| Qwen3-1.7B | on | f32 | 1,484 | 459 | 16.9 / 17.7 / 19.8 | 99.8 / 207.2 / 684.0 |
+| Qwen3-1.7B | on | f16 | **1,100** | 410 | **15.2** / 15.8 / 18.1 | 74.2 / 125.8 / 416.6 |
+
+Mistral 7B, flag on, `--weights f16`: 5,356 MiB resident (7,276 MiB with the prototype's
+`f32` default), decode 51.3 / 52.8 / 59.9 ms/token, model load 2.29 s.
+
+What this says against the `f16` baseline rather than `f32`:
+
+- **VRAM:** the flag still saves 58% (0.6B) and 60% (1.7B).
+- **Decode:** the margin shrinks from ~40% against `f32` to 11% (0.6B) and 15% (1.7B),
+  since `f16` already halved the weight bytes read per token.
+- **`generate`'s cold first token:** 30% faster. A tied LM head stays Q6_K instead of being
+  dequantized to the full vocab on first use.
+- **`system1` gets worse:** it is ~17 ms slower than the `f16` default (was ~7–10 ms against
+  `f32`). Its 12-token scoring pass runs on the fused Q4_K kernel at 27.9 ms, while `f16`'s
+  cuBLAS path, now warmed at load, takes 9.8 ms.
+- **Warm prefill is slower at every length:** 1.8x at 29 tokens and 1.1x at 449 for 0.6B.
+  The fused kernel and the scratch path both lose to `f16` weights read directly. That's
+  the "tiled multi-row Q4_K kernel" gap from the earlier results, now measured against the
+  faster baseline.
