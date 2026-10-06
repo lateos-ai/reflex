@@ -1,118 +1,232 @@
 # Design: Kolibri-1 MoE support
 
-**Status: proposal (2026-10-06). Nothing implemented. Phase 0 is a go/no-go gate.**
+**Status: Phase 0 done (2026-10-06): go. Nothing implemented yet.** Every convention
+below was read from Aleph Alpha's own checkpoint and inference code and from a real
+GGUF header, and cross-checked between two independent implementations. See
+[Confirmed conventions](#confirmed-conventions).
 
-Goal: run the Kolibri-1 Mixture-of-Experts model (reported as 78B total / ~3.46B active
-parameters, 384 routed experts + 1 shared expert, top-6 routing, a hybrid 4:1
-sliding-window-attention (512 tokens) / NoPE layer pattern, and a "UniBPE" tokenizer) on
-Reflex, measured on cold start (process launch to first token).
-
-Every architectural fact in that sentence is unverified. Phase 0 exists to replace each
-one with a value read from a real GGUF/HF checkpoint before any code is written.
+Goal: run Aleph Alpha's Kolibri-1 (released 2026-10-03, Apache 2.0) on Reflex,
+measured on cold start (process launch to first token). It is a 78B-parameter MoE
+(3.46B active per token) with 384 routed experts plus 1 shared expert and top-6
+routing in every layer. Attention alternates four sliding-window layers with RoPE and
+one full-attention layer without positional encoding (NoPE).
 
 ## Constraints that shape this plan
 
 - **Weights don't fit unless they stay quantized.** Matrix weights are dequantized to
-  `f16` at load by default: ~156 GB for 78B parameters, more than an 80 GB A100.
-  `REFLEX_QUANT_RESIDENT=1` keeps Q4_K weights quantized on the GPU, but only on the
-  dense path (see [quantized-resident-weights.md](quantized-resident-weights.md)); MoE
-  keeps normal storage. Extending it to stacked expert tensors is the core of this work.
+  `f16` at load by default, which is ~156 GB for this model. `REFLEX_QUANT_RESIDENT=1`
+  keeps Q4_K/Q6_K weights quantized on the GPU, but only on the dense path (see
+  [quantized-resident-weights.md](quantized-resident-weights.md)). The Q4_K_M GGUF is
+  47.5 GB, so it fits on an 80 GB GPU only if the expert tensors stay quantized.
 - **Single GPU only.** Every entry point uses `CudaDevice::new(0)`. Multi-GPU sharding
-  is out of scope here and would need its own proposal.
-- **No FP8 path, and quantized-resident covers Q4_K/Q6_K only.** Targets that assume FP8
-  or Q5 resident weights are out of scope.
-- **Correctness means byte-exact greedy agreement with llama.cpp** (`reflex check`), not
-  agreement with a vendor's own reference stack.
+  is out of scope.
+- **No FP8 path.** Aleph Alpha's own checkpoint is FP8 (128x128 block scales); we use
+  community GGUFs converted from it instead.
+- **Correctness means byte-exact greedy agreement with llama.cpp** (`reflex check`).
+  Mainline llama.cpp does not support `kolibri1` yet (upstream issue
+  [#29922](https://github.com/ggml-org/llama.cpp/issues/29922)), so the reference is
+  llama.cpp at commit `836d571` with the community patch the published GGUFs were made
+  with (see [Reference implementations](#reference-implementations)).
 - **Cold start is the metric.** Sustained tokens/s is reported, not optimized (see the
   Non-goals in [DEVELOPMENT.md](../DEVELOPMENT.md)).
-- Routing already runs on the host (`crate::moe::route_top_k`): a top-k over 384 logits
-  costs microseconds, so no new routing kernel is needed.
 
-## Phase 0: confirm the model and its conventions (go/no-go)
+## Reference implementations
 
-- Get the real HF `config.json`/tokenizer files and a real GGUF header. Record
-  `general.architecture` and every tensor name and shape. A header can be checked
-  without downloading the whole file (fetch the first few MB and parse with
-  `src/gguf.rs`).
-- **Check whether llama.cpp supports the architecture.** If it does, we get a GGUF
-  format, `convert_hf_to_gguf.py` and a reference implementation. If it doesn't, all
-  three are missing and the project becomes "build a converter and a reference first":
-  stop and re-plan.
-- Record from real metadata, not from model cards:
-  - tokenizer type (`tokenizer.ggml.model`) and pre-tokenizer (`tokenizer.ggml.pre`);
-  - sliding-window size and which layers use it (metadata key and layer pattern);
-  - which layers skip RoPE (NoPE), and any per-layer attention scaling on them;
-  - RoPE type, NORM vs NEOX (`rope_type_for` in `src/model/config.rs`; getting this
-    wrong silently corrupts output);
-  - router: softmax vs sigmoid, top-k weight renormalization or not;
-  - shared expert: ungated (MLA's `MlaFfn::Moe`) or sigmoid-gated (`*_shexp` in
-    `src/model/hybrid.rs`).
-- Output: fill in a "Confirmed conventions" section of this document, with sources.
+| Source | What it is | Role |
+|---|---|---|
+| [`aleph_alpha_inference/kolibri1.py`](https://github.com/Aleph-Alpha/aleph-alpha-inference) (commit `049a6a7`) | Aleph Alpha's official vLLM plugin | Ground truth for the math |
+| [`kolibri1-llama.cpp.patch`](https://huggingface.co/Hob-forge/Kolibri-1-GGUF) on llama.cpp `836d571` | Community patch (converter + model + `SIGMOID_LOGIT_ADD` gating) | Byte-exact reference; produced the GGUFs we load |
+| [CWBudde/llama.cpp](https://github.com/CWBudde/llama.cpp) (PRs #1, #2, #7, #9) | A second, independent community port | Third opinion when the first two disagree with Reflex |
 
-## Phase 1: config and tokenizer
+The official plugin and the Hob-forge patch were read side by side and agree on every
+convention listed below.
 
-- `src/model/config.rs`: accept the architecture string, parse the sliding-window and
-  layer-pattern keys, and add an explicit `rope_type_for` entry with a test in
+## Confirmed conventions
+
+Sources: HF `config.json` and `tokenizer.json` of
+[Aleph-Alpha/Kolibri-1-BF16](https://huggingface.co/Aleph-Alpha/Kolibri-1-BF16), the
+official plugin, and the header of `Kolibri-1-Q4_K_M.gguf` (read with an HTTP range
+request).
+
+**Shape.** 50 layers, `n_embd` 2560, 48 query heads, 4 KV heads, `head_dim` 128,
+vocab 128,000, untied `output.weight`. Expert FFN width 512, shared-expert FFN width
+512, RMSNorm eps 1e-6.
+
+**GGUF metadata** (`general.architecture = "kolibri1"`):
+
+| Key | Value |
+|---|---|
+| `kolibri1.expert_count` / `expert_used_count` | 384 / 6 |
+| `kolibri1.expert_shared_count` | 1 |
+| `kolibri1.expert_feed_forward_length` / `expert_shared_feed_forward_length` | 512 / 512 |
+| `kolibri1.expert_gating_func` | 5 (`SIGMOID_LOGIT_ADD`, new in the patch) |
+| `kolibri1.expert_weights_norm` | false |
+| `kolibri1.attention.sliding_window` | 513 |
+| `kolibri1.attention.sliding_window_pattern` | bool[50]: `true` = sliding layer, every 5th layer (index 4, 9, ..., 49) `false` |
+| `kolibri1.rope.freq_base` | 10000, no scaling keys |
+| `tokenizer.ggml.model` / `.pre` | `gpt2` / `kolibri1` |
+| `tokenizer.ggml.add_bos_token` | false (no BOS token at all) |
+| `tokenizer.ggml.eos_token_id` | 127906 (`<\|im_end\|>`); 127901 is padding and also a stop token in `generation_config.json` |
+
+**Tokenizer.** Plain byte-level BPE (127,644 merges), not a new format: the
+"German-tailored tokenizer" is a new vocabulary, not a new algorithm. Its split regex
+is identical to Qwen2's (`\p{N}{1}` is `\p{N}`), and the patch maps `kolibri1` to
+`LLAMA_VOCAB_PRE_TYPE_QWEN2`. Reflex's existing `gpt2` path should handle it as is.
+
+**Attention.**
+- Q/K per-head RMSNorm before RoPE (as in Qwen3).
+- Sliding layers: RoPE **NEOX** (half-split), theta 10000. The patch adds `kolibri1`
+  to llama.cpp's NEOX list, and vLLM's `get_rope` defaults to NEOX. Reflex's
+  `rope_type_for` already falls through to NEOX for unknown architectures, but should
+  get an explicit entry and test anyway.
+- Full-attention layers: **no RoPE at all** (NoPE) and no extra scaling. The scale is
+  `1/sqrt(128)` on every layer.
+- Window of 513 means a query attends to itself plus the 512 previous positions: key
+  `j` is visible from query `i` when `i - j < 513`. That is the semantics of vLLM's
+  `per_layer_sliding_window` and llama.cpp's `LLAMA_SWA_TYPE_STANDARD`. **For prompts
+  of 513 tokens or fewer the window has no effect**, so it doesn't touch most
+  cold-start runs.
+
+**Layer (sandwich norms).** The GGUF names are confusing, so here is the data flow:
+
+```
+h   = x + post_attention_norm( attn( attn_norm(x) ) )
+out = h + post_ffw_norm( moe( ffn_norm(h) ) + shared_expert( ffn_norm(h) ) )
+```
+
+HF's `post_attention_layernorm` is the **pre-FFN** norm (`ffn_norm` in the GGUF), HF's
+`post_attn_norm` is `post_attention_norm`, and HF's `post_ffn_norm` is
+`post_ffw_norm`. The shared expert is an ordinary ungated SwiGLU added to the routed
+output before the post-FFN norm. Every layer is MoE; there are no dense-lead layers.
+
+**Router (`SIGMOID_LOGIT_ADD`).** This is new; none of Reflex's existing routers match
+it.
+
+```
+logits  = ffn_gate_inp · x                          # f32, [384]
+chosen  = top6( logits + exp_probs_b )              # select on biased raw logits
+weights = sigmoid( logits[chosen] )                 # weight by UNbiased sigmoid
+                                                    # no renormalization
+```
+
+DeepSeek-V3's convention (selecting on `sigmoid(logits) + bias`) picks different
+experts whenever the bias is nonzero; using it would be a silent bug.
+
+**Tensor types in the Q4_K_M GGUF** (903 tensors, 47.5 GB):
+
+| Tensor | Type | Shape |
+|---|---|---|
+| `ffn_gate_exps`, `ffn_up_exps` | Q4_K (all 50 layers) | [2560, 512, 384] |
+| `ffn_down_exps` | **Q4_K in 25 layers, Q6_K in 25** | [512, 2560, 384] |
+| `ffn_gate_shexp`, `ffn_up_shexp` | Q4_K | [2560, 512] |
+| `ffn_down_shexp` | Q4_K / Q6_K (25 / 25) | [512, 2560] |
+| `attn_q`, `attn_k`, `attn_output` | Q4_K | |
+| `attn_v` | Q4_K / Q6_K (25 / 25) | [2560, 512] |
+| `token_embd` | Q4_K | [2560, 128000] |
+| `output` | Q6_K | [2560, 128000] |
+| norms, `ffn_gate_inp`, `exp_probs_b.bias` | F32 | |
+
+So keeping experts quantized needs **both a Q4_K and a Q6_K expert path**, not just
+Q4_K.
+
+**Other GGUFs.** [Hob-forge/Kolibri-1-GGUF](https://huggingface.co/Hob-forge/Kolibri-1-GGUF)
+also ships Q2_K, Q3_K_M, Q5_K_M, Q6_K and Q8_0;
+[webmp3/Sakura-MicroQuality-Kolibri-1-GGUF](https://huggingface.co/webmp3/Sakura-MicroQuality-Kolibri-1-GGUF)
+ships IQ2_XS/IQ3_XXS/IQ4_XS mixes (20.9 to 38 GiB). Q4_K_M is the target: the smallest
+file whose types the quantized-resident path already has kernels for. No small real
+`kolibri1` model exists.
+
+## Phase 1: config, tokenizer and fixture
+
+- `src/model/config.rs`: accept `kolibri1`, read the keys above (including the
+  sliding-window pattern array and the gating function, rejecting any other value of
+  `expert_gating_func`), add an explicit `rope_type_for` entry with a test in
   `src/model/rope_type_tests.rs`.
-- `src/tokenizer.rs`: if `tokenizer.ggml.model` is a new value, add it alongside
-  `llama` and `gpt2`. Test against llama.cpp's own tokenizer output on the same strings,
-  including German compound nouns and non-ASCII byte fallback.
-- Build a small synthetic fixture with llama.cpp's unmodified `convert_hf_to_gguf.py`
-  (random weights, real tensor names, a few layers, ~16 experts with top-k below the
-  expert count, at least one SWA layer and one NoPE layer), the same way the MLA and
-  qwen3moe fixtures were built (see [DEVELOPMENT.md](../DEVELOPMENT.md)'s
-  test-fixture section). Only possible if Phase 0 found converter support.
+- Tokenizer: no new algorithm. Add a golden test comparing Reflex's token IDs with
+  the patched llama.cpp's `llama-tokenize` (or HF `tokenizers`) on German compound
+  nouns, umlauts/ß, digits, code and the chat-template special tokens.
+- Synthetic fixture: write a small HF checkpoint (random weights, real tensor names,
+  ~4 layers with at least one full-attention layer, ~16 experts, top-k below the
+  expert count, nonzero `expert_bias`), convert it with the **patched**
+  `convert_hf_to_gguf.py`, and quantize it to Q4_K_M so it has the same type mix.
+  Same recipe as the MLA and qwen3moe fixtures (see
+  [DEVELOPMENT.md](../DEVELOPMENT.md)'s test-fixture section). A nonzero bias is what
+  separates `SIGMOID_LOGIT_ADD` from the DeepSeek-V3 convention, so a zero-bias
+  fixture would not catch that bug.
 
-## Phase 2: sliding-window attention and NoPE
+## Phase 2: layer math
 
-- **Correctness first, via masking:** keep the existing full-length KV cache and mask
-  keys older than `pos - window` in `attention.cu`, `attention_online.cu` and
-  `attention_prefill.cu`. That is what TTFT on a prompt depends on.
-- NoPE: skip the RoPE launch on the configured layers. Add per-layer attention scaling
-  only if Phase 0 found one.
-- **Ring-buffer KV cache: deferred.** It only saves memory on long contexts and is not
-  on the cold-start path. If it lands later it needs a new cache-shape version in
-  `src/kv_io.rs`, since `--export-kv`/`--import-kv` depend on the layout.
+- NoPE: skip the RoPE launch on layers where the pattern is `false`.
+- Sandwich norms: two extra RMSNorms per layer (`post_attention_norm`,
+  `post_ffw_norm`), as in the data flow above.
+- Router: add `route_sigmoid_logit_add` to `src/moe.rs` (host side, like the existing
+  routers), with unit tests that include a case where it and the DeepSeek-V3
+  convention pick different experts.
+- Shared expert: ungated, added before `post_ffw_norm` (same shape as MLA's
+  `MlaFfn::Moe` shared expert, different place in the layer).
+- Sliding window: mask keys with `i - j >= 513` in `attention.cu`,
+  `attention_online.cu` and `attention_prefill.cu`, keeping the full KV cache. Only
+  matters for contexts above 513 tokens. A ring-buffer KV cache stays deferred (not
+  on the cold-start path; it would also need a new cache-shape version in
+  `src/kv_io.rs`).
 
-## Phase 3: 384-expert MoE with quantized-resident experts (core work)
+## Phase 3: experts kept quantized on the GPU (core work)
 
-- Routing: reuse `route_top_k` or `route_top_k_with_norm` per Phase 0; add a sigmoid
-  variant only if needed.
-- Shared expert: reuse whichever existing convention matches, run unconditionally next
-  to the routed experts.
-- **Extend `REFLEX_QUANT_RESIDENT` to MoE expert tensors.** Keep Q4_K expert slices of
-  the stacked `[in, out, expert_count]` tensors as raw blocks in the device arena and
-  read them per expert with `gemv_q4k`: a sliced variant of `gemv_expert`. Q4_K_M at
-  78B is ~47 GB, which fits on an 80 GB A100.
-- Batched prefill: make the batched MoE prefill path handle 384 experts and quantized
-  experts; `prefill_dense_batched_matches_sequential_prefill` remains the guard test.
-- Optional, cold-start specific: **lazy expert upload.** A short prompt touches only a
-  fraction of 384 experts per layer. Measure the touched fraction before committing.
+- **Extend `REFLEX_QUANT_RESIDENT` to MoE expert tensors**: keep each stacked
+  `[in, out, 384]` tensor as raw blocks in the device arena and read one expert's
+  slice with `gemv_q4k` or `gemv_q6k`, a sliced variant of `gemv_expert` for each
+  type. Expert slices are whole rows of blocks (512 and 2560 are both multiples of
+  256), so an expert's slice is a contiguous byte range.
+- Attention weights (`attn_v` Q6_K in half the layers), the shared expert and the LM
+  head go through the same quantized path.
+- Batched prefill: the batched MoE prefill path has to handle 384 experts and
+  quantized experts; `prefill_dense_batched_matches_sequential_prefill` stays the
+  guard test.
+- Memory budget: ~47.5 GB of weights + KV cache (50 layers x 4 KV heads x 128 x 2 x
+  f32 = 200 KB per token) + scratch. Fits on 80 GB, not on 48 GB.
 
-## Phase 4: verification and benchmarks
+## Phase 4: cold-start work specific to a 47.5 GB model
 
-- Correctness: byte-exact greedy agreement with llama.cpp via `reflex check`, first on
-  the synthetic fixture, then on the real Q4_K_M GGUF. Use German and English prompts,
-  including ones longer than 512 tokens so the window is exercised.
-- Hardware: 1x A100 80 GB, Q4_K_M, `REFLEX_QUANT_RESIDENT=1`.
+At this size, reading the file dominates cold start: ~16 s at 3 GB/s NVMe, against
+~2 s of PCIe 4 transfer. Expert weights are ~97% of the file.
+
+- **Measure first**: for a set of real prompts, record how many distinct experts per
+  layer prefill and the first token actually touch.
+- If the fraction is small, **upload experts lazily**: map the file, upload
+  attention/shared/router weights eagerly, and upload an expert's slice the first time
+  the router selects it. This trades a small per-token stall for not reading most of
+  the file before the first token.
+
+## Phase 5: verification and benchmarks
+
+- Correctness: byte-exact greedy agreement with the patched llama.cpp via
+  `reflex check`, first on the synthetic fixture, then on the real Q4_K_M GGUF. Use
+  German and English prompts, including some longer than 513 tokens so the window is
+  exercised. If Reflex and the patch disagree, check against the official vLLM plugin
+  and the CWBudde port before deciding which side is wrong.
+- Hardware: 1x A100 80 GB or H100 80 GB, Q4_K_M, `REFLEX_QUANT_RESIDENT=1`.
 - Metrics: `process_start_to_first_token_ms`, the `model_load_ms` breakdown
-  (`REFLEX_LOAD_PROFILE=1`; at ~47 GB, load will likely dominate), energy, and
-  llama.cpp's cold-start numbers on the same machine for comparison. Report tokens/s
-  without optimizing for it.
+  (`REFLEX_LOAD_PROFILE=1`), cold vs warm page cache, energy, and the patched
+  llama.cpp's cold start on the same machine for comparison. Report tokens/s without
+  optimizing for it.
 - Docs: add the architecture to README's supported models and to
   [DEVELOPMENT.md](../DEVELOPMENT.md).
 
 ## Out of scope (separate proposals if wanted)
 
-- Multi-GPU sharding (e.g. 2x RTX 4090).
-- FP8 weights, Q5_K quantized-resident weights.
+- Multi-GPU sharding (e.g. 2x RTX 4090), which is also what Aleph Alpha's own BF16/FP8
+  checkpoints need.
+- FP8 weights; Q5_K, Q3_K, Q2_K and IQ quantized-resident kernels.
 - Ring-buffer KV cache.
 
 ## Risks
 
-- **No llama.cpp support** means no GGUF and no reference. This is the gate.
-- **Load time.** Reading ~47 GB from disk may dominate cold start; lazy expert upload
-  is the main lever.
-- **Silent convention mismatches** (RoPE type, router normalization, shared-expert
-  gating) produce wrong output without crashing, as happened during MLA bring-up. Each
-  must be confirmed in Phase 0 and covered by byte-exact comparison.
+- **The reference is unmerged community code.** The math matches the official plugin
+  as read, but the patch could still change, or upstream could land a different
+  conversion (different tensor names or metadata keys) that breaks these GGUFs. Pin
+  the patch file's hash and llama.cpp `836d571` in the test notes.
+- **Load time.** 47.5 GB may make cold start look poor next to small models; lazy
+  expert upload (Phase 4) is the main lever and its value is unmeasured.
+- **Silent convention mismatches.** The router selection rule, the sandwich-norm order
+  and NoPE layers are all ways to get wrong output without a crash. Each is pinned
+  above and must be covered by the byte-exact comparison.
