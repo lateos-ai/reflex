@@ -25,7 +25,8 @@ jobs:
           path-to-signatures: "signatures/cla.json"
           path-to-document: "https://github.com/lateos-ai/reflex/blob/master/CLA.md"
           branch: "cla-signatures"
-          allowlist: dependabot[bot],dependabot-preview[bot]
+          # leochong: the lateos-ai maintainer.
+          allowlist: leochong,dependabot[bot],dependabot-preview[bot]
           custom-pr-sign-comment: "I have read the CLA Document and I hereby sign the CLA"
           custom-notsigned-prcomment: |
             Thank you for your contribution! Before this PR can be merged, please
