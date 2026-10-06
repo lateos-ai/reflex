@@ -299,7 +299,16 @@ impl Tokenizer {
         }
     }
 
-    /// Encode `text` to token ids via greedy lowest-rank BPE merging.
+    /// Encode `text` to token ids, SentencePiece style.
+    ///
+    /// With `tokenizer.ggml.scores` present (every real SentencePiece GGUF),
+    /// merging follows llama.cpp's `llm_tokenizer_spm`: see
+    /// [`Self::spm_merge_by_score`]. llama.cpp ignores `tokenizer.ggml.merges`
+    /// for this tokenizer type, and many GGUFs don't carry it at all
+    /// (TheBloke's Mistral-7B-v0.1 has none); merging by merge rank alone then
+    /// merges nothing and encodes every prompt one character per token. Only
+    /// a vocab with no scores (the synthetic test vocabs) falls back to
+    /// greedy lowest-rank merging over `merge_rank`.
     ///
     /// Preprocessing: every space becomes [`WORD_BOUNDARY`] and a leading
     /// `WORD_BOUNDARY` is prepended for non-empty text (SentencePiece's
@@ -319,6 +328,9 @@ impl Tokenizer {
         }
         for ch in text.chars() {
             preprocessed.push(if ch == ' ' { WORD_BOUNDARY } else { ch });
+        }
+        if !self.scores.is_empty() {
+            return self.spm_merge_by_score(&preprocessed);
         }
 
         let mut symbols: Vec<String> = Vec::new();
@@ -350,6 +362,127 @@ impl Tokenizer {
                 })
             })
             .collect()
+    }
+
+    /// SentencePiece merging as llama.cpp's `llm_tokenizer_spm` does it, on
+    /// already-preprocessed text (spaces replaced by [`WORD_BOUNDARY`], dummy
+    /// prefix added). Start from one symbol per character; repeatedly merge
+    /// the adjacent pair whose concatenation is a vocab token with the highest
+    /// score (ties: the leftmost pair), re-scoring the merged symbol's new
+    /// neighbours each time. A final symbol that is a vocab token becomes its
+    /// id; any other (a single character missing from the vocab) becomes one
+    /// `<0xXX>` byte-fallback token per UTF-8 byte.
+    fn spm_merge_by_score(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
+        struct Symbol {
+            start: usize,
+            len: usize,
+            prev: Option<usize>,
+            next: Option<usize>,
+        }
+        struct Bigram {
+            score: f32,
+            left: usize,
+            right: usize,
+            size: usize,
+        }
+        impl PartialEq for Bigram {
+            fn eq(&self, other: &Self) -> bool {
+                self.cmp(other) == std::cmp::Ordering::Equal
+            }
+        }
+        impl Eq for Bigram {}
+        impl PartialOrd for Bigram {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Bigram {
+            // Max-heap: highest score first, then the leftmost pair.
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.score
+                    .total_cmp(&other.score)
+                    .then_with(|| other.left.cmp(&self.left))
+            }
+        }
+
+        let mut symbols: Vec<Symbol> = text
+            .char_indices()
+            .enumerate()
+            .map(|(i, (start, ch))| Symbol {
+                start,
+                len: ch.len_utf8(),
+                prev: i.checked_sub(1),
+                next: None,
+            })
+            .collect();
+        let n = symbols.len();
+        for (i, sym) in symbols.iter_mut().enumerate() {
+            sym.next = (i + 1 < n).then_some(i + 1);
+        }
+
+        let mut heap = std::collections::BinaryHeap::new();
+        let try_add = |heap: &mut std::collections::BinaryHeap<Bigram>,
+                       symbols: &[Symbol],
+                       left: usize,
+                       right: usize| {
+            let piece = &text[symbols[left].start..symbols[right].start + symbols[right].len];
+            if let Some(&id) = self.token_to_id.get(piece) {
+                heap.push(Bigram {
+                    score: self.scores.get(id as usize).copied().unwrap_or(0.0),
+                    left,
+                    right,
+                    size: piece.len(),
+                });
+            }
+        };
+        for i in 1..n {
+            try_add(&mut heap, &symbols, i - 1, i);
+        }
+        while let Some(b) = heap.pop() {
+            let (l, r) = (b.left, b.right);
+            // Stale entry: one side was already merged away, or grew since.
+            if symbols[l].len == 0
+                || symbols[r].len == 0
+                || symbols[l].len + symbols[r].len != b.size
+            {
+                continue;
+            }
+            symbols[l].len += symbols[r].len;
+            symbols[r].len = 0;
+            symbols[l].next = symbols[r].next;
+            if let Some(next) = symbols[r].next {
+                symbols[next].prev = Some(l);
+            }
+            if let Some(prev) = symbols[l].prev {
+                try_add(&mut heap, &symbols, prev, l);
+            }
+            if let Some(next) = symbols[l].next {
+                try_add(&mut heap, &symbols, l, next);
+            }
+        }
+
+        let mut ids = Vec::new();
+        let mut cur = (n > 0).then_some(0);
+        while let Some(k) = cur {
+            let piece = &text[symbols[k].start..symbols[k].start + symbols[k].len];
+            match self.token_to_id.get(piece) {
+                Some(&id) => ids.push(id),
+                None => {
+                    for &byte in piece.as_bytes() {
+                        let bt = byte_fallback_token(byte);
+                        let id = self.token_to_id.get(&bt).copied().ok_or_else(|| {
+                            crate::reflex_err!(
+                                Tokenizer,
+                                "'{piece}' not in vocab and byte-fallback token '{bt}' also missing"
+                            )
+                        })?;
+                        ids.push(id);
+                    }
+                }
+            }
+            cur = symbols[k].next;
+        }
+        Ok(ids)
     }
 
     /// Encode `text` to token ids via GPT-2-style byte-level BPE (Phase
@@ -916,6 +1049,74 @@ mod tests {
     /// `scripts/reference_tokenize.py`): unlike every non-empty input, empty
     /// text does not get the dummy-prefix `WORD_BOUNDARY` token — it encodes
     /// to zero tokens, not one.
+    /// A vocab with scores and no merge list (e.g. TheBloke's Mistral-7B
+    /// GGUFs) merges by score, as llama.cpp does, instead of not at all.
+    fn build_scored_tokenizer() -> Tokenizer {
+        let mut tok = build_synthetic_tokenizer();
+        tok.merge_rank = FxHashMap::default();
+        // Lone "▁" scored like Mistral's (-1e9): it must still merge into
+        // "▁hello" when that token exists.
+        tok.tokens.push("\u{2581}hello".to_string());
+        tok.token_to_id.insert("\u{2581}hello".to_string(), 20);
+        tok.scores = tok
+            .tokens
+            .iter()
+            .map(|t| match t.as_str() {
+                "\u{2581}" => -1e9,
+                "\u{2581}hello" => -1.0,
+                // Longer pieces score higher, like a real SentencePiece vocab.
+                other => -10.0 / other.chars().count() as f32,
+            })
+            .collect();
+        tok
+    }
+
+    #[test]
+    fn test_scored_vocab_without_merges_still_merges() {
+        let tok = build_scored_tokenizer();
+        let ids = tok.encode("hello world").expect("encode should succeed");
+        // "▁hello" (one token), then "▁", "world": "▁world" isn't in the vocab.
+        assert_eq!(ids, vec![20, 3, 18]);
+        assert_eq!(tok.decode(&ids), " hello world");
+    }
+
+    #[test]
+    fn test_scored_merge_prefers_higher_score_then_leftmost() {
+        let mut tok = build_scored_tokenizer();
+        // "ab" and "bc" both exist; "bc" scores higher, so "abc" -> "a", "bc".
+        for (piece, score) in [
+            ("a", -5.0),
+            ("b", -5.0),
+            ("c", -5.0),
+            ("ab", -2.0),
+            ("bc", -1.0),
+        ] {
+            tok.token_to_id
+                .insert(piece.to_string(), tok.tokens.len() as u32);
+            tok.tokens.push(piece.to_string());
+            tok.scores.push(score);
+        }
+        let id = |p: &str| tok.token_to_id[p];
+        assert_eq!(
+            tok.encode("abc").unwrap(),
+            vec![id("\u{2581}"), id("a"), id("bc")]
+        );
+        // Equal scores: the leftmost pair wins.
+        let bc = tok.token_to_id["bc"] as usize;
+        tok.scores[bc] = -2.0;
+        assert_eq!(
+            tok.encode("abc").unwrap(),
+            vec![id("\u{2581}"), id("ab"), id("c")]
+        );
+    }
+
+    #[test]
+    fn test_scored_merge_byte_falls_back_for_unknown_char() {
+        let tok = build_scored_tokenizer();
+        let ids = tok.encode("h!").expect("encode should succeed");
+        assert_eq!(ids, vec![3, 4, 19]); // "▁", "h", "<0x21>"
+    }
+
     #[test]
     fn test_encode_empty_string_produces_no_tokens() {
         let tok = build_synthetic_tokenizer();
