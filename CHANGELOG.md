@@ -18,9 +18,11 @@ What has been built, in order. Measurements live in
   saturates at 65504 instead of overflowing and reports what it clamped. `--weights f32`
   / `REFLEX_WEIGHTS=f32` keeps the exact reference mode, and `reflex check` defaults to
   it. LoRA merges stay in f32. Result lines gain `weights_dtype` (`--json` schema
-  `1.1.0`). **Not yet verified on a GPU**: correctness, cold-start, memory and decode
-  numbers are pending `scripts/verify_f16_weights.sh` (see
-  [docs/benchmarks.md](docs/benchmarks.md#f16-weight-storage)).
+  `1.1.0`). With f16 weights, cuBLAS's first-call cost is paid on the load's worker
+  thread. Verified on a T4 (2026-10-04): f16 and f32 give the same tokens on every tested
+  model, VRAM halves, decode is 36-42% faster, and cold start is 7% (`system1`) and 8%
+  (`generate`) faster than f32. Details in
+  [docs/benchmarks.md](docs/benchmarks.md#f16-weight-storage).
 
 ## 2026-10-01
 
