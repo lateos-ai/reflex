@@ -335,7 +335,8 @@ checksums, same phase timings within 1 ms).
 The 1"` vs. `" a city
   of many faces"`). The kernel matches the `f32` path on Mistral's own tensors, so this is
   not the quantized path; Mistral could not run on this engine's test GPUs before, and the
-  difference is still open.
+  difference is still open. *(Later traced to the tokenizer, not the weights: see
+  [Mistral 7B on the fixed tokenizer](#mistral-7b-on-the-fixed-tokenizer-2026-10-06).)*
 
 ### Where model load goes (step 0, `REFLEX_LOAD_PROFILE=1`, `system1`, n=5)
 
@@ -454,11 +455,11 @@ dedicated T4 (`g4dn.xlarge`, driver 595.91.07), portable-PTX builds, Qwen3 Q4_K_
   Mistral 7B.
 - **Flag on, greedy tokens:** 32 greedy tokens match plain `--weights f32` on every prompt for
   Qwen3-0.6B, Qwen3-1.7B and TinyLlama, with either `--weights` mode.
-- **Mistral 7B:** can't load as plain `f32` on a 16 GB card; its flag-on `f32` and `f16`
-  runs agree with each other. They do not match llama.cpp, and the text is garbled
-  (`", ithin ithis ithland, ithere ithwas"`). That looks like the known Mistral mismatch,
-  which points at the tokenizer or detokenizer rather than these kernels. It has not been
-  confirmed with the flag off, which needs ~14.5 GB in `f16`.
+- **Mistral 7B:** its flag-on `f32` and `f16` runs agreed with each other but not with
+  llama.cpp, and the text was garbled (`", ithin ithis ithland, ithere ithwas"`). The cause
+  was the SentencePiece tokenizer, which encoded Mistral's prompts one character per token;
+  it was fixed separately (it now merges by token score, as llama.cpp does). Mistral is
+  re-measured on the fixed tokenizer in the next section.
 
 **Cold start**, Qwen3-0.6B, `--weights f16`, n=10, two interleaved rounds, p50:
 
@@ -484,7 +485,8 @@ dedicated T4 (`g4dn.xlarge`, driver 595.91.07), portable-PTX builds, Qwen3 Q4_K_
 | Qwen3-1.7B | on | f16 | **1,100** | 410 | **15.2** / 15.8 / 18.1 | 74.2 / 125.8 / 416.6 |
 
 Mistral 7B, flag on, `--weights f16`: 5,356 MiB resident (7,276 MiB with the prototype's
-`f32` default), decode 51.3 / 52.8 / 59.9 ms/token, model load 2.29 s.
+`f32` default), decode 51.3 / 52.8 / 59.9 ms/token, model load 2.29 s. *(Measured with the
+broken tokenizer; superseded by the next section.)*
 
 What this says against the `f16` baseline rather than `f32`:
 
@@ -500,3 +502,47 @@ What this says against the `f16` baseline rather than `f32`:
   The fused kernel and the scratch path both lose to `f16` weights read directly. That's
   the "tiled multi-row Q4_K kernel" gap from the earlier results, now measured against the
   faster baseline.
+
+### Mistral 7B on the fixed tokenizer (2026-10-06)
+
+`TheBloke/Mistral-7B-v0.1-GGUF` Q4_K_M, same dedicated T4 (driver 595.91.07), this branch
+rebased onto the tokenizer fix.
+
+**Correctness.**
+
+- **Same tokens in every configuration:** flag off (`f16`), flag on (`f16`) and flag on
+  (`f32`) generate identical token ids on all three prompts (32 greedy tokens).
+- **Against llama.cpp:** prompts 0 and 1 match `llama-simple`'s text exactly. Prompt 2
+  matches for 30 tokens, then forks at a near-tie: at position 30 the top-2 logit gap is
+  0.049–0.050 in all three configurations ("decodes" vs. llama.cpp's "stores").
+- **Kernel tests:** `quant_resident_gemv_matches_f32` and
+  `quant_resident_lm_head_matches_f32` pass.
+- **Plain `--weights f32`:** about 29 GB, so not run on a 16 GB card.
+
+**Memory and decode** (`reflex bench`, warmup 3, 10 iterations; prompt buckets 29 / 113 / 449):
+
+| flag | weights | resident MiB | model load ms | decode ms/token | warm prompt p50 ms |
+|---|---|---|---|---|---|
+| off | f16 | 13,804 | 3,481 | 60.3 / 61.2 / 62.8 | 143 / 383 / 1,558 |
+| on | f16 | **5,356** | **2,345** | **48.7** / 49.6 / 51.1 | 332 / 570 / 1,753 |
+| on | f32 | 7,276 | 2,522 | 56.3 / 57.2 / 59.0 | 549 / 1,113 / 3,526 |
+
+**Cold start** (`--weights f16`, n=5, two interleaved rounds, p50):
+
+| | flag off | flag on |
+|---|---|---|
+| `system1` model load | 3,439 / 3,469 ms | 2,322 / 2,315 ms |
+| `system1` scoring pass | 227 / 227 ms | 383 / 382 ms |
+| `system1` total | 3,867 / 3,899 ms | **2,870 / 2,861 ms** |
+| `generate` prompt eval | 197 / 197 ms | 164 / 164 ms |
+| `generate` total | 3,839 / 3,864 ms | **2,646 / 2,652 ms** |
+
+At 7B the flag is a clear win on what this engine optimizes for:
+
+- **Cold start:** −26% for `system1` and −31% for `generate`, because model load (−1.1 s)
+  dominates and the slower short-prompt pass (+156 ms for `system1`) doesn't offset it.
+- **Memory and decode:** VRAM falls 61% (Mistral without the flag fills 13.8 GB of the
+  T4's 15 GB) and decode 19%.
+- **What still loses:** warm prefill is slower at every prompt length (2.3x at 29 tokens,
+  1.1x at 449), the same open multi-row Q4_K kernel gap as on Qwen3.
+- **Weights type:** with the flag on, `--weights f16` beats `f32` on every column.
