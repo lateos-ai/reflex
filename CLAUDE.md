@@ -101,7 +101,11 @@ regression (see README's "Phase 2, round 1" section) that made the engine ~4.3x 
 than llama.cpp until fixed. Only the token embedding table's *raw quantized* bytes stay
 host-resident (`LazyTokenEmbedding`, needed for the host-side embedding-lookup gather);
 individual rows are dequantized lazily and cached on first use (see HISTORY.md's "Lazy
-`token_embd` dequant (item 6)"). If the full vocab table is ever needed device-resident
+`token_embd` dequant (item 6)"). Those bytes stay **in the GGUF mmap**
+(`LazyTokenEmbedding::raw` is a `gguf::SharedBytes` handle; the model keeps the file
+mapped for its lifetime) — don't reintroduce a `to_vec()` copy: it was ~103 ms of ~231 ms
+`model_load_ms` on a T4 (`REFLEX_LOAD_PROFILE=1`), mostly page-faulting the new `Vec`.
+If the full vocab table is ever needed device-resident
 (a tied `lm_head`'s first full-vocab-logits call, or `load_hybrid`/`load_mla`'s eager
 tied case — see `Model::lm_head_resident`), it goes through the same on-device
 `dequantize_tensor_to_device` path every other weight tensor uses, **not** a host-side
