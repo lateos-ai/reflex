@@ -3,6 +3,17 @@
 What has been built, in order. Measurements live in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+## 2026-10-06
+
+- **Fixed: Mistral 7B produced garbled text.** The SentencePiece tokenizer merged
+  characters only by `tokenizer.ggml.merges`, which many llama-family GGUFs (including
+  TheBloke's Mistral-7B-v0.1) don't contain, so those prompts were encoded one character
+  per token. It now merges by token score, as llama.cpp does. On a T4, Reflex's prompt
+  token ids match llama.cpp's `llama-tokenize` on 12 of 12 test strings (spaces, digits,
+  punctuation, code, accents, CJK, emoji) for both Mistral-7B and TinyLlama, and
+  Mistral's generated text matches `llama-simple`. TinyLlama and Qwen3 output is
+  byte-identical to before.
+
 ## 2026-10-02
 
 - **Faster model load: the token embedding stays in the file mapping.** The table used to
