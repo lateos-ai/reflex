@@ -320,7 +320,134 @@ impl Model {
                     out_features,
                 )
             }
+            WeightData::Quant {
+                ty: GgmlType::Q4K, ..
+            } => self.gemv_q4k(x, w, 1),
+            WeightData::Quant {
+                ty: GgmlType::Q6K, ..
+            } => self.gemv_q6k(x, w),
+            WeightData::Quant { ty, .. } => Err(crate::reflex_err!(
+                Other,
+                "internal: no GEMV for quantized-resident {ty:?}"
+            )),
         }
+    }
+
+    /// One-row GEMV straight from a quantized-resident Q6_K weight
+    /// (`gemv_q6k_kernel`) -- the LM head when `REFLEX_QUANT_RESIDENT=1`.
+    pub(super) fn gemv_q6k(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let in_features = w.shape[0] as usize;
+        let out_features = w.shape[1] as usize;
+        let kernel = self.gemv_q6k_k.as_ref().ok_or_else(|| {
+            ReflexError::Other("internal: Q6_K weight but gemv_q6k_kernel not loaded".to_string())
+        })?;
+        let w_ptr = w
+            .quant_ptr()
+            .ok_or_else(|| ReflexError::Other("internal: gemv_q6k on an f32 weight".to_string()))?;
+        if x.len() != in_features || !in_features.is_multiple_of(QK_K) {
+            return Err(crate::reflex_err!(
+                Other,
+                "gemv_q6k: x.len()={} in_features={in_features} (must match, a multiple of {QK_K})",
+                x.len()
+            ));
+        }
+        let mut dev_y = self
+            .device
+            .alloc_zeros::<f32>(out_features)
+            .map_err(|e| crate::gpu_err!(e, "gemv_q6k alloc y: {e}"))?;
+        let threads = 256u32;
+        let warps_per_block = threads / WARP_SIZE;
+        let launch_cfg = LaunchConfig {
+            grid_dim: ((out_features as u32).div_ceil(warps_per_block).max(1), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            kernel
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (
+                        x,
+                        w_ptr,
+                        &mut dev_y,
+                        in_features as u32,
+                        out_features as u32,
+                    ),
+                )
+                .map_err(|e| crate::gpu_err!(e, "gemv_q6k launch: {e}"))?;
+        }
+        Ok(dev_y)
+    }
+
+    /// `y[rows, out_features] = x[rows, in_features] @ w^T` straight from a
+    /// quantized-resident Q4_K weight (`gemv_q4k_kernel`), launched in chunks
+    /// of [`GEMV_Q4K_MAX_ROWS`] rows -- each chunk reads the weight's bytes
+    /// once for all its rows. `rows == 1` is the decode GEMV.
+    pub(super) fn gemv_q4k(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let in_features = w.shape[0] as usize;
+        let out_features = w.shape[1] as usize;
+        let kernel = self.gemv_q4k_k.as_ref().ok_or_else(|| {
+            ReflexError::Other("internal: Q4_K weight but gemv_q4k_kernel not loaded".to_string())
+        })?;
+        let w_ptr = w
+            .quant_ptr()
+            .ok_or_else(|| ReflexError::Other("internal: gemv_q4k on an f32 weight".to_string()))?;
+        if x.len() != rows * in_features || !in_features.is_multiple_of(QK_K) {
+            return Err(crate::reflex_err!(
+                Other,
+                "gemv_q4k: x.len()={} rows={rows} in_features={in_features} (must be rows*in_features, a multiple of {QK_K})",
+                x.len()
+            ));
+        }
+        let dev_y = self
+            .device
+            .alloc_zeros::<f32>(rows * out_features)
+            .map_err(|e| crate::gpu_err!(e, "gemv_q4k alloc y: {e}"))?;
+        let threads = 256u32;
+        let warps_per_block = threads / WARP_SIZE;
+        let launch_cfg = LaunchConfig {
+            grid_dim: ((out_features as u32).div_ceil(warps_per_block).max(1), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let x_base = *x.device_ptr();
+        let y_base = *dev_y.device_ptr();
+        let mut r0 = 0usize;
+        while r0 < rows {
+            let r = (rows - r0).min(GEMV_Q4K_MAX_ROWS);
+            let x_ptr = x_base + (r0 * in_features * 4) as u64;
+            let y_ptr = y_base + (r0 * out_features * 4) as u64;
+            unsafe {
+                kernel
+                    .function
+                    .clone()
+                    .launch(
+                        launch_cfg,
+                        (
+                            x_ptr,
+                            w_ptr,
+                            y_ptr,
+                            in_features as u32,
+                            out_features as u32,
+                            r as u32,
+                        ),
+                    )
+                    .map_err(|e| crate::gpu_err!(e, "gemv_q4k launch: {e}"))?;
+            }
+            r0 += r;
+        }
+        Ok(dev_y)
     }
 
     /// Batched linear projection: `y[rows, out_features] = x[rows, in_features]
@@ -363,8 +490,108 @@ impl Model {
                 rows * in_features
             ));
         }
+        if let WeightData::Quant { ty, len, .. } = &w.data {
+            if *ty != GgmlType::Q4K {
+                return Err(crate::reflex_err!(
+                    Other,
+                    "internal: batched GEMM on a quantized-resident {ty:?} weight is not supported"
+                ));
+            }
+            // Up to the threshold, the fused kernel reads the Q4_K bytes once
+            // per 8 rows; above it, dequantize into scratch and use cuBLAS.
+            if rows <= quant_fused_max_rows() {
+                return self.gemv_q4k(x, w, rows);
+            }
+            return self.gemm_quant_scratch(x, w, *len, in_features, out_features, rows);
+        }
+        self.gemm_view(x, &w.full_view()?, in_features, out_features, rows)
+    }
 
-        self.gemm_view(x, &w.full_view(), in_features, out_features, rows)
+    /// [`Self::gemm`] for a quantized-resident Q4_K weight above the fused
+    /// kernel's row threshold: dequantize it into the reused scratch buffer
+    /// (device to device, no host traffic) in the model's `--weights` dtype,
+    /// then take the same cuBLAS path a weight stored in that dtype takes
+    /// (`Sgemm` for `f32`; activation cast + `cublasGemmEx` for `f16`).
+    fn gemm_quant_scratch(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+        len: usize,
+        in_features: usize,
+        out_features: usize,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let n = in_features * out_features;
+        let num_blocks = len / Q4K_BLOCK_BYTES;
+        let w_ptr = w.quant_ptr().ok_or_else(|| {
+            ReflexError::Other("internal: Q4_K weight without a device pointer".to_string())
+        })?;
+        let dtype = self.weights_dtype;
+        let (kernel, kernel_name) = match dtype {
+            WeightsDtype::F32 => (
+                &self.dequant_q4k_coalesced_k,
+                "dequantize_q4k_coalesced_kernel",
+            ),
+            WeightsDtype::F16 => (
+                &self.dequant_q4k_coalesced_f16_k,
+                "dequantize_q4k_coalesced_f16_kernel",
+            ),
+        };
+        let dq = kernel.as_ref().ok_or_else(|| {
+            ReflexError::Other(format!(
+                "internal: Q4_K weight but {kernel_name} not loaded"
+            ))
+        })?;
+
+        let mut scratch = self.quant_scratch.borrow_mut();
+        let fits = match (&*scratch, dtype) {
+            (Some(WeightData::F32(s)), WeightsDtype::F32) => s.len() >= n,
+            (Some(WeightData::F16(s)), WeightsDtype::F16) => s.len() >= n,
+            _ => false,
+        };
+        if !fits {
+            let alloc_err = |e| crate::gpu_err!(e, "quant scratch alloc: {e}");
+            *scratch = Some(match dtype {
+                WeightsDtype::F32 => {
+                    WeightData::F32(unsafe { self.device.alloc::<f32>(n) }.map_err(alloc_err)?)
+                }
+                WeightsDtype::F16 => WeightData::F16(
+                    unsafe { self.device.alloc::<half::f16>(n) }.map_err(alloc_err)?,
+                ),
+            });
+        }
+        let launch_cfg = LaunchConfig {
+            grid_dim: (num_blocks as u32, 1, 1),
+            block_dim: (QK_K as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let launch_err = |e| crate::gpu_err!(e, "quant scratch dequant launch: {e}");
+        let view = match scratch.as_mut() {
+            Some(WeightData::F32(buf)) => {
+                unsafe {
+                    dq.function
+                        .clone()
+                        .launch(launch_cfg, (w_ptr, &mut *buf, num_blocks as u32))
+                        .map_err(launch_err)?;
+                }
+                WeightView::F32(buf.slice(0..n))
+            }
+            Some(WeightData::F16(buf)) => {
+                unsafe {
+                    dq.function
+                        .clone()
+                        .launch(launch_cfg, (w_ptr, &mut *buf, num_blocks as u32))
+                        .map_err(launch_err)?;
+                }
+                WeightView::F16(buf.slice(0..n))
+            }
+            _ => {
+                return Err(ReflexError::Other(
+                    "internal: quantized-resident scratch buffer has the wrong type".to_string(),
+                ))
+            }
+        };
+        self.gemm_view(x, &view, in_features, out_features, rows)
     }
 
     /// Like [`Self::gemm`], but generic over both operands being any device-resident
@@ -503,7 +730,11 @@ impl Model {
         }
         let expert_len = in_features * out_features;
         let start = expert_idx * expert_len;
-        Ok((w.view(start..start + expert_len), in_features, out_features))
+        Ok((
+            w.view(start..start + expert_len)?,
+            in_features,
+            out_features,
+        ))
     }
 
     /// GEMV against expert `expert_idx`'s slice of a per-expert-stacked 3-D MoE tensor
@@ -652,6 +883,16 @@ impl Model {
                 "gemv_gather: row index {bad} out of range (out_features={out_features})"
             ));
         }
+        if let WeightData::Quant { .. } = &w.data {
+            // A quantized-resident LM head has no row-gather kernel: run the
+            // full-vocab GEMV (it reads ~1/5 of the f32 bytes) and pick the
+            // requested logits on the host.
+            let all = self
+                .device
+                .dtoh_sync_copy(&self.gemv(x, w)?)
+                .map_err(|e| crate::gpu_err!(e, "gemv_gather (quantized) dtoh: {e}"))?;
+            return Ok(row_indices.iter().map(|&r| all[r as usize]).collect());
+        }
         let num_rows = row_indices.len();
         let dev_indices = self
             .device
@@ -684,6 +925,12 @@ impl Model {
                     (x, data, &dev_indices, &mut dev_y, in_u32, rows_u32),
                 )
             },
+            WeightData::Quant { ty, .. } => {
+                return Err(crate::reflex_err!(
+                    Other,
+                    "internal: gemv_gather reached the row-gather kernel with a quantized-resident {ty:?} weight"
+                ))
+            }
         };
         launched.map_err(|e| crate::gpu_err!(e, "gemv_gather launch: {e}"))?;
         self.device
@@ -1303,7 +1550,7 @@ impl Model {
             .map_err(|e| crate::gpu_err!(e, "gemv_per_head alloc: {e}"))?;
         for h in 0..n_head {
             let w_view =
-                w.view(h * in_features * out_features..(h + 1) * in_features * out_features);
+                w.view(h * in_features * out_features..(h + 1) * in_features * out_features)?;
             let x_view = x.slice(h * in_features..(h + 1) * in_features);
             let y = self.gemv_view(&x_view, w_view, in_features, out_features)?;
             let mut dst = out.slice_mut(h * out_features..(h + 1) * out_features);
@@ -1389,6 +1636,12 @@ impl Model {
                     .clone()
                     .launch(launch_cfg, (x, data, &mut out, d0, d1, d2, d3, d4, d5, d6))
             },
+            WeightData::Quant { ty, .. } => {
+                return Err(crate::reflex_err!(
+                    Other,
+                    "internal: gemv_per_head_batch on a quantized-resident {ty:?} weight"
+                ))
+            }
         };
         launched.map_err(|e| crate::gpu_err!(e, "gemv_per_head_batch launch: {e}"))?;
         Ok(out)
@@ -1741,4 +1994,24 @@ pub(super) fn gemm_ex_f16_raw(
     };
     set_math(cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH)?;
     launched.map_err(|e| crate::gpu_err!(e, "gemm_ex_f16 launch: {e:?}"))
+}
+
+/// Rows per `gemv_q4k_kernel` launch -- must equal `GEMV_Q4K_MAX_ROWS` in
+/// `kernels_cuda/gemv_q4k.cu`.
+pub(super) const GEMV_Q4K_MAX_ROWS: usize = 8;
+
+/// Largest prefill row count the quantized-resident path runs through the
+/// fused `gemv_q4k_kernel` before switching to dequantize-to-scratch + cuBLAS
+/// (`Model::gemm`). `REFLEX_QUANT_FUSED_MAX_ROWS` overrides it. Default 16: on
+/// a T4 (Qwen3-0.6B) the fused path won at 12 rows (system1 prompt eval 49.4
+/// vs 51.2 ms) and lost at 29 (warm prefill 63.9 vs 35.9 ms); 16 sits between
+/// those two measured points and has not been measured itself.
+pub(super) fn quant_fused_max_rows() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("REFLEX_QUANT_FUSED_MAX_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16)
+    })
 }
