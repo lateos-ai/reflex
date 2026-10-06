@@ -412,6 +412,11 @@ impl Model {
             gemv_f16_k,
             gemv_gather_k,
             gemv_gather_f16_k,
+            gemv_q4k_k: None,
+            dequant_q4k_coalesced_k: None,
+            dequant_q4k_coalesced_f16_k: None,
+            gemv_q6k_k: None,
+            quant_scratch: RefCell::new(None),
             moe_gather_k,
             moe_scatter_add_k,
             attn_k,
@@ -641,7 +646,7 @@ impl Model {
             let q_nope_view = q.slice(h * n_embd_head_k_mla..h * n_embd_head_k_mla + qk_nope);
             let wk_b_view = w
                 .wk_b
-                .view(h * qk_nope * kv_lora..(h + 1) * qk_nope * kv_lora);
+                .view(h * qk_nope * kv_lora..(h + 1) * qk_nope * kv_lora)?;
             let absorbed = self.gemv_view(&q_nope_view, wk_b_view, qk_nope, kv_lora)?;
 
             let mut dst_nope = qcur.slice_mut(h * qk_dim..h * qk_dim + kv_lora);

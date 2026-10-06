@@ -105,7 +105,15 @@ individual rows are dequantized lazily and cached on first use (see HISTORY.md's
 (`LazyTokenEmbedding::raw` is a `gguf::SharedBytes` handle; the model keeps the file
 mapped for its lifetime) — don't reintroduce a `to_vec()` copy: it was ~103 ms of ~231 ms
 `model_load_ms` on a T4 (`REFLEX_LOAD_PROFILE=1`), mostly page-faulting the new `Vec`.
-If the full vocab table is ever needed device-resident
+
+**Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense path only; MoE/hybrid/MLA print a notice and
+keep their normal storage). Q4_K matmul weights stay as raw GGUF blocks in one device
+arena (`WeightData::Quant`), read by `gemv_q4k`/the fused multi-row prefill kernel, or,
+above a row crossover, dequantized device-to-device into a reused scratch buffer in the
+`--weights` dtype (f16 scratch + `cublasGemmEx`, or f32 + `Sgemm`); a Q6_K LM head stays
+quantized too (`gemv_q6k_kernel`). Every other matrix weight follows `--weights`. Design,
+results and open gaps: `docs/design/quantized-resident-weights.md` — read it before
+touching weight residency, the matmul kernels or `WeightLoadPipeline`. If the full vocab table is ever needed device-resident
 (a tied `lm_head`'s first full-vocab-logits call, or `load_hybrid`/`load_mla`'s eager
 tied case — see `Model::lm_head_resident`), it goes through the same on-device
 `dequantize_tensor_to_device` path every other weight tensor uses, **not** a host-side

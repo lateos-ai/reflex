@@ -147,8 +147,8 @@ device-resident buffer. Matrix weights (the operands of the matmul kernels:
 `is_matrix_weight` in `src/model/loading.rs`) are stored as `f16` by default and as
 `f32` with `--weights f32` / `REFLEX_WEIGHTS=f32`. Everything else is always `f32`:
 norms, biases, the Gated DeltaNet `ssm_*` tensors, the MoE routers, activations and the
-KV cache. `Weight.data` is a `WeightData` enum, and every matmul wrapper in
-`src/model/kernels.rs` dispatches on it, so a future quantized variant slots in there.
+KV cache. `Weight.data` is a `WeightData` enum (`F32`, `F16`, `Quant`), and every matmul
+wrapper in `src/model/kernels.rs` dispatches on it.
 
 - **The f16 path reads f16 weights and accumulates in f32.** Decode GEMVs
   (`gemv_f16_kernel` and friends) widen each weight exactly and multiply by the f32
@@ -160,6 +160,17 @@ KV cache. `Weight.data` is a `WeightData` enum, and every matmul wrapper in
   default to it.
 - **LoRA merges happen in f32.** `LoadOptions::lora_adapter` loads the adapter's target
   weights as `f32`; `apply_lora` adds the delta and then rounds to f16 once.
+
+**Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense Qwen3/Llama/Mistral path only; MoE, hybrid
+and MLA print a notice and keep their normal storage). Q4_K matmul weights are uploaded
+as their raw GGUF blocks into one device arena and dequantized inside the matmul
+kernels (`gemv_q4k`, the fused multi-row prefill kernel), or, for longer prompts, into
+a reused device scratch buffer that cuBLAS then reads. That scratch buffer has the
+`--weights` dtype: `f16` (read by `cublasGemmEx`) by default, `f32` (`Sgemm`) with
+`--weights f32`. A Q6_K LM head is kept as raw blocks too. Every other matrix weight
+follows `--weights`. The rules below still hold: the scratch path is device to device,
+so weights are never copied host-to-device per call. See
+[design/quantized-resident-weights.md](design/quantized-resident-weights.md).
 
 Rules that follow from measured regressions:
 

@@ -107,6 +107,8 @@ mod moe_fixture_tests;
 #[cfg(test)]
 mod prefill_batching_tests;
 #[cfg(test)]
+mod quant_resident_tests;
+#[cfg(test)]
 mod rope_type_tests;
 #[cfg(test)]
 mod system1_tests;
@@ -157,6 +159,22 @@ pub struct Model {
     gemv_gather_k: AotKernel,
     /// `gemv_gather_k` for an f16 weight matrix (`gemv_gather_f16_kernel`).
     gemv_gather_f16_k: AotKernel,
+    /// `gemv_q4k_kernel` (`kernels_cuda/gemv_q4k.cu`), loaded only when the
+    /// dense path keeps weights quantized (`REFLEX_QUANT_RESIDENT=1`).
+    gemv_q4k_k: Option<AotKernel>,
+    /// `dequantize_q4k_coalesced_kernel` (same module), for the
+    /// quantized-resident prefill path's scratch buffer with `--weights f32`.
+    dequant_q4k_coalesced_k: Option<AotKernel>,
+    /// `dequantize_q4k_coalesced_f16_kernel` (same module): the same, writing
+    /// the `--weights f16` scratch buffer.
+    dequant_q4k_coalesced_f16_k: Option<AotKernel>,
+    /// `gemv_q6k_kernel` (same module), for a quantized-resident LM head.
+    gemv_q6k_k: Option<AotKernel>,
+    /// Reused scratch for the quantized-resident prefill path above the fused
+    /// kernel's row threshold (dequantize one weight, then cuBLAS), in the
+    /// model's `--weights` dtype: `F16` read by `cublasGemmEx`, `F32` by
+    /// `Sgemm`. Grown, never shrunk. See `Model::gemm`.
+    quant_scratch: RefCell<Option<WeightData>>,
     /// Grouped-GEMM MoE batching (`Self::forward_layer_moe_batched`,
     /// `Self::forward_mla_moe_ffn_batched`): gathers one expert's assigned rows out of
     /// a batched-prefill hidden buffer into a contiguous group before running that
@@ -361,6 +379,7 @@ impl Model {
             function: self.dequant_kernels.f16_to_f32.function.clone(),
         };
         let target_dtype = self.weights_dtype;
+        let q4k_dequant = self.dequant_kernels.f32.q4k.function.clone();
 
         let mut applied = 0usize;
         for target in &adapter.targets {
@@ -399,17 +418,23 @@ impl Model {
                 ));
             }
 
-            // The add always happens in f32. A target loaded as f32 for this
+            // The add always happens in f32. A quantized-resident target is
+            // dequantized to f32 first. A target loaded as f32 for this
             // (`LoadOptions::lora_adapter`) is merged, then rounded to f16
             // once. One that is already f16 (an adapter the load wasn't told
             // about) is widened exactly, merged, and rounded again.
+            materialize_f32(&device, &q4k_dequant, weight)?;
             let data = &mut weight.data;
             if let WeightData::F16(w16) = data {
                 let widened = f16_to_f32_on_device(&device, &to_f32, w16)?;
                 *data = WeightData::F32(widened);
             }
             let WeightData::F32(w32) = data else {
-                unreachable!("widened to f32 above")
+                return Err(crate::reflex_err!(
+                    Other,
+                    "internal: LoRA target '{}' is not f32 after materializing",
+                    target.name
+                ));
             };
             let n = w32.len() as u32;
             let threads = 256u32;
@@ -1003,6 +1028,26 @@ impl Model {
                 }
                 let element_count =
                     self.token_embd.vocab_size as u64 * self.token_embd.hidden_size as u64;
+                if self.gemv_q6k_k.is_some() && self.token_embd.ggml_type == GgmlType::Q6K {
+                    // Quantized-resident (`REFLEX_QUANT_RESIDENT=1`): upload the
+                    // raw Q6_K blocks (~1/5 of the f32 size) and let
+                    // `gemv_q6k_kernel` read them directly.
+                    let raw: &[u8] = &self.token_embd.raw;
+                    let buf = self
+                        .device
+                        .htod_sync_copy(raw)
+                        .map_err(|e| crate::gpu_err!(e, "upload quantized LM head: {e}"))?;
+                    let _ = cell.set(Weight {
+                        data: WeightData::Quant {
+                            ty: GgmlType::Q6K,
+                            arena: Arc::new(buf),
+                            offset: 0,
+                            len: raw.len(),
+                        },
+                        shape: shape.clone(),
+                    });
+                    return Ok(cell.get().expect("just set"));
+                }
                 let data = dequantize_matrix_to_device(
                     &mut self.dequant_pipeline.borrow_mut(),
                     &self.dequant_kernels,

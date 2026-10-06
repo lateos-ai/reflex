@@ -92,6 +92,8 @@ impl Model {
     ) -> Result<Self, ReflexError> {
         let (cfg, block_count, moe) = parse_model_config(file)?;
         let expert_used_count = moe.map(|m| m.expert_used_count);
+        let profile_on = load_profile_enabled();
+        let t_modules = std::time::Instant::now();
 
         let rmsnorm_k = aot::load_kernel(
             &device,
@@ -192,6 +194,67 @@ impl Model {
             .ok_or_else(|| ReflexError::Other("missing moe_scatter_add_kernel".to_string()))?;
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
+        if profile_on {
+            pipeline.profile = Some(LoadProfile::default());
+        }
+
+        // Quantized-resident weights (docs/design/quantized-resident-weights.md):
+        // dense (non-MoE) layers only for now; MoE keeps f32 and says so.
+        let quant_on = quant_resident_enabled();
+        if quant_on && expert_used_count.is_some() {
+            eprintln!("note: REFLEX_QUANT_RESIDENT=1 is not supported for MoE models yet; using f32 weights");
+        }
+        // Layer matmuls stay quantized if Q4_K; an untied `output.weight` (the
+        // LM head) if Q6_K or Q4_K. A tied LM head is handled lazily in
+        // `Model::lm_head_resident`.
+        let quant_dense = quant_on && expert_used_count.is_none();
+        let mut arena = if quant_dense {
+            let mut names: Vec<String> = (0..block_count)
+                .flat_map(|i| {
+                    [
+                        "attn_q",
+                        "attn_k",
+                        "attn_v",
+                        "attn_output",
+                        "ffn_gate",
+                        "ffn_up",
+                        "ffn_down",
+                    ]
+                    .map(|t| format!("blk.{i}.{t}.weight"))
+                })
+                .collect();
+            names.push("output.weight".to_string());
+            // LoRA targets load in f32 for the merge, so they need no arena space.
+            QuantArena::for_tensors(&device, file, &names, |name, ty| {
+                !policy.keep_f32.contains(name)
+                    && (ty == GgmlType::Q4K || (name == "output.weight" && ty == GgmlType::Q6K))
+            })?
+        } else {
+            None
+        };
+        let (gemv_q4k_k, dequant_q4k_coalesced_k, dequant_q4k_coalesced_f16_k, gemv_q6k_k) =
+            if quant_dense {
+                let mut fns = aot::load_kernel_module(
+                    &device,
+                    include_bytes!(env!("REFLEX_KERNEL_GEMV_Q4K")),
+                    "gemv_q4k",
+                    &[
+                        "gemv_q4k_kernel",
+                        "dequantize_q4k_coalesced_kernel",
+                        "dequantize_q4k_coalesced_f16_kernel",
+                        "gemv_q6k_kernel",
+                    ],
+                )?;
+                let q6 = fns.pop().expect("four kernels requested");
+                let dq16 = fns.pop().expect("four kernels requested");
+                let dq = fns.pop().expect("four kernels requested");
+                let gemv = fns.pop().expect("four kernels requested");
+                (Some(gemv), Some(dq), Some(dq16), Some(q6))
+            } else {
+                (None, None, None, None)
+            };
+        let modules_ms = t_modules.elapsed().as_secs_f64() * 1000.0;
+        let t_weights = std::time::Instant::now();
 
         // Dequantizes straight from the mmap'd GGUF bytes (on-device for
         // every format but the IQ family, Phase 2 round 3 + post-MVP
@@ -201,21 +264,35 @@ impl Model {
         // call re-uploads it (see `Weight`'s doc comment). Pipelined across
         // successive calls via `pipeline` (see `WeightLoadPipeline`'s doc
         // comment) instead of the old sequential blocking-H2D-copy path.
-        let mut load_weight = |name: &str| -> Result<Weight, ReflexError> {
-            load_weight_device(&mut pipeline, &dequant_kernels, policy, file, name)
+        // `matmul` = an `nn.Linear` weight that may stay quantized; norms and
+        // everything else follow `policy` (f32, or the `--weights` dtype for a
+        // matrix weight).
+        let mut load_weight_kind = |name: &str, matmul: bool| -> Result<Weight, ReflexError> {
+            match arena.as_mut() {
+                Some(a) if matmul => load_weight_device_quant(
+                    &mut pipeline,
+                    &dequant_kernels,
+                    policy,
+                    file,
+                    name,
+                    a,
+                    &[GgmlType::Q4K],
+                ),
+                _ => load_weight_device(&mut pipeline, &dequant_kernels, policy, file, name),
+            }
         };
 
         let mut layers = Vec::with_capacity(block_count);
         for i in 0..block_count {
             eprint!("\rLoading weights: layer {}/{block_count}", i + 1);
-            let attn_norm = load_weight(&format!("blk.{i}.attn_norm.weight"))?;
-            let attn_q = load_weight(&format!("blk.{i}.attn_q.weight"))?;
-            let attn_k = load_weight(&format!("blk.{i}.attn_k.weight"))?;
-            let attn_v = load_weight(&format!("blk.{i}.attn_v.weight"))?;
-            let attn_output = load_weight(&format!("blk.{i}.attn_output.weight"))?;
-            let attn_q_norm = load_weight(&format!("blk.{i}.attn_q_norm.weight")).ok();
-            let attn_k_norm = load_weight(&format!("blk.{i}.attn_k_norm.weight")).ok();
-            let ffn_norm = load_weight(&format!("blk.{i}.ffn_norm.weight"))?;
+            let attn_norm = load_weight_kind(&format!("blk.{i}.attn_norm.weight"), false)?;
+            let attn_q = load_weight_kind(&format!("blk.{i}.attn_q.weight"), true)?;
+            let attn_k = load_weight_kind(&format!("blk.{i}.attn_k.weight"), true)?;
+            let attn_v = load_weight_kind(&format!("blk.{i}.attn_v.weight"), true)?;
+            let attn_output = load_weight_kind(&format!("blk.{i}.attn_output.weight"), true)?;
+            let attn_q_norm = load_weight_kind(&format!("blk.{i}.attn_q_norm.weight"), false).ok();
+            let attn_k_norm = load_weight_kind(&format!("blk.{i}.attn_k_norm.weight"), false).ok();
+            let ffn_norm = load_weight_kind(&format!("blk.{i}.ffn_norm.weight"), false)?;
 
             let layer = if expert_used_count.is_some() {
                 LayerWeights::Moe(MoeLayerWeights {
@@ -227,10 +304,16 @@ impl Model {
                     attn_q_norm,
                     attn_k_norm,
                     ffn_norm,
-                    ffn_gate_inp: load_weight(&format!("blk.{i}.ffn_gate_inp.weight"))?,
-                    ffn_gate_exps: load_weight(&format!("blk.{i}.ffn_gate_exps.weight"))?,
-                    ffn_up_exps: load_weight(&format!("blk.{i}.ffn_up_exps.weight"))?,
-                    ffn_down_exps: load_weight(&format!("blk.{i}.ffn_down_exps.weight"))?,
+                    ffn_gate_inp: load_weight_kind(&format!("blk.{i}.ffn_gate_inp.weight"), false)?,
+                    ffn_gate_exps: load_weight_kind(
+                        &format!("blk.{i}.ffn_gate_exps.weight"),
+                        false,
+                    )?,
+                    ffn_up_exps: load_weight_kind(&format!("blk.{i}.ffn_up_exps.weight"), false)?,
+                    ffn_down_exps: load_weight_kind(
+                        &format!("blk.{i}.ffn_down_exps.weight"),
+                        false,
+                    )?,
                 })
             } else {
                 LayerWeights::Dense(DenseLayerWeights {
@@ -242,15 +325,17 @@ impl Model {
                     attn_q_norm,
                     attn_k_norm,
                     ffn_norm,
-                    ffn_gate: load_weight(&format!("blk.{i}.ffn_gate.weight"))?,
-                    ffn_up: load_weight(&format!("blk.{i}.ffn_up.weight"))?,
-                    ffn_down: load_weight(&format!("blk.{i}.ffn_down.weight"))?,
+                    ffn_gate: load_weight_kind(&format!("blk.{i}.ffn_gate.weight"), true)?,
+                    ffn_up: load_weight_kind(&format!("blk.{i}.ffn_up.weight"), true)?,
+                    ffn_down: load_weight_kind(&format!("blk.{i}.ffn_down.weight"), true)?,
                 })
             };
             layers.push(layer);
         }
         eprintln!();
+        let weights_enqueue_ms = t_weights.elapsed().as_secs_f64() * 1000.0;
 
+        let t_embd = std::time::Instant::now();
         let token_embd_info = file
             .tensor_info("token_embd.weight")
             .ok_or_else(|| ReflexError::Gguf("missing weight 'token_embd.weight'".to_string()))?;
@@ -260,8 +345,9 @@ impl Model {
             token_embd_bytes,
             &token_embd_info.shape,
         )?;
+        let token_embd_ms = t_embd.elapsed().as_secs_f64() * 1000.0;
 
-        let output_norm = load_weight("output_norm.weight")?;
+        let output_norm = load_weight_kind("output_norm.weight", false)?;
 
         // Tied-embedding models have no separate `output.weight` tensor --
         // rather than eagerly re-uploading `token_embd`'s already-dequantized
@@ -270,6 +356,15 @@ impl Model {
         // see `LmHead`'s doc comment), defer that upload until something
         // actually needs the full matrix.
         let lm_head = match file.tensor_info("output.weight") {
+            Some(_) if arena.is_some() => LmHead::Resident(load_weight_device_quant(
+                &mut pipeline,
+                &dequant_kernels,
+                policy,
+                file,
+                "output.weight",
+                arena.as_mut().expect("checked by the guard"),
+                &[GgmlType::Q4K, GgmlType::Q6K],
+            )?),
             Some(info) => {
                 let bytes = file.tensor_bytes(info)?;
                 let data = dequantize_matrix_to_device(
@@ -292,9 +387,38 @@ impl Model {
             },
         };
 
+        let t_join = std::time::Instant::now();
         let (tokenizer, cublas) = init.join().map_err(|_| {
             ReflexError::Other("background load-init thread panicked".to_string())
         })??;
+        let init_join_wait_ms = t_join.elapsed().as_secs_f64() * 1000.0;
+
+        if let Some(mut p) = pipeline.profile.take() {
+            // Drain everything queued so the GPU-side totals are complete.
+            // Profile mode only: the normal load never blocks here.
+            let t_drain = std::time::Instant::now();
+            device
+                .synchronize()
+                .map_err(|e| crate::gpu_err!(e, "load profile: synchronize: {e}"))?;
+            unsafe { result::stream::synchronize(pipeline.copy_stream) }
+                .map_err(|e| crate::gpu_err!(e, "load profile: sync copy stream: {e}"))?;
+            let drain_ms = t_drain.elapsed().as_secs_f64() * 1000.0;
+            let (h2d_gpu_ms, dequant_gpu_ms) = p.gpu_ms();
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "REFLEX_LOAD_PROFILE quant_resident={} modules_ms={modules_ms:.2} weights_enqueue_ms={weights_enqueue_ms:.2}                  pinned_wait_ms={:.2} pinned_fill_ms={:.2} staging_grow_ms={:.2} out_alloc_ms={:.2} launch_ms={:.2}                  h2d_gpu_ms={h2d_gpu_ms:.2} dequant_gpu_ms={dequant_gpu_ms:.2} token_embd_ms={token_embd_ms:.2}                  init_join_wait_ms={init_join_wait_ms:.2} drain_ms={drain_ms:.2} tensors_f32={} tensors_quant={}                  h2d_mb={:.1} f32_mb={:.1}",
+                arena.is_some(),
+                ms(p.pinned_wait),
+                ms(p.pinned_fill),
+                ms(p.staging_grow),
+                ms(p.out_alloc),
+                ms(p.launch),
+                p.tensors_f32,
+                p.tensors_quant,
+                p.h2d_bytes as f64 / 1e6,
+                p.f32_bytes as f64 / 1e6,
+            );
+        }
 
         let f16_act_stats = device
             .alloc_zeros::<u32>(2)
@@ -312,6 +436,11 @@ impl Model {
             gemv_f16_k,
             gemv_gather_k,
             gemv_gather_f16_k,
+            gemv_q4k_k,
+            dequant_q4k_coalesced_k,
+            dequant_q4k_coalesced_f16_k,
+            gemv_q6k_k,
+            quant_scratch: RefCell::new(None),
             moe_gather_k,
             moe_scatter_add_k,
             attn_k,
