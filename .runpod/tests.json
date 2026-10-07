@@ -7,6 +7,15 @@
         "max_tokens": 16
       },
       "timeout": 120000
+    },
+    {
+      "name": "smoke-chat-completion-stream",
+      "input": {
+        "messages": [{"role": "user", "content": "Say hello in exactly three words."}],
+        "max_tokens": 16,
+        "stream": true
+      },
+      "timeout": 120000
     }
   ],
   "config": {

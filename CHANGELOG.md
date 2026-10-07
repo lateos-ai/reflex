@@ -3,6 +3,18 @@
 What has been built, in order. Measurements live in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+## 2026-10-07
+
+- **Runpod Hub worker: streaming and an `ADAPTER_ARGS` deploy field** (`v0.2.3-runpod-hub`).
+  `.runpod/handler.py` is now a generator handler: a job with `"stream": true` yields each
+  `chat.completion.chunk` (readable live from `/stream/{job_id}`), and any other job yields
+  its one `chat.completion`. **Breaking for existing callers:** a non-streaming job's
+  `output` is now a one-element list (the `worker-vllm` convention), not the bare object.
+  Adapter errors fail the job with the adapter's error JSON. `hub.json` declares
+  `ADAPTER_ARGS` as an advanced deploy field, allows the whole `AMPERE_16` pool (Ada cards
+  included, now that the fatbin is verified on Ada), and names the baked-in model. The
+  release also moves the Hub image to the fatbin kernels and slim runtime.
+
 ## 2026-10-06
 
 - **Fixed: Mistral 7B produced garbled text.** The SentencePiece tokenizer merged
