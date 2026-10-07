@@ -289,6 +289,7 @@ fn f16_gemm_ex_matches_rowwise_gemv_and_reports_saturation() {
     let attn_q = match &model.layers[0] {
         LayerWeights::Dense(l) => &l.attn_q,
         LayerWeights::Moe(l) => &l.attn_q,
+        LayerWeights::Kolibri(l) => &l.attn_q,
     };
     assert_eq!(attn_q.dtype(), WeightsDtype::F16);
     let (in_f, out_f) = (attn_q.shape[0] as usize, attn_q.shape[1] as usize);

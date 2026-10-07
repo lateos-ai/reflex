@@ -106,8 +106,9 @@ individual rows are dequantized lazily and cached on first use (see HISTORY.md's
 mapped for its lifetime) — don't reintroduce a `to_vec()` copy: it was ~103 ms of ~231 ms
 `model_load_ms` on a T4 (`REFLEX_LOAD_PROFILE=1`), mostly page-faulting the new `Vec`.
 
-**Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense path only; MoE/hybrid/MLA print a notice and
-keep their normal storage). Q4_K matmul weights stay as raw GGUF blocks in one device
+**Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense path, plus Kolibri-1 including its stacked
+experts and Q6_K tensors, one expert at a time via `Model::quant_expert_weight`; other
+MoE models, hybrid and MLA print a notice and keep their normal storage). Q4_K matmul weights stay as raw GGUF blocks in one device
 arena (`WeightData::Quant`), read by `gemv_q4k`/the fused multi-row prefill kernel, or,
 above a row crossover, dequantized device-to-device into a reused scratch buffer in the
 `--weights` dtype (f16 scratch + `cublasGemmEx`, or f32 + `Sgemm`); a Q6_K LM head stays
@@ -124,11 +125,23 @@ lazy, silently relocated into `prompt_eval_ms` on `generate`/`check`'s first cal
 instead of removed — a net regression documented in item 6's own numbers); don't
 reintroduce it.
 
-That per-tensor load loop runs through `WeightLoadPipeline`, which double-buffers each
-tensor's raw quantized bytes through pinned host memory and uploads them on a forked
-copy stream so tensor N+1's H2D transfer overlaps tensor N's dequant kernel — **don't
-"simplify" it back to a blocking `htod_sync_copy` per tensor**, and don't make its two
-staging buffers per-tensor allocations: both were measured, and the reasons each
+That per-tensor load loop runs through `WeightLoadPipeline`, which stages each
+tensor's raw quantized bytes through two reused pinned host buffers in chunks of at
+most 64 MB and uploads them on a forked copy stream, so chunk N+1's fill overlaps chunk
+N's H2D and tensor N+1's transfer overlaps tensor N's dequant kernel. A chunk of 8 MB or
+more is filled by several threads (`REFLEX_LOAD_THREADS`, default min(cores, 8)), and
+separate prefetch readers (`REFLEX_LOAD_READERS`, default 16, 0 = off) fault the
+file's pages in up to 1 GB ahead of the fill without copying: cold loads want many
+reads in flight, warm loads want few copy threads (more fight the H2D DMA for memory
+bandwidth), so the two counts are separate knobs. On a 47.5 GB model one host memcpy
+thread was the whole load's bottleneck (Kolibri Phase 4, docs/design/kolibri.md);
+small models never wake either kind of thread.
+Tensors with no dequant kernel (`F32` norms, the host fallback) go through the same
+staging slots plus an async device-to-device copy (`upload_host_bytes`), **not**
+`htod_sync_copy`: that synchronizes the compute stream, so every norm drained the whole
+pipeline (~0.9 s of a 2.3 s Mistral 7B load on a T4).
+**Don't "simplify" it back to a blocking `htod_sync_copy` per tensor**, and don't make
+its staging buffers per-tensor allocations: both were measured, and the reasons each
 alternative is wrong (a host/device race in one case, a cross-stream dependency that
 serializes the pipeline in the other) are written up in HISTORY.md's "Pipelined model
 load (item 5)" entry. `Model` keeps its `dequant_kernels`/`dequant_pipeline` alive past
