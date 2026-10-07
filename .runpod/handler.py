@@ -6,9 +6,12 @@ endpoint, waits for it to report ready, and forwards each Runpod job to its
 existing POST /v1/chat/completions over loopback. See ../.runpod/README.md and
 ../serverless/runpod/README.md for why two deployment paths exist.
 
-v1 limitation: non-streaming only. Streaming would mean translating Server-Sent
-Events into a Runpod generator handler -- real new logic, out of scope for a
-shim whose only job is speaking Runpod's queue job-envelope format.
+The handler is a generator, so Runpod's /stream/{job_id} works. With
+"stream": true in the job input, each Server-Sent Event the adapter sends is
+yielded as one chat.completion.chunk dict; otherwise the single complete
+chat.completion is yielded once. return_aggregate_stream makes /run and
+/runsync return those yields as a list, so a non-streaming job's output is a
+one-element list (the same shape runpod-workers/worker-vllm returns).
 """
 
 import json
@@ -81,9 +84,22 @@ def _start_adapter():
     threading.Thread(target=_watchdog, daemon=True).start()
 
 
+def _sse_events(resp):
+    """Yield each SSE event's data payload until the adapter's [DONE] line."""
+    for raw in resp:
+        line = raw.decode("utf-8").rstrip("\r\n")
+        if not line.startswith("data:"):
+            continue  # blank separators; the adapter sends no other SSE fields
+        data = line[len("data:"):].lstrip(" ")
+        if data == "[DONE]":
+            return
+        yield json.loads(data)
+
+
 def handler(event):
     payload = dict(event.get("input", {}))
-    payload["stream"] = False  # v1: non-streaming only, see module docstring
+    stream = bool(payload.get("stream", False))
+    payload["stream"] = stream
 
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -93,13 +109,25 @@ def handler(event):
         method="POST",
     )
     try:
+        # The timeout is per socket read, so a long stream is fine as long as
+        # tokens keep arriving; the adapter's own --request-timeout-secs bounds
+        # the whole job.
         with urllib.request.urlopen(request, timeout=300) as resp:
-            return json.loads(resp.read())
+            if not stream:
+                yield json.loads(resp.read())
+                return
+            for chunk in _sse_events(resp):
+                if "error" in chunk:
+                    # A mid-stream error event (e.g. the adapter's timeout).
+                    yield {"error": json.dumps(chunk["error"])}
+                    return
+                yield chunk
     except urllib.error.HTTPError as e:
-        return {"error": e.read().decode("utf-8", errors="replace")}
+        yield {"error": e.read().decode("utf-8", errors="replace")}
     except urllib.error.URLError as e:
-        return {"error": str(e)}
+        yield {"error": str(e)}
 
 
-_start_adapter()
-runpod.serverless.start({"handler": handler})
+if __name__ == "__main__":
+    _start_adapter()
+    runpod.serverless.start({"handler": handler, "return_aggregate_stream": True})

@@ -1,6 +1,6 @@
 {
   "title": "Reflex (GGUF-native cold-start-optimized inference)",
-  "description": "OpenAI-compatible chat completions backed by Reflex, a GGUF-native GPU inference engine built for fast cold starts (AOT-compiled CUDA kernels, no runtime NVRTC/JIT tax). Model baked into the image; see the linked repo for architecture support.",
+  "description": "OpenAI-compatible chat completions, streaming or not, backed by Reflex: a GGUF-native GPU inference engine built for fast cold starts (ahead-of-time compiled CUDA kernels, no runtime JIT). Serves Qwen3-0.6B (Q4_K_M), baked into the image.",
   "type": "serverless",
   "category": "language",
   "iconUrl": "https://raw.githubusercontent.com/lateos-ai/reflex/master/.runpod/icon.jpg",
@@ -8,8 +8,19 @@
     "runsOn": "GPU",
     "containerDiskInGb": 10,
     "gpuCount": 1,
-    "gpuIds": "AMPERE_16,-NVIDIA RTX 2000 Ada Generation,-NVIDIA RTX 4000 Ada Generation",
+    "gpuIds": "AMPERE_16",
     "allowedCudaVersions": ["12.4", "12.8", "13.0"],
-    "env": []
+    "env": [
+      {
+        "key": "ADAPTER_ARGS",
+        "input": {
+          "name": "Adapter Arguments",
+          "type": "string",
+          "description": "Extra reflex-openai-adapter flags, space-separated, e.g. \"--max-tokens-cap 1024 --default-max-tokens 128\". Request limits default to max_tokens 2048, prompt 256 KiB, queue depth 16, timeout 300 s.",
+          "default": "",
+          "advanced": true
+        }
+      }
+    ]
   }
 }

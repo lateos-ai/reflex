@@ -29,12 +29,29 @@ an internal queue/scheduler, and this handler doesn't change that. The queue her
 own platform queue, external to the engine, exactly like `serverless/runpod/`'s load balancer
 is also external to the engine.
 
-## Known v1 limitation
+## Job input and output
 
-**Non-streaming only.** The `stream` field is forced to `false` regardless of what a caller
-sends. Streaming would require translating Server-Sent Events into a Runpod generator
-handler — real new logic, out of scope for a shim whose only job is speaking Runpod's job
-envelope format. This is a deliberate, documented v1 limitation, not an oversight.
+The job `input` is an OpenAI chat-completions request body (`messages`, `max_tokens`,
+`temperature`, `top_p`, `top_k`, `seed`, `stream`), passed to the adapter as is.
+
+`handler` is a Runpod **generator** handler started with `return_aggregate_stream`, the
+same convention `runpod-workers/worker-vllm` uses:
+
+- **`"stream": true`**: each Server-Sent Event the adapter sends is yielded as one
+  `chat.completion.chunk` object. Read them live from `/stream/{job_id}`; `/run` +
+  `/status` and `/runsync` return the whole list once the job finishes.
+- **otherwise**: the single complete `chat.completion` object is yielded once, so the job's
+  `output` is a **one-element list** `[{...}]`. Up to `v0.2.2-runpod-hub` this handler
+  returned that object bare and forced `stream` to `false`.
+
+An adapter error (`400`/`429`/`503`/`504` before the first token, or a mid-stream error
+event such as the request timeout) fails the job, with the adapter's OpenAI-shaped error
+JSON as the job's `error`.
+
+`ADAPTER_ARGS` (an advanced field in the Hub's deploy form, empty by default) appends
+`reflex-openai-adapter` flags, e.g. `--max-tokens-cap 1024 --default-max-tokens 128`; see
+[`sidecar/openai-adapter/README.md`](../sidecar/openai-adapter/README.md)'s flag list and
+request limits.
 
 ## GPU pin: portable PTX, not sm_86 (unlike `serverless/runpod/`)
 
@@ -52,8 +69,8 @@ That works anywhere but was later measured to cost about 0.8 s of JIT on every f
 new container has no driver JIT cache). It now builds a **multi-arch fatbin**
 (`REFLEX_CUDA_ARCHS=sm_75,sm_80,sm_86,sm_89,sm_90` in `.runpod/Dockerfile`): a native image for
 every card in the pool, Ada included, plus PTX that newer GPUs JIT. So it runs whichever card the
-Hub picks, with no JIT on the listed ones. `hub.json`'s Ada exclusions are kept until this is
-confirmed on a real Hub worker.
+Hub picks, with no JIT on the listed ones. Confirmed on real Runpod workers on 2026-10-02 (see
+"Fatbin on Ada" below), so `hub.json` now allows the whole `AMPERE_16` pool, Ada cards included.
 
 ## Non-goals for this addition
 
@@ -130,18 +147,38 @@ Also fixed from this same first attempt: `hub.json`'s `category` field was set t
 `Language`/`Embedding`, confirmed by inspecting the live "Add Repo" form) — corrected to
 `"language"`.
 
+## Fatbin on Ada (2026-10-02)
+
+The Ada exclusions in `hub.json` were removed after these checks on real Runpod serverless
+workers, all from the fatbin images:
+
+- This directory's queue image (`ghcr.io/lateos-ai/reflex-runpod-hub:latest`, rebuilt from
+  `.runpod/Dockerfile`, 2.37 GB, down from 4.86 GB before the slim runtime) on an endpoint
+  allowing the whole `AMPERE_16` pool, with no exclusions: the `tests.json` smoke input completed
+  on an RTX A4500 (`sm_86`), both from a cold worker and warm. The scheduler also started a
+  second worker on an **RTX 2000 Ada** (`sm_89`) in EUR-IS-1, but it stayed `THROTTLED` (no
+  capacity at that host) and never served a job.
+- The load-balancing image (root `Dockerfile`, `--target runpod-lb`, same kernel build args)
+  served `/v1/chat/completions` on an **NVIDIA L4** (Ada, `sm_89`, the same compute capability
+  as the RTX 2000/4000 Ada), engine ready ~0.4 s after container start, same output as on the
+  A4500. Neither small `AMPERE_16` Ada SKU had serverless capacity on CUDA 12.x/13.0 hosts
+  during the run, which is why the L4 stood in.
+
+So the `sm_89` code path that used to panic on the RTX 2000 Ada is verified on Runpod, and the
+pool's Ampere cards keep working. The listing picks up the new `hub.json` with the next Hub
+release.
+
 ## Status
 
-**Registered in Runpod's Hub, not yet publicly listed** (re-checked 2026-09-30 via
-`runpodctl`, after re-submitting). `runpodctl hub get lateos-ai/reflex` resolves the
-listing (id `cmuj7rnqr000007jwfsbb4ipc`), and its `listedRelease` is now
-**`v0.2.2-runpod-hub`** with the real hosted `iconUrl` below — so the Hub pipeline did pick
-up the icon fix (release `updatedAt` 2026-09-30 03:21Z, build image
-`registry.runpod.net/lateos-ai-reflex-master-runpod-dockerfile:16370973d`). It still appears
-in neither `runpodctl hub list --limit 100` nor `runpodctl hub search reflex`/`lateos`, and
-`https://www.runpod.io/hub/lateos-ai/reflex` 404s: the listing is registered and
-release-current, pending Runpod's **manual review/approval** before it shows in the public
-catalog.
+**Listed in Runpod's Hub catalog** (checked 2026-10-07): the Hub's public catalog API
+returns `lateos-ai/reflex` (listing id `cmuj7rnqr000007jwfsbb4ipc`) both for an owner filter
+and for a plain `reflex` search, which it did not on 2026-09-30. The listing page is
+<https://console.runpod.io/hub/lateos-ai/reflex>; `https://www.runpod.io/hub/lateos-ai/reflex`
+still 404s. The listed release at that check was **`v0.2.2-runpod-hub`** (build image
+`registry.runpod.net/lateos-ai-reflex-master-runpod-dockerfile:16370973d`), which predates the
+fatbin kernels and the slim runtime, so every fresh worker still pays the PTX JIT.
+**`v0.2.3-runpod-hub`** brings the fatbin build, the Ada-inclusive `gpuIds`, streaming, and
+the `ADAPTER_ARGS` deploy field.
 
 `iconUrl` in `hub.json` points at a real hosted asset (`.runpod/icon.jpg` on `master`), not
 the old `TODO:` placeholder. The GPU-selection fields in `hub.json`/`tests.json` are kept as
