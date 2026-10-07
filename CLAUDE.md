@@ -106,8 +106,9 @@ individual rows are dequantized lazily and cached on first use (see HISTORY.md's
 mapped for its lifetime) — don't reintroduce a `to_vec()` copy: it was ~103 ms of ~231 ms
 `model_load_ms` on a T4 (`REFLEX_LOAD_PROFILE=1`), mostly page-faulting the new `Vec`.
 
-**Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense path only; MoE/hybrid/MLA print a notice and
-keep their normal storage). Q4_K matmul weights stay as raw GGUF blocks in one device
+**Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense path, plus Kolibri-1 including its stacked
+experts and Q6_K tensors, one expert at a time via `Model::quant_expert_weight`; other
+MoE models, hybrid and MLA print a notice and keep their normal storage). Q4_K matmul weights stay as raw GGUF blocks in one device
 arena (`WeightData::Quant`), read by `gemv_q4k`/the fused multi-row prefill kernel, or,
 above a row crossover, dequantized device-to-device into a reused scratch buffer in the
 `--weights` dtype (f16 scratch + `cublasGemmEx`, or f32 + `Sgemm`); a Q6_K LM head stays

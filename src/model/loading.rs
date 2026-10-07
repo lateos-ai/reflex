@@ -1370,11 +1370,12 @@ pub(super) fn load_weight_device(
     })
 }
 
-/// [`load_weight_device`], but a 2-D tensor whose type is in `allowed` is kept
-/// as raw blocks in `arena` instead of being dequantized
-/// (`REFLEX_QUANT_RESIDENT=1`, dense path). Every other tensor, and a LoRA
-/// target (`policy.keep_f32`, merged in f32), takes [`load_weight_device`]'s
-/// path unchanged.
+/// [`load_weight_device`], but a 2-D tensor (or a 3-D per-expert stack, read
+/// one expert at a time through `Model::quant_expert_weight`) whose type is in
+/// `allowed` is kept as raw blocks in `arena` instead of being dequantized
+/// (`REFLEX_QUANT_RESIDENT=1`: the dense path, and Kolibri-1's layers). Every
+/// other tensor, and a LoRA target (`policy.keep_f32`, merged in f32), takes
+/// [`load_weight_device`]'s path unchanged.
 pub(super) fn load_weight_device_quant(
     pipeline: &mut WeightLoadPipeline,
     kernels: &DequantKernels,
@@ -1387,7 +1388,9 @@ pub(super) fn load_weight_device_quant(
     let info = file
         .tensor_info(name)
         .ok_or_else(|| crate::reflex_err!(Gguf, "missing weight '{name}'"))?;
-    if !allowed.contains(&info.ggml_type) || info.shape.len() != 2 || policy.keep_f32.contains(name)
+    if !allowed.contains(&info.ggml_type)
+        || !matches!(info.shape.len(), 2 | 3)
+        || policy.keep_f32.contains(name)
     {
         return load_weight_device(pipeline, kernels, policy, file, name);
     }
@@ -1413,15 +1416,21 @@ pub(super) fn load_weight_device_quant(
 pub(super) fn materialize_f32(
     device: &Arc<CudaDevice>,
     q4k_dequant: &cudarc::driver::CudaFunction,
+    q6k_dequant: &cudarc::driver::CudaFunction,
     w: &mut Weight,
 ) -> Result<(), ReflexError> {
-    let len = match &w.data {
+    let (dequant, num_blocks) = match &w.data {
         WeightData::F32(_) | WeightData::F16(_) => return Ok(()),
         WeightData::Quant {
             ty: GgmlType::Q4K,
             len,
             ..
-        } => len,
+        } => (q4k_dequant, *len / Q4K_BLOCK_BYTES),
+        WeightData::Quant {
+            ty: GgmlType::Q6K,
+            len,
+            ..
+        } => (q6k_dequant, *len / Q6K_BLOCK_BYTES),
         WeightData::Quant { ty, .. } => {
             return Err(crate::reflex_err!(
                 Other,
@@ -1429,8 +1438,9 @@ pub(super) fn materialize_f32(
             ))
         }
     };
-    let num_blocks = *len / Q4K_BLOCK_BYTES;
-    let ptr = w.quant_ptr().expect("Q4K weight has a device pointer");
+    let ptr = w
+        .quant_ptr()
+        .expect("quantized weight has a device pointer");
     let mut out = unsafe { device.alloc::<f32>(num_blocks * QK_K) }
         .map_err(|e| crate::gpu_err!(e, "alloc materialized weight: {e}"))?;
     let threads = 256u32;
@@ -1440,7 +1450,7 @@ pub(super) fn materialize_f32(
         shared_mem_bytes: 0,
     };
     unsafe {
-        q4k_dequant
+        dequant
             .clone()
             .launch(launch_cfg, (ptr, &mut out, num_blocks as u32))
             .map_err(|e| crate::gpu_err!(e, "materialize dequant launch: {e}"))?;

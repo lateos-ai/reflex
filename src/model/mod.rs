@@ -384,6 +384,7 @@ impl Model {
         };
         let target_dtype = self.weights_dtype;
         let q4k_dequant = self.dequant_kernels.f32.q4k.function.clone();
+        let q6k_dequant = self.dequant_kernels.f32.q6k.function.clone();
 
         let mut applied = 0usize;
         for target in &adapter.targets {
@@ -427,7 +428,7 @@ impl Model {
             // (`LoadOptions::lora_adapter`) is merged, then rounded to f16
             // once. One that is already f16 (an adapter the load wasn't told
             // about) is widened exactly, merged, and rounded again.
-            materialize_f32(&device, &q4k_dequant, weight)?;
+            materialize_f32(&device, &q4k_dequant, &q6k_dequant, weight)?;
             let data = &mut weight.data;
             if let WeightData::F16(w16) = data {
                 let widened = f16_to_f32_on_device(&device, &to_f32, w16)?;

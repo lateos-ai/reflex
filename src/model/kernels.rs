@@ -496,57 +496,104 @@ impl Model {
             ));
         }
         if let WeightData::Quant { ty, len, .. } = &w.data {
-            if *ty != GgmlType::Q4K {
-                return Err(crate::reflex_err!(
+            return match ty {
+                // Up to the threshold, the fused kernel reads the Q4_K bytes
+                // once per 8 rows; above it, dequantize into scratch and use
+                // cuBLAS.
+                GgmlType::Q4K if rows <= quant_fused_max_rows() => self.gemv_q4k(x, w, rows),
+                // No multi-row Q6_K kernel yet: one row is the decode GEMV,
+                // anything more goes through the scratch path.
+                GgmlType::Q6K if rows == 1 => self.gemv_q6k(x, w),
+                GgmlType::Q4K | GgmlType::Q6K => {
+                    self.gemm_quant_scratch(x, w, *ty, *len, in_features, out_features, rows)
+                }
+                _ => Err(crate::reflex_err!(
                     Other,
                     "internal: batched GEMM on a quantized-resident {ty:?} weight is not supported"
-                ));
-            }
-            // Up to the threshold, the fused kernel reads the Q4_K bytes once
-            // per 8 rows; above it, dequantize into scratch and use cuBLAS.
-            if rows <= quant_fused_max_rows() {
-                return self.gemv_q4k(x, w, rows);
-            }
-            return self.gemm_quant_scratch(x, w, *len, in_features, out_features, rows);
+                )),
+            };
         }
         self.gemm_view(x, &w.full_view()?, in_features, out_features, rows)
     }
 
-    /// [`Self::gemm`] for a quantized-resident Q4_K weight above the fused
-    /// kernel's row threshold: dequantize it into the reused scratch buffer
-    /// (device to device, no host traffic) in the model's `--weights` dtype,
-    /// then take the same cuBLAS path a weight stored in that dtype takes
-    /// (`Sgemm` for `f32`; activation cast + `cublasGemmEx` for `f16`).
+    /// [`Self::gemm`] for a quantized-resident weight that the fused kernel
+    /// doesn't cover (Q4_K above its row threshold, Q6_K above one row):
+    /// dequantize it into the reused scratch buffer (device to device, no host
+    /// traffic) in the model's `--weights` dtype, then take the same cuBLAS
+    /// path a weight stored in that dtype takes (`Sgemm` for `f32`; activation
+    /// cast + `cublasGemmEx` for `f16`). Q4_K uses the coalesced dequant
+    /// kernel (one thread block per Q4_K block); Q6_K the load-time dequant
+    /// kernel (one thread per block), which writes the same values the load
+    /// would have.
+    #[allow(clippy::too_many_arguments)]
     fn gemm_quant_scratch(
         &self,
         x: &CudaSlice<f32>,
         w: &Weight,
+        ty: GgmlType,
         len: usize,
         in_features: usize,
         out_features: usize,
         rows: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let n = in_features * out_features;
-        let num_blocks = len / Q4K_BLOCK_BYTES;
         let w_ptr = w.quant_ptr().ok_or_else(|| {
-            ReflexError::Other("internal: Q4_K weight without a device pointer".to_string())
+            ReflexError::Other("internal: quantized weight without a device pointer".to_string())
         })?;
         let dtype = self.weights_dtype;
-        let (kernel, kernel_name) = match dtype {
-            WeightsDtype::F32 => (
-                &self.dequant_q4k_coalesced_k,
-                "dequantize_q4k_coalesced_kernel",
-            ),
-            WeightsDtype::F16 => (
-                &self.dequant_q4k_coalesced_f16_k,
-                "dequantize_q4k_coalesced_f16_kernel",
-            ),
+        let (dq, num_blocks, launch_cfg) = match ty {
+            GgmlType::Q4K => {
+                let (kernel, kernel_name) = match dtype {
+                    WeightsDtype::F32 => (
+                        &self.dequant_q4k_coalesced_k,
+                        "dequantize_q4k_coalesced_kernel",
+                    ),
+                    WeightsDtype::F16 => (
+                        &self.dequant_q4k_coalesced_f16_k,
+                        "dequantize_q4k_coalesced_f16_kernel",
+                    ),
+                };
+                let dq = kernel.as_ref().ok_or_else(|| {
+                    ReflexError::Other(format!(
+                        "internal: Q4_K weight but {kernel_name} not loaded"
+                    ))
+                })?;
+                let num_blocks = len / Q4K_BLOCK_BYTES;
+                let cfg = LaunchConfig {
+                    grid_dim: (num_blocks as u32, 1, 1),
+                    block_dim: (QK_K as u32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                (dq, num_blocks, cfg)
+            }
+            GgmlType::Q6K => {
+                let dq = match dtype {
+                    WeightsDtype::F32 => &self.dequant_kernels.f32.q6k,
+                    WeightsDtype::F16 => &self.dequant_kernels.f16.q6k,
+                };
+                let num_blocks = len / Q6K_BLOCK_BYTES;
+                let threads = 256u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((num_blocks as u32).div_ceil(threads).max(1), 1, 1),
+                    block_dim: (threads, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                (dq, num_blocks, cfg)
+            }
+            other => {
+                return Err(crate::reflex_err!(
+                    Other,
+                    "internal: no scratch dequant for quantized-resident {other:?}"
+                ))
+            }
         };
-        let dq = kernel.as_ref().ok_or_else(|| {
-            ReflexError::Other(format!(
-                "internal: Q4_K weight but {kernel_name} not loaded"
-            ))
-        })?;
+        if num_blocks * QK_K != n {
+            return Err(crate::reflex_err!(
+                Other,
+                "internal: {ty:?} weight holds {} elements, expected {in_features}x{out_features}",
+                num_blocks * QK_K
+            ));
+        }
 
         let mut scratch = self.quant_scratch.borrow_mut();
         let fits = match (&*scratch, dtype) {
@@ -565,11 +612,6 @@ impl Model {
                 ),
             });
         }
-        let launch_cfg = LaunchConfig {
-            grid_dim: (num_blocks as u32, 1, 1),
-            block_dim: (QK_K as u32, 1, 1),
-            shared_mem_bytes: 0,
-        };
         let launch_err = |e| crate::gpu_err!(e, "quant scratch dequant launch: {e}");
         let view = match scratch.as_mut() {
             Some(WeightData::F32(buf)) => {
@@ -740,6 +782,53 @@ impl Model {
             in_features,
             out_features,
         ))
+    }
+
+    /// Expert `expert_idx` of a quantized-resident per-expert-stacked tensor as
+    /// its own 2-D [`Weight`] (`[in_features, out_features]`), sharing the
+    /// arena: an expert's chunk is whole rows of whole blocks, so it is a
+    /// contiguous byte range at `expert_idx * len / expert_count`. `None` for an
+    /// f32/f16 weight, which [`Self::expert_weight_view`] slices instead. Lets
+    /// the quantized GEMV/GEMM dispatch in [`Self::gemv`]/[`Self::gemm`] serve
+    /// one expert unchanged.
+    pub(super) fn quant_expert_weight(
+        w: &Weight,
+        expert_idx: usize,
+    ) -> Result<Option<Weight>, ReflexError> {
+        let WeightData::Quant {
+            ty,
+            arena,
+            offset,
+            len,
+        } = &w.data
+        else {
+            return Ok(None);
+        };
+        let (in_features, out_features, expert_count) = match w.shape.as_slice() {
+            [i, o, e] => (*i, *o, *e as usize),
+            other => {
+                return Err(crate::reflex_err!(
+                    Other,
+                    "quant_expert_weight: expected 3-D per-expert tensor shape, got {other:?}"
+                ))
+            }
+        };
+        if expert_idx >= expert_count || len % expert_count != 0 {
+            return Err(crate::reflex_err!(
+                Other,
+                "quant_expert_weight: expert {expert_idx} of {expert_count} in a {len}-byte {ty:?} tensor"
+            ));
+        }
+        let expert_len = len / expert_count;
+        Ok(Some(Weight {
+            data: WeightData::Quant {
+                ty: *ty,
+                arena: arena.clone(),
+                offset: offset + expert_idx * expert_len,
+                len: expert_len,
+            },
+            shape: vec![in_features, out_features],
+        }))
     }
 
     /// GEMV against expert `expert_idx`'s slice of a per-expert-stacked 3-D MoE tensor

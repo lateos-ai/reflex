@@ -1,9 +1,10 @@
 # Design: Kolibri-1 MoE support
 
-**Status: Phase 2 done (2026-10-06): the forward pass runs on the dense/MoE path and
-matches the patched llama.cpp token for token on the synthetic fixture (T4). Experts
-are dequantized at load (no quantized-resident path yet, Phase 3), so the real
-47.5 GB model does not fit yet.**
+**Status: Phase 3 step 1 done (2026-10-06): with `REFLEX_QUANT_RESIDENT=1`, every
+Kolibri-1 matmul tensor (stacked experts included) stays as raw Q4_K/Q6_K blocks on the
+GPU, verified on the synthetic fixture (T4). The forward pass (Phase 2) matches the
+patched llama.cpp token for token there. Next: one run of the real Q4_K_M model on an
+80 GB GPU.**
 Every convention
 below was read from Aleph Alpha's own checkpoint and inference code and from a real
 GGUF header, and cross-checked between two independent implementations. See
@@ -251,6 +252,35 @@ file whose types the quantized-resident path already has kernels for. No small r
   guard test.
 - Memory budget: ~47.5 GB of weights + KV cache (50 layers x 4 KV heads x 128 x 2 x
   f32 = 200 KB per token) + scratch. Fits on 80 GB, not on 48 GB.
+
+### Phase 3 step 1 results (2026-10-06)
+
+- **Loading**: with the flag on, Kolibri-1's ten per-layer matmul tensors
+  (`KOLIBRI_MATMUL_TENSORS`, including the 3-D `ffn_*_exps` stacks) and a Q6_K
+  `output.weight` go into the quantized arena if Q4_K or Q6_K. Norms, the F32 router
+  and `exp_probs_b` stay f32. Other MoE models still ignore the flag, with a notice.
+- **Experts**: `Model::quant_expert_weight` turns expert `e` of a quantized stack into
+  its own 2-D `Weight` sharing the arena (offset `e * len / expert_count`), so the
+  existing GEMV/GEMM dispatch serves it. `expert_gemv` (decode) and `expert_gemm` (an
+  expert group of batched prefill) pick that or the old f32/f16 view; for f32/f16
+  stacks they behave exactly as before.
+- **Q6_K in batched GEMM**: one row uses `gemv_q6k_kernel`; more rows dequantize into
+  the shared scratch buffer with the load-time Q6_K kernel (same values the load would
+  write), then cuBLAS. There is no multi-row Q6_K kernel yet. `apply_lora`'s
+  materialize step handles Q6_K and 3-D tensors too.
+- **Verified on a T4**: every matmul tensor of layers 0 (Q4_K) and 2 (Q6_K
+  `attn_v`/`ffn_down_*`) against its dequantized copy, first/middle/last expert, 1 to
+  23 rows, both `--weights` modes, relative max diff < 1e-4
+  (`kolibri1_quant_resident_matmuls_match_dequantized`); greedy ids identical to the
+  flag-off path in both modes, including a prompt past the 16-token window, and
+  batched vs sequential prefill agree with the flag on
+  (`kolibri1_quant_resident_generate_matches_dequantized`). Regressions unchanged:
+  Phase 2's tests, dense quantized-resident on Qwen3-0.6B, grouped MoE prefill on the
+  qwen3moe/qwen35moe/MLA fixtures.
+- **Fixture numbers** (Q4_K_M, 7-token prompt, 16 tokens, n=3, flag off vs on): same
+  16 tokens; peak VRAM 279 vs 183 MiB (process total, CUDA context included);
+  `prompt_eval_ms` ~31 vs ~13; first token ~427 vs ~409 ms, `model_load_ms` ~220 for
+  both (this fixture's load is dominated by fixed costs, not weight bytes).
 
 ## Phase 4: cold-start work specific to a 47.5 GB model
 

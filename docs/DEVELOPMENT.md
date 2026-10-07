@@ -161,8 +161,9 @@ wrapper in `src/model/kernels.rs` dispatches on it.
 - **LoRA merges happen in f32.** `LoadOptions::lora_adapter` loads the adapter's target
   weights as `f32`; `apply_lora` adds the delta and then rounds to f16 once.
 
-**Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense Qwen3/Llama/Mistral path only; MoE, hybrid
-and MLA print a notice and keep their normal storage). Q4_K matmul weights are uploaded
+**Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense Qwen3/Llama/Mistral path, and Kolibri-1,
+whose Q4_K and Q6_K tensors stay quantized including the stacked experts; other MoE
+models, hybrid and MLA print a notice and keep their normal storage). Q4_K matmul weights are uploaded
 as their raw GGUF blocks into one device arena and dequantized inside the matmul
 kernels (`gemv_q4k`, the fused multi-row prefill kernel), or, for longer prompts, into
 a reused device scratch buffer that cuBLAS then reads. That scratch buffer has the

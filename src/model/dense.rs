@@ -106,6 +106,22 @@ pub(super) struct KolibriLayerWeights {
     pub(super) normalize_top_k: bool,
 }
 
+/// Kolibri-1's per-layer matmul tensors (`blk.{i}.<name>.weight`): the ones
+/// `REFLEX_QUANT_RESIDENT=1` keeps as raw Q4_K/Q6_K blocks. `ffn_gate_inp`
+/// (the router) is F32 in the file and stays dequantized.
+pub(super) const KOLIBRI_MATMUL_TENSORS: [&str; 10] = [
+    "attn_q",
+    "attn_k",
+    "attn_v",
+    "attn_output",
+    "ffn_gate_exps",
+    "ffn_up_exps",
+    "ffn_down_exps",
+    "ffn_gate_shexp",
+    "ffn_up_shexp",
+    "ffn_down_shexp",
+];
+
 /// Per-layer attention variant for [`Model::forward_attn_block`]: whether Q/K
 /// get RoPE, and the sliding window (`0` = plain causal attention). Every
 /// architecture but Kolibri-1 uses [`AttnMode::STANDARD`].
@@ -278,35 +294,50 @@ impl Model {
         }
 
         // Quantized-resident weights (docs/design/quantized-resident-weights.md):
-        // dense (non-MoE) layers only for now; MoE keeps f32 and says so.
+        // dense layers and Kolibri-1's layers; other MoE models keep f32 and
+        // say so.
         let quant_on = quant_resident_enabled();
-        if quant_on && expert_used_count.is_some() {
-            eprintln!("note: REFLEX_QUANT_RESIDENT=1 is not supported for MoE models yet; using f32 weights");
+        if quant_on && expert_used_count.is_some() && kolibri.is_none() {
+            eprintln!("note: REFLEX_QUANT_RESIDENT=1 is not supported for this MoE model yet; using f32 weights");
         }
-        // Layer matmuls stay quantized if Q4_K; an untied `output.weight` (the
-        // LM head) if Q6_K or Q4_K. A tied LM head is handled lazily in
-        // `Model::lm_head_resident`.
-        let quant_dense = quant_on && expert_used_count.is_none();
+        // Dense layer matmuls stay quantized if Q4_K; an untied `output.weight`
+        // (the LM head) if Q6_K or Q4_K. A tied LM head is handled lazily in
+        // `Model::lm_head_resident`. Kolibri-1 keeps every matmul tensor,
+        // stacked experts included, if Q4_K or Q6_K: its Q4_K_M file has Q6_K
+        // `attn_v`/`ffn_down_exps`/`ffn_down_shexp` in half the layers.
+        let quant_dense = quant_on && (expert_used_count.is_none() || kolibri.is_some());
+        let layer_quant_types: &[GgmlType] = if kolibri.is_some() {
+            &[GgmlType::Q4K, GgmlType::Q6K]
+        } else {
+            &[GgmlType::Q4K]
+        };
         let mut arena = if quant_dense {
+            let layer_tensors: &[&str] = if kolibri.is_some() {
+                &KOLIBRI_MATMUL_TENSORS
+            } else {
+                &[
+                    "attn_q",
+                    "attn_k",
+                    "attn_v",
+                    "attn_output",
+                    "ffn_gate",
+                    "ffn_up",
+                    "ffn_down",
+                ]
+            };
             let mut names: Vec<String> = (0..block_count)
                 .flat_map(|i| {
-                    [
-                        "attn_q",
-                        "attn_k",
-                        "attn_v",
-                        "attn_output",
-                        "ffn_gate",
-                        "ffn_up",
-                        "ffn_down",
-                    ]
-                    .map(|t| format!("blk.{i}.{t}.weight"))
+                    layer_tensors
+                        .iter()
+                        .map(move |t| format!("blk.{i}.{t}.weight"))
                 })
                 .collect();
             names.push("output.weight".to_string());
             // LoRA targets load in f32 for the merge, so they need no arena space.
             QuantArena::for_tensors(&device, file, &names, |name, ty| {
                 !policy.keep_f32.contains(name)
-                    && (ty == GgmlType::Q4K || (name == "output.weight" && ty == GgmlType::Q6K))
+                    && (layer_quant_types.contains(&ty)
+                        || (name == "output.weight" && ty == GgmlType::Q6K))
             })?
         } else {
             None
@@ -355,7 +386,7 @@ impl Model {
                     file,
                     name,
                     a,
-                    &[GgmlType::Q4K],
+                    layer_quant_types,
                 ),
                 _ => load_weight_device(&mut pipeline, &dequant_kernels, policy, file, name),
             }
@@ -413,21 +444,21 @@ impl Model {
                     exp_probs_b,
                     ffn_gate_exps: load_weight_kind(
                         &format!("blk.{i}.ffn_gate_exps.weight"),
-                        false,
+                        true,
                     )?,
-                    ffn_up_exps: load_weight_kind(&format!("blk.{i}.ffn_up_exps.weight"), false)?,
+                    ffn_up_exps: load_weight_kind(&format!("blk.{i}.ffn_up_exps.weight"), true)?,
                     ffn_down_exps: load_weight_kind(
                         &format!("blk.{i}.ffn_down_exps.weight"),
-                        false,
+                        true,
                     )?,
                     ffn_gate_shexp: load_weight_kind(
                         &format!("blk.{i}.ffn_gate_shexp.weight"),
-                        false,
+                        true,
                     )?,
-                    ffn_up_shexp: load_weight_kind(&format!("blk.{i}.ffn_up_shexp.weight"), false)?,
+                    ffn_up_shexp: load_weight_kind(&format!("blk.{i}.ffn_up_shexp.weight"), true)?,
                     ffn_down_shexp: load_weight_kind(
                         &format!("blk.{i}.ffn_down_shexp.weight"),
-                        false,
+                        true,
                     )?,
                     post_ffw_norm: load_weight_kind(
                         &format!("blk.{i}.post_ffw_norm.weight"),
@@ -866,10 +897,10 @@ impl Model {
             .htod_sync_copy(&[0u32])
             .map_err(|e| crate::gpu_err!(e, "moe dest_row htod: {e}"))?;
         for &(expert_idx, weight) in routed {
-            let gate = self.gemv_expert(ffn_normed, ffn_gate_exps, expert_idx)?;
-            let up = self.gemv_expert(ffn_normed, ffn_up_exps, expert_idx)?;
+            let gate = self.expert_gemv(ffn_normed, ffn_gate_exps, expert_idx)?;
+            let up = self.expert_gemv(ffn_normed, ffn_up_exps, expert_idx)?;
             let activated = self.silu_and_mul(&gate, &up, ffn_hidden_size)?;
-            let down = self.gemv_expert(&activated, ffn_down_exps, expert_idx)?;
+            let down = self.expert_gemv(&activated, ffn_down_exps, expert_idx)?;
             let weight_dev = self
                 .device
                 .htod_sync_copy(&[weight])
@@ -877,6 +908,40 @@ impl Model {
             self.moe_scatter_add(&down, &dest_row0, &weight_dev, ffn_out, hidden_size)?;
         }
         Ok(())
+    }
+
+    /// One-row [`Self::gemv_expert`] for any storage of a stacked per-expert
+    /// tensor: a quantized-resident one goes through [`Self::gemv`] on that
+    /// expert's slice ([`Self::quant_expert_weight`]).
+    pub(super) fn expert_gemv(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+        expert_idx: usize,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        match Self::quant_expert_weight(w, expert_idx)? {
+            Some(ew) => self.gemv(x, &ew),
+            None => self.gemv_expert(x, w, expert_idx),
+        }
+    }
+
+    /// `x[rows, in_features] @ w[expert_idx]^T` for one expert group of
+    /// batched prefill: a quantized-resident tensor goes through
+    /// [`Self::gemm`] on that expert's slice, an f32/f16 one through
+    /// [`Self::gemm_view`] on its zero-copy view (cuBLAS even for a one-row
+    /// group, as before quantized experts existed).
+    pub(super) fn expert_gemm(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+        expert_idx: usize,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        if let Some(ew) = Self::quant_expert_weight(w, expert_idx)? {
+            return self.gemm(x, &ew, rows);
+        }
+        let (view, in_features, out_features) = Self::expert_weight_view(w, expert_idx)?;
+        self.gemm_view(x, &view, in_features, out_features, rows)
     }
 
     /// Kolibri-1 decode step for one layer; see [`KolibriLayerWeights`] for the
@@ -1201,21 +1266,11 @@ impl Model {
             let group_size = rows_e.len();
 
             let x_e = self.moe_gather(ffn_normed, &perm_row, hidden_size)?;
-            let (gate_w, in_features, gate_out_features) =
-                Self::expert_weight_view(ffn_gate_exps, expert_idx)?;
-            let gate = self.gemm_view(&x_e, &gate_w, in_features, gate_out_features, group_size)?;
-            let (up_w, _, up_out_features) = Self::expert_weight_view(ffn_up_exps, expert_idx)?;
-            let up = self.gemm_view(&x_e, &up_w, in_features, up_out_features, group_size)?;
+            let gate_out_features = ffn_gate_exps.shape[1] as usize;
+            let gate = self.expert_gemm(&x_e, ffn_gate_exps, expert_idx, group_size)?;
+            let up = self.expert_gemm(&x_e, ffn_up_exps, expert_idx, group_size)?;
             let activated = self.silu_and_mul(&gate, &up, group_size * gate_out_features)?;
-            let (down_w, down_in_features, down_out_features) =
-                Self::expert_weight_view(ffn_down_exps, expert_idx)?;
-            let down = self.gemm_view(
-                &activated,
-                &down_w,
-                down_in_features,
-                down_out_features,
-                group_size,
-            )?;
+            let down = self.expert_gemm(&activated, ffn_down_exps, expert_idx, group_size)?;
 
             self.moe_scatter_add(&down, &perm_row, &weight_dev, ffn_out, hidden_size)?;
         }

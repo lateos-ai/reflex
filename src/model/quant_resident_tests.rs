@@ -264,3 +264,184 @@ fn quant_resident_lm_head_matches_f32() {
         assert_eq!(*g, yq[r as usize], "gather row {r}");
     }
 }
+
+const KOLIBRI_Q4KM: &str = "test-data/tiny-kolibri1.gguf";
+
+/// Kolibri-1 with `REFLEX_QUANT_RESIDENT=1`: every matmul tensor of layer 0
+/// (all Q4_K) and layer 2 (Q6_K `attn_v`/`ffn_down_exps`/`ffn_down_shexp`) of
+/// the Q4_K_M fixture, against the same tensor dequantized. Stacked expert
+/// tensors are checked on their first, a middle and the last expert, through
+/// `expert_gemv` (decode) and `expert_gemm` (an expert group of batched
+/// prefill). Row counts cover decode, Q4_K's fused kernel and the
+/// dequantize-to-scratch path (always taken by Q6_K above one row), whose
+/// reference is the weight in the model's `--weights` dtype. Run
+/// single-threaded: `cargo test --release -- --ignored --test-threads=1 kolibri1_quant`
+#[test]
+#[ignore]
+fn kolibri1_quant_resident_matmuls_match_dequantized() {
+    let file = GgufFile::open(KOLIBRI_Q4KM).expect("open Kolibri fixture");
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    for dtype in [WeightsDtype::F32, WeightsDtype::F16] {
+        let model = load_model(device.clone(), &file, dtype, true);
+        let kernels = load_dequant_kernels(&device).expect("dequant kernels");
+        let mut pipeline = WeightLoadPipeline::new(&device).expect("pipeline");
+        let scratch_rows = quant_fused_max_rows() + 7;
+        let mut seen: Vec<GgmlType> = Vec::new();
+        for layer in [0usize, 2] {
+            let LayerWeights::Kolibri(l) = &model.layers[layer] else {
+                panic!("layer {layer} is not a Kolibri layer");
+            };
+            let tensors: [(&str, &Weight); 10] = [
+                ("attn_q", &l.attn_q),
+                ("attn_k", &l.attn_k),
+                ("attn_v", &l.attn_v),
+                ("attn_output", &l.attn_output),
+                ("ffn_gate_exps", &l.ffn_gate_exps),
+                ("ffn_up_exps", &l.ffn_up_exps),
+                ("ffn_down_exps", &l.ffn_down_exps),
+                ("ffn_gate_shexp", &l.ffn_gate_shexp),
+                ("ffn_up_shexp", &l.ffn_up_shexp),
+                ("ffn_down_shexp", &l.ffn_down_shexp),
+            ];
+            for (t, wq) in tensors {
+                let name = format!("blk.{layer}.{t}.weight");
+                let ty = file.tensor_info(&name).expect("tensor").ggml_type;
+                assert!(
+                    wq.quant_ptr().is_some(),
+                    "{name} ({ty:?}) should be quantized-resident"
+                );
+                if !seen.contains(&ty) {
+                    seen.push(ty);
+                }
+                let wf = load_weight_device(
+                    &mut pipeline,
+                    &kernels,
+                    &policy(WeightsDtype::F32),
+                    &file,
+                    &name,
+                )
+                .expect("f32 weight");
+                let wd = load_weight_device(&mut pipeline, &kernels, &policy(dtype), &file, &name)
+                    .expect("weight in the model's dtype");
+                let in_f = wf.shape[0] as usize;
+                let experts: Vec<Option<usize>> = match wf.shape.len() {
+                    3 => {
+                        let n = wf.shape[2] as usize;
+                        vec![Some(0), Some(n / 2), Some(n - 1)]
+                    }
+                    _ => vec![None],
+                };
+                for expert in experts {
+                    for rows in [1usize, 3, 8, 13, scratch_rows] {
+                        let fused =
+                            rows == 1 || (ty == GgmlType::Q4K && rows <= quant_fused_max_rows());
+                        let reference = if fused { &wf } else { &wd };
+                        let x = device
+                            .htod_sync_copy(&activations(rows * in_f, rows as u64 + layer as u64))
+                            .expect("upload x");
+                        let (yf, yq) = match (expert, rows) {
+                            (Some(e), 1) => (
+                                model.gemv_expert(&x, reference, e),
+                                model.expert_gemv(&x, wq, e),
+                            ),
+                            (Some(e), _) => (
+                                model.expert_gemm(&x, reference, e, rows),
+                                model.expert_gemm(&x, wq, e, rows),
+                            ),
+                            (None, 1) => (model.gemv(&x, reference), model.gemv(&x, wq)),
+                            (None, _) => {
+                                (model.gemm(&x, reference, rows), model.gemm(&x, wq, rows))
+                            }
+                        };
+                        let yf = device
+                            .dtoh_sync_copy(&yf.expect("dequantized path"))
+                            .expect("dtoh");
+                        let yq = device
+                            .dtoh_sync_copy(&yq.expect("quantized path"))
+                            .expect("dtoh");
+                        let d = rel_max_diff(&yq, &yf);
+                        assert!(
+                            d < 1e-4,
+                            "{dtype} {name} {ty:?} expert={expert:?} rows={rows}: relative max diff {d}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.contains(&GgmlType::Q4K) && seen.contains(&GgmlType::Q6K),
+            "fixture must exercise both Q4_K and Q6_K, saw {seen:?}"
+        );
+        let lm = model.lm_head_resident().expect("lm head");
+        assert!(
+            lm.quant_ptr().is_some(),
+            "Q6_K LM head should be quantized-resident"
+        );
+    }
+}
+
+/// End to end on the Kolibri-1 Q4_K_M fixture: greedy ids with
+/// `REFLEX_QUANT_RESIDENT=1` equal the flag-off path in the same `--weights`
+/// mode, on a short prompt and one past the fixture's 16-token window, and
+/// quantized-resident batched prefill matches sequential prefill. Run
+/// single-threaded (`--test-threads=1 kolibri1_quant`).
+#[test]
+#[ignore]
+fn kolibri1_quant_resident_generate_matches_dequantized() {
+    let file = GgufFile::open(KOLIBRI_Q4KM).expect("open Kolibri fixture");
+    let prompts = [
+        "Die Hauptstadt von Deutschland ist",
+        "The quick brown fox jumps over the lazy dog while the river runs past the old mill, and the miller counts his sacks of flour one by one before the sun goes down over the hills.",
+    ];
+    for dtype in [WeightsDtype::F32, WeightsDtype::F16] {
+        let run = |quant: bool| {
+            let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+            let model = load_model(device, &file, dtype, quant);
+            let ids: Vec<Vec<u32>> = prompts
+                .iter()
+                .map(|p| {
+                    model
+                        .generate(p, 12, None, &SamplingParams::default(), |_| {}, |_, _| {})
+                        .expect("generate")
+                        .0
+                })
+                .collect();
+            (model, ids)
+        };
+        let (_, plain) = run(false);
+        let (model, quant) = run(true);
+        assert!(
+            model.layers.iter().all(
+                |l| matches!(l, LayerWeights::Kolibri(k) if k.ffn_down_exps.quant_ptr().is_some())
+            ),
+            "every layer's experts should be quantized-resident"
+        );
+        for ((p, a), b) in prompts.iter().zip(&quant).zip(&plain) {
+            eprintln!(
+                "{dtype} {:?}: quant {a:?}",
+                p.chars().take(24).collect::<String>()
+            );
+            assert_eq!(
+                a, b,
+                "{dtype}: greedy ids differ for {p:?} (quantized-resident vs dequantized)"
+            );
+        }
+
+        let (seq_ids, seq_hidden, _, _, _) = model
+            .prefill_dense(prompts[1], None, 0)
+            .expect("prefill_dense");
+        let (batch_ids, batch_hidden, _, _, _) = model
+            .prefill_dense_batched(prompts[1], None, 0)
+            .expect("prefill_dense_batched");
+        assert_eq!(seq_ids, batch_ids);
+        let last = model
+            .last_row(&batch_hidden, batch_ids.len(), model.cfg.hidden_size)
+            .expect("last_row");
+        super::prefill_batching_tests::assert_prefill_hidden_close(
+            &model.device.dtoh_sync_copy(&seq_hidden).unwrap(),
+            &model.device.dtoh_sync_copy(&last).unwrap(),
+            dtype,
+            "kolibri quant-resident prefill",
+        );
+    }
+}
