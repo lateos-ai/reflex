@@ -16,6 +16,14 @@
         "stream": true
       },
       "timeout": 120000
+    },
+    {
+      "name": "smoke-classify",
+      "input": {
+        "prompt": "Review: The battery died after two days. Sentiment:",
+        "labels": [" positive", " negative"]
+      },
+      "timeout": 120000
     }
   ],
   "config": {

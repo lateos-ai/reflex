@@ -3,8 +3,11 @@
 Translation shim only, no engine logic: spawns the same, unmodified
 reflex-openai-adapter binary that serverless/runpod/ uses as a load-balancing
 endpoint, waits for it to report ready, and forwards each Runpod job to its
-existing POST /v1/chat/completions over loopback. See ../.runpod/README.md and
-../serverless/runpod/README.md for why two deployment paths exist.
+existing POST /v1/chat/completions over loopback -- or, for a job whose input
+has "labels", to POST /v1/classify (one engine pass scoring each label; the
+one response is yielded once, like a non-streaming chat job). See
+../.runpod/README.md and ../serverless/runpod/README.md for why two deployment
+paths exist.
 
 The handler is a generator, so Runpod's /stream/{job_id} works. With
 "stream": true in the job input, each Server-Sent Event the adapter sends is
@@ -98,12 +101,15 @@ def _sse_events(resp):
 
 def handler(event):
     payload = dict(event.get("input", {}))
-    stream = bool(payload.get("stream", False))
-    payload["stream"] = stream
+    if "labels" in payload:
+        path, stream = "/v1/classify", False
+    else:
+        path, stream = "/v1/chat/completions", bool(payload.get("stream", False))
+        payload["stream"] = stream
 
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
-        f"{ADAPTER_BASE}/v1/chat/completions",
+        f"{ADAPTER_BASE}{path}",
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",

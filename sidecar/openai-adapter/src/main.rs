@@ -1,6 +1,7 @@
 //! `reflex-openai-adapter`: a standalone OpenAI-compatible HTTP sidecar in front of
 //! one managed `reflex stdio <gguf>` process. Implements `POST /v1/chat/completions`
-//! (streaming via SSE and non-streaming JSON), `GET /v1/models`, and a health check
+//! (streaming via SSE and non-streaming JSON), `POST /v1/classify` (System1 label
+//! scoring, not an OpenAI endpoint -- see `classify.rs`), `GET /v1/models`, and a health check
 //! served at both `/healthz` and `/ping` (identical handler -- `/ping` exists because
 //! Runpod Serverless load-balancing endpoints hard-poll that exact path, confirmed
 //! against a real deployment) -- see this crate's README for usage, scope, and known
@@ -15,6 +16,7 @@
 //! [--max-queue-depth <n>] [--request-timeout-secs <n>]`
 
 mod chat_template;
+mod classify;
 mod gguf_meta;
 mod openai;
 mod reflex_client;
@@ -30,7 +32,7 @@ use futures::Stream;
 use openai::{
     build_prompt, build_sampling, estimate_prompt_tokens, extract_text_messages, finish_reason,
     now_unix, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessageOut,
-    Choice, ChunkChoice, Delta, ModelInfo, ModelPricing, ModelsResponse, Usage,
+    Choice, ChunkChoice, Delta, ModelInfo, ModelPricing, ModelsResponse, RawMessage, Usage,
 };
 use reflex_client::ReflexClient;
 use serde_json::Value;
@@ -54,6 +56,31 @@ impl AppState {
     fn next_chat_id(&self) -> String {
         let n = self.request_counter.fetch_add(1, Ordering::Relaxed);
         format!("chatcmpl-reflex-{n:x}")
+    }
+
+    fn next_classify_id(&self) -> String {
+        let n = self.request_counter.fetch_add(1, Ordering::Relaxed);
+        format!("classify-reflex-{n:x}")
+    }
+
+    /// Renders chat messages into the engine's prompt: the GGUF's chat template
+    /// (assistant turn opened) when one loaded, else the generic role-labeled
+    /// flattening. Errs (for a `400`) on messages this adapter can't take.
+    fn render_messages(&self, raw: &[RawMessage]) -> Result<String, String> {
+        let messages = extract_text_messages(raw)?;
+        Ok(match &self.chat_template {
+            Some(ct) => match ct.render(&messages, true) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "[adapter] chat template render failed for this request ({e}); \
+                         falling back to generic prompt flattening for this request"
+                    );
+                    build_prompt(&messages)
+                }
+            },
+            None => build_prompt(&messages),
+        })
     }
 }
 
@@ -375,6 +402,10 @@ async fn main() {
             "/v1/chat/completions",
             post(chat_completions).layer(DefaultBodyLimit::max(body_limit)),
         )
+        .route(
+            "/v1/classify",
+            post(classify_handler).layer(DefaultBodyLimit::max(body_limit)),
+        )
         .route("/v1/models", get(list_models))
         .route("/healthz", get(healthz))
         // Alias of /healthz, same handler: Runpod Serverless load-balancing endpoints
@@ -608,22 +639,9 @@ async fn chat_completions(
         Err(e) => return error_response(e.status(), e.body_text()),
     };
 
-    let messages = match extract_text_messages(&req.messages) {
-        Ok(m) => m,
+    let prompt = match state.render_messages(&req.messages) {
+        Ok(p) => p,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
-    };
-    let prompt = match &state.chat_template {
-        Some(ct) => match ct.render(&messages, true) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "[adapter] chat template render failed for this request ({e}); \
-                     falling back to generic prompt flattening for this request"
-                );
-                build_prompt(&messages)
-            }
-        },
-        None => build_prompt(&messages),
     };
     let max_tokens = req.max_tokens.unwrap_or(state.default_max_tokens).max(1);
     if let Some(response) = request_limit_violation(&state.limits, prompt.len(), max_tokens) {
@@ -695,6 +713,80 @@ async fn chat_completions(
             Ok(response) => response,
             Err(_) => timeout_response(timeout),
         }
+    }
+}
+
+/// `POST /v1/classify`: scores `labels` as continuations of the prompt with one
+/// engine pass and returns their probabilities. See `classify.rs` for the request
+/// and response shapes. Shares the chat endpoint's limits: `--max-prompt-bytes`
+/// (prompt plus longest label), `--max-queue-depth` and `--request-timeout-secs`.
+async fn classify_handler(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<classify::ClassifyRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(e) => return error_response(e.status(), e.body_text()),
+    };
+    let prompt = match classify::validate(&req) {
+        Ok(classify::PromptSource::Raw(p)) => p.to_string(),
+        Ok(classify::PromptSource::Messages(m)) => match state.render_messages(m) {
+            Ok(p) => p,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
+        },
+        Err(e) => {
+            return error_response_with(
+                StatusCode::BAD_REQUEST,
+                e,
+                "invalid_request_error",
+                Some("invalid_input"),
+            )
+        }
+    };
+    let bytes = classify::request_bytes(&prompt, &req.labels);
+    if let Some(response) = request_limit_violation(&state.limits, bytes, 0) {
+        return response;
+    }
+    let line = match serde_json::to_string(&classify::ipc_request(&prompt, &req)) {
+        Ok(l) => l,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("sidecar: failed to serialize IPC request: {e}"),
+            )
+        }
+    };
+    let mut rx = match state.client.request(line).await {
+        Ok(rx) => rx,
+        Err(full) => return queue_full_response(full.max_in_flight),
+    };
+    let id = state.next_classify_id();
+    let model_label = req.model.unwrap_or_else(|| state.model_label.clone());
+    let timeout = state.limits.request_timeout;
+    // Dropping `rx` on timeout is safe, as for chat completions.
+    let response = async move {
+        while let Some(v) = rx.recv().await {
+            if v.get("event").and_then(Value::as_str) != Some("final") {
+                continue;
+            }
+            if let Some(err) = engine_error(&v) {
+                return engine_error_response(&err);
+            }
+            return match classify::build_response(&v, id, now_unix(), model_label) {
+                Ok(r) => (StatusCode::OK, Json(r)).into_response(),
+                Err(e) => {
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("sidecar: {e}"))
+                }
+            };
+        }
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "sidecar: reflex closed the connection without a final response",
+        )
+    };
+    match tokio::time::timeout_at(Instant::now() + timeout, response).await {
+        Ok(response) => response,
+        Err(_) => timeout_response(timeout),
     }
 }
 

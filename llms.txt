@@ -100,7 +100,9 @@ on identical hardware — see [`docs/serverless-cost-comparison.md`](docs/server
 doesn't currently accept load-balancing endpoints. Deploy from that page, or with
 `runpod-mcp`'s `deploy-hub-repo` / `runpodctl hub` for `lateos-ai/reflex`. Job `input` is an
 OpenAI chat-completions body; `"stream": true` streams chunks via `/stream/{job_id}`, and a
-non-streaming job's `output` is a one-element list holding the `chat.completion`. The
+non-streaming job's `output` is a one-element list holding the `chat.completion`. A job with
+`labels` (plus `prompt` or `messages`) is a classification instead: one engine pass
+scores each label and returns their probabilities (the sidecar's `POST /v1/classify`). The
 optional `ADAPTER_ARGS` env var passes extra `reflex-openai-adapter` flags (request limits
 etc.). Prefer `serverless/runpod/` for a manual/direct deployment.
 

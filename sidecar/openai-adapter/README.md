@@ -140,7 +140,7 @@ this sidecar has no auth (see Known limitations).
 
 ## Scope
 
-Implements `POST /v1/chat/completions` only, both non-streaming (JSON) and streaming
+Implements `POST /v1/chat/completions`, both non-streaming (JSON) and streaming
 (`"stream": true`, Server-Sent Events, `chat.completion.chunk` objects terminated by
 a `data: [DONE]` line) — see `src/main.rs::build_sse_stream`/`non_streaming_response`.
 Also exposes `GET /healthz`, a three-state health check (see Known limitations
@@ -163,6 +163,54 @@ Request fields honored: `model`, `messages` (`role`/`content`, string content on
 Reflex-specific extension (not part of the OpenAI schema) since `IpcSamplingParams`
 supports it. `temperature` omitted or `<= 0` selects greedy argmax, mirroring
 `IpcRequest::sampling_params`'s own rule.
+
+### `POST /v1/classify`
+
+Reflex's System1 candidate scoring over HTTP, for classification and routing
+decisions. Not an OpenAI endpoint: OpenAI has no classification API, so the shape is
+this sidecar's own (`src/classify.rs`). The engine runs the prompt through one prefill
+and scores every label as a continuation of it; nothing is generated.
+
+```
+curl http://127.0.0.1:8000/v1/classify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Review: The battery died after two days.\nSentiment:",
+    "labels": [" positive", " negative"]
+  }'
+```
+
+```json
+{
+  "id": "classify-reflex-3", "object": "classification", "created": 1791400000,
+  "model": "Qwen3-0.6B-Q4_K_M",
+  "label": " negative", "label_index": 1,
+  "labels": [
+    {"label": " positive", "probability": 0.04, "score": -3.9, "tokens": 1},
+    {"label": " negative", "probability": 0.96, "score": -0.7, "tokens": 1}
+  ],
+  "entropy": 0.17
+}
+```
+
+(Values illustrative.) Request fields:
+
+- `prompt` (string, used exactly as given) **or** `messages` (chat messages, rendered
+  like `/v1/chat/completions` renders them, with the assistant turn opened, so the
+  labels are scored as the start of the reply). Exactly one.
+- `labels`: 1 to 64 non-empty strings. Each is scored as the literal text that follows
+  the prompt, so it usually wants a leading space (`" urgent"`, not `"urgent"`). A label
+  that doesn't tokenize as a clean continuation of the prompt fails the request with
+  `400` `invalid_input`. On the Qwen3.5 hybrid models every label must be one token.
+- `temperature` (optional, positive, default `1.0`): softmax temperature over the label
+  scores. It sharpens or flattens `probability` without changing the ranking.
+- `model` (optional): echoed back, as on the chat endpoint.
+
+`probability` is relative to this label set only (it sums to 1 over `labels`), not a
+probability over the vocabulary; `score` is the engine's raw input to that softmax.
+`label` is the most probable label (the first one on a tie), `entropy` is in nats.
+The same request limits apply: the prompt plus its longest label counts against
+`--max-prompt-bytes`, and the queue-depth and timeout limits work as for chat.
 
 ## Known limitations
 

@@ -5,6 +5,13 @@ What has been built, in order. Measurements live in
 
 ## 2026-10-07
 
+- **`POST /v1/classify` in the OpenAI sidecar**: Reflex's System1 candidate scoring over
+  HTTP. A request names a `prompt` (or chat `messages`) and up to 64 `labels`; the engine
+  runs one prefill, scores each label as a continuation, and the response carries each
+  label's probability within the set, the most probable label and the entropy. Nothing
+  is generated. Not an OpenAI endpoint (OpenAI has no classification API). The Runpod
+  Hub worker sends any job whose input has `labels` to it, and `tests.json` gains a
+  classification smoke test.
 - **Kolibri-1 support** (Aleph Alpha's 78B MoE, 3.46B active, 384 experts, top-6,
   released 2026-10-03 under Apache 2.0). A third layer variant on the dense/MoE path:
   sigmoid routing with a selection-only bias, sandwich norms, sliding-window RoPE layers
