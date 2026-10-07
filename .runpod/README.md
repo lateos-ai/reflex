@@ -34,6 +34,18 @@ is also external to the engine.
 The job `input` is an OpenAI chat-completions request body (`messages`, `max_tokens`,
 `temperature`, `top_p`, `top_k`, `seed`, `stream`), passed to the adapter as is.
 
+**Classification**: a job whose `input` has `labels` goes to the adapter's
+`POST /v1/classify` instead (see
+[`sidecar/openai-adapter/README.md`](../sidecar/openai-adapter/README.md#post-v1classify)):
+one engine pass scores each label as a continuation of `prompt` (or of `messages`,
+chat-templated) and returns their probabilities. Its output is a one-element list
+holding that `classification` object, like a non-streaming chat job:
+
+```json
+{"input": {"prompt": "Review: The battery died after two days. Sentiment:",
+           "labels": [" positive", " negative"]}}
+```
+
 `handler` is a Runpod **generator** handler started with `return_aggregate_stream`, the
 same convention `runpod-workers/worker-vllm` uses:
 
