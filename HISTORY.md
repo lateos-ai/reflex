@@ -3585,3 +3585,66 @@ warnings` (default and `--features nvml,json-output`); `cargo test` (86 passed /
 ignored); host-only fixture test passes locally too. One scoped
 `#[allow(clippy::large_enum_variant)]` on `HybridFfn` (always stored inside an
 already-boxed per-layer struct). The T4 instance was stopped at the end of the session.
+
+### Parallel chunked load pipeline (Kolibri-1 Phase 4 step 1), 2026-10-07
+
+Branch `kolibri-phase1`, commits `db9328a` (code) and `33e80ad` (A6000 numbers); full
+tables in `docs/design/kolibri.md`, "Phase 4 step 1".
+
+**Problem.** On the 47.5 GB Kolibri-1 Q4_K_M (`REFLEX_QUANT_RESIDENT=1`) cold start was
+almost all model load, and `REFLEX_LOAD_PROFILE` showed one host thread copying the
+mmap into `WeightLoadPipeline`'s pinned buffers as the bottleneck: ~4 GB/s cold
+(page-faulting, one read in flight) and ~7.7 GB/s warm, against an 11.3 GB/s disk and
+19.7 GB/s PCIe. Each expert stack (hundreds of MB) was staged whole, so the
+two-slot overlap hid almost nothing.
+
+**Options weighed.** (A) several fill threads over fixed pinned chunks, (B) `O_DIRECT`
+reads into pinned buffers, (C) `cuMemHostRegister` on the mmap. B makes warm loads run
+at disk speed (it bypasses the page cache) and is Linux-only; C faults and pins pages
+on one driver thread (no cold gain) and runs into memlock/container limits at 47 GB.
+Chose A.
+
+**What changed.**
+1. Tensors are staged in chunks of at most 64 MB through the two reused pinned
+   buffers (pinned memory now 2 x 64 MB instead of 2 x largest tensor). Chunks of
+   8 MB or more are split across fill threads (`REFLEX_LOAD_THREADS`, default
+   min(cores, 8)) that live only during `Model::load`. Small models never reach the
+   threshold. A `MADV_WILLNEED` window runs ahead inside large tensors
+   (`REFLEX_LOAD_READAHEAD=0` disables it). The item-5 rules still hold: host-side
+   event wait before reusing a pinned buffer, no per-tensor staging allocation.
+2. **A second, older stall found on the way:** tensors with no dequant kernel (`F32`
+   norms) used cudarc's `htod_sync_copy`, which synchronizes the compute stream. That
+   compute stream waits on the copy stream, so every norm (two per layer) drained
+   the whole pipeline. It was invisible in the profile as ~0.9 s of unexplained
+   `weights_enqueue_ms` on Mistral 7B, the same before and after the fill change.
+   Those tensors now take the device staging slots plus an async device-to-device
+   copy (`upload_host_bytes`).
+
+**Verification.** T4: all quant-resident, Kolibri fixture, dense/MoE/hybrid/MLA prefill
+tests pass. A new byte-exact staging test (`pipeline_stages_large_tensors_byte_exact`)
+covers multi-chunk uploads, the dequant path and F32/F16 host-path tensors. The real
+fixtures are too small to reach the multi-chunk path, and the LM-head comparison
+would pass with a staging bug that corrupts both of its sides the same way. Same
+generated tokens before and after on Qwen3-0.6B, Qwen3-4B, Mistral 7B, Qwen3.5-0.8B,
+the MLA fixture and Kolibri-1.
+
+**Results.**
+
+| | before | after |
+|---|---|---|
+| T4 warm `model_load_ms`, Mistral 7B quant-resident | 2306 ms | 1738 ms |
+| T4 warm, Qwen3-4B quant-resident | 1098 ms | 805 ms |
+| T4 warm, Qwen3-0.6B | 223-233 ms | unchanged |
+| A6000, Kolibri-1 cold TTFT (llama.cpp 41.3 s) | 71.6 s | 19.7 s |
+| A6000, Kolibri-1 warm TTFT (llama.cpp 7.1 s) | 7.6 s | 3.7 s |
+
+The A6000 pod (CA-MTL-3) had a 4.3 GB/s disk, unlike the 11.3 GB/s host of the earlier
+Kolibri table, so its cold numbers only compare within the run. T4 cold numbers
+measure only its ~134 MB/s EBS volume.
+
+**What the fill-thread sweep showed** (A6000, cold `model_load_ms`, one run each): 2
+threads 39.5 s, 4: 28.7 s, 8: 19.5 s, 16: ~13.9 s, 32: 12.6 s. Warm is best at 8 (16 is
+~10% slower: copy threads compete with the H2D DMA for host memory bandwidth).
+`MADV_WILLNEED` made no measurable difference. So cold wants many reads in flight and
+warm wants few copy threads, and one knob can't serve both. Next step: separate reader
+threads that only fault pages in ahead of the copy.
