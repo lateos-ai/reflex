@@ -1539,4 +1539,92 @@ mod tests {
             "expected plain text after the special token"
         );
     }
+
+    /// Kolibri-1's tokenizer is plain byte-level BPE with Qwen2's split regex
+    /// (`tokenizer.ggml.pre = "kolibri1"`, mapped to `LLAMA_VOCAB_PRE_TYPE_QWEN2`
+    /// by the community llama.cpp patch), so `encode_gpt2` should handle it
+    /// unchanged. Golden ids from HF `tokenizers` 0.23.2 on
+    /// `Aleph-Alpha/Kolibri-1-BF16`'s `tokenizer.json`
+    /// (`add_special_tokens=False`; the model has no BOS). Covers German
+    /// compounds, umlauts/ß/ẞ, digits (split one per token), code, contractions,
+    /// whitespace runs, emoji and the ChatML/`<think>` markers its chat
+    /// template emits.
+    ///
+    /// `test-data/kolibri1-tokenizer.gguf` is the metadata section of
+    /// `Hob-forge/Kolibri-1-GGUF`'s `Kolibri-1-Q4_K_M.gguf` with the tensor
+    /// table dropped (~4.8 MB, gitignored); see docs/DEVELOPMENT.md's
+    /// test-fixture section. Skips if absent.
+    #[test]
+    fn test_kolibri1_encode_matches_hf_tokenizers_if_fixture_present() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test-data")
+            .join("kolibri1-tokenizer.gguf");
+        if !path.exists() {
+            eprintln!(
+                "Skipping test_kolibri1_encode_matches_hf_tokenizers_if_fixture_present: \
+                 test-data/kolibri1-tokenizer.gguf not present"
+            );
+            return;
+        }
+        let file = GgufFile::open(&path).expect("open kolibri1 tokenizer GGUF");
+        let tok = Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf on kolibri1");
+        assert_eq!(tok.architecture, "gpt2");
+        assert_eq!(tok.vocab_size(), 128_000);
+        assert_eq!(tok.prompt_bos(), None, "Kolibri-1 has no BOS token");
+        assert_eq!(tok.eos_token_id, Some(127_906));
+
+        let golden: &[(&str, &[u32])] = &[
+            (
+                "Donaudampfschifffahrtsgesellschaftskapitän",
+                &[24587, 10669, 9355, 104246, 115, 11381, 115, 116721],
+            ),
+            (
+                "Rindfleischetikettierungsüberwachungsaufgabenübertragungsgesetz",
+                &[82, 69950, 106789, 7263, 45356, 35837, 2761, 23903, 61308, 92151],
+            ),
+            (
+                "Größenänderung, Straße, Fußgängerübergang – Ärger über Öl und ÄÖÜ äöü ß ẞ",
+                &[72236, 266, 40644, 44, 12779, 44, 33059, 90022, 1829, 46525, 1489, 21262, 420, 10739, 1674, 960, 121214, 276, 264, 123143, 32, 8578, 158],
+            ),
+            (
+                "Die Rechnung über 1.234,56 € ist am 03.10.2026 fällig.",
+                &[452, 21069, 1489, 32, 49, 46, 50, 51, 52, 44, 53, 54, 13088, 2459, 10304, 32, 48, 51, 46, 49, 48, 46, 50, 48, 50, 54, 45118, 46],
+            ),
+            (
+                "12345678901234567890 und 3,14159",
+                &[49, 50, 51, 52, 53, 54, 55, 56, 57, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 48, 420, 32, 51, 44, 49, 52, 49, 53, 57],
+            ),
+            (
+                "fn main() {\n    println!(\"Hallo, Welt!\");\n}\n",
+                &[47328, 995, 765, 982, 14141, 88473, 69175, 38241, 44, 3389, 56895, 475],
+            ),
+            (
+                "def f(x):\n\treturn x**2  # Quadrat\n",
+                &[1363, 1083, 2931, 2488, 1779, 14169, 294, 50, 32, 4396, 17403, 10],
+            ),
+            (
+                "The quick brown fox jumps over the lazy dog's back. IT'S I'M we'll",
+                &[325, 13040, 10633, 39671, 61041, 1637, 262, 25423, 5926, 589, 3785, 46, 12194, 48743, 669, 121336, 527, 3597],
+            ),
+            (
+                "  leading spaces\n\n\ntrailing   \t",
+                &[32, 4018, 14356, 120038, 755, 57641, 14141, 9],
+            ),
+            (
+                "Grüße 👋🏽 — naïve café, 日本語",
+                &[72678, 53615, 32, 36121, 139, 52651, 189, 14188, 68455, 39993, 44, 32, 80815, 71163],
+            ),
+            (
+                "<|im_start|>user\nWie spät ist es in München?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nEs ist 14:30 Uhr.<|im_end|>",
+                &[127904, 1646, 10, 12403, 30512, 2459, 14154, 622, 8047, 63, 127906, 10, 127904, 64090, 10, 127907, 263, 127908, 263, 35212, 2459, 32, 49, 52, 58, 51, 48, 5269, 46, 127906],
+            ),
+        ];
+        for &(text, expected) in golden {
+            let ids = tok
+                .encode(text)
+                .unwrap_or_else(|e| panic!("encode({text:?}) failed: {e}"));
+            assert_eq!(ids, expected, "token ids differ from HF tokenizers for {text:?}");
+            assert_eq!(tok.decode(&ids), text, "round trip failed for {text:?}");
+        }
+    }
 }

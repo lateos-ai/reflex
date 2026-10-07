@@ -101,6 +101,8 @@ mod hybrid_batching_tests;
 #[cfg(test)]
 mod iq_dequant_host_vs_device_tests;
 #[cfg(test)]
+mod kolibri_config_tests;
+#[cfg(test)]
 mod mla_batching_tests;
 #[cfg(test)]
 mod moe_fixture_tests;
@@ -576,6 +578,15 @@ impl Model {
         }
         if architecture == "deepseek2" {
             return Self::load_mla(device, file, &policy);
+        }
+        if architecture == "kolibri1" {
+            // Config parsing is in place (so a malformed file is reported
+            // precisely); the forward pass is not yet. See
+            // docs/design/kolibri.md's Phase 2.
+            config::parse_kolibri_config(file)?;
+            return Err(crate::reflex_err!(UnsupportedArchitecture,
+                "'kolibri1' is recognized but its forward pass (sandwich norms, NoPE layers, SIGMOID_LOGIT_ADD routing) is not implemented yet"
+            ));
         }
 
         Self::load_dense(device, file, &policy)

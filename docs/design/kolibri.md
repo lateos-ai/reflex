@@ -1,6 +1,8 @@
 # Design: Kolibri-1 MoE support
 
-**Status: Phase 0 done (2026-10-06): go. Nothing implemented yet.** Every convention
+**Status: Phase 1 done (2026-10-06): config, tokenizer and fixture. The forward pass
+(Phase 2) is not implemented; `Model::load` rejects `kolibri1` with a clear error.**
+Every convention
 below was read from Aleph Alpha's own checkpoint and inference code and from a real
 GGUF header, and cross-checked between two independent implementations. See
 [Confirmed conventions](#confirmed-conventions).
@@ -153,6 +155,35 @@ file whose types the quantized-resident path already has kernels for. No small r
   [DEVELOPMENT.md](../DEVELOPMENT.md)'s test-fixture section). A nonzero bias is what
   separates `SIGMOID_LOGIT_ADD` from the DeepSeek-V3 convention, so a zero-bias
   fixture would not catch that bug.
+
+### Phase 1 results (2026-10-06)
+
+- **Config**: `parse_kolibri_config` / `KolibriConfig` in `src/model/config.rs`.
+  `parse_model_config` now refuses `kolibri1` (it reports a nonzero `expert_count`,
+  so it used to be accepted as a generic MoE model). One convention found in the
+  patch's `load_arch_hparams` and not listed above: sliding layers take their RoPE
+  base from `rope.freq_base_swa` when present (real Kolibri-1 doesn't set it). The
+  parser is stricter than the patch in one place: a missing sliding-window pattern
+  is an error, not a period-5 default. Tests: `src/model/kolibri_config_tests.rs`.
+- **Tokenizer**: no code change needed. Reflex, HF `tokenizers` 0.23.2 and the
+  patched `llama-tokenize` agree on all 11 golden strings (German compounds,
+  umlauts/ß/ẞ, digits, code, whitespace, emoji, ChatML and `<think>` markers):
+  `test_kolibri1_encode_matches_hf_tokenizers_if_fixture_present`, against
+  `test-data/kolibri1-tokenizer.gguf` (the real Q4_K_M file's metadata section).
+- **Fixture**: `test-data/tiny-kolibri1.gguf` (Q4_K_M, 63 MB) and
+  `tiny-kolibri1-f32.gguf`: 6 layers (layer 4 full/NoPE), hidden 256, 4 Q / 2 KV
+  heads of 64, 16 experts top-4, expert and shared width 256, nonzero router bias,
+  **sliding window 16** (not 513, so short prompts exercise the mask), real
+  vocab. Its Q4_K_M type mix matches the real file: Q6_K `attn_v`/`ffn_down_exps`/
+  `ffn_down_shexp` in layers 2 and 5, Q6_K `output`, Q4_K `token_embd`. The patched
+  `llama-simple` loads it and generates. Source, Dockerfile and check scripts:
+  `test-data/tiny-kolibri1-src.tar.gz`.
+- **Pinned reference**: llama.cpp `836d571` + `kolibri1-llama.cpp.patch` sha256
+  `e0d17c26a03784a8267cb16a7287e8b4e7d799979b584334770bf7eb620c66aa`. Fixture sha256
+  (the generator is seeded, so a rebuild should reproduce them):
+  - `tiny-kolibri1.gguf`: `19861ca01f481f358fe5af96bf1a2a77b84c77d7c0a9ba2fd72078c4749ed78e`
+  - `tiny-kolibri1-f32.gguf`: `1c419c0ed871909c6133e513161a3f3ff8d4845fea0d4bd5b734645096daf239`
+  - `kolibri1-tokenizer.gguf`: `3bac2514011717e84822aa233b7abeb903dda16f033f8452e617f89686a5c06d`
 
 ## Phase 2: layer math
 

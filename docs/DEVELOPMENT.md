@@ -227,6 +227,17 @@ in `test-data/` locally:
   in the repo. Community `deepseek2` GGUFs that predate llama.cpp's MLA tensor-split
   conversion are rejected by this engine, so convert it fresh with a current
   `convert_hf_to_gguf.py`.
+- `test-data/kolibri1-tokenizer.gguf` is the metadata section of
+  `Hob-forge/Kolibri-1-GGUF`'s `Kolibri-1-Q4_K_M.gguf` (the first ~4.8 MB, read with an
+  HTTP range request) rewritten with an empty tensor table. It carries the real
+  Kolibri-1 vocab and merges for the tokenizer golden test.
+- `test-data/tiny-kolibri1.gguf` (Q4_K_M) and `tiny-kolibri1-f32.gguf` are a synthetic
+  `kolibri1` model: 6 layers (layer 4 full attention), 16 experts with top-4, a nonzero
+  router bias, a 16-token sliding window and the real Kolibri-1 tokenizer. Mainline
+  llama.cpp has no `kolibri1` support, so it was converted and quantized with llama.cpp
+  `836d571` plus the community `kolibri1-llama.cpp.patch` (see
+  [design/kolibri.md](design/kolibri.md)). Source and build scripts are archived as
+  `test-data/tiny-kolibri1-src.tar.gz`.
 - Tests that need a real model read its path from `REFLEX_TEST_GGUF`.
 
 [`scripts/gpu_nightly_tests.sh`](../scripts/gpu_nightly_tests.sh) maps each GPU test to
