@@ -351,9 +351,9 @@ type that requires a Python SDK handler). Two details that matter there:
   capability it was built for, so an endpoint free to schedule anywhere in that pool
   fails nondeterministically. That applies to a single-arch build: the images now
   default to a multi-arch fatbin with native code for both, so they run anywhere in the
-  pool. `scripts/deploy_runpod.sh` still pins the SKU to **RTX A4500** (`sm_86`, 20GB, the
-  only one in the tier with HIGH availability) until the fatbin is confirmed on a real Ada
-  worker. A single-arch image for the AWS guides' T4 (`sm_75`) and one for the A4500
+  pool; that was verified on real Runpod workers on 2026-10-02 (RTX A4500 `sm_86` and L4
+  `sm_89`). `scripts/deploy_runpod.sh` still pins the SKU to **RTX A4500** by default, but
+  only because benchmarks need one fixed SKU. A single-arch image for the AWS guides' T4 (`sm_75`) and one for the A4500
   (`sm_86`) are not interchangeable; the fatbin is.
 
 ## Kubernetes

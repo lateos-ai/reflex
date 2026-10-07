@@ -82,20 +82,26 @@ default (see the README's image-size section). To do it by hand, build and push 
 or `runpod-mcp`'s `create-endpoint` / `runpodctl`) with:
 - Endpoint type: Load Balancing
 - `GGUF_PATH` env var (model is baked into the image at build time), `PORT` if not `80`
-- **Pin the GPU SKU to RTX A4500** (`sm_86`) — the cheapest pool `AMPERE_16` is
-  mixed-architecture (also contains Ada `sm_89` cards) despite its name; an unpinned
-  endpoint fails nondeterministically depending on which card it lands on.
+- **Pin the GPU SKU to RTX A4500** (`sm_86`) only for a single-arch image
+  (`REFLEX_CUDA_ARCH=sm_86`) or a benchmark: the cheapest pool `AMPERE_16` is
+  mixed-architecture (also contains Ada `sm_89` cards) despite its name. The default
+  multi-arch fatbin image runs natively on every card in it (verified on an A4500 and an
+  L4, 2026-10-02).
 - Do not rely on `HEALTH_CHECK_PATH` — Runpod's gateway polls the hardcoded `/ping` path
   regardless; the adapter serves the same three-state health check at both paths.
 
 Real measured result: ~3.4x faster cold start than Runpod's own official `worker-vllm`
 on identical hardware — see [`docs/serverless-cost-comparison.md`](docs/serverless-cost-comparison.md).
 
-**Discoverability via the Runpod Hub** (browsable catalog, one-click deploy): see
-[`.runpod/`](.runpod/README.md) — a second, parallel, queue-based build required only
-because the Hub's publishing pipeline doesn't currently accept load-balancing endpoints.
-Deploy via the Hub UI or `deploy-hub-repo` pointing at this GitHub repo; `.runpod/hub.json`
-carries the listing metadata. Prefer `serverless/runpod/` for a manual/direct deployment.
+**Runpod Hub listing** (browsable catalog, one-click deploy):
+<https://console.runpod.io/hub/lateos-ai/reflex>, built from [`.runpod/`](.runpod/README.md)
+— a second, parallel, queue-based build required only because the Hub's publishing pipeline
+doesn't currently accept load-balancing endpoints. Deploy from that page, or with
+`runpod-mcp`'s `deploy-hub-repo` / `runpodctl hub` for `lateos-ai/reflex`. Job `input` is an
+OpenAI chat-completions body; `"stream": true` streams chunks via `/stream/{job_id}`, and a
+non-streaming job's `output` is a one-element list holding the `chat.completion`. The
+optional `ADAPTER_ARGS` env var passes extra `reflex-openai-adapter` flags (request limits
+etc.). Prefer `serverless/runpod/` for a manual/direct deployment.
 
 ## Modal
 
