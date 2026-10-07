@@ -140,7 +140,7 @@ this sidecar has no auth (see Known limitations).
 
 ## Scope
 
-Implements `POST /v1/chat/completions` only, both non-streaming (JSON) and streaming
+Implements `POST /v1/chat/completions`, both non-streaming (JSON) and streaming
 (`"stream": true`, Server-Sent Events, `chat.completion.chunk` objects terminated by
 a `data: [DONE]` line) — see `src/main.rs::build_sse_stream`/`non_streaming_response`.
 Also exposes `GET /healthz`, a three-state health check (see Known limitations
@@ -163,6 +163,73 @@ Request fields honored: `model`, `messages` (`role`/`content`, string content on
 Reflex-specific extension (not part of the OpenAI schema) since `IpcSamplingParams`
 supports it. `temperature` omitted or `<= 0` selects greedy argmax, mirroring
 `IpcRequest::sampling_params`'s own rule.
+
+### `POST /v1/classify`
+
+Reflex's System1 candidate scoring over HTTP, for classification and routing
+decisions. Not an OpenAI endpoint: OpenAI has no classification API, so the shape is
+this sidecar's own (`src/classify.rs`). The engine runs the prompt through one prefill
+and scores every label as a continuation of it; nothing is generated.
+
+```
+curl http://127.0.0.1:8000/v1/classify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Review: The battery died after two days. Sentiment:",
+    "labels": [" positive", " negative"]
+  }'
+```
+
+Real response (Tesla T4, `Qwen3-0.6B-Q4_K_M`; ~10 ms per request once warm):
+
+```json
+{
+  "id": "classify-reflex-0", "object": "classification", "created": 1791412558,
+  "model": "Qwen3-0.6B-Q4_K_M",
+  "label": " negative", "label_index": 1,
+  "labels": [
+    {"label": " positive", "probability": 0.08692727, "score": 15.241831, "tokens": 1},
+    {"label": " negative", "probability": 0.9130727, "score": 17.593575, "tokens": 1}
+  ],
+  "entropy": 0.42612946
+}
+```
+
+The probabilities are identical to `reflex system1` on the same prompt and labels.
+Request fields:
+
+- `prompt` (string, used exactly as given) **or** `messages` (chat messages, rendered
+  like `/v1/chat/completions` renders them, with the assistant turn opened, so the
+  labels are scored as the start of the reply). Exactly one.
+- `labels`: 1 to 64 non-empty strings. Each is scored as the literal text that follows
+  the prompt, so it usually wants a leading space (`" urgent"`, not `"urgent"`). A label
+  that doesn't tokenize as a clean continuation of the prompt fails the request with
+  `400` `invalid_input`. On the Qwen3.5 hybrid models every label must be one token.
+- `temperature` (optional, positive, default `1.0`): softmax temperature over the label
+  scores. It sharpens or flattens `probability` without changing the ranking.
+- `model` (optional): echoed back, as on the chat endpoint.
+
+`probability` is relative to this label set only (it sums to 1 over `labels`), not a
+probability over the vocabulary. `score` is the engine's input to that softmax: the sum
+of the label's raw token logits, not a log-probability. `label` is the most probable
+label (the first one on a tie), and `entropy` is in bits (0 is certain,
+`log2(labels.len())` is uniform). The same request limits apply: the prompt plus its
+longest label counts against `--max-prompt-bytes`, and the queue-depth and timeout
+limits work as for chat.
+
+**Choosing labels and prompts:**
+
+- **Use labels of equal token length, ideally one token each.** Because `score` sums raw
+  logits, a longer label scores higher for its length alone. On the T4, `" urgent and
+  critical"` (3 tokens) beat `" routine"` (1 token) with probability 1.0 for that reason.
+  When the labels' token counts differ, the response carries a `warning` saying so;
+  each label's `tokens` shows its count.
+- **Prefer `prompt` with reasoning models.** With `messages`, labels are scored at the
+  start of the assistant's reply. Models that open every reply with a thinking block
+  (Qwen3 emits `<think>` there) don't expect a label at that position, so the scores
+  mean little: Qwen3-0.6B rated "The battery died after two days." `positive` at 0.89
+  through `messages`, and `" negative"` at 0.91 through a plain `prompt`. End a `prompt`
+  where the label naturally follows (`... Sentiment:`).
 
 ## Known limitations
 
