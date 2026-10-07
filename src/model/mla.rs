@@ -288,6 +288,7 @@ impl Model {
         )?;
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
+        pipeline.prefetch_from(file);
 
         let mut load_weight = |name: &str| -> Result<Weight, ReflexError> {
             load_weight_device(&mut pipeline, &dequant_kernels, policy, file, name)
@@ -399,6 +400,7 @@ impl Model {
         let f16_act_stats = device
             .alloc_zeros::<u32>(2)
             .map_err(|e| crate::gpu_err!(e, "alloc f16 activation stats: {e}"))?;
+        pipeline.end_load();
         Ok(Model {
             device,
             cublas,
@@ -1118,8 +1120,9 @@ impl Model {
             hidden_size,
             &router_logits,
             num_experts,
-            moe_cfg.expert_used_count,
-            moe_cfg.normalize_top_k,
+            &|logits| {
+                route_top_k_with_norm(logits, moe_cfg.expert_used_count, moe_cfg.normalize_top_k)
+            },
             moe_cfg.routed_scaling_factor,
             ffn_gate_exps,
             ffn_up_exps,

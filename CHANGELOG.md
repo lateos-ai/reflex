@@ -5,6 +5,23 @@ What has been built, in order. Measurements live in
 
 ## 2026-10-07
 
+- **Kolibri-1 support** (Aleph Alpha's 78B MoE, 3.46B active, 384 experts, top-6,
+  released 2026-10-03 under Apache 2.0). A third layer variant on the dense/MoE path:
+  sigmoid routing with a selection-only bias, sandwich norms, sliding-window RoPE layers
+  alternating with full-attention NoPE layers. Its experts stay quantized on the GPU with
+  `REFLEX_QUANT_RESIDENT=1` (new `Q6_K` kernels alongside `Q4_K`), so the 47.5 GB
+  `Q4_K_M` runs in 45.4 GiB. On an A100 it matches llama.cpp (`836d571` plus the community
+  `kolibri1` patch; mainline has no support yet) 20/20 tokens on five German and English
+  prompts up to 627 tokens, once llama.cpp computes with f32 activations: its default Q8
+  activations flip near-tie expert choices. Details in
+  [docs/design/kolibri.md](docs/design/kolibri.md).
+- **Parallel model load.** `WeightLoadPipeline` stages tensors in 64 MB chunks filled by
+  several threads (`REFLEX_LOAD_THREADS`, default min(cores, 8)), with prefetch reader
+  threads (`REFLEX_LOAD_READERS`, default 16) faulting pages in up to 1 GB ahead; `F32`
+  norms no longer stall the pipeline with a synchronous copy. Kolibri-1 on an RTX A6000
+  (4.3 GB/s disk), first token: cold 71.6 s -> 19.7 s (llama.cpp 41.3 s), warm 7.6 s ->
+  3.7 s (llama.cpp 7.1 s), measured before the prefetch readers. T4 warm load: Mistral 7B
+  quantized-resident 2306 -> 1738 ms, Qwen3-4B 1098 -> 805 ms; Qwen3-0.6B unchanged.
 - **Runpod Hub worker: streaming and an `ADAPTER_ARGS` deploy field** (`v0.2.3-runpod-hub`).
   `.runpod/handler.py` is now a generator handler: a job with `"stream": true` yields each
   `chat.completion.chunk` (readable live from `/stream/{job_id}`), and any other job yields

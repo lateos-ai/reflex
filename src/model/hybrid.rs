@@ -408,6 +408,7 @@ impl Model {
             .ok_or_else(|| ReflexError::Other("missing gdn_gated_norm_kernel".to_string()))?;
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
+        pipeline.prefetch_from(file);
 
         let mut load_weight = |name: &str| -> Result<Weight, ReflexError> {
             load_weight_device(&mut pipeline, &dequant_kernels, policy, file, name)
@@ -532,6 +533,7 @@ impl Model {
         let f16_act_stats = device
             .alloc_zeros::<u32>(2)
             .map_err(|e| crate::gpu_err!(e, "alloc f16 activation stats: {e}"))?;
+        pipeline.end_load();
         Ok(Model {
             device,
             cublas,
@@ -1055,6 +1057,7 @@ impl Model {
             cfg.num_kv_heads,
             cfg.head_dim,
             seq_len,
+            0,
         )?;
 
         {
@@ -1214,6 +1217,7 @@ impl Model {
             cfg.head_dim,
             start_pos,
             rows,
+            0,
         )?;
 
         {
@@ -1499,8 +1503,7 @@ impl Model {
             hidden_size,
             &router_logits,
             num_experts,
-            moe_cfg.expert_used_count,
-            true,
+            &|logits| route_top_k_with_norm(logits, moe_cfg.expert_used_count, true),
             moe_cfg.weights_scale,
             &w.ffn_gate_exps,
             &w.ffn_up_exps,

@@ -297,8 +297,18 @@ impl QuantArena {
     }
 }
 
+/// `REFLEX_EXPERT_TRACE=1`: Kolibri-1 layers print each forward call's
+/// routed experts to stderr, one `REFLEX_EXPERT_TRACE rows=N experts=...` line
+/// per layer in layer order (all rows of a batched prefill on one line), for
+/// measuring how many distinct experts a prompt touches
+/// (docs/design/kolibri.md, Phase 4). Off by default.
+pub(super) fn expert_trace_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("REFLEX_EXPERT_TRACE").is_ok_and(|v| v == "1"))
+}
+
 /// `REFLEX_QUANT_RESIDENT=1` turns on quantized-resident weights for the
-/// dense path (Q4_K only for now). Read once per load.
+/// dense path and Kolibri-1. Read once per load.
 pub(super) fn quant_resident_enabled() -> bool {
     std::env::var("REFLEX_QUANT_RESIDENT").is_ok_and(|v| v == "1")
 }
@@ -317,6 +327,10 @@ pub(super) fn load_profile_enabled() -> bool {
 pub(super) struct LoadProfile {
     pub(super) pinned_wait: std::time::Duration,
     pub(super) pinned_fill: std::time::Duration,
+    /// Bytes the prefetch readers touched ahead of the fill.
+    pub(super) prefetched_bytes: usize,
+    /// Bytes copied into the pinned slots (`pinned_fill`'s throughput).
+    pub(super) fill_bytes: usize,
     pub(super) staging_grow: std::time::Duration,
     pub(super) out_alloc: std::time::Duration,
     pub(super) launch: std::time::Duration,
@@ -324,6 +338,8 @@ pub(super) struct LoadProfile {
     pub(super) dequant_events: Vec<(sys::CUevent, sys::CUevent)>,
     pub(super) tensors_f32: usize,
     pub(super) tensors_quant: usize,
+    /// Tensors uploaded without a dequant kernel (`F32` norms, host fallback).
+    pub(super) tensors_host: usize,
     pub(super) h2d_bytes: usize,
     pub(super) f32_bytes: usize,
 }
@@ -848,8 +864,8 @@ fn elementwise_launch_cfg(n: usize) -> LaunchConfig {
 }
 
 /// One pinned (page-locked) host staging buffer for [`WeightLoadPipeline`],
-/// grown lazily (never shrunk) to the largest tensor byte length seen so
-/// far. Plain pageable host memory (e.g. straight from the mmap'd GGUF)
+/// grown lazily (never shrunk) up to [`STAGE_CHUNK_BYTES`]. Plain pageable
+/// host memory (e.g. straight from the mmap'd GGUF)
 /// forces the CUDA driver to silently stage `cuMemcpyHtoDAsync` through its
 /// own temporary pinned buffer instead of actually running it concurrently
 /// with other work -- pinning it ourselves is what makes the H2D transfer
@@ -872,14 +888,13 @@ impl PinnedHostBuffer {
     }
 
     /// Grows the buffer to hold at least `len` bytes if it doesn't already
-    /// (real models reuse only a handful of distinct tensor byte lengths
-    /// per slot, so this stops reallocating after the first few calls).
+    /// (chunks are capped at [`STAGE_CHUNK_BYTES`], so this stops
+    /// reallocating after the first few calls).
     ///
     /// # Safety
     /// The caller must guarantee no async transfer still reads this slot's
-    /// current allocation -- [`WeightLoadPipeline::dequantize`] only grows
-    /// a slot right after waiting for that slot's prior kernel (which also
-    /// covers the copy that fed it) to finish.
+    /// current allocation -- [`WeightLoadPipeline::stage_h2d`] only grows a
+    /// slot right after waiting for that slot's prior copy to finish.
     unsafe fn ensure_capacity(&mut self, len: usize) -> Result<(), ReflexError> {
         if len <= self.cap {
             return Ok(());
@@ -893,15 +908,6 @@ impl PinnedHostBuffer {
         self.ptr = raw_ptr as *mut u8;
         self.cap = len;
         Ok(())
-    }
-
-    /// Copies `src` into this buffer's first `src.len()` bytes.
-    ///
-    /// # Safety
-    /// `ensure_capacity(src.len())` must have already succeeded, and no
-    /// async transfer may still be reading this slot's previous contents.
-    unsafe fn write(&mut self, src: &[u8]) {
-        std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr, src.len());
     }
 
     /// Borrows this buffer's first `len` bytes (`len <= self.cap`).
@@ -926,72 +932,373 @@ impl Drop for PinnedHostBuffer {
     }
 }
 
-/// Double-buffered pipeline for the per-tensor on-device dequant load path
+/// Largest piece of a tensor staged through one pinned slot. A bigger tensor
+/// (a Kolibri-1 expert stack is hundreds of MB) is staged as several chunks,
+/// so the H2D of chunk i overlaps the fill of chunk i+1 within one tensor and
+/// pinned memory stays at 2 x this instead of 2 x the largest tensor.
+const STAGE_CHUNK_BYTES: usize = 64 << 20;
+
+/// Chunks smaller than this are filled on the loading thread alone: small
+/// models (Qwen3-0.6B's matrix weights are all under ~2 MB) never wake the
+/// fill workers, so their load is unchanged.
+const PARALLEL_FILL_MIN_BYTES: usize = 8 << 20;
+
+/// Smallest piece one fill thread copies.
+const FILL_PIECE_MIN_BYTES: usize = 2 << 20;
+
+/// Fill threads (the loading thread included): `REFLEX_LOAD_THREADS`, else
+/// the core count capped at 8.
+fn fill_thread_count() -> usize {
+    if let Some(n) = std::env::var("REFLEX_LOAD_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return n.max(1);
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(8)
+}
+
+/// How far ahead of the chunk being filled the [`Prefetcher`] reads.
+const PREFETCH_WINDOW_BYTES: usize = 1 << 30;
+
+/// One unit of prefetch work: a reader touches this much before taking more.
+const PREFETCH_BLOCK_BYTES: usize = 2 << 20;
+
+/// Prefetch reader threads: `REFLEX_LOAD_READERS` (0 turns prefetching off),
+/// else 16. Readers mostly sleep in page faults, so they cost little CPU.
+fn reader_thread_count() -> usize {
+    std::env::var("REFLEX_LOAD_READERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16)
+}
+
+/// Shared between the loading thread and the readers: the readers touch
+/// `[cursor, frontier)` of the data section, `PREFETCH_BLOCK_BYTES` at a time.
+struct PrefetchState {
+    cursor: usize,
+    frontier: usize,
+    stop: bool,
+}
+
+/// Threads that fault the GGUF data section into the page cache ahead of the
+/// fill, touching one byte per page and copying nothing. A cold load is bound
+/// by how many disk reads are in flight -- one per thread taking a page fault
+/// -- while a warm one is bound by host memory bandwidth, which extra copy
+/// threads only fight the H2D DMA for. Fill-thread sweeps on an A6000 showed
+/// both: cold kept improving up to 32 threads, warm was best at 8. So the
+/// readers provide the I/O depth and [`FillWorkers`] stays small. On a warm
+/// file a touch is a cheap minor fault that the fill threads then skip.
+///
+/// The window follows the fill's position in the file and only moves
+/// forward; a tensor loaded out of file order is simply faulted in by the
+/// fill threads themselves.
+struct Prefetcher {
+    shared: Arc<(std::sync::Mutex<PrefetchState>, std::sync::Condvar)>,
+    /// Bytes the readers have touched (`REFLEX_LOAD_PROFILE`).
+    touched: Arc<std::sync::atomic::AtomicUsize>,
+    base: usize,
+    len: usize,
+    readers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Prefetcher {
+    /// Spawns up to `n` readers over `data` (which they keep alive: for a
+    /// GGUF, its shared mapping).
+    fn spawn<D>(data: D, n: usize) -> Option<Self>
+    where
+        D: std::ops::Deref<Target = [u8]> + Send + Sync + 'static,
+    {
+        let base = data.as_ptr() as usize;
+        let len = data.len();
+        let data = Arc::new(data);
+        let shared = Arc::new((
+            std::sync::Mutex::new(PrefetchState {
+                cursor: 0,
+                frontier: 0,
+                stop: false,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let touched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut readers = Vec::with_capacity(n);
+        for i in 0..n {
+            let (data, shared, touched) = (data.clone(), shared.clone(), touched.clone());
+            let spawned = std::thread::Builder::new()
+                .name(format!("reflex-prefetch-{i}"))
+                .stack_size(64 << 10)
+                .spawn(move || Self::reader::<D>(&data, &shared, &touched));
+            match spawned {
+                Ok(h) => readers.push(h),
+                Err(_) => break,
+            }
+        }
+        if readers.is_empty() {
+            return None;
+        }
+        Some(Self {
+            shared,
+            touched,
+            base,
+            len,
+            readers,
+        })
+    }
+
+    fn reader<D: std::ops::Deref<Target = [u8]>>(
+        data: &D,
+        shared: &(std::sync::Mutex<PrefetchState>, std::sync::Condvar),
+        touched: &std::sync::atomic::AtomicUsize,
+    ) {
+        let (lock, cvar) = shared;
+        loop {
+            let (start, end) = {
+                let Ok(mut st) = lock.lock() else { return };
+                loop {
+                    if st.stop {
+                        return;
+                    }
+                    if st.cursor < st.frontier {
+                        break;
+                    }
+                    st = match cvar.wait(st) {
+                        Ok(st) => st,
+                        Err(_) => return,
+                    };
+                }
+                let start = st.cursor;
+                let end = (start + PREFETCH_BLOCK_BYTES).min(st.frontier);
+                st.cursor = end;
+                (start, end)
+            };
+            let mut acc = 0u8;
+            for i in (start..end).step_by(4096) {
+                acc ^= unsafe { std::ptr::read_volatile(data.as_ptr().add(i)) };
+            }
+            std::hint::black_box(acc);
+            touched.fetch_add(end - start, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The fill is about to read `chunk`: move the window to start there.
+    /// A no-op for bytes outside the data section (e.g. a host-side buffer).
+    fn advance(&self, chunk: &[u8]) {
+        let p = chunk.as_ptr() as usize;
+        if p < self.base || p >= self.base + self.len {
+            return;
+        }
+        let pos = p - self.base;
+        let frontier = (pos + PREFETCH_WINDOW_BYTES).min(self.len);
+        let (lock, cvar) = &*self.shared;
+        let Ok(mut st) = lock.lock() else { return };
+        // Readers behind the fill would only touch pages it already has.
+        st.cursor = st.cursor.max(pos);
+        if frontier > st.frontier {
+            st.frontier = frontier;
+            if st.cursor < st.frontier {
+                cvar.notify_all();
+            }
+        }
+    }
+
+    fn touched_bytes(&self) -> usize {
+        self.touched.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for Prefetcher {
+    /// Stops the readers and waits for each to finish its current block
+    /// (at most one 2 MB block of page faults).
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.shared;
+        if let Ok(mut st) = lock.lock() {
+            st.stop = true;
+        }
+        cvar.notify_all();
+        for h in self.readers.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+/// One piece of a pinned-buffer fill, sent to a [`FillWorkers`] thread.
+struct FillJob {
+    src: *const u8,
+    dst: *mut u8,
+    len: usize,
+}
+
+// SAFETY: `FillWorkers::copy` keeps both ranges alive and untouched by
+// anything else until the worker reports the piece done.
+unsafe impl Send for FillJob {}
+
+/// Helper threads that copy pieces of one chunk from the mmap into a pinned
+/// buffer alongside the loading thread. Cold, each one takes its own page
+/// faults, so several disk reads are in flight instead of one; warm, the copy
+/// runs at several threads' memory bandwidth. They live only while a model
+/// loads ([`WeightLoadPipeline::end_load`]) and only copy bytes -- not a
+/// request pool.
+struct FillWorkers {
+    jobs: Vec<std::sync::mpsc::Sender<FillJob>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl FillWorkers {
+    /// Spawns up to `n` workers; `None` if not even one could start.
+    fn spawn(n: usize) -> Option<Self> {
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let mut jobs = Vec::with_capacity(n);
+        for i in 0..n {
+            let (tx, rx) = std::sync::mpsc::channel::<FillJob>();
+            let done_tx = done_tx.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("reflex-fill-{i}"))
+                .spawn(move || {
+                    for job in rx {
+                        unsafe { std::ptr::copy_nonoverlapping(job.src, job.dst, job.len) };
+                        if done_tx.send(()).is_err() {
+                            break;
+                        }
+                    }
+                });
+            if spawned.is_err() {
+                break;
+            }
+            jobs.push(tx);
+        }
+        (!jobs.is_empty()).then_some(Self { jobs, done })
+    }
+
+    /// Copies `src` to `dst` in `pieces` page-aligned parts: the first on
+    /// the calling thread, the rest on workers. Returns only once every
+    /// piece has landed. A piece whose worker is gone is copied here instead.
+    ///
+    /// # Safety
+    /// `dst` must be valid for `src.len()` bytes and not overlap `src`.
+    unsafe fn copy(&self, src: &[u8], dst: *mut u8, pieces: usize) {
+        let piece = src
+            .len()
+            .div_ceil(pieces.max(1))
+            .next_multiple_of(4096)
+            .max(4096);
+        let mut sent = 0usize;
+        for (i, part) in src.chunks(piece).enumerate().skip(1) {
+            let job = FillJob {
+                src: part.as_ptr(),
+                dst: dst.add(i * piece),
+                len: part.len(),
+            };
+            match self.jobs.get(i - 1).map(|tx| tx.send(job)) {
+                Some(Ok(())) => sent += 1,
+                _ => std::ptr::copy_nonoverlapping(part.as_ptr(), dst.add(i * piece), part.len()),
+            }
+        }
+        let first = &src[..piece.min(src.len())];
+        std::ptr::copy_nonoverlapping(first.as_ptr(), dst, first.len());
+        // Every sent job holds a live `done` sender, so this only fails if a
+        // worker died mid-copy -- then no other job is still in flight
+        // either (each worker runs one at a time and `sent` counts them all).
+        for _ in 0..sent {
+            if self.done.recv().is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// Pipelined host-to-device upload for the per-tensor load path
 /// (`Model::load`/`load_hybrid`/`load_mla`'s `load_weight` closures, ~310
 /// calls for a Qwen3-0.6B GGUF). The pre-pipeline code called
 /// `CudaDevice::htod_sync_copy` (a *blocking* H2D copy of each tensor's raw
 /// quantized bytes) before launching that tensor's dequant kernel,
 /// sequentially -- nothing overlapped tensor N+1's transfer with tensor N's
-/// kernel still running. This pipelines the two: raw bytes are staged into
-/// one of two pinned host buffers and uploaded asynchronously on a forked
-/// `copy_stream`, while the dequant kernel for a previous tensor is still
-/// executing on the device's own default stream (`compute_stream` below --
-/// every kernel launch in this codebase already runs there). Every dequant
-/// kernel still reads byte-identical input and produces byte-identical
-/// output to the pre-pipeline sequential path: this is a timing/memory-
-/// movement change only.
+/// kernel. This pipelines the two: raw bytes are staged through two pinned
+/// host buffers and uploaded asynchronously on a forked `copy_stream`, while
+/// the dequant kernel for a previous tensor is still executing on the
+/// device's own default stream (`compute_stream` below -- every kernel
+/// launch in this codebase already runs there). Every dequant kernel still
+/// reads byte-identical input and produces byte-identical output to the
+/// pre-pipeline sequential path: this is a timing/memory-movement change only.
 ///
-/// Slot lifecycle for tensor `i` (`slot = i % 2`):
-/// 1. If slot `slot` has been used before (tensor `i - 2`), block the
-///    *host* on `copy_done[slot]` via `cuEventSynchronize`. This one is a
-///    CPU-side wait on purpose, and it is the pipeline's only correctness-
-///    critical synchronization: steps 2-5 are all asynchronous, so the CPU
-///    runs arbitrarily far ahead of the GPU, and the pinned buffer is
-///    written by the *CPU*. A GPU-side `cuStreamWaitEvent` would order the
-///    copy stream but would not stop the host from overwriting (or, on
-///    growth, freeing) a staging buffer whose previous H2D transfer is
-///    still in flight -- a silent wrong-weight-bytes race. In steady state
-///    this blocks for ~0: a whole other tensor's copy and kernel were
-///    enqueued since this slot's last use.
-/// 2. Make `copy_stream` wait on `kernel_done[slot]` (GPU-side): the
-///    device-side staging buffer for this slot is reused every other
-///    tensor, so the dequant kernel that last read it must finish before
-///    this tensor's transfer overwrites it. Unlike step 1 this one is
-///    correctly a *stream* wait -- the writer here is the GPU's copy
-///    engine, not the host.
-/// 3. Host-side `memcpy` this tensor's raw bytes into the pinned buffer,
-///    and grow this slot's device staging buffer if this tensor is bigger
-///    than anything seen on that slot so far.
-/// 4. Async H2D copy on `copy_stream`, then record `copy_done[slot]`.
-/// 5. `compute_stream` waits on `copy_done[slot]`, the dequant kernel
-///    launches exactly as before, and `kernel_done[slot]` is recorded right
-///    after it for step 2's use two tensors from now.
+/// Two kinds of slot, each double-buffered:
+/// - **Pinned slots**, one per staged *chunk*: a tensor is staged in pieces
+///   of at most [`STAGE_CHUNK_BYTES`], alternating between the two pinned
+///   buffers, so a big tensor's chunk i+1 is filled while chunk i is on the
+///   wire. A large chunk is filled by several threads ([`FillWorkers`]):
+///   one host thread copying from the mmap (~4 GB/s cold, ~7.7 GB/s warm on
+///   an A6000 host) was the whole load's bottleneck for a 47.5 GB model,
+///   well under both the disk and PCIe.
+/// - **Device staging slots**, one per *tensor* (`dequantize` only): the raw
+///   bytes the dequant kernel reads.
 ///
-/// Both staging buffers (pinned host and device) are *reused* across
-/// tensors rather than allocated per tensor. That is deliberate: allocating
-/// the device buffer per tensor via `CudaDevice::alloc` would stream-order
-/// it on `compute_stream`, and the cross-stream event that then has to make
-/// `copy_stream` wait for that allocation also drags in every kernel
-/// already queued on `compute_stream` -- which serializes copy N+1 behind
-/// kernel N and destroys exactly the overlap this type exists to create
-/// (measured: ~2% instead of ~20%+ on a real Qwen3-0.6B load).
+/// Lifecycle for each chunk (pinned slot `p`):
+/// 1. If slot `p` has been used before, block the *host* on `pinned_done[p]`
+///    via `cuEventSynchronize`. This one is a CPU-side wait on purpose, and
+///    it is the pipeline's only correctness-critical synchronization: the
+///    rest is asynchronous, so the CPU runs arbitrarily far ahead of the
+///    GPU, and the pinned buffer is written by the *CPU*. A GPU-side
+///    `cuStreamWaitEvent` would order the copy stream but would not stop the
+///    host from overwriting (or, on growth, freeing) a staging buffer whose
+///    previous H2D transfer is still in flight -- a silent wrong-weight-bytes
+///    race. It blocks only while the other slot's fill outruns the wire.
+/// 2. Fill the pinned buffer (in parallel if the chunk is large), async H2D
+///    on `copy_stream` to the chunk's place in the destination, and record
+///    `pinned_done[p]`.
+///
+/// And for each tensor (`dequantize`/`upload_host_bytes`, device slot `d`):
+/// 1. Make `copy_stream` wait on `kernel_done[d]` (GPU-side): the device
+///    staging buffer for this slot is reused every other tensor, so the
+///    dequant kernel that last read it must finish before this tensor's
+///    transfer overwrites it. Unlike the pinned wait this one is correctly
+///    a *stream* wait -- the writer here is the GPU's copy engine.
+/// 2. Stage the chunks as above, then `compute_stream` waits on the last
+///    chunk's `pinned_done` (the copy stream runs the chunks in order).
+/// 3. Launch the dequant kernel (for a tensor with no kernel,
+///    `upload_host_bytes`: a device-to-device copy into a fresh buffer) and
+///    record `kernel_done[d]` after it. Nothing in the load loop blocks the
+///    host on the compute stream: a `htod_sync_copy` per norm tensor used to
+///    drain the whole pipeline twice per layer.
+///
+/// Both kinds of staging buffer are *reused* rather than allocated per
+/// tensor. That is deliberate: allocating the device buffer per tensor via
+/// `CudaDevice::alloc` would stream-order it on `compute_stream`, and the
+/// cross-stream event that then has to make `copy_stream` wait for that
+/// allocation also drags in every kernel already queued on `compute_stream`
+/// -- which serializes copy N+1 behind kernel N and destroys exactly the
+/// overlap this type exists to create (measured: ~2% instead of ~20%+ on a
+/// real Qwen3-0.6B load).
 pub(super) struct WeightLoadPipeline {
     pub(super) device: Arc<CudaDevice>,
     pub(super) copy_stream: sys::CUstream,
     pub(super) pinned: [PinnedHostBuffer; 2],
+    /// Recorded on `copy_stream` after each pinned slot's last H2D copy.
+    pub(super) pinned_done: [sys::CUevent; 2],
+    /// Whether `pinned_done[slot]` has ever been recorded -- synchronizing on
+    /// a never-recorded event returns immediately, but this keeps the
+    /// intent explicit rather than relying on that.
+    pub(super) pinned_used: [bool; 2],
+    pub(super) next_pinned: usize,
     /// Device-side raw quantized-byte staging buffers, one per slot, grown
     /// lazily (never shrunk) like their pinned host counterparts.
     pub(super) raw_dev: [Option<CudaSlice<u8>>; 2],
     pub(super) raw_cap: [usize; 2],
-    pub(super) copy_done: [sys::CUevent; 2],
     /// Recorded on `compute_stream` right after the dequant kernel reading
     /// a slot is launched; `None` until that slot has been used once.
     pub(super) kernel_done: [Option<sys::CUevent>; 2],
-    /// Whether `copy_done[slot]` has ever been recorded -- synchronizing on
-    /// a never-recorded event returns immediately, but this keeps the
-    /// intent explicit rather than relying on that.
-    pub(super) slot_used: [bool; 2],
     pub(super) next: usize,
+    /// Fill threads, the loading thread included (`REFLEX_LOAD_THREADS`).
+    fill_threads: usize,
+    /// Spawned on the first chunk big enough to split, dropped by `end_load`.
+    fill_workers: Option<FillWorkers>,
+    /// The GGUF data section, set by [`Self::prefetch_from`]; the readers
+    /// start with the first chunk big enough to split (so never for a small
+    /// model) and stop at `end_load`.
+    prefetch_source: Option<crate::gguf::SharedBytes>,
+    reader_threads: usize,
+    prefetcher: Option<Prefetcher>,
     /// `REFLEX_LOAD_PROFILE` accumulators; `None` (the default) adds no work.
     pub(super) profile: Option<LoadProfile>,
 }
@@ -1008,14 +1315,40 @@ impl WeightLoadPipeline {
             device: device.clone(),
             copy_stream,
             pinned: [PinnedHostBuffer::new(), PinnedHostBuffer::new()],
+            pinned_done: [mk_event()?, mk_event()?],
+            pinned_used: [false, false],
+            next_pinned: 0,
             raw_dev: [None, None],
             raw_cap: [0, 0],
-            copy_done: [mk_event()?, mk_event()?],
             kernel_done: [None, None],
-            slot_used: [false, false],
             next: 0,
+            fill_threads: fill_thread_count(),
+            fill_workers: None,
+            prefetch_source: None,
+            reader_threads: reader_thread_count(),
+            prefetcher: None,
             profile: None,
         })
+    }
+
+    /// Lets the fill threads exit once the model's bulk load is done (the
+    /// pipeline itself stays on `Model` for `lm_head_resident`, which
+    /// respawns them if it needs them; no fill is in flight between calls),
+    /// and stops the prefetch readers.
+    pub(super) fn end_load(&mut self) {
+        self.fill_workers = None;
+        if let (Some(p), Some(pf)) = (&mut self.profile, &self.prefetcher) {
+            p.prefetched_bytes = pf.touched_bytes();
+        }
+        self.prefetcher = None;
+        self.prefetch_source = None;
+    }
+
+    /// Lets this load prefetch `file`'s tensor data ahead of the fill (see
+    /// [`Prefetcher`]). Without it (tests, the post-load LM head) the fill
+    /// threads fault pages in themselves.
+    pub(super) fn prefetch_from(&mut self, file: &GgufFile) {
+        self.prefetch_source = Some(file.data_section_shared());
     }
 
     /// Grows slot `slot`'s device-side staging buffer to hold at least
@@ -1047,6 +1380,83 @@ impl WeightLoadPipeline {
         Ok(())
     }
 
+    /// Per-tensor steps 1-2 (see the struct doc comment): takes the next
+    /// device staging slot, orders the copy stream after the kernel that last
+    /// read it, grows it if needed and stages `bytes` into it. The compute
+    /// stream waits for the bytes; the caller enqueues the slot's reader on
+    /// it and then calls [`Self::device_slot_read`].
+    fn stage_to_device_slot(&mut self, bytes: &[u8]) -> Result<usize, ReflexError> {
+        let slot = self.next % 2;
+        self.next += 1;
+        if let Some(ev) = self.kernel_done[slot] {
+            unsafe {
+                result::stream::wait_event(
+                    self.copy_stream,
+                    ev,
+                    sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+                )
+            }
+            .map_err(|e| {
+                crate::gpu_err!(e, "pipeline: wait for slot {slot}'s prior kernel: {e}")
+            })?;
+        }
+        self.ensure_raw_capacity(slot, bytes.len())?;
+        let raw_ptr = *self.raw_dev[slot]
+            .as_ref()
+            .expect("staging buffer set by ensure_raw_capacity")
+            .device_ptr();
+        self.stage_h2d(raw_ptr, bytes)?;
+        Ok(slot)
+    }
+
+    /// Per-tensor step 3's event: records `kernel_done[slot]` on the compute
+    /// stream after the slot's reader was enqueued there.
+    fn device_slot_read(&mut self, slot: usize) -> Result<(), ReflexError> {
+        if self.kernel_done[slot].is_none() {
+            let ev = result::event::create(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
+                .map_err(|e| crate::gpu_err!(e, "create pipeline kernel_done event: {e}"))?;
+            self.kernel_done[slot] = Some(ev);
+        }
+        let kdone = self.kernel_done[slot].expect("kernel_done[slot] was just set");
+        unsafe { result::event::record(kdone, *self.device.cu_stream()) }
+            .map_err(|e| crate::gpu_err!(e, "pipeline: record kernel_done: {e}"))
+    }
+
+    /// Uploads host values that need no dequant kernel (an `F32` tensor's
+    /// bytes as they are, or the host fallback's output) through the same
+    /// device staging slots, then copies them device to device into a fresh
+    /// buffer on the compute stream. This used to be `htod_sync_copy`, which
+    /// synchronizes the compute stream: every norm tensor (two per layer)
+    /// waited for all queued uploads and dequant kernels, ~0.9 s of a 2.3 s
+    /// Mistral 7B load on a T4. `bytes.len()` must be a multiple of `T`'s size.
+    pub(super) fn upload_host_bytes<T: DeviceRepr>(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<CudaSlice<T>, ReflexError> {
+        let n = bytes.len() / std::mem::size_of::<T>();
+        let slot = self.stage_to_device_slot(bytes)?;
+        let out = unsafe { self.device.alloc::<T>(n) }
+            .map_err(|e| crate::gpu_err!(e, "alloc host-path weight: {e}"))?;
+        let src = *self.raw_dev[slot]
+            .as_ref()
+            .expect("staging buffer set by ensure_raw_capacity")
+            .device_ptr();
+        unsafe {
+            result::memcpy_dtod_async(
+                *out.device_ptr(),
+                src,
+                bytes.len(),
+                *self.device.cu_stream(),
+            )
+        }
+        .map_err(|e| crate::gpu_err!(e, "pipeline: copy host-path weight: {e}"))?;
+        self.device_slot_read(slot)?;
+        if let Some(p) = &mut self.profile {
+            p.tensors_host += 1;
+        }
+        Ok(out)
+    }
+
     /// Pipelined replacement for the old sequential `htod_sync_copy` +
     /// kernel-launch (see the struct doc comment for the full slot
     /// lifecycle) -- same truncation behavior as before if the last block
@@ -1060,55 +1470,8 @@ impl WeightLoadPipeline {
         bytes: &[u8],
         element_count: u64,
     ) -> Result<CudaSlice<T>, ReflexError> {
-        let slot = self.next % 2;
-        self.next += 1;
         let compute_stream = *self.device.cu_stream();
-
-        // Host-side wait -- see the struct doc comment's step 1. Without
-        // this, the CPU (which never blocks anywhere else in this method)
-        // would overwrite or free a pinned buffer whose previous async H2D
-        // transfer is still reading it.
-        let t_wait = std::time::Instant::now();
-        if self.slot_used[slot] {
-            unsafe { sys::lib().cuEventSynchronize(self.copy_done[slot]) }
-                .result()
-                .map_err(|e| {
-                    crate::gpu_err!(e, "pipeline: await slot {slot}'s prior H2D copy: {e}")
-                })?;
-        }
-
-        // GPU-side wait -- step 2: this slot's device staging buffer is
-        // about to be overwritten by the transfer below, so the kernel that
-        // last read it has to be done first.
-        if let Some(ev) = self.kernel_done[slot] {
-            unsafe {
-                result::stream::wait_event(
-                    self.copy_stream,
-                    ev,
-                    sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
-                )
-            }
-            .map_err(|e| {
-                crate::gpu_err!(e, "pipeline: wait for slot {slot}'s prior kernel: {e}")
-            })?;
-        }
-
-        let t_fill = std::time::Instant::now();
-        unsafe {
-            self.pinned[slot].ensure_capacity(bytes.len())?;
-            self.pinned[slot].write(bytes);
-        }
-        if let Some(p) = &mut self.profile {
-            p.pinned_wait += t_fill - t_wait;
-            p.pinned_fill += t_fill.elapsed();
-        }
-        self.ensure_raw_capacity(slot, bytes.len())?;
-
-        let raw_ptr = *self.raw_dev[slot]
-            .as_ref()
-            .expect("staging buffer set by ensure_raw_capacity")
-            .device_ptr();
-        self.h2d_async(raw_ptr, slot, bytes.len())?;
+        let slot = self.stage_to_device_slot(bytes)?;
 
         let num_blocks = bytes.len() / block_bytes;
         let out_len = num_blocks * block_elems;
@@ -1154,14 +1517,7 @@ impl WeightLoadPipeline {
             p.f32_bytes += out_len * 4;
         }
 
-        if self.kernel_done[slot].is_none() {
-            let ev = result::event::create(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
-                .map_err(|e| crate::gpu_err!(e, "create pipeline kernel_done event: {e}"))?;
-            self.kernel_done[slot] = Some(ev);
-        }
-        let kdone = self.kernel_done[slot].expect("kernel_done[slot] was just set");
-        unsafe { result::event::record(kdone, compute_stream) }
-            .map_err(|e| crate::gpu_err!(e, "pipeline: record kernel_done: {e}"))?;
+        self.device_slot_read(slot)?;
 
         if out_len as u64 == element_count {
             return Ok(dev_out);
@@ -1178,17 +1534,95 @@ impl WeightLoadPipeline {
 }
 
 impl WeightLoadPipeline {
-    /// Steps 4-5 of the slot lifecycle (see the struct doc comment): async
-    /// copy of the first `len` bytes of pinned slot `slot` to `dst` on
-    /// `copy_stream`, record `copy_done[slot]`, and make the compute stream
-    /// wait for it. Shared by [`Self::dequantize`] and [`Self::upload_raw`].
+    /// Stages `bytes` through the pinned slots, chunk by chunk (see the
+    /// struct doc comment's per-chunk lifecycle), into device memory at
+    /// `dst`, then makes the compute stream wait for the last chunk. Shared
+    /// by [`Self::dequantize`] and [`Self::upload_raw`].
+    fn stage_h2d(&mut self, dst: sys::CUdeviceptr, bytes: &[u8]) -> Result<(), ReflexError> {
+        let mut last_slot = None;
+        for (i, chunk) in bytes.chunks(STAGE_CHUNK_BYTES).enumerate() {
+            let off = i * STAGE_CHUNK_BYTES;
+            if self.prefetcher.is_none()
+                && chunk.len() >= PARALLEL_FILL_MIN_BYTES
+                && self.reader_threads > 0
+            {
+                if let Some(src) = self.prefetch_source.take() {
+                    self.prefetcher = Prefetcher::spawn(src, self.reader_threads);
+                }
+            }
+            if let Some(pf) = &self.prefetcher {
+                pf.advance(chunk);
+            }
+
+            let slot = self.next_pinned % 2;
+            self.next_pinned += 1;
+            // Host-side wait -- per-chunk step 1. Without this, the CPU
+            // (which never blocks anywhere else here) would overwrite or
+            // free a pinned buffer whose previous async H2D transfer is
+            // still reading it.
+            let t_wait = std::time::Instant::now();
+            if self.pinned_used[slot] {
+                unsafe { sys::lib().cuEventSynchronize(self.pinned_done[slot]) }
+                    .result()
+                    .map_err(|e| {
+                        crate::gpu_err!(e, "pipeline: await slot {slot}'s prior H2D copy: {e}")
+                    })?;
+            }
+            let t_fill = std::time::Instant::now();
+            unsafe { self.pinned[slot].ensure_capacity(chunk.len())? };
+            self.fill(slot, chunk);
+            if let Some(p) = &mut self.profile {
+                p.pinned_wait += t_fill - t_wait;
+                p.pinned_fill += t_fill.elapsed();
+                p.fill_bytes += chunk.len();
+            }
+            self.h2d_async(dst + off as u64, slot, chunk.len())?;
+            last_slot = Some(slot);
+        }
+        let Some(slot) = last_slot else {
+            return Ok(());
+        };
+        unsafe {
+            result::stream::wait_event(
+                *self.device.cu_stream(),
+                self.pinned_done[slot],
+                sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+        }
+        .map_err(|e| crate::gpu_err!(e, "pipeline: wait for copy: {e}"))
+    }
+
+    /// Copies `chunk` into pinned slot `slot`, split across the fill
+    /// threads when it is big enough to be worth it. The slot must already
+    /// hold `chunk.len()` bytes and have no copy reading it.
+    fn fill(&mut self, slot: usize, chunk: &[u8]) {
+        let dst = self.pinned[slot].ptr;
+        let pieces = if chunk.len() >= PARALLEL_FILL_MIN_BYTES {
+            self.fill_threads.min(chunk.len() / FILL_PIECE_MIN_BYTES)
+        } else {
+            1
+        };
+        if pieces > 1 && self.fill_workers.is_none() {
+            self.fill_workers = FillWorkers::spawn(self.fill_threads - 1);
+            if self.fill_workers.is_none() {
+                self.fill_threads = 1;
+            }
+        }
+        match &self.fill_workers {
+            Some(w) if pieces > 1 => unsafe { w.copy(chunk, dst, pieces.min(w.jobs.len() + 1)) },
+            _ => unsafe { std::ptr::copy_nonoverlapping(chunk.as_ptr(), dst, chunk.len()) },
+        }
+    }
+
+    /// Per-chunk step 2's transfer: async copy of the first `len` bytes of
+    /// pinned slot `slot` to `dst` on `copy_stream`, then record
+    /// `pinned_done[slot]`.
     fn h2d_async(
         &mut self,
         dst: sys::CUdeviceptr,
         slot: usize,
         len: usize,
     ) -> Result<(), ReflexError> {
-        let compute_stream = *self.device.cu_stream();
         let h2d_start = match &self.profile {
             Some(_) => {
                 let ev = LoadProfile::timed_event()?;
@@ -1209,54 +1643,39 @@ impl WeightLoadPipeline {
             p.h2d_events.push((start, end));
             p.h2d_bytes += len;
         }
-        unsafe { result::event::record(self.copy_done[slot], self.copy_stream) }
-            .map_err(|e| crate::gpu_err!(e, "pipeline: record copy_done: {e}"))?;
-        self.slot_used[slot] = true;
-        unsafe {
-            result::stream::wait_event(
-                compute_stream,
-                self.copy_done[slot],
-                sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
-            )
-        }
-        .map_err(|e| crate::gpu_err!(e, "pipeline: wait for copy_done: {e}"))
+        unsafe { result::event::record(self.pinned_done[slot], self.copy_stream) }
+            .map_err(|e| crate::gpu_err!(e, "pipeline: record pinned_done: {e}"))?;
+        self.pinned_used[slot] = true;
+        Ok(())
+    }
+
+    /// Fill threads this pipeline uses (for `REFLEX_LOAD_PROFILE`).
+    pub(super) fn fill_threads(&self) -> usize {
+        self.fill_threads
+    }
+
+    /// Prefetch reader threads this pipeline is configured for.
+    pub(super) fn reader_threads(&self) -> usize {
+        self.reader_threads
     }
 
     /// Quantized-resident counterpart of [`Self::dequantize`]: stages `bytes`
-    /// through the same pinned double buffer and copies them asynchronously
-    /// to their final place in `arena` -- no device staging buffer, no
-    /// dequant kernel. Step 1's host wait still guards the pinned slot; step
-    /// 2 doesn't apply (no device staging buffer is reused). The compute
-    /// stream waits on the copy, so any later kernel reading the arena sees
-    /// the bytes. Returns the tensor's `(offset, len)` in the arena.
+    /// through the same pinned slots and copies them asynchronously to their
+    /// final place in `arena` -- no device staging buffer, no dequant kernel,
+    /// so only the per-chunk steps apply. The compute stream waits on the
+    /// copy, so any later kernel reading the arena sees the bytes. Returns
+    /// the tensor's `(offset, len)` in the arena.
     pub(super) fn upload_raw(
         &mut self,
         arena: &mut QuantArena,
         bytes: &[u8],
     ) -> Result<(usize, usize), ReflexError> {
-        let slot = self.next % 2;
-        self.next += 1;
-        let t_wait = std::time::Instant::now();
-        if self.slot_used[slot] {
-            unsafe { sys::lib().cuEventSynchronize(self.copy_done[slot]) }
-                .result()
-                .map_err(|e| {
-                    crate::gpu_err!(e, "pipeline: await slot {slot}'s prior H2D copy: {e}")
-                })?;
-        }
-        let t_fill = std::time::Instant::now();
-        unsafe {
-            self.pinned[slot].ensure_capacity(bytes.len())?;
-            self.pinned[slot].write(bytes);
-        }
-        if let Some(p) = &mut self.profile {
-            p.pinned_wait += t_fill - t_wait;
-            p.pinned_fill += t_fill.elapsed();
-            p.tensors_quant += 1;
-        }
         let offset = arena.reserve(bytes.len())?;
         let dst = *arena.buf.device_ptr() + offset as u64;
-        self.h2d_async(dst, slot, bytes.len())?;
+        self.stage_h2d(dst, bytes)?;
+        if let Some(p) = &mut self.profile {
+            p.tensors_quant += 1;
+        }
         Ok((offset, bytes.len()))
     }
 }
@@ -1270,7 +1689,7 @@ impl Drop for WeightLoadPipeline {
         unsafe {
             let _ = result::stream::synchronize(self.copy_stream);
             let _ = result::stream::destroy(self.copy_stream);
-            for ev in self.copy_done {
+            for ev in self.pinned_done {
                 let _ = result::event::destroy(ev);
             }
             for ev in self.kernel_done.into_iter().flatten() {
@@ -1299,11 +1718,25 @@ pub(super) fn dequantize_tensor_to_device(
     if let Some((kernel, block_bytes, block_elems)) = kernels.f32.for_type(ggml_type) {
         return pipeline.dequantize(kernel, block_bytes, block_elems, bytes, element_count);
     }
+    if ggml_type == GgmlType::F32 {
+        // Already the f32 values: upload the file's bytes as they are.
+        let len = (element_count as usize) * 4;
+        let raw = bytes.get(..len).ok_or_else(|| {
+            crate::reflex_err!(
+                Gguf,
+                "F32 tensor: {len} bytes needed, {} present",
+                bytes.len()
+            )
+        })?;
+        return pipeline.upload_host_bytes(raw);
+    }
     let host = dequant::dequantize(ggml_type, bytes, element_count)?;
-    pipeline
-        .device
-        .htod_sync_copy(&host)
-        .map_err(|e| crate::gpu_err!(e, "upload weight to device: {e}"))
+    pipeline.upload_host_bytes(as_bytes(&host))
+}
+
+/// A slice of plain numbers as its bytes (for [`WeightLoadPipeline::upload_host_bytes`]).
+fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 /// [`dequantize_tensor_to_device`] with f16 output: the same pipelined upload
@@ -1324,10 +1757,7 @@ pub(super) fn dequantize_tensor_to_device_f16(
         .into_iter()
         .map(half::f16::from_f32)
         .collect();
-    pipeline
-        .device
-        .htod_sync_copy(&host)
-        .map_err(|e| crate::gpu_err!(e, "upload weight to device: {e}"))
+    pipeline.upload_host_bytes(as_bytes(&host))
 }
 
 /// Loads and dequantizes weight `name` straight to device memory -- shared
@@ -1370,11 +1800,12 @@ pub(super) fn load_weight_device(
     })
 }
 
-/// [`load_weight_device`], but a 2-D tensor whose type is in `allowed` is kept
-/// as raw blocks in `arena` instead of being dequantized
-/// (`REFLEX_QUANT_RESIDENT=1`, dense path). Every other tensor, and a LoRA
-/// target (`policy.keep_f32`, merged in f32), takes [`load_weight_device`]'s
-/// path unchanged.
+/// [`load_weight_device`], but a 2-D tensor (or a 3-D per-expert stack, read
+/// one expert at a time through `Model::quant_expert_weight`) whose type is in
+/// `allowed` is kept as raw blocks in `arena` instead of being dequantized
+/// (`REFLEX_QUANT_RESIDENT=1`: the dense path, and Kolibri-1's layers). Every
+/// other tensor, and a LoRA target (`policy.keep_f32`, merged in f32), takes
+/// [`load_weight_device`]'s path unchanged.
 pub(super) fn load_weight_device_quant(
     pipeline: &mut WeightLoadPipeline,
     kernels: &DequantKernels,
@@ -1387,7 +1818,9 @@ pub(super) fn load_weight_device_quant(
     let info = file
         .tensor_info(name)
         .ok_or_else(|| crate::reflex_err!(Gguf, "missing weight '{name}'"))?;
-    if !allowed.contains(&info.ggml_type) || info.shape.len() != 2 || policy.keep_f32.contains(name)
+    if !allowed.contains(&info.ggml_type)
+        || !matches!(info.shape.len(), 2 | 3)
+        || policy.keep_f32.contains(name)
     {
         return load_weight_device(pipeline, kernels, policy, file, name);
     }
@@ -1413,15 +1846,21 @@ pub(super) fn load_weight_device_quant(
 pub(super) fn materialize_f32(
     device: &Arc<CudaDevice>,
     q4k_dequant: &cudarc::driver::CudaFunction,
+    q6k_dequant: &cudarc::driver::CudaFunction,
     w: &mut Weight,
 ) -> Result<(), ReflexError> {
-    let len = match &w.data {
+    let (dequant, num_blocks) = match &w.data {
         WeightData::F32(_) | WeightData::F16(_) => return Ok(()),
         WeightData::Quant {
             ty: GgmlType::Q4K,
             len,
             ..
-        } => len,
+        } => (q4k_dequant, *len / Q4K_BLOCK_BYTES),
+        WeightData::Quant {
+            ty: GgmlType::Q6K,
+            len,
+            ..
+        } => (q6k_dequant, *len / Q6K_BLOCK_BYTES),
         WeightData::Quant { ty, .. } => {
             return Err(crate::reflex_err!(
                 Other,
@@ -1429,8 +1868,9 @@ pub(super) fn materialize_f32(
             ))
         }
     };
-    let num_blocks = *len / Q4K_BLOCK_BYTES;
-    let ptr = w.quant_ptr().expect("Q4K weight has a device pointer");
+    let ptr = w
+        .quant_ptr()
+        .expect("quantized weight has a device pointer");
     let mut out = unsafe { device.alloc::<f32>(num_blocks * QK_K) }
         .map_err(|e| crate::gpu_err!(e, "alloc materialized weight: {e}"))?;
     let threads = 256u32;
@@ -1440,7 +1880,7 @@ pub(super) fn materialize_f32(
         shared_mem_bytes: 0,
     };
     unsafe {
-        q4k_dequant
+        dequant
             .clone()
             .launch(launch_cfg, (ptr, &mut out, num_blocks as u32))
             .map_err(|e| crate::gpu_err!(e, "materialize dequant launch: {e}"))?;
@@ -1493,5 +1933,56 @@ mod tests {
             &[2048, 1]
         ));
         assert!(!is_matrix_weight("token_embd.weight", &[1024, 151936]));
+    }
+
+    /// Owned bytes for a [`Prefetcher`] in tests.
+    struct TestBytes(Arc<Vec<u8>>);
+    impl std::ops::Deref for TestBytes {
+        type Target = [u8];
+        fn deref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    fn wait_touched(pf: &Prefetcher, want: usize) {
+        let t = std::time::Instant::now();
+        while pf.touched_bytes() < want && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn prefetcher_touches_the_window_once_and_only_forward() {
+        let len = (24 << 20) + 12345;
+        let data = Arc::new(vec![7u8; len]);
+        let pf = Prefetcher::spawn(TestBytes(data.clone()), 4).expect("spawn readers");
+
+        // Starting at 16 MB: the window (1 GB) reaches the end, so the
+        // readers touch exactly [16 MB, len).
+        pf.advance(&data[16 << 20..]);
+        wait_touched(&pf, len - (16 << 20));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(pf.touched_bytes(), len - (16 << 20));
+
+        // Moving back, or to bytes outside the source, adds no work.
+        pf.advance(&data[..]);
+        let elsewhere = vec![0u8; 4096];
+        pf.advance(&elsewhere);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(pf.touched_bytes(), len - (16 << 20));
+        drop(pf); // joins the readers
+    }
+
+    #[test]
+    fn parallel_fill_copies_every_byte() {
+        let workers = FillWorkers::spawn(7).expect("spawn fill workers");
+        for len in [0usize, 1, 4095, 4096 * 3 + 7, (9 << 20) + 13] {
+            let src: Vec<u8> = (0..len).map(|i| (i * 31 + i / 4096) as u8).collect();
+            for pieces in 1..=8 {
+                let mut dst = vec![0u8; len];
+                unsafe { workers.copy(&src, dst.as_mut_ptr(), pieces) };
+                assert!(dst == src, "len={len} pieces={pieces}");
+            }
+        }
     }
 }

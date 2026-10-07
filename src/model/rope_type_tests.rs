@@ -10,7 +10,9 @@ fn rope_type_mapping_matches_llama_cpp() {
     for arch in ["llama", "mistral", "mixtral"] {
         assert_eq!(rope_type_for(arch), RopeType::Norm, "{arch}");
     }
-    for arch in ["qwen3", "qwen3moe", "some_other_moe"] {
+    // `kolibri1`: added to llama.cpp's NEOX list by the community patch, and
+    // vLLM's default in Aleph Alpha's official plugin (docs/design/kolibri.md).
+    for arch in ["qwen3", "qwen3moe", "kolibri1", "some_other_moe"] {
         assert_eq!(rope_type_for(arch), RopeType::Neox, "{arch}");
     }
 }

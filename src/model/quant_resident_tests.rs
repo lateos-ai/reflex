@@ -264,3 +264,285 @@ fn quant_resident_lm_head_matches_f32() {
         assert_eq!(*g, yq[r as usize], "gather row {r}");
     }
 }
+
+/// The pipeline's chunked, multi-threaded staging against the host bytes, byte
+/// for byte: sizes below the parallel-fill threshold, one chunk split across
+/// the fill threads, and several 64 MB chunks with a ragged tail, through
+/// `upload_raw`, `dequantize` (Q8_0, against the host dequant) and
+/// `upload_host_bytes` (F32 and F16 tensors).
+/// Real fixtures are too small to reach the multi-chunk path, and the
+/// LM-head test above would pass with a staging bug that corrupts both its
+/// sides the same way. Run: `cargo test --release -- --ignored pipeline_stages`
+#[test]
+#[ignore]
+fn pipeline_stages_large_tensors_byte_exact() {
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let mut pipeline = WeightLoadPipeline::new(&device).expect("pipeline");
+
+    let sizes = [1000usize, 3 << 20, (9 << 20) + 5, (150 << 20) + 12345];
+    let bufs: Vec<Vec<u8>> = sizes
+        .iter()
+        .enumerate()
+        .map(|(k, &n)| {
+            (0..n as u64)
+                .map(|i| (i.wrapping_mul(2654435761).wrapping_add(k as u64 * 977) >> 7) as u8)
+                .collect()
+        })
+        .collect();
+    let total: usize = sizes
+        .iter()
+        .map(|n| n.next_multiple_of(QUANT_ARENA_ALIGN))
+        .sum();
+    let mut arena = QuantArena {
+        buf: Arc::new(unsafe { device.alloc::<u8>(total) }.expect("alloc arena")),
+        used: 0,
+    };
+    let placed: Vec<(usize, usize)> = bufs
+        .iter()
+        .map(|b| pipeline.upload_raw(&mut arena, b).expect("upload_raw"))
+        .collect();
+    device.synchronize().expect("sync");
+    let back = device
+        .dtoh_sync_copy(arena.buf.as_ref())
+        .expect("dtoh arena");
+    for (b, &(off, len)) in bufs.iter().zip(&placed) {
+        assert_eq!(len, b.len());
+        assert!(back[off..off + len] == b[..], "upload_raw of {len} bytes");
+    }
+
+    // ~80 MB of Q8_0 blocks: two chunks into one device staging slot.
+    let blocks = (80 << 20) / 34 + 3;
+    let mut q8 = Vec::with_capacity(blocks * 34);
+    for b in 0..blocks {
+        let d = half::f16::from_f32(((b % 97) as f32 + 1.0) / 64.0);
+        q8.extend_from_slice(&d.to_le_bytes());
+        q8.extend((0..32).map(|j| ((b * 7 + j * 13) % 251) as u8));
+    }
+    let n = (blocks * 32) as u64;
+    let kernels = load_dequant_kernels(&device).expect("dequant kernels");
+    let got = dequantize_tensor_to_device(&mut pipeline, &kernels, GgmlType::Q8_0, &q8, n)
+        .expect("dequantize");
+    let got = device.dtoh_sync_copy(&got).expect("dtoh dequant");
+    let want_q8 = dequant::dequantize(GgmlType::Q8_0, &q8, n).expect("host dequant");
+    assert_eq!(got.len(), want_q8.len());
+    let bad = got
+        .iter()
+        .zip(&want_q8)
+        .position(|(a, b)| a.to_bits() != b.to_bits());
+    assert!(bad.is_none(), "dequantize mismatch at element {bad:?}");
+
+    // Tensors with no dequant kernel (`upload_host_bytes`): F32 as is, F16
+    // through the host fallback, small (a norm) and multi-chunk, alternating
+    // with Q8_0 dequants so both device slots are reused across kinds.
+    for &elems in &[4096usize, (20 << 20) + 3] {
+        let f32s: Vec<f32> = (0..elems).map(|i| (i as f32 * 0.37).sin()).collect();
+        let f32_bytes: Vec<u8> = f32s.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f16_bytes: Vec<u8> = f32s
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect();
+        for (ty, raw) in [(GgmlType::F32, &f32_bytes), (GgmlType::F16, &f16_bytes)] {
+            let got = dequantize_tensor_to_device(&mut pipeline, &kernels, ty, raw, elems as u64)
+                .expect("host-path upload");
+            let q = dequantize_tensor_to_device(&mut pipeline, &kernels, GgmlType::Q8_0, &q8, n)
+                .expect("dequantize");
+            let got = device.dtoh_sync_copy(&got).expect("dtoh host-path");
+            let want = dequant::dequantize(ty, raw, elems as u64).expect("host dequant");
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                    && got.len() == want.len(),
+                "{ty:?} upload of {elems} elements"
+            );
+            let q = device.dtoh_sync_copy(&q).expect("dtoh dequant");
+            assert!(
+                q.iter()
+                    .zip(&want_q8)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "Q8_0 dequant after {ty:?} upload"
+            );
+        }
+    }
+}
+
+const KOLIBRI_Q4KM: &str = "test-data/tiny-kolibri1.gguf";
+
+/// Kolibri-1 with `REFLEX_QUANT_RESIDENT=1`: every matmul tensor of layer 0
+/// (all Q4_K) and layer 2 (Q6_K `attn_v`/`ffn_down_exps`/`ffn_down_shexp`) of
+/// the Q4_K_M fixture, against the same tensor dequantized. Stacked expert
+/// tensors are checked on their first, a middle and the last expert, through
+/// `expert_gemv` (decode) and `expert_gemm` (an expert group of batched
+/// prefill). Row counts cover decode, Q4_K's fused kernel and the
+/// dequantize-to-scratch path (always taken by Q6_K above one row), whose
+/// reference is the weight in the model's `--weights` dtype. Run
+/// single-threaded: `cargo test --release -- --ignored --test-threads=1 kolibri1_quant`
+#[test]
+#[ignore]
+fn kolibri1_quant_resident_matmuls_match_dequantized() {
+    let file = GgufFile::open(KOLIBRI_Q4KM).expect("open Kolibri fixture");
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    for dtype in [WeightsDtype::F32, WeightsDtype::F16] {
+        let model = load_model(device.clone(), &file, dtype, true);
+        let kernels = load_dequant_kernels(&device).expect("dequant kernels");
+        let mut pipeline = WeightLoadPipeline::new(&device).expect("pipeline");
+        let scratch_rows = quant_fused_max_rows() + 7;
+        let mut seen: Vec<GgmlType> = Vec::new();
+        for layer in [0usize, 2] {
+            let LayerWeights::Kolibri(l) = &model.layers[layer] else {
+                panic!("layer {layer} is not a Kolibri layer");
+            };
+            let tensors: [(&str, &Weight); 10] = [
+                ("attn_q", &l.attn_q),
+                ("attn_k", &l.attn_k),
+                ("attn_v", &l.attn_v),
+                ("attn_output", &l.attn_output),
+                ("ffn_gate_exps", &l.ffn_gate_exps),
+                ("ffn_up_exps", &l.ffn_up_exps),
+                ("ffn_down_exps", &l.ffn_down_exps),
+                ("ffn_gate_shexp", &l.ffn_gate_shexp),
+                ("ffn_up_shexp", &l.ffn_up_shexp),
+                ("ffn_down_shexp", &l.ffn_down_shexp),
+            ];
+            for (t, wq) in tensors {
+                let name = format!("blk.{layer}.{t}.weight");
+                let ty = file.tensor_info(&name).expect("tensor").ggml_type;
+                assert!(
+                    wq.quant_ptr().is_some(),
+                    "{name} ({ty:?}) should be quantized-resident"
+                );
+                if !seen.contains(&ty) {
+                    seen.push(ty);
+                }
+                let wf = load_weight_device(
+                    &mut pipeline,
+                    &kernels,
+                    &policy(WeightsDtype::F32),
+                    &file,
+                    &name,
+                )
+                .expect("f32 weight");
+                let wd = load_weight_device(&mut pipeline, &kernels, &policy(dtype), &file, &name)
+                    .expect("weight in the model's dtype");
+                let in_f = wf.shape[0] as usize;
+                let experts: Vec<Option<usize>> = match wf.shape.len() {
+                    3 => {
+                        let n = wf.shape[2] as usize;
+                        vec![Some(0), Some(n / 2), Some(n - 1)]
+                    }
+                    _ => vec![None],
+                };
+                for expert in experts {
+                    for rows in [1usize, 3, 8, 13, scratch_rows] {
+                        let fused =
+                            rows == 1 || (ty == GgmlType::Q4K && rows <= quant_fused_max_rows());
+                        let reference = if fused { &wf } else { &wd };
+                        let x = device
+                            .htod_sync_copy(&activations(rows * in_f, rows as u64 + layer as u64))
+                            .expect("upload x");
+                        let (yf, yq) = match (expert, rows) {
+                            (Some(e), 1) => (
+                                model.gemv_expert(&x, reference, e),
+                                model.expert_gemv(&x, wq, e),
+                            ),
+                            (Some(e), _) => (
+                                model.expert_gemm(&x, reference, e, rows),
+                                model.expert_gemm(&x, wq, e, rows),
+                            ),
+                            (None, 1) => (model.gemv(&x, reference), model.gemv(&x, wq)),
+                            (None, _) => {
+                                (model.gemm(&x, reference, rows), model.gemm(&x, wq, rows))
+                            }
+                        };
+                        let yf = device
+                            .dtoh_sync_copy(&yf.expect("dequantized path"))
+                            .expect("dtoh");
+                        let yq = device
+                            .dtoh_sync_copy(&yq.expect("quantized path"))
+                            .expect("dtoh");
+                        let d = rel_max_diff(&yq, &yf);
+                        assert!(
+                            d < 1e-4,
+                            "{dtype} {name} {ty:?} expert={expert:?} rows={rows}: relative max diff {d}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.contains(&GgmlType::Q4K) && seen.contains(&GgmlType::Q6K),
+            "fixture must exercise both Q4_K and Q6_K, saw {seen:?}"
+        );
+        let lm = model.lm_head_resident().expect("lm head");
+        assert!(
+            lm.quant_ptr().is_some(),
+            "Q6_K LM head should be quantized-resident"
+        );
+    }
+}
+
+/// End to end on the Kolibri-1 Q4_K_M fixture: greedy ids with
+/// `REFLEX_QUANT_RESIDENT=1` equal the flag-off path in the same `--weights`
+/// mode, on a short prompt and one past the fixture's 16-token window, and
+/// quantized-resident batched prefill matches sequential prefill. Run
+/// single-threaded (`--test-threads=1 kolibri1_quant`).
+#[test]
+#[ignore]
+fn kolibri1_quant_resident_generate_matches_dequantized() {
+    let file = GgufFile::open(KOLIBRI_Q4KM).expect("open Kolibri fixture");
+    let prompts = [
+        "Die Hauptstadt von Deutschland ist",
+        "The quick brown fox jumps over the lazy dog while the river runs past the old mill, and the miller counts his sacks of flour one by one before the sun goes down over the hills.",
+    ];
+    for dtype in [WeightsDtype::F32, WeightsDtype::F16] {
+        let run = |quant: bool| {
+            let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+            let model = load_model(device, &file, dtype, quant);
+            let ids: Vec<Vec<u32>> = prompts
+                .iter()
+                .map(|p| {
+                    model
+                        .generate(p, 12, None, &SamplingParams::default(), |_| {}, |_, _| {})
+                        .expect("generate")
+                        .0
+                })
+                .collect();
+            (model, ids)
+        };
+        let (_, plain) = run(false);
+        let (model, quant) = run(true);
+        assert!(
+            model.layers.iter().all(
+                |l| matches!(l, LayerWeights::Kolibri(k) if k.ffn_down_exps.quant_ptr().is_some())
+            ),
+            "every layer's experts should be quantized-resident"
+        );
+        for ((p, a), b) in prompts.iter().zip(&quant).zip(&plain) {
+            eprintln!(
+                "{dtype} {:?}: quant {a:?}",
+                p.chars().take(24).collect::<String>()
+            );
+            assert_eq!(
+                a, b,
+                "{dtype}: greedy ids differ for {p:?} (quantized-resident vs dequantized)"
+            );
+        }
+
+        let (seq_ids, seq_hidden, _, _, _) = model
+            .prefill_dense(prompts[1], None, 0)
+            .expect("prefill_dense");
+        let (batch_ids, batch_hidden, _, _, _) = model
+            .prefill_dense_batched(prompts[1], None, 0)
+            .expect("prefill_dense_batched");
+        assert_eq!(seq_ids, batch_ids);
+        let last = model
+            .last_row(&batch_hidden, batch_ids.len(), model.cfg.hidden_size)
+            .expect("last_row");
+        super::prefill_batching_tests::assert_prefill_hidden_close(
+            &model.device.dtoh_sync_copy(&seq_hidden).unwrap(),
+            &model.device.dtoh_sync_copy(&last).unwrap(),
+            dtype,
+            "kolibri quant-resident prefill",
+        );
+    }
+}
