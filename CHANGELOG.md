@@ -12,7 +12,10 @@ What has been built, in order. Measurements live in
   is generated. On a T4 with Qwen3-0.6B a warm request takes ~10 ms and returns exactly
   the probabilities `reflex system1` gives. A label's score sums raw token logits, so
   labels of different token lengths aren't comparable: the response carries a `warning`
-  when they differ. Not an OpenAI endpoint (OpenAI has no classification API). The Runpod
+  when they differ. On Kolibri-1 (RTX A6000), a warm decision takes ~0.2 s and a cold
+  process reaches its result in ~8.6 s; bare zero-shot prompts got 2 of 3 test cases
+  wrong there, so check a classifier on real data first
+  ([docs/design/kolibri.md](docs/design/kolibri.md)). Not an OpenAI endpoint (OpenAI has no classification API). The Runpod
   Hub worker sends any job whose input has `labels` to it, and `tests.json` gains a
   classification smoke test.
 - **Kolibri-1 support** (Aleph Alpha's 78B MoE, 3.46B active, 384 experts, top-6,
@@ -30,7 +33,9 @@ What has been built, in order. Measurements live in
   threads (`REFLEX_LOAD_READERS`, default 16) faulting pages in up to 1 GB ahead; `F32`
   norms no longer stall the pipeline with a synchronous copy. Kolibri-1 on an RTX A6000
   (4.3 GB/s disk), first token: cold 71.6 s -> 19.7 s (llama.cpp 41.3 s), warm 7.6 s ->
-  3.7 s (llama.cpp 7.1 s), measured before the prefetch readers. T4 warm load: Mistral 7B
+  3.7 s (llama.cpp 7.1 s), measured before the prefetch readers. On a second A6000 host
+  (6.1 GB/s disk) with the readers: cold 8.5 s (9.25 s with readers off; llama.cpp
+  17.2 s), warm 3.8-4.0 s (llama.cpp 7.6 s). T4 warm load: Mistral 7B
   quantized-resident 2306 -> 1738 ms, Qwen3-4B 1098 -> 805 ms; Qwen3-0.6B unchanged.
 - **Runpod Hub worker: streaming and an `ADAPTER_ARGS` deploy field** (`v0.2.3-runpod-hub`).
   `.runpod/handler.py` is now a generator handler: a job with `"stream": true` yields each

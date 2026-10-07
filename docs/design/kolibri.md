@@ -5,10 +5,12 @@ runs with `REFLEX_QUANT_RESIDENT=1` (45.4 GiB peak VRAM, so it fits a 48 GB card
 matches llama.cpp token for token on 5 German/English prompts up to 627 tokens, once
 llama.cpp computes with f32 activations like Reflex (see
 [Phase 3 step 2 results](#phase-3-step-2-results-2026-10-07)). After the parallel load
-pipeline, a cold first token on an RTX A6000 takes 19.7 s against llama.cpp's 41.3 s on
-the same host ([Phase 4 step 1](#phase-4-step-1-on-an-rtx-a6000-2026-10-07)). Next: an
-A6000 measurement of the prefetch readers, then Phase 4 step 2 (lazy expert upload),
-which the expert-usage numbers below support for short prompts.
+pipeline and prefetch readers, a cold first token on an RTX A6000 takes 8.5 s against
+llama.cpp's 17.2 s on the same host, and 3.8-4.0 s vs 7.6 s with the file in the page
+cache ([readers and System1](#prefetch-readers-and-system1-on-an-rtx-a6000-2026-10-07);
+an earlier, slower-disk host measured 19.7 vs 41.3 s cold). A warm System1
+classification takes ~0.2 s. Next: Phase 4 step 2 (lazy expert upload), which the
+expert-usage numbers below support for short prompts.
 Every convention
 below was read from Aleph Alpha's own checkpoint and inference code and from a real
 GGUF header, and cross-checked between two independent implementations. See
@@ -455,12 +457,79 @@ p2 short prompt, first token, n=3 interleaved, medians; Reflex with
   compete with the H2D DMA for host memory bandwidth (`h2d_gpu_ms` 2.4 -> 2.8 s).
 - `MADV_WILLNEED` made no measurable difference, cold or warm (18.6 s vs 18.8-20.0 s
   cold at 8 threads).
-- Since done, not yet measured on an A6000: prefetch reader threads
+- Since done (measured below): prefetch reader threads
   (`REFLEX_LOAD_READERS`, default 16) touch pages up to 1 GB ahead of the fill and copy
   nothing, replacing `MADV_WILLNEED`; T4 tests and tokens unchanged. The original idea:
   decouple I/O depth from copy threads (e.g. prefetch threads that
   only touch pages ahead of the fill, or `O_DIRECT` reads when `mincore` says the file
   isn't cached), so cold gets 16-32 reads in flight while warm keeps ~8 copy threads.
+
+#### Prefetch readers and System1 on an RTX A6000 (2026-10-07)
+
+Runpod Secure Cloud RTX A6000 in US-TX-1, **a third host** (cold numbers compare only
+within this table): container disk 6.1 GB/s with `O_DIRECT`, pinned H2D 26.8 GB/s, a
+15.3-CPU cgroup quota, 71 GB memory limit. Reflex built from public `master` at
+`9ea5240` (sm_86, `REFLEX_QUANT_RESIDENT=1`). "Readers off" is the same binary with
+`REFLEX_LOAD_READERS=0`, which is the `db9328a` load minus the `MADV_WILLNEED` hint that
+measured no effect above. Same harness as the tables above: p2 short prompt, first
+token, n=3 interleaved, medians; llama.cpp is stock `836d571` + the kolibri1 patch, all
+layers on the GPU.
+
+| | Reflex, readers off | Reflex, readers on (default 16) | llama.cpp |
+|---|---|---|---|
+| short prompt, cold: TTFT | 9.25 s (9.15–9.41) | **8.52 s** (8.43–8.55) | 17.19 s (16.99–17.22) |
+| short prompt, cold: wall | 11.4 s | 10.7 s | 17.6 s |
+| short prompt, warm: TTFT | **3.79 s** (3.58–3.82) | 4.02 s (3.24–4.16) | 7.63 s (7.49–8.01) |
+| short prompt, warm: wall | 5.6 s | 5.8 s | 8.0 s |
+| 627-token prompt, cold (n=1): TTFT | | 11.16 s | 18.40 s |
+
+- Same 20 tokens with readers off and on; first token 1678 (p2) and 127907 (p5) match
+  llama.cpp in every run.
+- **Readers cut the cold load by ~0.8 s (~9%)**: `model_load_ms` 8.67 -> 7.85 s, fill
+  5.75 -> 7.31 GB/s, faster than one `O_DIRECT` stream reads this disk (6.1 GB/s). Warm,
+  they don't help: the file is already cached, yet the readers still walk all 47 GB
+  (`prefetched_mb` 46,987) and the warm median is ~0.2 s worse, within this host's warm
+  spread. Skipping the readers when `mincore` shows the file cached is the obvious fix;
+  not done.
+- **Cold sweep (one run each, TTFT)**: readers 0 / 8 / 16 / 32 at 8 fill threads: 9.04 /
+  8.19 / 8.52 / 8.73 s; 16 readers at 4 / 16 threads: 8.75 / 8.34 s; 32 readers at 16
+  threads: 8.57 s. On this disk everything from 8 readers up sits within ~0.5 s, the
+  run-to-run spread, so the default of 16 stays.
+- **Reflex is ~2.0x faster than llama.cpp to a cold first token here** (8.5 vs 17.2 s)
+  and on a warm one (3.8-4.0 vs 7.6 s), about the same ratio as the CA-MTL-3 table's
+  19.7 vs 41.3 s (2.1x), on a disk that reads 1.4x faster.
+- **Wall minus TTFT** is ~2 s for Reflex against ~0.4 s for llama.cpp: Reflex's process
+  takes longer to exit after the first token. Not broken down yet; it matters only
+  where a caller waits for the process to exit rather than for the token.
+
+**System1 (candidate scoring, the path behind the sidecar's `POST /v1/classify`)** on
+the same pod, prompt `Review: The battery died after two days. Sentiment:`, candidates
+`" positive"` / `" negative"`:
+
+| | process start to result |
+|---|---|
+| cold (one process per decision), n=2 | 8.60 s, 8.77 s |
+| warm page cache, new process, n=2 | 4.16 s, 4.19 s |
+
+Warm process (`reflex stdio`, the engine path `/v1/classify` uses; one process, 20
+requests per case, ready 4.25 s after launch with the file cached):
+
+| case | labels | p50 | min–max |
+|---|---|---|---|
+| English sentiment (above) | 2 | 190 ms | 187–311 ms |
+| German sentiment (`Bewertung: Der Akku war nach zwei Tagen leer. Stimmung:`) | 2 | 203 ms | 200–205 ms |
+| 4-way ticket routing (`I was charged twice for my subscription this month. Department:`) | 4 | 229 ms | 227–230 ms |
+
+- A warm decision costs ~0.2 s, about 20x Qwen3-0.6B's ~10 ms on a T4: one prefill of a
+  ~15-token prompt through 384-expert layers (`prompt_eval_ms` ~165 ms for the 5-token
+  p2 prompt above). Every label here is one token.
+- **Zero-shot answers with bare prompts are unreliable on Kolibri-1.** The English
+  review came out `positive` at 0.74, and the double charge went to `legal` (0.45) and
+  `sales` (0.41), with `billing` at 0.06. The German review was right (`negativ` 0.98).
+  Three prompts are not a quality evaluation, but they are enough to say that a
+  classifier on this model needs prompt work (or few-shot examples) checked on real
+  data before it is trusted. The scores themselves are deterministic: identical across
+  all cold, warm and stdio runs.
 
 ## Phase 5: verification and benchmarks
 
