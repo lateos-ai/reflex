@@ -129,10 +129,13 @@ That per-tensor load loop runs through `WeightLoadPipeline`, which stages each
 tensor's raw quantized bytes through two reused pinned host buffers in chunks of at
 most 64 MB and uploads them on a forked copy stream, so chunk N+1's fill overlaps chunk
 N's H2D and tensor N+1's transfer overlaps tensor N's dequant kernel. A chunk of 8 MB or
-more is filled by several threads (`REFLEX_LOAD_THREADS`, default min(cores, 8);
-`MADV_WILLNEED` readahead ahead of the fill, `REFLEX_LOAD_READAHEAD=0` turns it off):
-on a 47.5 GB model one host memcpy thread was the whole load's bottleneck (Kolibri
-Phase 4 step 1, docs/design/kolibri.md); small models never wake the fill threads.
+more is filled by several threads (`REFLEX_LOAD_THREADS`, default min(cores, 8)), and
+separate prefetch readers (`REFLEX_LOAD_READERS`, default 16, 0 = off) fault the
+file's pages in up to 1 GB ahead of the fill without copying: cold loads want many
+reads in flight, warm loads want few copy threads (more fight the H2D DMA for memory
+bandwidth), so the two counts are separate knobs. On a 47.5 GB model one host memcpy
+thread was the whole load's bottleneck (Kolibri Phase 4, docs/design/kolibri.md);
+small models never wake either kind of thread.
 Tensors with no dequant kernel (`F32` norms, the host fallback) go through the same
 staging slots plus an async device-to-device copy (`upload_host_bytes`), **not**
 `htod_sync_copy`: that synchronizes the compute stream, so every norm drained the whole

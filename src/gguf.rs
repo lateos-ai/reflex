@@ -291,6 +291,16 @@ impl GgufFile {
         })
     }
 
+    /// The tensor data section (every tensor's bytes, in file order) as one
+    /// shared handle, for the model load's page-prefetch threads. Same
+    /// lifetime and mmap caveat as [`Self::tensor_bytes_shared`].
+    pub fn data_section_shared(&self) -> SharedBytes {
+        SharedBytes {
+            mmap: self.mmap.clone(),
+            range: self.data_section_start..self.mmap.len(),
+        }
+    }
+
     /// Raw bytes for a tensor, as a slice directly into the mmap — no copy.
     pub fn tensor_bytes(&self, info: &GgufTensorInfo) -> Result<&[u8], ReflexError> {
         let range = self.tensor_byte_range(info)?;

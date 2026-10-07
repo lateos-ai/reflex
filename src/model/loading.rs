@@ -327,8 +327,8 @@ pub(super) fn load_profile_enabled() -> bool {
 pub(super) struct LoadProfile {
     pub(super) pinned_wait: std::time::Duration,
     pub(super) pinned_fill: std::time::Duration,
-    /// Time spent issuing `MADV_WILLNEED` readahead hints.
-    pub(super) readahead: std::time::Duration,
+    /// Bytes the prefetch readers touched ahead of the fill.
+    pub(super) prefetched_bytes: usize,
     /// Bytes copied into the pinned slots (`pinned_fill`'s throughput).
     pub(super) fill_bytes: usize,
     pub(super) staging_grow: std::time::Duration,
@@ -946,11 +946,6 @@ const PARALLEL_FILL_MIN_BYTES: usize = 8 << 20;
 /// Smallest piece one fill thread copies.
 const FILL_PIECE_MIN_BYTES: usize = 2 << 20;
 
-/// How far past the current chunk [`WeightLoadPipeline::stage_h2d`] asks the
-/// kernel to read ahead (`madvise(MADV_WILLNEED)`), so a cold load keeps the
-/// disk busy instead of waiting on one page fault's readahead at a time.
-const READAHEAD_BYTES: usize = 4 * STAGE_CHUNK_BYTES;
-
 /// Fill threads (the loading thread included): `REFLEX_LOAD_THREADS`, else
 /// the core count capped at 8.
 fn fill_thread_count() -> usize {
@@ -966,34 +961,168 @@ fn fill_thread_count() -> usize {
         .min(8)
 }
 
-/// `REFLEX_LOAD_READAHEAD=0` turns off the `MADV_WILLNEED` hint (for A/B
-/// measurements); on by default.
-fn readahead_enabled() -> bool {
-    std::env::var("REFLEX_LOAD_READAHEAD").map_or(true, |v| v != "0")
+/// How far ahead of the chunk being filled the [`Prefetcher`] reads.
+const PREFETCH_WINDOW_BYTES: usize = 1 << 30;
+
+/// One unit of prefetch work: a reader touches this much before taking more.
+const PREFETCH_BLOCK_BYTES: usize = 2 << 20;
+
+/// Prefetch reader threads: `REFLEX_LOAD_READERS` (0 turns prefetching off),
+/// else 16. Readers mostly sleep in page faults, so they cost little CPU.
+fn reader_thread_count() -> usize {
+    std::env::var("REFLEX_LOAD_READERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16)
 }
 
-/// Asks the kernel to start reading `range`'s pages in the background. A
-/// hint only: errors are ignored, and it is a no-op off Linux.
-#[cfg(target_os = "linux")]
-fn advise_willneed(range: &[u8]) {
-    extern "C" {
-        fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: core::ffi::c_int) -> i32;
+/// Shared between the loading thread and the readers: the readers touch
+/// `[cursor, frontier)` of the data section, `PREFETCH_BLOCK_BYTES` at a time.
+struct PrefetchState {
+    cursor: usize,
+    frontier: usize,
+    stop: bool,
+}
+
+/// Threads that fault the GGUF data section into the page cache ahead of the
+/// fill, touching one byte per page and copying nothing. A cold load is bound
+/// by how many disk reads are in flight -- one per thread taking a page fault
+/// -- while a warm one is bound by host memory bandwidth, which extra copy
+/// threads only fight the H2D DMA for. Fill-thread sweeps on an A6000 showed
+/// both: cold kept improving up to 32 threads, warm was best at 8. So the
+/// readers provide the I/O depth and [`FillWorkers`] stays small. On a warm
+/// file a touch is a cheap minor fault that the fill threads then skip.
+///
+/// The window follows the fill's position in the file and only moves
+/// forward; a tensor loaded out of file order is simply faulted in by the
+/// fill threads themselves.
+struct Prefetcher {
+    shared: Arc<(std::sync::Mutex<PrefetchState>, std::sync::Condvar)>,
+    /// Bytes the readers have touched (`REFLEX_LOAD_PROFILE`).
+    touched: Arc<std::sync::atomic::AtomicUsize>,
+    base: usize,
+    len: usize,
+    readers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Prefetcher {
+    /// Spawns up to `n` readers over `data` (which they keep alive: for a
+    /// GGUF, its shared mapping).
+    fn spawn<D>(data: D, n: usize) -> Option<Self>
+    where
+        D: std::ops::Deref<Target = [u8]> + Send + Sync + 'static,
+    {
+        let base = data.as_ptr() as usize;
+        let len = data.len();
+        let data = Arc::new(data);
+        let shared = Arc::new((
+            std::sync::Mutex::new(PrefetchState {
+                cursor: 0,
+                frontier: 0,
+                stop: false,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let touched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut readers = Vec::with_capacity(n);
+        for i in 0..n {
+            let (data, shared, touched) = (data.clone(), shared.clone(), touched.clone());
+            let spawned = std::thread::Builder::new()
+                .name(format!("reflex-prefetch-{i}"))
+                .stack_size(64 << 10)
+                .spawn(move || Self::reader::<D>(&data, &shared, &touched));
+            match spawned {
+                Ok(h) => readers.push(h),
+                Err(_) => break,
+            }
+        }
+        if readers.is_empty() {
+            return None;
+        }
+        Some(Self {
+            shared,
+            touched,
+            base,
+            len,
+            readers,
+        })
     }
-    const MADV_WILLNEED: core::ffi::c_int = 3;
-    if range.is_empty() {
-        return;
+
+    fn reader<D: std::ops::Deref<Target = [u8]>>(
+        data: &D,
+        shared: &(std::sync::Mutex<PrefetchState>, std::sync::Condvar),
+        touched: &std::sync::atomic::AtomicUsize,
+    ) {
+        let (lock, cvar) = shared;
+        loop {
+            let (start, end) = {
+                let Ok(mut st) = lock.lock() else { return };
+                loop {
+                    if st.stop {
+                        return;
+                    }
+                    if st.cursor < st.frontier {
+                        break;
+                    }
+                    st = match cvar.wait(st) {
+                        Ok(st) => st,
+                        Err(_) => return,
+                    };
+                }
+                let start = st.cursor;
+                let end = (start + PREFETCH_BLOCK_BYTES).min(st.frontier);
+                st.cursor = end;
+                (start, end)
+            };
+            let mut acc = 0u8;
+            for i in (start..end).step_by(4096) {
+                acc ^= unsafe { std::ptr::read_volatile(data.as_ptr().add(i)) };
+            }
+            std::hint::black_box(acc);
+            touched.fetch_add(end - start, std::sync::atomic::Ordering::Relaxed);
+        }
     }
-    // madvise wants a page-aligned start; the page holding `range`'s first
-    // byte is part of the same mapping.
-    let start = range.as_ptr() as usize & !4095;
-    let end = range.as_ptr() as usize + range.len();
-    unsafe {
-        madvise(start as *mut core::ffi::c_void, end - start, MADV_WILLNEED);
+
+    /// The fill is about to read `chunk`: move the window to start there.
+    /// A no-op for bytes outside the data section (e.g. a host-side buffer).
+    fn advance(&self, chunk: &[u8]) {
+        let p = chunk.as_ptr() as usize;
+        if p < self.base || p >= self.base + self.len {
+            return;
+        }
+        let pos = p - self.base;
+        let frontier = (pos + PREFETCH_WINDOW_BYTES).min(self.len);
+        let (lock, cvar) = &*self.shared;
+        let Ok(mut st) = lock.lock() else { return };
+        // Readers behind the fill would only touch pages it already has.
+        st.cursor = st.cursor.max(pos);
+        if frontier > st.frontier {
+            st.frontier = frontier;
+            if st.cursor < st.frontier {
+                cvar.notify_all();
+            }
+        }
+    }
+
+    fn touched_bytes(&self) -> usize {
+        self.touched.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn advise_willneed(_range: &[u8]) {}
+impl Drop for Prefetcher {
+    /// Stops the readers and waits for each to finish its current block
+    /// (at most one 2 MB block of page faults).
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.shared;
+        if let Ok(mut st) = lock.lock() {
+            st.stop = true;
+        }
+        cvar.notify_all();
+        for h in self.readers.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
 
 /// One piece of a pinned-buffer fill, sent to a [`FillWorkers`] thread.
 struct FillJob {
@@ -1164,7 +1293,12 @@ pub(super) struct WeightLoadPipeline {
     fill_threads: usize,
     /// Spawned on the first chunk big enough to split, dropped by `end_load`.
     fill_workers: Option<FillWorkers>,
-    readahead: bool,
+    /// The GGUF data section, set by [`Self::prefetch_from`]; the readers
+    /// start with the first chunk big enough to split (so never for a small
+    /// model) and stop at `end_load`.
+    prefetch_source: Option<crate::gguf::SharedBytes>,
+    reader_threads: usize,
+    prefetcher: Option<Prefetcher>,
     /// `REFLEX_LOAD_PROFILE` accumulators; `None` (the default) adds no work.
     pub(super) profile: Option<LoadProfile>,
 }
@@ -1190,17 +1324,31 @@ impl WeightLoadPipeline {
             next: 0,
             fill_threads: fill_thread_count(),
             fill_workers: None,
-            readahead: readahead_enabled(),
+            prefetch_source: None,
+            reader_threads: reader_thread_count(),
+            prefetcher: None,
             profile: None,
         })
     }
 
     /// Lets the fill threads exit once the model's bulk load is done (the
     /// pipeline itself stays on `Model` for `lm_head_resident`, which
-    /// respawns them if it needs them). Doesn't wait: no fill is in flight
-    /// between calls.
+    /// respawns them if it needs them; no fill is in flight between calls),
+    /// and stops the prefetch readers.
     pub(super) fn end_load(&mut self) {
         self.fill_workers = None;
+        if let (Some(p), Some(pf)) = (&mut self.profile, &self.prefetcher) {
+            p.prefetched_bytes = pf.touched_bytes();
+        }
+        self.prefetcher = None;
+        self.prefetch_source = None;
+    }
+
+    /// Lets this load prefetch `file`'s tensor data ahead of the fill (see
+    /// [`Prefetcher`]). Without it (tests, the post-load LM head) the fill
+    /// threads fault pages in themselves.
+    pub(super) fn prefetch_from(&mut self, file: &GgufFile) {
+        self.prefetch_source = Some(file.data_section_shared());
     }
 
     /// Grows slot `slot`'s device-side staging buffer to hold at least
@@ -1392,19 +1540,18 @@ impl WeightLoadPipeline {
     /// by [`Self::dequantize`] and [`Self::upload_raw`].
     fn stage_h2d(&mut self, dst: sys::CUdeviceptr, bytes: &[u8]) -> Result<(), ReflexError> {
         let mut last_slot = None;
-        let mut advised_end = 0usize;
         for (i, chunk) in bytes.chunks(STAGE_CHUNK_BYTES).enumerate() {
             let off = i * STAGE_CHUNK_BYTES;
-            if self.readahead && bytes.len() > STAGE_CHUNK_BYTES {
-                let t_ra = std::time::Instant::now();
-                let want = (off + READAHEAD_BYTES).min(bytes.len());
-                if want > advised_end {
-                    advise_willneed(&bytes[advised_end.max(off)..want]);
-                    advised_end = want;
+            if self.prefetcher.is_none()
+                && chunk.len() >= PARALLEL_FILL_MIN_BYTES
+                && self.reader_threads > 0
+            {
+                if let Some(src) = self.prefetch_source.take() {
+                    self.prefetcher = Prefetcher::spawn(src, self.reader_threads);
                 }
-                if let Some(p) = &mut self.profile {
-                    p.readahead += t_ra.elapsed();
-                }
+            }
+            if let Some(pf) = &self.prefetcher {
+                pf.advance(chunk);
             }
 
             let slot = self.next_pinned % 2;
@@ -1505,6 +1652,11 @@ impl WeightLoadPipeline {
     /// Fill threads this pipeline uses (for `REFLEX_LOAD_PROFILE`).
     pub(super) fn fill_threads(&self) -> usize {
         self.fill_threads
+    }
+
+    /// Prefetch reader threads this pipeline is configured for.
+    pub(super) fn reader_threads(&self) -> usize {
+        self.reader_threads
     }
 
     /// Quantized-resident counterpart of [`Self::dequantize`]: stages `bytes`
@@ -1781,6 +1933,44 @@ mod tests {
             &[2048, 1]
         ));
         assert!(!is_matrix_weight("token_embd.weight", &[1024, 151936]));
+    }
+
+    /// Owned bytes for a [`Prefetcher`] in tests.
+    struct TestBytes(Arc<Vec<u8>>);
+    impl std::ops::Deref for TestBytes {
+        type Target = [u8];
+        fn deref(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    fn wait_touched(pf: &Prefetcher, want: usize) {
+        let t = std::time::Instant::now();
+        while pf.touched_bytes() < want && t.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn prefetcher_touches_the_window_once_and_only_forward() {
+        let len = (24 << 20) + 12345;
+        let data = Arc::new(vec![7u8; len]);
+        let pf = Prefetcher::spawn(TestBytes(data.clone()), 4).expect("spawn readers");
+
+        // Starting at 16 MB: the window (1 GB) reaches the end, so the
+        // readers touch exactly [16 MB, len).
+        pf.advance(&data[16 << 20..]);
+        wait_touched(&pf, len - (16 << 20));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(pf.touched_bytes(), len - (16 << 20));
+
+        // Moving back, or to bytes outside the source, adds no work.
+        pf.advance(&data[..]);
+        let elsewhere = vec![0u8; 4096];
+        pf.advance(&elsewhere);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(pf.touched_bytes(), len - (16 << 20));
+        drop(pf); // joins the readers
     }
 
     #[test]

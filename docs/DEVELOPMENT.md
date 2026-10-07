@@ -195,9 +195,12 @@ Rules that follow from measured regressions:
   through two reused pinned host buffers, in chunks of at most 64 MB, and uploads on a
   separate stream, so one chunk's fill overlaps the previous chunk's copy and tensor
   N+1's copy overlaps tensor N's dequant kernel. Chunks of 8 MB or more are filled by
-  several threads (`REFLEX_LOAD_THREADS`, default min(cores, 8)) with a
-  `MADV_WILLNEED` readahead hint ahead of them (`REFLEX_LOAD_READAHEAD=0` disables it);
-  one fill thread was the bottleneck on large models, and small models never use more.
+  several threads (`REFLEX_LOAD_THREADS`, default min(cores, 8)), while prefetch
+  reader threads (`REFLEX_LOAD_READERS`, default 16, 0 disables them) fault the file's
+  pages in up to 1 GB ahead without copying. Cold loads need many reads in flight;
+  warm loads need few copy threads, since extra ones compete with the H2D copy for
+  memory bandwidth. One fill thread was the bottleneck on large models, and small
+  models never start either kind of thread.
   Tensors with no dequant kernel (`F32` norms) take the same slots plus an async
   device-to-device copy; a `htod_sync_copy` there synchronizes the compute stream and
   drains the pipeline at every norm. Replacing it with a blocking copy per tensor,

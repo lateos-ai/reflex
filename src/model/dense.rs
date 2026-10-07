@@ -289,6 +289,7 @@ impl Model {
             .ok_or_else(|| ReflexError::Other("missing moe_scatter_add_kernel".to_string()))?;
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
+        pipeline.prefetch_from(file);
         if profile_on {
             pipeline.profile = Some(LoadProfile::default());
         }
@@ -583,13 +584,14 @@ impl Model {
             let (h2d_gpu_ms, dequant_gpu_ms) = p.gpu_ms();
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
-                "REFLEX_LOAD_PROFILE quant_resident={} modules_ms={modules_ms:.2} weights_enqueue_ms={weights_enqueue_ms:.2}                  pinned_wait_ms={:.2} pinned_fill_ms={:.2} fill_threads={} fill_gbps={:.2} readahead_ms={:.2} staging_grow_ms={:.2} out_alloc_ms={:.2} launch_ms={:.2}                  h2d_gpu_ms={h2d_gpu_ms:.2} dequant_gpu_ms={dequant_gpu_ms:.2} token_embd_ms={token_embd_ms:.2}                  init_join_wait_ms={init_join_wait_ms:.2} drain_ms={drain_ms:.2} tensors_f32={} tensors_quant={} tensors_host={}                  h2d_mb={:.1} f32_mb={:.1}",
+                "REFLEX_LOAD_PROFILE quant_resident={} modules_ms={modules_ms:.2} weights_enqueue_ms={weights_enqueue_ms:.2}                  pinned_wait_ms={:.2} pinned_fill_ms={:.2} fill_threads={} fill_gbps={:.2} readers={} prefetched_mb={:.1} staging_grow_ms={:.2} out_alloc_ms={:.2} launch_ms={:.2}                  h2d_gpu_ms={h2d_gpu_ms:.2} dequant_gpu_ms={dequant_gpu_ms:.2} token_embd_ms={token_embd_ms:.2}                  init_join_wait_ms={init_join_wait_ms:.2} drain_ms={drain_ms:.2} tensors_f32={} tensors_quant={} tensors_host={}                  h2d_mb={:.1} f32_mb={:.1}",
                 arena.is_some(),
                 ms(p.pinned_wait),
                 ms(p.pinned_fill),
                 pipeline.fill_threads(),
                 p.fill_bytes as f64 / 1e9 / p.pinned_fill.as_secs_f64().max(1e-9),
-                ms(p.readahead),
+                pipeline.reader_threads(),
+                p.prefetched_bytes as f64 / 1e6,
                 ms(p.staging_grow),
                 ms(p.out_alloc),
                 ms(p.launch),
