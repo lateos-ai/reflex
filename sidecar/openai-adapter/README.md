@@ -175,25 +175,28 @@ and scores every label as a continuation of it; nothing is generated.
 curl http://127.0.0.1:8000/v1/classify \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "Review: The battery died after two days.\nSentiment:",
+    "prompt": "Review: The battery died after two days. Sentiment:",
     "labels": [" positive", " negative"]
   }'
 ```
 
+Real response (Tesla T4, `Qwen3-0.6B-Q4_K_M`; ~10 ms per request once warm):
+
 ```json
 {
-  "id": "classify-reflex-3", "object": "classification", "created": 1791400000,
+  "id": "classify-reflex-0", "object": "classification", "created": 1791412558,
   "model": "Qwen3-0.6B-Q4_K_M",
   "label": " negative", "label_index": 1,
   "labels": [
-    {"label": " positive", "probability": 0.04, "score": -3.9, "tokens": 1},
-    {"label": " negative", "probability": 0.96, "score": -0.7, "tokens": 1}
+    {"label": " positive", "probability": 0.08692727, "score": 15.241831, "tokens": 1},
+    {"label": " negative", "probability": 0.9130727, "score": 17.593575, "tokens": 1}
   ],
-  "entropy": 0.17
+  "entropy": 0.42612946
 }
 ```
 
-(Values illustrative.) Request fields:
+The probabilities are identical to `reflex system1` on the same prompt and labels.
+Request fields:
 
 - `prompt` (string, used exactly as given) **or** `messages` (chat messages, rendered
   like `/v1/chat/completions` renders them, with the assistant turn opened, so the
@@ -207,10 +210,26 @@ curl http://127.0.0.1:8000/v1/classify \
 - `model` (optional): echoed back, as on the chat endpoint.
 
 `probability` is relative to this label set only (it sums to 1 over `labels`), not a
-probability over the vocabulary; `score` is the engine's raw input to that softmax.
-`label` is the most probable label (the first one on a tie), `entropy` is in nats.
-The same request limits apply: the prompt plus its longest label counts against
-`--max-prompt-bytes`, and the queue-depth and timeout limits work as for chat.
+probability over the vocabulary. `score` is the engine's input to that softmax: the sum
+of the label's raw token logits, not a log-probability. `label` is the most probable
+label (the first one on a tie), and `entropy` is in bits (0 is certain,
+`log2(labels.len())` is uniform). The same request limits apply: the prompt plus its
+longest label counts against `--max-prompt-bytes`, and the queue-depth and timeout
+limits work as for chat.
+
+**Choosing labels and prompts:**
+
+- **Use labels of equal token length, ideally one token each.** Because `score` sums raw
+  logits, a longer label scores higher for its length alone. On the T4, `" urgent and
+  critical"` (3 tokens) beat `" routine"` (1 token) with probability 1.0 for that reason.
+  When the labels' token counts differ, the response carries a `warning` saying so;
+  each label's `tokens` shows its count.
+- **Prefer `prompt` with reasoning models.** With `messages`, labels are scored at the
+  start of the assistant's reply. Models that open every reply with a thinking block
+  (Qwen3 emits `<think>` there) don't expect a label at that position, so the scores
+  mean little: Qwen3-0.6B rated "The battery died after two days." `positive` at 0.89
+  through `messages`, and `" negative"` at 0.91 through a plain `prompt`. End a `prompt`
+  where the label naturally follows (`... Sentiment:`).
 
 ## Known limitations
 

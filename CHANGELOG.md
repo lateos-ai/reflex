@@ -9,7 +9,10 @@ What has been built, in order. Measurements live in
   HTTP. A request names a `prompt` (or chat `messages`) and up to 64 `labels`; the engine
   runs one prefill, scores each label as a continuation, and the response carries each
   label's probability within the set, the most probable label and the entropy. Nothing
-  is generated. Not an OpenAI endpoint (OpenAI has no classification API). The Runpod
+  is generated. On a T4 with Qwen3-0.6B a warm request takes ~10 ms and returns exactly
+  the probabilities `reflex system1` gives. A label's score sums raw token logits, so
+  labels of different token lengths aren't comparable: the response carries a `warning`
+  when they differ. Not an OpenAI endpoint (OpenAI has no classification API). The Runpod
   Hub worker sends any job whose input has `labels` to it, and `tests.json` gains a
   classification smoke test.
 - **Kolibri-1 support** (Aleph Alpha's 78B MoE, 3.46B active, 384 experts, top-6,

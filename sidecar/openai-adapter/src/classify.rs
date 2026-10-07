@@ -11,7 +11,8 @@
 //!
 //! Labels are scored as literal continuations of the prompt text, so they usually
 //! want a leading space (`" urgent"`, not `"urgent"`) after a prompt that ends in a
-//! word or a colon.
+//! word or a colon. A label's score sums raw logits over its tokens, so labels of
+//! different token lengths aren't comparable; the response says so in `warning`.
 
 use crate::openai::RawMessage;
 use serde::{Deserialize, Serialize};
@@ -102,8 +103,10 @@ pub struct LabelScore {
     pub label: String,
     /// Probability within this request's label set (sums to 1 over `labels`).
     pub probability: f32,
-    /// The engine's raw score for this label, the input to the softmax. Comparable
-    /// only within one request.
+    /// The engine's raw score for this label, the input to the softmax: the sum of
+    /// its tokens' raw logits, not a log-probability. Comparable only within one
+    /// request, and only between labels with the same `tokens` (see
+    /// [`ClassifyResponse::warning`]).
     pub score: f32,
     /// How many tokens the label took as a continuation of this prompt.
     pub tokens: usize,
@@ -120,9 +123,27 @@ pub struct ClassifyResponse {
     pub label_index: usize,
     /// Every label, in request order.
     pub labels: Vec<LabelScore>,
-    /// Entropy of `labels`' probabilities, in nats: 0 is certain, `ln(labels.len())`
-    /// is uniform.
+    /// Entropy of `labels`' probabilities, in bits: 0 is certain,
+    /// `log2(labels.len())` is uniform.
     pub entropy: f32,
+    /// Set when the labels tokenized to different lengths. A label's score sums
+    /// raw logits over its tokens, so a longer label tends to score higher for its
+    /// length alone and the probabilities are not a fair comparison.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// [`ClassifyResponse::warning`]'s text, when the labels' token counts differ.
+fn length_warning(labels: &[LabelScore]) -> Option<String> {
+    let min = labels.iter().map(|l| l.tokens).min()?;
+    let max = labels.iter().map(|l| l.tokens).max()?;
+    (min != max).then(|| {
+        format!(
+            "labels tokenized to between {min} and {max} tokens; scores sum raw logits per \
+             token, so longer labels are favored. Use labels of equal token length \
+             (single-token labels are best) for comparable probabilities"
+        )
+    })
 }
 
 /// Builds the response from the engine's successful `final` event, or an error
@@ -166,6 +187,7 @@ pub fn build_response(
         label: labels[label_index].label.clone(),
         label_index,
         entropy: v.get("entropy").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        warning: length_warning(&labels),
         labels,
     })
 }
@@ -244,6 +266,8 @@ mod tests {
         assert_eq!(r.labels[1].tokens, 2);
         assert_eq!(r.entropy, 0.5);
         assert_eq!(r.object, "classification");
+        // 1 token vs 2: the probabilities favor the longer label by construction.
+        assert!(r.warning.unwrap().contains("between 1 and 2 tokens"));
     }
 
     #[test]
@@ -254,6 +278,9 @@ mod tests {
         ]});
         let r = build_response(&engine, "c".into(), 0, "m".into()).unwrap();
         assert_eq!(r.label_index, 0);
+        assert_eq!(r.warning, None, "equal token lengths need no warning");
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.get("warning").is_none(), "omitted when unset: {json}");
     }
 
     #[test]
