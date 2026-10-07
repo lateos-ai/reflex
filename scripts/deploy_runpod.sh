@@ -22,9 +22,11 @@
 #     "create, then pin the SKU with a control-plane call" sequence the README
 #     documents. With a single-arch cubin (REFLEX_CUDA_ARCH=sm_86), skipping this
 #     makes the endpoint fail nondeterministically depending on which card a
-#     worker lands on. The image now defaults to a multi-arch fatbin that also runs
-#     natively on the Ada cards, but the pin stays until that is confirmed on a real
-#     Ada worker.
+#     worker lands on. The image now defaults to a multi-arch fatbin that runs
+#     natively on the Ada cards too (verified on a real Runpod Ada worker,
+#     2026-10-02), so the pin is no longer needed for correctness. It stays the
+#     default because benchmarks need one fixed SKU; set REFLEX_GPU_TYPE_ID to
+#     another card, or drop the pin by hand, for a non-benchmark deployment.
 #   * Health check is `/ping` (the adapter serves it as an alias of /healthz),
 #     because Runpod's gateway polls the hardcoded `/ping` regardless of the
 #     documented HEALTH_CHECK_PATH override.

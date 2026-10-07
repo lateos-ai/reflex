@@ -78,8 +78,8 @@ When creating the Serverless endpoint in Runpod's console/API:
 - **Environment variables**: `GGUF_PATH` (path to the model file inside the container — see
   below; this deployment bakes it in rather than using a volume), `PORT` (only if not using the
   default `80`).
-- **Pin the GPU SKU** — see the architecture warning below. Do not leave the endpoint free to
-  pick any SKU in its pool.
+- **Pin the GPU SKU if the image is single-arch** — see the architecture warning below. The
+  default multi-arch fatbin image runs on every card in the pool, so a pin is optional with it.
 
 ## GPU selection: pin the SKU, don't trust the pool name
 
@@ -93,6 +93,11 @@ assumed: the cheapest serverless pool, **`AMPERE_16` at $0.58/hr**, is
 | RTX A4000 | 16GB | Ampere | `sm_86` | LOW |
 | RTX 4000 Ada | 20GB | Ada | `sm_89` | LOW |
 | RTX 2000 Ada | 16GB | Ada | `sm_89` | LOW |
+
+**With the default multi-arch fatbin image, this no longer matters for correctness**: it has
+native code for both `sm_86` and `sm_89`, and was verified on 2026-10-02 serving on a real
+Runpod RTX A4500 (`sm_86`) and an L4 (Ada, `sm_89`). The rest of this section applies to a
+single-arch build (`REFLEX_CUDA_ARCH=sm_86`), and to benchmarks, which want one fixed SKU anyway.
 
 An `sm_86`-pinned cubin **will not run** on the two Ada cards. An endpoint left free to
 schedule anywhere in this pool therefore fails nondeterministically depending on which SKU a
