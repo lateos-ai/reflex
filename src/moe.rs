@@ -97,6 +97,76 @@ pub fn route_top_k_with_norm(
     Ok(top.iter().map(|&i| (i, probs[i] / top_sum)).collect())
 }
 
+/// Kolibri-1's router (llama.cpp's `SIGMOID_LOGIT_ADD` gating, from the
+/// community `kolibri1` patch; the official vLLM plugin agrees): select the
+/// top-`k` experts on the *biased raw logits* `logits[i] + bias[i]`, then
+/// weight each selected expert by the *unbiased* `sigmoid(logits[i])`,
+/// optionally renormalized to sum to 1 (`expert_weights_norm`; real
+/// Kolibri-1 leaves it off). Returns `k` `(expert_index, weight)` pairs in
+/// selection order (biased logit descending, ties by ascending index).
+///
+/// Not DeepSeek-V3's rule, which selects on `sigmoid(logits) + bias`: since
+/// sigmoid is nonlinear, adding the bias before or after it ranks experts
+/// differently whenever the bias is nonzero (see the tests).
+pub fn route_sigmoid_logit_add(
+    logits: &[f32],
+    bias: &[f32],
+    k: usize,
+    normalize: bool,
+) -> Result<Vec<(usize, f32)>, ReflexError> {
+    if logits.is_empty() || logits.len() != bias.len() {
+        return Err(crate::reflex_err!(
+            Other,
+            "route_sigmoid_logit_add: {} logits vs {} bias entries (must be equal and nonzero)",
+            logits.len(),
+            bias.len()
+        ));
+    }
+    if k == 0 || k > logits.len() {
+        return Err(crate::reflex_err!(
+            Other,
+            "route_sigmoid_logit_add: k ({k}) must be in 1..={} (logits.len())",
+            logits.len()
+        ));
+    }
+    if let Some(bad) = logits
+        .iter()
+        .zip(bias)
+        .position(|(l, b)| !(l + b).is_finite())
+    {
+        return Err(crate::reflex_err!(
+            Other,
+            "route_sigmoid_logit_add: biased logit of expert {bad} is not finite"
+        ));
+    }
+
+    let biased: Vec<f32> = logits.iter().zip(bias).map(|(l, b)| l + b).collect();
+    let mut order: Vec<usize> = (0..biased.len()).collect();
+    order.sort_unstable_by(|&a, &b| {
+        biased[b]
+            .partial_cmp(&biased[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let mut routed: Vec<(usize, f32)> = order[..k]
+        .iter()
+        .map(|&i| (i, 1.0 / (1.0 + (-logits[i]).exp())))
+        .collect();
+
+    if normalize {
+        // llama.cpp clamps the sum the same way (`build_moe_ffn`'s norm_w).
+        let sum: f32 = routed
+            .iter()
+            .map(|&(_, w)| w)
+            .sum::<f32>()
+            .max(2f32.powi(-14));
+        for (_, w) in &mut routed {
+            *w /= sum;
+        }
+    }
+    Ok(routed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +228,68 @@ mod tests {
     #[test]
     fn test_route_top_k_errs_on_all_negative_infinity_logits() {
         assert!(route_top_k(&[f32::NEG_INFINITY, f32::NEG_INFINITY], 1).is_err());
+    }
+
+    fn sigmoid(x: f32) -> f32 {
+        1.0 / (1.0 + (-x).exp())
+    }
+
+    #[test]
+    fn sigmoid_logit_add_selects_on_biased_logits_and_weights_by_unbiased_sigmoid() {
+        let logits = [0.5f32, -1.0, 2.0, 0.0];
+        let bias = [0.0f32, 3.0, 0.0, 0.25];
+        // Biased: [0.5, 2.0, 2.0, 0.25] -> experts 1 and 2 tie, 1 wins on index.
+        let routed = route_sigmoid_logit_add(&logits, &bias, 3, false).unwrap();
+        assert_eq!(
+            routed.iter().map(|&(i, _)| i).collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
+        for &(i, w) in &routed {
+            assert_eq!(
+                w,
+                sigmoid(logits[i]),
+                "expert {i} must be weighted by the unbiased sigmoid"
+            );
+        }
+    }
+
+    /// The bug this router exists to avoid: DeepSeek-V3 selects on
+    /// `sigmoid(logits) + bias`, which picks a different expert here.
+    #[test]
+    fn sigmoid_logit_add_differs_from_deepseek_v3_selection() {
+        let logits = [4.0f32, 0.0];
+        let bias = [0.0f32, 0.6];
+        // Kolibri: 4.0 vs 0.6 -> expert 0.
+        let kolibri = route_sigmoid_logit_add(&logits, &bias, 1, false).unwrap();
+        assert_eq!(kolibri[0].0, 0);
+        // DeepSeek-V3: sigmoid(4) + 0 = 0.982 vs sigmoid(0) + 0.6 = 1.1 -> expert 1.
+        let v3_scores: Vec<f32> = logits
+            .iter()
+            .zip(&bias)
+            .map(|(l, b)| sigmoid(*l) + b)
+            .collect();
+        assert!(v3_scores[1] > v3_scores[0]);
+    }
+
+    #[test]
+    fn sigmoid_logit_add_normalizes_only_when_asked() {
+        let logits = [1.0f32, 2.0, -3.0];
+        let bias = [0.0f32; 3];
+        let raw = route_sigmoid_logit_add(&logits, &bias, 2, false).unwrap();
+        let raw_sum: f32 = raw.iter().map(|&(_, w)| w).sum();
+        assert!((raw_sum - (sigmoid(2.0) + sigmoid(1.0))).abs() < 1e-6);
+        let normed = route_sigmoid_logit_add(&logits, &bias, 2, true).unwrap();
+        let sum: f32 = normed.iter().map(|&(_, w)| w).sum();
+        assert!((sum - 1.0).abs() < 1e-6);
+        assert_eq!(normed[0].0, raw[0].0);
+    }
+
+    #[test]
+    fn sigmoid_logit_add_rejects_bad_inputs() {
+        assert!(route_sigmoid_logit_add(&[], &[], 1, false).is_err());
+        assert!(route_sigmoid_logit_add(&[1.0, 2.0], &[0.0], 1, false).is_err());
+        assert!(route_sigmoid_logit_add(&[1.0, 2.0], &[0.0, 0.0], 0, false).is_err());
+        assert!(route_sigmoid_logit_add(&[1.0, 2.0], &[0.0, 0.0], 3, false).is_err());
+        assert!(route_sigmoid_logit_add(&[f32::NAN, 2.0], &[0.0, 0.0], 1, false).is_err());
     }
 }

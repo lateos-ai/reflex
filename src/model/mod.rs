@@ -61,7 +61,7 @@ use crate::dequant;
 use crate::diagnostics;
 use crate::gguf::{GgmlType, GgufFile, GgufValue};
 use crate::lora;
-use crate::moe::{route_top_k, route_top_k_with_norm};
+use crate::moe::{route_sigmoid_logit_add, route_top_k, route_top_k_with_norm};
 use crate::sampling::SamplingParams;
 use crate::tokenizer::Tokenizer;
 use cudarc::cublas::sys as cublas_sys;
@@ -100,6 +100,10 @@ mod f16_kernel_tests;
 mod hybrid_batching_tests;
 #[cfg(test)]
 mod iq_dequant_host_vs_device_tests;
+#[cfg(test)]
+mod kolibri_config_tests;
+#[cfg(test)]
+mod kolibri_forward_tests;
 #[cfg(test)]
 mod mla_batching_tests;
 #[cfg(test)]
@@ -380,6 +384,7 @@ impl Model {
         };
         let target_dtype = self.weights_dtype;
         let q4k_dequant = self.dequant_kernels.f32.q4k.function.clone();
+        let q6k_dequant = self.dequant_kernels.f32.q6k.function.clone();
 
         let mut applied = 0usize;
         for target in &adapter.targets {
@@ -423,7 +428,7 @@ impl Model {
             // (`LoadOptions::lora_adapter`) is merged, then rounded to f16
             // once. One that is already f16 (an adapter the load wasn't told
             // about) is widened exactly, merged, and rounded again.
-            materialize_f32(&device, &q4k_dequant, weight)?;
+            materialize_f32(&device, &q4k_dequant, &q6k_dequant, weight)?;
             let data = &mut weight.data;
             if let WeightData::F16(w16) = data {
                 let widened = f16_to_f32_on_device(&device, &to_f32, w16)?;
@@ -541,6 +546,16 @@ impl Model {
             (LayerWeights::Moe(l), "ffn_gate_exps") => Some(&mut l.ffn_gate_exps),
             (LayerWeights::Moe(l), "ffn_up_exps") => Some(&mut l.ffn_up_exps),
             (LayerWeights::Moe(l), "ffn_down_exps") => Some(&mut l.ffn_down_exps),
+            (LayerWeights::Kolibri(l), "attn_q") => Some(&mut l.attn_q),
+            (LayerWeights::Kolibri(l), "attn_k") => Some(&mut l.attn_k),
+            (LayerWeights::Kolibri(l), "attn_v") => Some(&mut l.attn_v),
+            (LayerWeights::Kolibri(l), "attn_output") => Some(&mut l.attn_output),
+            (LayerWeights::Kolibri(l), "ffn_gate_exps") => Some(&mut l.ffn_gate_exps),
+            (LayerWeights::Kolibri(l), "ffn_up_exps") => Some(&mut l.ffn_up_exps),
+            (LayerWeights::Kolibri(l), "ffn_down_exps") => Some(&mut l.ffn_down_exps),
+            (LayerWeights::Kolibri(l), "ffn_gate_shexp") => Some(&mut l.ffn_gate_shexp),
+            (LayerWeights::Kolibri(l), "ffn_up_shexp") => Some(&mut l.ffn_up_shexp),
+            (LayerWeights::Kolibri(l), "ffn_down_shexp") => Some(&mut l.ffn_down_shexp),
             _ => None,
         }
     }
@@ -577,7 +592,8 @@ impl Model {
         if architecture == "deepseek2" {
             return Self::load_mla(device, file, &policy);
         }
-
+        // `kolibri1` also goes through the dense/MoE path, as its own layer
+        // variant (`LayerWeights::Kolibri`).
         Self::load_dense(device, file, &policy)
     }
 

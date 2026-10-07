@@ -161,8 +161,9 @@ wrapper in `src/model/kernels.rs` dispatches on it.
 - **LoRA merges happen in f32.** `LoadOptions::lora_adapter` loads the adapter's target
   weights as `f32`; `apply_lora` adds the delta and then rounds to f16 once.
 
-**Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense Qwen3/Llama/Mistral path only; MoE, hybrid
-and MLA print a notice and keep their normal storage). Q4_K matmul weights are uploaded
+**Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense Qwen3/Llama/Mistral path, and Kolibri-1,
+whose Q4_K and Q6_K tensors stay quantized including the stacked experts; other MoE
+models, hybrid and MLA print a notice and keep their normal storage). Q4_K matmul weights are uploaded
 as their raw GGUF blocks into one device arena and dequantized inside the matmul
 kernels (`gemv_q4k`, the fused multi-row prefill kernel), or, for longer prompts, into
 a reused device scratch buffer that cuBLAS then reads. That scratch buffer has the
@@ -190,9 +191,19 @@ Rules that follow from measured regressions:
   owned `Vec` at load (127.6 MB for Qwen3-0.6B) was the largest single part of model
   load, about 103 ms of 231 ms on a T4, mostly first-touch page faults on the new
   allocation rather than file reads.
-- **Keep the pipelined upload.** `WeightLoadPipeline` double-buffers each tensor's raw
-  bytes through pinned host memory and uploads on a separate stream, so tensor N+1's
-  copy overlaps tensor N's dequant kernel. Replacing it with a blocking copy per tensor,
+- **Keep the pipelined upload.** `WeightLoadPipeline` stages each tensor's raw bytes
+  through two reused pinned host buffers, in chunks of at most 64 MB, and uploads on a
+  separate stream, so one chunk's fill overlaps the previous chunk's copy and tensor
+  N+1's copy overlaps tensor N's dequant kernel. Chunks of 8 MB or more are filled by
+  several threads (`REFLEX_LOAD_THREADS`, default min(cores, 8)), while prefetch
+  reader threads (`REFLEX_LOAD_READERS`, default 16, 0 disables them) fault the file's
+  pages in up to 1 GB ahead without copying. Cold loads need many reads in flight;
+  warm loads need few copy threads, since extra ones compete with the H2D copy for
+  memory bandwidth. One fill thread was the bottleneck on large models, and small
+  models never start either kind of thread.
+  Tensors with no dequant kernel (`F32` norms) take the same slots plus an async
+  device-to-device copy; a `htod_sync_copy` there synchronizes the compute stream and
+  drains the pipeline at every norm. Replacing it with a blocking copy per tensor,
   or allocating the staging buffers per tensor, reintroduces a host/device race or
   serializes the pipeline. The f16 dequant kernels go through the same pipeline; only
   the output element type differs.
@@ -227,6 +238,17 @@ in `test-data/` locally:
   in the repo. Community `deepseek2` GGUFs that predate llama.cpp's MLA tensor-split
   conversion are rejected by this engine, so convert it fresh with a current
   `convert_hf_to_gguf.py`.
+- `test-data/kolibri1-tokenizer.gguf` is the metadata section of
+  `Hob-forge/Kolibri-1-GGUF`'s `Kolibri-1-Q4_K_M.gguf` (the first ~4.8 MB, read with an
+  HTTP range request) rewritten with an empty tensor table. It carries the real
+  Kolibri-1 vocab and merges for the tokenizer golden test.
+- `test-data/tiny-kolibri1.gguf` (Q4_K_M) and `tiny-kolibri1-f32.gguf` are a synthetic
+  `kolibri1` model: 6 layers (layer 4 full attention), 16 experts with top-4, a nonzero
+  router bias, a 16-token sliding window and the real Kolibri-1 tokenizer. Mainline
+  llama.cpp has no `kolibri1` support, so it was converted and quantized with llama.cpp
+  `836d571` plus the community `kolibri1-llama.cpp.patch` (see
+  [design/kolibri.md](design/kolibri.md)). Source and build scripts are archived as
+  `test-data/tiny-kolibri1-src.tar.gz`.
 - Tests that need a real model read its path from `REFLEX_TEST_GGUF`.
 
 [`scripts/gpu_nightly_tests.sh`](../scripts/gpu_nightly_tests.sh) maps each GPU test to

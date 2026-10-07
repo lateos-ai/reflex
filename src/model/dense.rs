@@ -65,9 +65,87 @@ pub(super) struct MoeLayerWeights {
     pub(super) ffn_down_exps: Weight,
 }
 
+/// One Kolibri-1 (`kolibri1`) layer: Qwen3-MoE-style attention with sandwich
+/// norms around both blocks, a `SIGMOID_LOGIT_ADD` router
+/// (`crate::moe::route_sigmoid_logit_add`), and one ungated shared expert added
+/// to the routed output before `post_ffw_norm`:
+///
+/// ```text
+/// h   = x + post_attention_norm( attn( attn_norm(x) ) )
+/// out = h + post_ffw_norm( moe( ffn_norm(h) ) + shared_expert( ffn_norm(h) ) )
+/// ```
+///
+/// Sliding layers apply RoPE and a sliding attention window; full-attention
+/// layers apply neither (NoPE). Conventions: docs/design/kolibri.md.
+pub(super) struct KolibriLayerWeights {
+    pub(super) attn_norm: Weight,
+    pub(super) attn_q: Weight,
+    pub(super) attn_k: Weight,
+    pub(super) attn_v: Weight,
+    pub(super) attn_output: Weight,
+    /// Always present in `kolibri1`; `Option` only to share
+    /// `Model::forward_attn_block`'s signature.
+    pub(super) attn_q_norm: Option<Weight>,
+    pub(super) attn_k_norm: Option<Weight>,
+    pub(super) post_attention_norm: Weight,
+    pub(super) ffn_norm: Weight,
+    pub(super) ffn_gate_inp: Weight,
+    /// `exp_probs_b.bias`, kept host-side: it is only ever added to the router
+    /// logits, which the host-side top-k already downloads.
+    pub(super) exp_probs_b: Vec<f32>,
+    pub(super) ffn_gate_exps: Weight,
+    pub(super) ffn_up_exps: Weight,
+    pub(super) ffn_down_exps: Weight,
+    pub(super) ffn_gate_shexp: Weight,
+    pub(super) ffn_up_shexp: Weight,
+    pub(super) ffn_down_shexp: Weight,
+    pub(super) post_ffw_norm: Weight,
+    /// RoPE on/off and sliding window for this layer.
+    pub(super) attn_mode: AttnMode,
+    /// `expert_weights_norm` (off in real Kolibri-1).
+    pub(super) normalize_top_k: bool,
+}
+
+/// Kolibri-1's per-layer matmul tensors (`blk.{i}.<name>.weight`): the ones
+/// `REFLEX_QUANT_RESIDENT=1` keeps as raw Q4_K/Q6_K blocks. `ffn_gate_inp`
+/// (the router) is F32 in the file and stays dequantized.
+pub(super) const KOLIBRI_MATMUL_TENSORS: [&str; 10] = [
+    "attn_q",
+    "attn_k",
+    "attn_v",
+    "attn_output",
+    "ffn_gate_exps",
+    "ffn_up_exps",
+    "ffn_down_exps",
+    "ffn_gate_shexp",
+    "ffn_up_shexp",
+    "ffn_down_shexp",
+];
+
+/// Per-layer attention variant for [`Model::forward_attn_block`]: whether Q/K
+/// get RoPE, and the sliding window (`0` = plain causal attention). Every
+/// architecture but Kolibri-1 uses [`AttnMode::STANDARD`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AttnMode {
+    pub(super) rope: bool,
+    pub(super) window: usize,
+}
+
+impl AttnMode {
+    pub(super) const STANDARD: AttnMode = AttnMode {
+        rope: true,
+        window: 0,
+    };
+}
+
+/// A per-row MoE router: one row's expert logits to its `(expert, weight)`
+/// picks. See `Model::moe_ffn_grouped`.
+pub(super) type MoeRouter<'a> = dyn Fn(&[f32]) -> Result<Vec<(usize, f32)>, ReflexError> + 'a;
+
 pub(super) enum LayerWeights {
     Dense(DenseLayerWeights),
     Moe(MoeLayerWeights),
+    Kolibri(Box<KolibriLayerWeights>),
 }
 
 impl Model {
@@ -90,8 +168,25 @@ impl Model {
         policy: &WeightPolicy,
         init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), ReflexError>>,
     ) -> Result<Self, ReflexError> {
-        let (cfg, block_count, moe) = parse_model_config(file)?;
-        let expert_used_count = moe.map(|m| m.expert_used_count);
+        let kolibri = match file
+            .metadata
+            .get("general.architecture")
+            .and_then(GgufValue::as_str)
+        {
+            Some("kolibri1") => Some(parse_kolibri_config(file)?.0),
+            _ => None,
+        };
+        let (cfg, block_count, expert_used_count) = match &kolibri {
+            Some(kc) => (
+                kc.layer.clone(),
+                kc.sliding_layers.len(),
+                Some(kc.expert_used_count),
+            ),
+            None => {
+                let (cfg, block_count, moe) = parse_model_config(file)?;
+                (cfg, block_count, moe.map(|m| m.expert_used_count))
+            }
+        };
         let profile_on = load_profile_enabled();
         let t_modules = std::time::Instant::now();
 
@@ -194,40 +289,56 @@ impl Model {
             .ok_or_else(|| ReflexError::Other("missing moe_scatter_add_kernel".to_string()))?;
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
+        pipeline.prefetch_from(file);
         if profile_on {
             pipeline.profile = Some(LoadProfile::default());
         }
 
         // Quantized-resident weights (docs/design/quantized-resident-weights.md):
-        // dense (non-MoE) layers only for now; MoE keeps f32 and says so.
+        // dense layers and Kolibri-1's layers; other MoE models keep f32 and
+        // say so.
         let quant_on = quant_resident_enabled();
-        if quant_on && expert_used_count.is_some() {
-            eprintln!("note: REFLEX_QUANT_RESIDENT=1 is not supported for MoE models yet; using f32 weights");
+        if quant_on && expert_used_count.is_some() && kolibri.is_none() {
+            eprintln!("note: REFLEX_QUANT_RESIDENT=1 is not supported for this MoE model yet; using f32 weights");
         }
-        // Layer matmuls stay quantized if Q4_K; an untied `output.weight` (the
-        // LM head) if Q6_K or Q4_K. A tied LM head is handled lazily in
-        // `Model::lm_head_resident`.
-        let quant_dense = quant_on && expert_used_count.is_none();
+        // Dense layer matmuls stay quantized if Q4_K; an untied `output.weight`
+        // (the LM head) if Q6_K or Q4_K. A tied LM head is handled lazily in
+        // `Model::lm_head_resident`. Kolibri-1 keeps every matmul tensor,
+        // stacked experts included, if Q4_K or Q6_K: its Q4_K_M file has Q6_K
+        // `attn_v`/`ffn_down_exps`/`ffn_down_shexp` in half the layers.
+        let quant_dense = quant_on && (expert_used_count.is_none() || kolibri.is_some());
+        let layer_quant_types: &[GgmlType] = if kolibri.is_some() {
+            &[GgmlType::Q4K, GgmlType::Q6K]
+        } else {
+            &[GgmlType::Q4K]
+        };
         let mut arena = if quant_dense {
+            let layer_tensors: &[&str] = if kolibri.is_some() {
+                &KOLIBRI_MATMUL_TENSORS
+            } else {
+                &[
+                    "attn_q",
+                    "attn_k",
+                    "attn_v",
+                    "attn_output",
+                    "ffn_gate",
+                    "ffn_up",
+                    "ffn_down",
+                ]
+            };
             let mut names: Vec<String> = (0..block_count)
                 .flat_map(|i| {
-                    [
-                        "attn_q",
-                        "attn_k",
-                        "attn_v",
-                        "attn_output",
-                        "ffn_gate",
-                        "ffn_up",
-                        "ffn_down",
-                    ]
-                    .map(|t| format!("blk.{i}.{t}.weight"))
+                    layer_tensors
+                        .iter()
+                        .map(move |t| format!("blk.{i}.{t}.weight"))
                 })
                 .collect();
             names.push("output.weight".to_string());
             // LoRA targets load in f32 for the merge, so they need no arena space.
             QuantArena::for_tensors(&device, file, &names, |name, ty| {
                 !policy.keep_f32.contains(name)
-                    && (ty == GgmlType::Q4K || (name == "output.weight" && ty == GgmlType::Q6K))
+                    && (layer_quant_types.contains(&ty)
+                        || (name == "output.weight" && ty == GgmlType::Q6K))
             })?
         } else {
             None
@@ -276,7 +387,7 @@ impl Model {
                     file,
                     name,
                     a,
-                    &[GgmlType::Q4K],
+                    layer_quant_types,
                 ),
                 _ => load_weight_device(&mut pipeline, &dequant_kernels, policy, file, name),
             }
@@ -294,7 +405,73 @@ impl Model {
             let attn_k_norm = load_weight_kind(&format!("blk.{i}.attn_k_norm.weight"), false).ok();
             let ffn_norm = load_weight_kind(&format!("blk.{i}.ffn_norm.weight"), false)?;
 
-            let layer = if expert_used_count.is_some() {
+            let layer = if let Some(kc) = &kolibri {
+                let bias_name = format!("blk.{i}.exp_probs_b.bias");
+                let bias_info = file
+                    .tensor_info(&bias_name)
+                    .ok_or_else(|| crate::reflex_err!(Gguf, "missing tensor '{bias_name}'"))?;
+                let exp_probs_b = dequant::dequantize(
+                    bias_info.ggml_type,
+                    file.tensor_bytes(bias_info)?,
+                    bias_info.element_count(),
+                )?;
+                if exp_probs_b.len() != kc.expert_count {
+                    return Err(crate::reflex_err!(
+                        Gguf,
+                        "{bias_name} has {} entries, expected expert_count = {}",
+                        exp_probs_b.len(),
+                        kc.expert_count
+                    ));
+                }
+                let sliding = kc.sliding_layers[i];
+                LayerWeights::Kolibri(Box::new(KolibriLayerWeights {
+                    attn_norm,
+                    attn_q,
+                    attn_k,
+                    attn_v,
+                    attn_output,
+                    attn_q_norm: Some(attn_q_norm.ok_or_else(|| {
+                        crate::reflex_err!(Gguf, "missing weight 'blk.{i}.attn_q_norm.weight'")
+                    })?),
+                    attn_k_norm: Some(attn_k_norm.ok_or_else(|| {
+                        crate::reflex_err!(Gguf, "missing weight 'blk.{i}.attn_k_norm.weight'")
+                    })?),
+                    post_attention_norm: load_weight_kind(
+                        &format!("blk.{i}.post_attention_norm.weight"),
+                        false,
+                    )?,
+                    ffn_norm,
+                    ffn_gate_inp: load_weight_kind(&format!("blk.{i}.ffn_gate_inp.weight"), false)?,
+                    exp_probs_b,
+                    ffn_gate_exps: load_weight_kind(
+                        &format!("blk.{i}.ffn_gate_exps.weight"),
+                        true,
+                    )?,
+                    ffn_up_exps: load_weight_kind(&format!("blk.{i}.ffn_up_exps.weight"), true)?,
+                    ffn_down_exps: load_weight_kind(
+                        &format!("blk.{i}.ffn_down_exps.weight"),
+                        true,
+                    )?,
+                    ffn_gate_shexp: load_weight_kind(
+                        &format!("blk.{i}.ffn_gate_shexp.weight"),
+                        true,
+                    )?,
+                    ffn_up_shexp: load_weight_kind(&format!("blk.{i}.ffn_up_shexp.weight"), true)?,
+                    ffn_down_shexp: load_weight_kind(
+                        &format!("blk.{i}.ffn_down_shexp.weight"),
+                        true,
+                    )?,
+                    post_ffw_norm: load_weight_kind(
+                        &format!("blk.{i}.post_ffw_norm.weight"),
+                        false,
+                    )?,
+                    attn_mode: AttnMode {
+                        rope: sliding,
+                        window: if sliding { kc.sliding_window } else { 0 },
+                    },
+                    normalize_top_k: kc.normalize_top_k,
+                }))
+            } else if expert_used_count.is_some() {
                 LayerWeights::Moe(MoeLayerWeights {
                     attn_norm,
                     attn_q,
@@ -387,6 +564,7 @@ impl Model {
             },
         };
 
+        pipeline.end_load();
         let t_join = std::time::Instant::now();
         let (tokenizer, cublas) = init.join().map_err(|_| {
             ReflexError::Other("background load-init thread panicked".to_string())
@@ -406,15 +584,20 @@ impl Model {
             let (h2d_gpu_ms, dequant_gpu_ms) = p.gpu_ms();
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
-                "REFLEX_LOAD_PROFILE quant_resident={} modules_ms={modules_ms:.2} weights_enqueue_ms={weights_enqueue_ms:.2}                  pinned_wait_ms={:.2} pinned_fill_ms={:.2} staging_grow_ms={:.2} out_alloc_ms={:.2} launch_ms={:.2}                  h2d_gpu_ms={h2d_gpu_ms:.2} dequant_gpu_ms={dequant_gpu_ms:.2} token_embd_ms={token_embd_ms:.2}                  init_join_wait_ms={init_join_wait_ms:.2} drain_ms={drain_ms:.2} tensors_f32={} tensors_quant={}                  h2d_mb={:.1} f32_mb={:.1}",
+                "REFLEX_LOAD_PROFILE quant_resident={} modules_ms={modules_ms:.2} weights_enqueue_ms={weights_enqueue_ms:.2}                  pinned_wait_ms={:.2} pinned_fill_ms={:.2} fill_threads={} fill_gbps={:.2} readers={} prefetched_mb={:.1} staging_grow_ms={:.2} out_alloc_ms={:.2} launch_ms={:.2}                  h2d_gpu_ms={h2d_gpu_ms:.2} dequant_gpu_ms={dequant_gpu_ms:.2} token_embd_ms={token_embd_ms:.2}                  init_join_wait_ms={init_join_wait_ms:.2} drain_ms={drain_ms:.2} tensors_f32={} tensors_quant={} tensors_host={}                  h2d_mb={:.1} f32_mb={:.1}",
                 arena.is_some(),
                 ms(p.pinned_wait),
                 ms(p.pinned_fill),
+                pipeline.fill_threads(),
+                p.fill_bytes as f64 / 1e9 / p.pinned_fill.as_secs_f64().max(1e-9),
+                pipeline.reader_threads(),
+                p.prefetched_bytes as f64 / 1e6,
                 ms(p.staging_grow),
                 ms(p.out_alloc),
                 ms(p.launch),
                 p.tensors_f32,
                 p.tensors_quant,
+                p.tensors_host,
                 p.h2d_bytes as f64 / 1e6,
                 p.f32_bytes as f64 / 1e6,
             );
@@ -475,7 +658,9 @@ impl Model {
     /// `forward_layer_moe`). Takes ownership of `hidden` and mutates it
     /// in place for the final residual add, returning it back to the
     /// caller -- the whole block stays device-resident end to end (Phase 2
-    /// round 2), no host round-trip.
+    /// round 2), no host round-trip. `mode` turns RoPE off and/or sets a
+    /// sliding window (Kolibri-1); `post_norm`, when given, is applied to the
+    /// O-proj output before the residual add (Kolibri-1's sandwich norm).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_attn_block(
         &self,
@@ -486,6 +671,8 @@ impl Model {
         attn_output: &Weight,
         attn_q_norm: &Option<Weight>,
         attn_k_norm: &Option<Weight>,
+        mode: AttnMode,
+        post_norm: Option<&Weight>,
         mut hidden: CudaSlice<f32>,
         position: usize,
         k_cache: &mut CudaSlice<f32>,
@@ -523,24 +710,26 @@ impl Model {
             )?;
         }
 
-        self.rope(
-            &mut q,
-            cfg.num_q_heads,
-            cfg.head_dim,
-            cfg.rotary_dim,
-            position,
-            cfg.rope_base,
-            cfg.rope_type,
-        )?;
-        self.rope(
-            &mut k,
-            cfg.num_kv_heads,
-            cfg.head_dim,
-            cfg.rotary_dim,
-            position,
-            cfg.rope_base,
-            cfg.rope_type,
-        )?;
+        if mode.rope {
+            self.rope(
+                &mut q,
+                cfg.num_q_heads,
+                cfg.head_dim,
+                cfg.rotary_dim,
+                position,
+                cfg.rope_base,
+                cfg.rope_type,
+            )?;
+            self.rope(
+                &mut k,
+                cfg.num_kv_heads,
+                cfg.head_dim,
+                cfg.rotary_dim,
+                position,
+                cfg.rope_base,
+                cfg.rope_type,
+            )?;
+        }
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
         let offset = position * kv_stride;
@@ -568,8 +757,12 @@ impl Model {
             cfg.num_kv_heads,
             cfg.head_dim,
             seq_len,
+            mode.window,
         )?;
-        let o_proj = self.gemv(&attn_out, attn_output)?;
+        let mut o_proj = self.gemv(&attn_out, attn_output)?;
+        if let Some(w) = post_norm {
+            o_proj = self.rmsnorm(&o_proj, w.f32()?, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        }
         self.add_inplace(&mut hidden, &o_proj)?;
         Ok(hidden)
     }
@@ -590,6 +783,8 @@ impl Model {
             &layer.attn_output,
             &layer.attn_q_norm,
             &layer.attn_k_norm,
+            AttnMode::STANDARD,
+            None,
             hidden,
             position,
             k_cache,
@@ -641,6 +836,8 @@ impl Model {
             &layer.attn_output,
             &layer.attn_q_norm,
             &layer.attn_k_norm,
+            AttnMode::STANDARD,
+            None,
             hidden,
             position,
             k_cache,
@@ -672,29 +869,188 @@ impl Model {
             .device
             .alloc_zeros::<f32>(cfg.hidden_size)
             .map_err(|e| crate::gpu_err!(e, "moe ffn_out alloc: {e}"))?;
+        self.moe_ffn_routed(
+            &ffn_normed,
+            &routed,
+            &layer.ffn_gate_exps,
+            &layer.ffn_up_exps,
+            &layer.ffn_down_exps,
+            &mut ffn_out_dev,
+        )?;
+
+        self.add_inplace(&mut post_attn, &ffn_out_dev)?;
+        Ok(post_attn)
+    }
+
+    /// Single-token routed-expert FFN: for each `(expert, weight)` in `routed`,
+    /// runs that expert's SwiGLU on `ffn_normed` (`Self::gemv_expert`) and
+    /// adds `weight *` its output into `ffn_out` on the device
+    /// (`Self::moe_scatter_add` with a one-row group). The router itself is the
+    /// caller's (softmax top-k for Qwen3-MoE, `SIGMOID_LOGIT_ADD` for
+    /// Kolibri-1).
+    pub(super) fn moe_ffn_routed(
+        &self,
+        ffn_normed: &CudaSlice<f32>,
+        routed: &[(usize, f32)],
+        ffn_gate_exps: &Weight,
+        ffn_up_exps: &Weight,
+        ffn_down_exps: &Weight,
+        ffn_out: &mut CudaSlice<f32>,
+    ) -> Result<(), ReflexError> {
+        let hidden_size = ffn_normed.len();
+        let ffn_hidden_size = ffn_gate_exps.shape[1] as usize;
         let dest_row0 = self
             .device
             .htod_sync_copy(&[0u32])
             .map_err(|e| crate::gpu_err!(e, "moe dest_row htod: {e}"))?;
-        for (expert_idx, weight) in routed {
-            let gate = self.gemv_expert(&ffn_normed, &layer.ffn_gate_exps, expert_idx)?;
-            let up = self.gemv_expert(&ffn_normed, &layer.ffn_up_exps, expert_idx)?;
-            let activated = self.silu_and_mul(&gate, &up, cfg.ffn_hidden_size)?;
-            let down = self.gemv_expert(&activated, &layer.ffn_down_exps, expert_idx)?;
+        for &(expert_idx, weight) in routed {
+            let gate = self.expert_gemv(ffn_normed, ffn_gate_exps, expert_idx)?;
+            let up = self.expert_gemv(ffn_normed, ffn_up_exps, expert_idx)?;
+            let activated = self.silu_and_mul(&gate, &up, ffn_hidden_size)?;
+            let down = self.expert_gemv(&activated, ffn_down_exps, expert_idx)?;
             let weight_dev = self
                 .device
                 .htod_sync_copy(&[weight])
                 .map_err(|e| crate::gpu_err!(e, "moe weight htod: {e}"))?;
-            self.moe_scatter_add(
-                &down,
-                &dest_row0,
-                &weight_dev,
-                &mut ffn_out_dev,
-                cfg.hidden_size,
-            )?;
+            self.moe_scatter_add(&down, &dest_row0, &weight_dev, ffn_out, hidden_size)?;
         }
+        Ok(())
+    }
 
-        self.add_inplace(&mut post_attn, &ffn_out_dev)?;
+    /// One-row [`Self::gemv_expert`] for any storage of a stacked per-expert
+    /// tensor: a quantized-resident one goes through [`Self::gemv`] on that
+    /// expert's slice ([`Self::quant_expert_weight`]).
+    pub(super) fn expert_gemv(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+        expert_idx: usize,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        match Self::quant_expert_weight(w, expert_idx)? {
+            Some(ew) => self.gemv(x, &ew),
+            None => self.gemv_expert(x, w, expert_idx),
+        }
+    }
+
+    /// `x[rows, in_features] @ w[expert_idx]^T` for one expert group of
+    /// batched prefill: a quantized-resident tensor goes through
+    /// [`Self::gemm`] on that expert's slice, an f32/f16 one through
+    /// [`Self::gemm_view`] on its zero-copy view (cuBLAS even for a one-row
+    /// group, as before quantized experts existed).
+    pub(super) fn expert_gemm(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+        expert_idx: usize,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        if let Some(ew) = Self::quant_expert_weight(w, expert_idx)? {
+            return self.gemm(x, &ew, rows);
+        }
+        let (view, in_features, out_features) = Self::expert_weight_view(w, expert_idx)?;
+        self.gemm_view(x, &view, in_features, out_features, rows)
+    }
+
+    /// One `REFLEX_EXPERT_TRACE` line (see [`expert_trace_enabled`]).
+    /// `router_logits` holds `rows` rows of `bias.len()` logits. Besides the
+    /// picks, prints each row's margin between the `k`-th and `(k+1)`-th
+    /// biased logit: a margin near zero is a routing near-tie, where another
+    /// implementation's rounding can pick a different expert.
+    fn print_expert_trace(router_logits: &[f32], bias: &[f32], k: usize, normalize: bool) {
+        let mut experts = Vec::new();
+        let mut margins = Vec::new();
+        for row in router_logits.chunks(bias.len()) {
+            if let Ok(routed) = route_sigmoid_logit_add(row, bias, k, normalize) {
+                experts.extend(routed.iter().map(|&(e, _)| e.to_string()));
+            }
+            let mut biased: Vec<f32> = row.iter().zip(bias).map(|(l, b)| l + b).collect();
+            biased.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            margins.push(match biased.get(k) {
+                Some(next) => format!("{:.4}", biased[k - 1] - next),
+                None => "inf".to_string(),
+            });
+        }
+        eprintln!(
+            "REFLEX_EXPERT_TRACE rows={} experts={} topk_margin={}",
+            router_logits.len() / bias.len(),
+            experts.join(","),
+            margins.join(",")
+        );
+    }
+
+    /// Kolibri-1 decode step for one layer; see [`KolibriLayerWeights`] for the
+    /// data flow. The shared expert seeds the FFN accumulator, the routed
+    /// experts add onto it, and `post_ffw_norm` is applied to the sum before
+    /// the residual add.
+    pub(super) fn forward_layer_kolibri(
+        &self,
+        layer: &KolibriLayerWeights,
+        hidden: CudaSlice<f32>,
+        position: usize,
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let mut post_attn = self.forward_attn_block(
+            &layer.attn_norm,
+            &layer.attn_q,
+            &layer.attn_k,
+            &layer.attn_v,
+            &layer.attn_output,
+            &layer.attn_q_norm,
+            &layer.attn_k_norm,
+            layer.attn_mode,
+            Some(&layer.post_attention_norm),
+            hidden,
+            position,
+            k_cache,
+            v_cache,
+        )?;
+
+        let cfg = &self.cfg;
+        let ffn_normed = self.rmsnorm(
+            &post_attn,
+            layer.ffn_norm.f32()?,
+            1,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
+
+        let shared_hidden_size = layer.ffn_gate_shexp.shape[1] as usize;
+        let shared_gate = self.gemv(&ffn_normed, &layer.ffn_gate_shexp)?;
+        let shared_up = self.gemv(&ffn_normed, &layer.ffn_up_shexp)?;
+        let shared_activated = self.silu_and_mul(&shared_gate, &shared_up, shared_hidden_size)?;
+        let mut ffn_out = self.gemv(&shared_activated, &layer.ffn_down_shexp)?;
+
+        let router_logits_dev = self.gemv(&ffn_normed, &layer.ffn_gate_inp)?;
+        let router_logits = self
+            .device
+            .dtoh_sync_copy(&router_logits_dev)
+            .map_err(|e| crate::gpu_err!(e, "kolibri router dtoh: {e}"))?;
+        let k = self.expert_used_count.ok_or_else(|| {
+            ReflexError::Other("forward_layer_kolibri: no expert_used_count".to_string())
+        })?;
+        let routed =
+            route_sigmoid_logit_add(&router_logits, &layer.exp_probs_b, k, layer.normalize_top_k)?;
+        if expert_trace_enabled() {
+            Self::print_expert_trace(&router_logits, &layer.exp_probs_b, k, layer.normalize_top_k);
+        }
+        self.moe_ffn_routed(
+            &ffn_normed,
+            &routed,
+            &layer.ffn_gate_exps,
+            &layer.ffn_up_exps,
+            &layer.ffn_down_exps,
+            &mut ffn_out,
+        )?;
+
+        let ffn_out = self.rmsnorm(
+            &ffn_out,
+            layer.post_ffw_norm.f32()?,
+            1,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
+        self.add_inplace(&mut post_attn, &ffn_out)?;
         Ok(post_attn)
     }
 
@@ -711,6 +1067,9 @@ impl Model {
                 self.forward_layer_dense(l, hidden, position, k_cache, v_cache)
             }
             LayerWeights::Moe(l) => self.forward_layer_moe(l, hidden, position, k_cache, v_cache),
+            LayerWeights::Kolibri(l) => {
+                self.forward_layer_kolibri(l, hidden, position, k_cache, v_cache)
+            }
         }
     }
 
@@ -731,6 +1090,8 @@ impl Model {
         attn_output: &Weight,
         attn_q_norm: &Option<Weight>,
         attn_k_norm: &Option<Weight>,
+        mode: AttnMode,
+        post_norm: Option<&Weight>,
         mut hidden: CudaSlice<f32>,
         start_pos: usize,
         rows: usize,
@@ -769,26 +1130,28 @@ impl Model {
             )?;
         }
 
-        self.rope_batch(
-            &mut q,
-            start_pos,
-            cfg.num_q_heads,
-            cfg.head_dim,
-            cfg.rotary_dim,
-            rows,
-            cfg.rope_base,
-            cfg.rope_type,
-        )?;
-        self.rope_batch(
-            &mut k,
-            start_pos,
-            cfg.num_kv_heads,
-            cfg.head_dim,
-            cfg.rotary_dim,
-            rows,
-            cfg.rope_base,
-            cfg.rope_type,
-        )?;
+        if mode.rope {
+            self.rope_batch(
+                &mut q,
+                start_pos,
+                cfg.num_q_heads,
+                cfg.head_dim,
+                cfg.rotary_dim,
+                rows,
+                cfg.rope_base,
+                cfg.rope_type,
+            )?;
+            self.rope_batch(
+                &mut k,
+                start_pos,
+                cfg.num_kv_heads,
+                cfg.head_dim,
+                cfg.rotary_dim,
+                rows,
+                cfg.rope_base,
+                cfg.rope_type,
+            )?;
+        }
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
         let offset = start_pos * kv_stride;
@@ -818,8 +1181,12 @@ impl Model {
             cfg.head_dim,
             start_pos,
             rows,
+            mode.window,
         )?;
-        let o_proj = self.gemm(&attn_out, attn_output, rows)?;
+        let mut o_proj = self.gemm(&attn_out, attn_output, rows)?;
+        if let Some(w) = post_norm {
+            o_proj = self.rmsnorm(&o_proj, w.f32()?, rows, cfg.hidden_size, cfg.rmsnorm_eps)?;
+        }
         self.add_inplace(&mut hidden, &o_proj)?;
         Ok(hidden)
     }
@@ -846,6 +1213,8 @@ impl Model {
             &layer.attn_output,
             &layer.attn_q_norm,
             &layer.attn_k_norm,
+            AttnMode::STANDARD,
+            None,
             hidden,
             start_pos,
             rows,
@@ -873,7 +1242,7 @@ impl Model {
     /// Grouped-GEMM MoE FFN batching core, shared by [`Self::forward_layer_moe_batched`]
     /// (dense/MoE Qwen3) and [`Self::forward_mla_moe_ffn_batched`] (DeepSeek-V2/V3
     /// MLA): each of `rows` tokens routes to a different, data-dependent top-k subset
-    /// of experts (host-side `crate::moe::route_top_k`/`route_top_k_with_norm`), so
+    /// of experts (host-side `route`, one call per row's logits), so
     /// there's no single shared weight matrix to run one GEMM against like the
     /// attention block's projections. Instead this groups rows by *which expert they
     /// selected* (bounded by `expert_count`, not by `rows * k`), and for every expert
@@ -886,7 +1255,9 @@ impl Model {
     /// unlike the single-token/per-row path this replaces. `ffn_out` must already be
     /// allocated to `[rows, hidden_size]` and seeded with whatever this should
     /// accumulate on top of (zero for dense/MoE, MLA's always-on shared-expert output
-    /// for `MlaFfn::Moe`); this function only ever adds into it. `weight_scale` folds
+    /// for `MlaFfn::Moe`, Kolibri-1's shared expert); this function only ever adds into
+    /// it. `route` maps one row's `expert_count` logits to its `(expert, weight)` picks
+    /// (softmax top-k for Qwen3-MoE/MLA, `SIGMOID_LOGIT_ADD` for Kolibri-1). `weight_scale` folds
     /// in a caller-side scalar (MLA's `routed_scaling_factor`; `1.0` -- a no-op -- for
     /// dense/MoE, which has no such knob) so the scatter kernel itself stays
     /// architecture-agnostic.
@@ -898,8 +1269,7 @@ impl Model {
         hidden_size: usize,
         router_logits: &[f32],
         expert_count: usize,
-        k: usize,
-        normalize_top_k: bool,
+        route: &MoeRouter,
         weight_scale: f32,
         ffn_gate_exps: &Weight,
         ffn_up_exps: &Weight,
@@ -909,7 +1279,7 @@ impl Model {
         let mut groups: Vec<Vec<(u32, f32)>> = vec![Vec::new(); expert_count];
         for row in 0..rows {
             let row_logits = &router_logits[row * expert_count..(row + 1) * expert_count];
-            let routed = route_top_k_with_norm(row_logits, k, normalize_top_k)?;
+            let routed = route(row_logits)?;
             for (expert_idx, weight) in routed {
                 groups[expert_idx].push((row as u32, weight * weight_scale));
             }
@@ -933,21 +1303,11 @@ impl Model {
             let group_size = rows_e.len();
 
             let x_e = self.moe_gather(ffn_normed, &perm_row, hidden_size)?;
-            let (gate_w, in_features, gate_out_features) =
-                Self::expert_weight_view(ffn_gate_exps, expert_idx)?;
-            let gate = self.gemm_view(&x_e, &gate_w, in_features, gate_out_features, group_size)?;
-            let (up_w, _, up_out_features) = Self::expert_weight_view(ffn_up_exps, expert_idx)?;
-            let up = self.gemm_view(&x_e, &up_w, in_features, up_out_features, group_size)?;
+            let gate_out_features = ffn_gate_exps.shape[1] as usize;
+            let gate = self.expert_gemm(&x_e, ffn_gate_exps, expert_idx, group_size)?;
+            let up = self.expert_gemm(&x_e, ffn_up_exps, expert_idx, group_size)?;
             let activated = self.silu_and_mul(&gate, &up, group_size * gate_out_features)?;
-            let (down_w, down_in_features, down_out_features) =
-                Self::expert_weight_view(ffn_down_exps, expert_idx)?;
-            let down = self.gemm_view(
-                &activated,
-                &down_w,
-                down_in_features,
-                down_out_features,
-                group_size,
-            )?;
+            let down = self.expert_gemm(&activated, ffn_down_exps, expert_idx, group_size)?;
 
             self.moe_scatter_add(&down, &perm_row, &weight_dev, ffn_out, hidden_size)?;
         }
@@ -976,6 +1336,8 @@ impl Model {
             &layer.attn_output,
             &layer.attn_q_norm,
             &layer.attn_k_norm,
+            AttnMode::STANDARD,
+            None,
             hidden,
             start_pos,
             rows,
@@ -1013,15 +1375,98 @@ impl Model {
             cfg.hidden_size,
             &router_logits,
             num_experts,
-            k,
-            true, // Qwen3-MoE's convention: renormalize the selected top-k weights (crate::moe::route_top_k).
-            1.0,  // no routed_scaling_factor-equivalent knob for dense/MoE.
+            // Qwen3-MoE's convention: renormalize the selected top-k weights (crate::moe::route_top_k).
+            &|logits| route_top_k_with_norm(logits, k, true),
+            1.0, // no routed_scaling_factor-equivalent knob for dense/MoE.
             &layer.ffn_gate_exps,
             &layer.ffn_up_exps,
             &layer.ffn_down_exps,
             &mut ffn_out,
         )?;
 
+        self.add_inplace(&mut post_attn, &ffn_out)?;
+        Ok(post_attn)
+    }
+
+    /// Batched-prefill variant of [`Self::forward_layer_kolibri`]: the shared
+    /// expert runs as one GEMM over every row and seeds the accumulator; the
+    /// routed experts batch through [`Self::moe_ffn_grouped`] with the
+    /// `SIGMOID_LOGIT_ADD` router.
+    pub(super) fn forward_layer_kolibri_batched(
+        &self,
+        layer: &KolibriLayerWeights,
+        hidden: CudaSlice<f32>,
+        start_pos: usize,
+        rows: usize,
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let mut post_attn = self.forward_attn_block_batched(
+            &layer.attn_norm,
+            &layer.attn_q,
+            &layer.attn_k,
+            &layer.attn_v,
+            &layer.attn_output,
+            &layer.attn_q_norm,
+            &layer.attn_k_norm,
+            layer.attn_mode,
+            Some(&layer.post_attention_norm),
+            hidden,
+            start_pos,
+            rows,
+            k_cache,
+            v_cache,
+        )?;
+
+        let cfg = &self.cfg;
+        let ffn_normed = self.rmsnorm(
+            &post_attn,
+            layer.ffn_norm.f32()?,
+            rows,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
+
+        let shared_hidden_size = layer.ffn_gate_shexp.shape[1] as usize;
+        let shared_gate = self.gemm(&ffn_normed, &layer.ffn_gate_shexp, rows)?;
+        let shared_up = self.gemm(&ffn_normed, &layer.ffn_up_shexp, rows)?;
+        let shared_activated =
+            self.silu_and_mul(&shared_gate, &shared_up, rows * shared_hidden_size)?;
+        let mut ffn_out = self.gemm(&shared_activated, &layer.ffn_down_shexp, rows)?;
+
+        let router_logits_dev = self.gemm(&ffn_normed, &layer.ffn_gate_inp, rows)?;
+        let router_logits = self
+            .device
+            .dtoh_sync_copy(&router_logits_dev)
+            .map_err(|e| crate::gpu_err!(e, "kolibri router dtoh: {e}"))?;
+        let k = self.expert_used_count.ok_or_else(|| {
+            ReflexError::Other("forward_layer_kolibri_batched: no expert_used_count".to_string())
+        })?;
+        let num_experts = layer.exp_probs_b.len();
+        if expert_trace_enabled() {
+            Self::print_expert_trace(&router_logits, &layer.exp_probs_b, k, layer.normalize_top_k);
+        }
+        self.moe_ffn_grouped(
+            &ffn_normed,
+            rows,
+            cfg.hidden_size,
+            &router_logits,
+            num_experts,
+            &|logits| route_sigmoid_logit_add(logits, &layer.exp_probs_b, k, layer.normalize_top_k),
+            1.0,
+            &layer.ffn_gate_exps,
+            &layer.ffn_up_exps,
+            &layer.ffn_down_exps,
+            &mut ffn_out,
+        )?;
+
+        let ffn_out = self.rmsnorm(
+            &ffn_out,
+            layer.post_ffw_norm.f32()?,
+            rows,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
         self.add_inplace(&mut post_attn, &ffn_out)?;
         Ok(post_attn)
     }
@@ -1042,6 +1487,9 @@ impl Model {
             }
             LayerWeights::Moe(l) => {
                 self.forward_layer_moe_batched(l, hidden, start_pos, rows, k_cache, v_cache)
+            }
+            LayerWeights::Kolibri(l) => {
+                self.forward_layer_kolibri_batched(l, hidden, start_pos, rows, k_cache, v_cache)
             }
         }
     }
