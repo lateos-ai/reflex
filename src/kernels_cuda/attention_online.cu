@@ -24,8 +24,10 @@
 //   dst  num_splits == 1: the output, [rows, num_q_heads, v_dim]
 //        num_splits  > 1: partials, [rows, num_q_heads, num_splits, v_dim + 2], each
 //        holding the unnormalized acc[v_dim], then m, then l
-// Query row r attends to positions [0, start_pos + r] (causal). Query head qh reads KV
-// head qh / group_size.
+// Query row r attends to positions [0, start_pos + r] (causal), or with a sliding
+// window (window > 0) only to the last `window` of them: position j is visible from
+// query position i iff j <= i and i - j < window (llama.cpp's LLAMA_SWA_TYPE_STANDARD).
+// Query head qh reads KV head qh / group_size.
 //
 // Launch: grid (rows, num_q_heads, num_splits), block ATTN_WARPS * 32 threads, dynamic
 // shared memory (qk_dim + ATTN_WARPS * (v_dim + 2)) * sizeof(float). qk_dim and v_dim
@@ -47,6 +49,7 @@ struct AttnParams {
     unsigned int start_pos;
     unsigned int num_splits;
     unsigned int split_len;
+    unsigned int window;  // 0 = no sliding window
     float scale;
 };
 
@@ -84,9 +87,10 @@ extern "C" __global__ void attention_online_kernel(
     }
     __syncthreads();
 
-    // This block's slice of the causal window [0, seq_len).
+    // This block's slice of the causal window [lo, seq_len).
     const unsigned int seq_len = p.start_pos + row + 1;
-    const unsigned int begin = split * p.split_len;
+    const unsigned int lo = (p.window != 0 && seq_len > p.window) ? seq_len - p.window : 0;
+    const unsigned int begin = max(split * p.split_len, lo);
     const unsigned int end = min(seq_len, begin + p.split_len);
 
     float m = -INFINITY;

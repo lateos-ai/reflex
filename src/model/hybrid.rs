@@ -1055,6 +1055,7 @@ impl Model {
             cfg.num_kv_heads,
             cfg.head_dim,
             seq_len,
+            0,
         )?;
 
         {
@@ -1214,6 +1215,7 @@ impl Model {
             cfg.head_dim,
             start_pos,
             rows,
+            0,
         )?;
 
         {
@@ -1499,8 +1501,7 @@ impl Model {
             hidden_size,
             &router_logits,
             num_experts,
-            moe_cfg.expert_used_count,
-            true,
+            &|logits| route_top_k_with_norm(logits, moe_cfg.expert_used_count, true),
             moe_cfg.weights_scale,
             &w.ffn_gate_exps,
             &w.ffn_up_exps,

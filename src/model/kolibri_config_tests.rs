@@ -129,7 +129,10 @@ fn real_kolibri1() -> Header {
         (k("expert_weights_norm"), Val::Bool(false)),
     ];
     let tensors = vec![
-        ("blk.0.ffn_gate_exps.weight".to_string(), vec![2560, 512, 384]),
+        (
+            "blk.0.ffn_gate_exps.weight".to_string(),
+            vec![2560, 512, 384],
+        ),
         ("blk.0.ffn_gate_shexp.weight".to_string(), vec![2560, 512]),
     ];
     Header { kv, tensors }
@@ -159,7 +162,6 @@ fn parses_real_kolibri1_header() {
     assert_eq!(cfg.n_ff_exp, 512);
     assert_eq!(cfg.n_ff_shexp, 512);
     assert!(!cfg.normalize_top_k);
-    assert_eq!(cfg.weights_scale, 1.0);
     assert_eq!(cfg.sliding_window, 513);
     let full: Vec<usize> = (0..50).filter(|&i| !cfg.sliding_layers[i]).collect();
     assert_eq!(full, vec![4, 9, 14, 19, 24, 29, 34, 39, 44, 49]);
@@ -245,6 +247,10 @@ fn rejects_unsupported_shapes_and_scaling() {
     let mut h = real_kolibri1();
     h.set("kolibri1.attention.value_length", Val::U32(64));
     assert!(err_text(&h).contains("value_length (64)"));
+
+    let mut h = real_kolibri1();
+    h.set("kolibri1.expert_weights_scale", Val::F32(2.5));
+    assert!(err_text(&h).contains("expert_weights_scale = 2.5"));
 }
 
 /// `test-data/tiny-kolibri1.gguf`: synthetic Kolibri-1 (random weights, real
@@ -261,19 +267,29 @@ fn kolibri1_fixture_has_the_properties_it_was_built_for() {
     let (cfg, block_count) = parse_kolibri_config(&file).expect("parse_kolibri_config");
 
     assert_eq!(block_count, 6);
-    assert_eq!(cfg.sliding_layers, vec![true, true, true, true, false, true]);
-    assert_eq!(cfg.sliding_window, 16, "small window so short prompts exercise it");
+    assert_eq!(
+        cfg.sliding_layers,
+        vec![true, true, true, true, false, true]
+    );
+    assert_eq!(
+        cfg.sliding_window, 16,
+        "small window so short prompts exercise it"
+    );
     assert_eq!((cfg.expert_count, cfg.expert_used_count), (16, 4));
     assert!(!cfg.normalize_top_k);
 
     // A zero bias would make SIGMOID_LOGIT_ADD indistinguishable from
     // selecting on the raw logits.
-    let bias = file.tensor_info("blk.0.exp_probs_b.bias").expect("exp_probs_b");
+    let bias = file
+        .tensor_info("blk.0.exp_probs_b.bias")
+        .expect("exp_probs_b");
     assert_eq!(bias.ggml_type, GgmlType::F32);
     let raw = file.tensor_bytes(bias).unwrap();
     assert!(raw
-        .chunks_exact(4)
-        .any(|c| f32::from_le_bytes(c.try_into().unwrap()).abs() > 0.1));
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|c| f32::from_le_bytes(*c).abs() > 0.1));
 
     // Same Q4_K/Q6_K mix as the real Q4_K_M file.
     let ty = |name: &str| file.tensor_info(name).expect(name).ggml_type;
@@ -284,8 +300,16 @@ fn kolibri1_fixture_has_the_properties_it_was_built_for() {
     assert_eq!(ty("output.weight"), GgmlType::Q6K);
     assert_eq!(ty("token_embd.weight"), GgmlType::Q4K);
     for i in 0..block_count {
-        for t in ["post_attention_norm", "post_ffw_norm", "ffn_gate_shexp", "attn_q_norm"] {
-            assert!(file.tensor_info(&format!("blk.{i}.{t}.weight")).is_some(), "blk.{i}.{t}");
+        for t in [
+            "post_attention_norm",
+            "post_ffw_norm",
+            "ffn_gate_shexp",
+            "attn_q_norm",
+        ] {
+            assert!(
+                file.tensor_info(&format!("blk.{i}.{t}.weight")).is_some(),
+                "blk.{i}.{t}"
+            );
         }
     }
 }

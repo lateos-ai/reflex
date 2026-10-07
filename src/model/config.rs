@@ -110,7 +110,8 @@ pub fn parse_model_config(
     // would be accepted as a generic MoE model and run with the wrong router,
     // no sandwich norms and RoPE on every layer -- wrong output, no crash.
     if architecture == "kolibri1" {
-        return Err(crate::reflex_err!(UnsupportedArchitecture,
+        return Err(crate::reflex_err!(
+            UnsupportedArchitecture,
             "'kolibri1' has its own config (parse_kolibri_config), not the generic dense/MoE one"
         ));
     }
@@ -701,8 +702,6 @@ pub(super) const KOLIBRI_GATING_SIGMOID_LOGIT_ADD: u64 = 5;
 /// (routed experts plus one always-on shared expert, no dense-lead layers),
 /// with sandwich norms around both the attention and FFN blocks.
 /// Conventions and sources: `docs/design/kolibri.md`.
-// Only the tests read the fields until the forward pass lands (Phase 2).
-#[allow(dead_code)]
 pub(super) struct KolibriConfig {
     /// Attention shape, RoPE and norm settings. `rotary_dim == head_dim`
     /// (full rotation on sliding layers), `rope_type` is `Neox`, and
@@ -710,16 +709,17 @@ pub(super) struct KolibriConfig {
     pub(super) layer: LayerConfig,
     pub(super) expert_count: usize,
     pub(super) expert_used_count: usize,
-    /// Routed-expert FFN hidden size (`expert_feed_forward_length`).
+    /// Routed-expert FFN hidden size (`expert_feed_forward_length`). This and
+    /// `n_ff_shexp` are checked against the tensors here; the forward pass
+    /// reads the widths from the tensor shapes.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) n_ff_exp: usize,
     /// Shared-expert FFN hidden size (`expert_shared_feed_forward_length`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) n_ff_shexp: usize,
     /// `expert_weights_norm`, default `false` when absent (real Kolibri-1 sets
     /// it to `false`; the official plugin never renormalizes).
     pub(super) normalize_top_k: bool,
-    /// `expert_weights_scale`, `1.0` when absent or `0` (llama.cpp treats both
-    /// as no-ops).
-    pub(super) weights_scale: f32,
     /// `attention.sliding_window`: a query at position `i` sees key `j` iff
     /// `i - j < sliding_window` (llama.cpp's `LLAMA_SWA_TYPE_STANDARD`).
     pub(super) sliding_window: usize,
@@ -762,7 +762,8 @@ pub(super) fn parse_kolibri_config(file: &GgufFile) -> Result<(KolibriConfig, us
         .unwrap_or(hidden_size / num_q_heads);
     if let Some(v) = u64_meta(file, &key("attention.value_length")) {
         if v as usize != head_dim {
-            return Err(crate::reflex_err!(UnsupportedArchitecture,
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
                 "{} ({v}) != {} ({head_dim}) is not supported",
                 key("attention.value_length"),
                 key("attention.key_length")
@@ -792,7 +793,8 @@ pub(super) fn parse_kolibri_config(file: &GgufFile) -> Result<(KolibriConfig, us
     }
     let shared = required("expert_shared_count")?;
     if shared != 1 {
-        return Err(crate::reflex_err!(UnsupportedArchitecture,
+        return Err(crate::reflex_err!(
+            UnsupportedArchitecture,
             "{} = {shared} is not supported (only 1 shared expert is implemented)",
             key("expert_shared_count")
         ));
@@ -835,7 +837,8 @@ pub(super) fn parse_kolibri_config(file: &GgufFile) -> Result<(KolibriConfig, us
         .and_then(GgufValue::as_str)
     {
         if scaling != "none" {
-            return Err(crate::reflex_err!(UnsupportedArchitecture,
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
                 "{} = {scaling:?} is not supported (Kolibri-1 uses unscaled RoPE)",
                 key("rope.scaling.type")
             ));
@@ -875,16 +878,30 @@ pub(super) fn parse_kolibri_config(file: &GgufFile) -> Result<(KolibriConfig, us
                 "{pattern_key} must be a per-layer bool array, got {other:?}"
             ))
         }
-        None => return Err(crate::reflex_err!(Gguf, "missing {pattern_key} metadata key")),
+        None => {
+            return Err(crate::reflex_err!(
+                Gguf,
+                "missing {pattern_key} metadata key"
+            ))
+        }
     };
 
     let normalize_top_k = matches!(
         file.metadata.get(&key("expert_weights_norm")),
         Some(GgufValue::Bool(true))
     );
-    let weights_scale = f32_meta(file, &key("expert_weights_scale"))
-        .filter(|&s| s != 0.0)
-        .unwrap_or(1.0);
+    // The patch's graph passes a hardcoded `w_scale = 0` (no scaling) to
+    // `build_moe_ffn`, so a file that sets a real scale would mean something
+    // the reference ignores. Real Kolibri-1 doesn't set it.
+    if let Some(scale) = f32_meta(file, &key("expert_weights_scale")) {
+        if scale != 0.0 && scale != 1.0 {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "{} = {scale} is not supported (the reference implementation ignores it)",
+                key("expert_weights_scale")
+            ));
+        }
+    }
     // Only sliding layers apply RoPE, and the patch's `load_arch_hparams`
     // gives them `rope.freq_base_swa` when present (real Kolibri-1 doesn't set
     // it, so both are 10000).
@@ -911,7 +928,6 @@ pub(super) fn parse_kolibri_config(file: &GgufFile) -> Result<(KolibriConfig, us
             n_ff_exp,
             n_ff_shexp,
             normalize_top_k,
-            weights_scale,
             sliding_window,
             sliding_layers,
         },

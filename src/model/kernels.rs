@@ -53,6 +53,7 @@ struct AttnParams {
     start_pos: u32,
     num_splits: u32,
     split_len: u32,
+    window: u32,
     scale: f32,
 }
 
@@ -73,6 +74,9 @@ pub(super) struct OnlineAttnShape {
     pub(super) v_pos_stride: usize,
     pub(super) v_head_stride: usize,
     pub(super) scale: f32,
+    /// Sliding window: query position `i` sees key `j` iff `i - j < window`.
+    /// `0` = plain causal attention.
+    pub(super) window: usize,
 }
 
 /// `attention_online.cu`'s block size, in warps, and widest supported head.
@@ -143,6 +147,7 @@ impl Model {
             start_pos: s.start_pos as u32,
             num_splits: num_splits as u32,
             split_len: split_len as u32,
+            window: s.window as u32,
             scale: s.scale,
         };
         let cfg = LaunchConfig {
@@ -1281,7 +1286,9 @@ impl Model {
     /// `h / (num_q_heads / num_kv_heads)`. `q`/`k_cache`/`v_cache` are all
     /// already device-resident (Phase 2 round 2) -- `k_cache`/`v_cache` are
     /// `CudaView`s into a preallocated per-layer device buffer, not a fresh
-    /// upload of the whole cache history on every call.
+    /// upload of the whole cache history on every call. `window > 0` restricts
+    /// the query to the last `window` positions (a sliding-window layer); it is
+    /// applied by narrowing the K/V views, so neither kernel needs to know.
     // Each parameter maps 1:1 to a distinct attention-kernel launch argument;
     // bundling them into a struct would just relocate the count, not reduce it.
     #[allow(clippy::too_many_arguments)]
@@ -1294,7 +1301,17 @@ impl Model {
         num_kv_heads: usize,
         head_dim: usize,
         seq_len: usize,
+        window: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
+        let first = if window > 0 {
+            seq_len.saturating_sub(window)
+        } else {
+            0
+        };
+        let kv_stride = num_kv_heads * head_dim;
+        let k_cache = &k_cache.slice(first * kv_stride..);
+        let v_cache = &v_cache.slice(first * kv_stride..);
+        let seq_len = seq_len - first;
         if self.attn_impl == AttnImpl::Online {
             return self.attention_online(
                 q,
@@ -1312,6 +1329,7 @@ impl Model {
                     v_pos_stride: num_kv_heads * head_dim,
                     v_head_stride: head_dim,
                     scale: 1.0f32 / (head_dim as f32).sqrt(),
+                    window: 0,
                 },
             );
         }
@@ -1357,7 +1375,9 @@ impl Model {
     /// (this batch's own K/V, written by the caller before this call --
     /// `Self::forward_attn_block_batched`). `q` is row-major `[rows,
     /// num_q_heads, head_dim]`; returns row-major `[rows, num_q_heads,
-    /// head_dim]`.
+    /// head_dim]`. `window` is [`Self::attention`]'s sliding window (`0` =
+    /// none), masked per row inside the kernel since each row's window starts
+    /// at a different position.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn attention_prefill(
         &self,
@@ -1369,6 +1389,7 @@ impl Model {
         head_dim: usize,
         start_pos: usize,
         rows: usize,
+        window: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         if self.attn_impl == AttnImpl::Online {
             return self.attention_online(
@@ -1387,6 +1408,7 @@ impl Model {
                     v_pos_stride: num_kv_heads * head_dim,
                     v_head_stride: head_dim,
                     scale: 1.0f32 / (head_dim as f32).sqrt(),
+                    window,
                 },
             );
         }
@@ -1418,6 +1440,7 @@ impl Model {
                         head_dim as u32,
                         start_pos as u32,
                         rows as u32,
+                        window as u32,
                         scale,
                     ),
                 )
@@ -1691,6 +1714,7 @@ impl Model {
                     v_pos_stride: qk_dim,
                     v_head_stride: 0,
                     scale,
+                    window: 0,
                 },
             );
         }
@@ -1765,6 +1789,7 @@ impl Model {
                     v_pos_stride: qk_dim,
                     v_head_stride: 0,
                     scale,
+                    window: 0,
                 },
             );
         }

@@ -1623,7 +1623,10 @@ mod tests {
             let ids = tok
                 .encode(text)
                 .unwrap_or_else(|e| panic!("encode({text:?}) failed: {e}"));
-            assert_eq!(ids, expected, "token ids differ from HF tokenizers for {text:?}");
+            assert_eq!(
+                ids, expected,
+                "token ids differ from HF tokenizers for {text:?}"
+            );
             assert_eq!(tok.decode(&ids), text, "round trip failed for {text:?}");
         }
     }

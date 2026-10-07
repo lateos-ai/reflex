@@ -72,9 +72,19 @@ fn online_attention_matches_legacy_kernels_gqa() {
         let k = upload(model, &pseudo_random(positions * hkv * d, seed + 1));
         let v = upload(model, &pseudo_random(positions * hkv * d, seed + 2));
         let out = if rows == 1 {
-            model.attention(&q, &k.slice(..), &v.slice(..), hq, hkv, d, positions)
+            model.attention(&q, &k.slice(..), &v.slice(..), hq, hkv, d, positions, 0)
         } else {
-            model.attention_prefill(&q, &k.slice(..), &v.slice(..), hq, hkv, d, start_pos, rows)
+            model.attention_prefill(
+                &q,
+                &k.slice(..),
+                &v.slice(..),
+                hq,
+                hkv,
+                d,
+                start_pos,
+                rows,
+                0,
+            )
         }
         .expect("attention");
         download(model, &out)

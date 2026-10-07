@@ -1118,8 +1118,9 @@ impl Model {
             hidden_size,
             &router_logits,
             num_experts,
-            moe_cfg.expert_used_count,
-            moe_cfg.normalize_top_k,
+            &|logits| {
+                route_top_k_with_norm(logits, moe_cfg.expert_used_count, moe_cfg.normalize_top_k)
+            },
             moe_cfg.routed_scaling_factor,
             ffn_gate_exps,
             ffn_up_exps,

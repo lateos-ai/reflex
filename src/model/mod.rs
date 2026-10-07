@@ -61,7 +61,7 @@ use crate::dequant;
 use crate::diagnostics;
 use crate::gguf::{GgmlType, GgufFile, GgufValue};
 use crate::lora;
-use crate::moe::{route_top_k, route_top_k_with_norm};
+use crate::moe::{route_sigmoid_logit_add, route_top_k, route_top_k_with_norm};
 use crate::sampling::SamplingParams;
 use crate::tokenizer::Tokenizer;
 use cudarc::cublas::sys as cublas_sys;
@@ -102,6 +102,8 @@ mod hybrid_batching_tests;
 mod iq_dequant_host_vs_device_tests;
 #[cfg(test)]
 mod kolibri_config_tests;
+#[cfg(test)]
+mod kolibri_forward_tests;
 #[cfg(test)]
 mod mla_batching_tests;
 #[cfg(test)]
@@ -543,6 +545,16 @@ impl Model {
             (LayerWeights::Moe(l), "ffn_gate_exps") => Some(&mut l.ffn_gate_exps),
             (LayerWeights::Moe(l), "ffn_up_exps") => Some(&mut l.ffn_up_exps),
             (LayerWeights::Moe(l), "ffn_down_exps") => Some(&mut l.ffn_down_exps),
+            (LayerWeights::Kolibri(l), "attn_q") => Some(&mut l.attn_q),
+            (LayerWeights::Kolibri(l), "attn_k") => Some(&mut l.attn_k),
+            (LayerWeights::Kolibri(l), "attn_v") => Some(&mut l.attn_v),
+            (LayerWeights::Kolibri(l), "attn_output") => Some(&mut l.attn_output),
+            (LayerWeights::Kolibri(l), "ffn_gate_exps") => Some(&mut l.ffn_gate_exps),
+            (LayerWeights::Kolibri(l), "ffn_up_exps") => Some(&mut l.ffn_up_exps),
+            (LayerWeights::Kolibri(l), "ffn_down_exps") => Some(&mut l.ffn_down_exps),
+            (LayerWeights::Kolibri(l), "ffn_gate_shexp") => Some(&mut l.ffn_gate_shexp),
+            (LayerWeights::Kolibri(l), "ffn_up_shexp") => Some(&mut l.ffn_up_shexp),
+            (LayerWeights::Kolibri(l), "ffn_down_shexp") => Some(&mut l.ffn_down_shexp),
             _ => None,
         }
     }
@@ -579,16 +591,8 @@ impl Model {
         if architecture == "deepseek2" {
             return Self::load_mla(device, file, &policy);
         }
-        if architecture == "kolibri1" {
-            // Config parsing is in place (so a malformed file is reported
-            // precisely); the forward pass is not yet. See
-            // docs/design/kolibri.md's Phase 2.
-            config::parse_kolibri_config(file)?;
-            return Err(crate::reflex_err!(UnsupportedArchitecture,
-                "'kolibri1' is recognized but its forward pass (sandwich norms, NoPE layers, SIGMOID_LOGIT_ADD routing) is not implemented yet"
-            ));
-        }
-
+        // `kolibri1` also goes through the dense/MoE path, as its own layer
+        // variant (`LayerWeights::Kolibri`).
         Self::load_dense(device, file, &policy)
     }
 

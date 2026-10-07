@@ -1,7 +1,9 @@
 # Design: Kolibri-1 MoE support
 
-**Status: Phase 1 done (2026-10-06): config, tokenizer and fixture. The forward pass
-(Phase 2) is not implemented; `Model::load` rejects `kolibri1` with a clear error.**
+**Status: Phase 2 done (2026-10-06): the forward pass runs on the dense/MoE path and
+matches the patched llama.cpp token for token on the synthetic fixture (T4). Experts
+are dequantized at load (no quantized-resident path yet, Phase 3), so the real
+47.5 GB model does not fit yet.**
 Every convention
 below was read from Aleph Alpha's own checkpoint and inference code and from a real
 GGUF header, and cross-checked between two independent implementations. See
@@ -200,6 +202,40 @@ file whose types the quantized-resident path already has kernels for. No small r
   matters for contexts above 513 tokens. A ring-buffer KV cache stays deferred (not
   on the cold-start path; it would also need a new cache-shape version in
   `src/kv_io.rs`).
+
+### Phase 2 results (2026-10-06)
+
+- **Where it lives**: Kolibri is a third layer variant on the dense/MoE path
+  (`LayerWeights::Kolibri`, `src/model/dense.rs`), not a separate model like
+  hybrid/MLA. Its KV cache has the dense shape (the window is a mask over the full
+  cache), so generate, `--export-kv`/`--import-kv`, System1 and batched prefill work
+  unchanged. `forward_attn_block{,_batched}` take an `AttnMode` (RoPE on/off, window)
+  and an optional post-attention norm; every other architecture passes
+  `AttnMode::STANDARD` and `None`.
+- **Router**: `crate::moe::route_sigmoid_logit_add`, with a unit test where it and
+  the DeepSeek-V3 rule pick different experts. `moe_ffn_grouped` now takes the router
+  as a closure; the decode loop is `moe_ffn_routed`.
+- **Sliding window**: the decode path narrows the K/V views to the last `window`
+  positions (no kernel change); `attention_online.cu` and `attention_prefill.cu` mask
+  per row (`window` argument, `0` = none).
+- **`expert_weights_scale`**: the patch hardcodes `w_scale = 0` (ignored), so a file
+  that sets a scale other than 0/1 is now rejected instead of applied.
+- **Tests** (`src/model/kolibri_forward_tests.rs`, GPU, `#[ignore]`): byte-exact
+  greedy ids vs the patched llama.cpp on `tiny-kolibri1-f32.gguf` (4 prompts up to 39
+  tokens, 20 generated tokens each, so prefill and decode both cross the 16-token
+  window); sequential vs batched prefill on both fixtures and both attention kernels;
+  both kernels' window masking vs a host reference. The golden ids come from
+  `ref_ids.cpp` (a 20-token greedy loop over `llama.h`, f32 KV cache) in
+  `tiny-kolibri1-src.tar.gz`. The Q4_K_M fixture is only run end to end: llama.cpp's
+  CPU path quantizes activations to Q8_K, and that random-weight fixture's top-1/top-2
+  margins (down to 0.008) are too narrow for an exact comparison to mean much.
+- **Verified on a T4 (2026-10-06)**: all 4 golden prompts 20/20 tokens identical to
+  llama.cpp; `reflex check` passes on the f32 fixture; sequential vs batched prefill
+  max abs diff 6.8e-6 (f32) and rel L2 7.3e-4 (f16); window masking vs the host
+  reference 2.1e-7 worst case, both kernels. Regressions unchanged: Qwen3-0.6B
+  online-vs-legacy attention (GQA and MLA) and end to end, batched prefill on
+  Qwen3-0.6B, the qwen3moe, qwen35moe and MLA fixtures. Cold start on the Q4_K_M
+  fixture: 412 ms to first token (`model_load_ms` 218).
 
 ## Phase 3: experts kept quantized on the GPU (core work)
 
