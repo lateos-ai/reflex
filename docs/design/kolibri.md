@@ -389,7 +389,7 @@ At this size, reading the file dominates cold start: ~16 s at 3 GB/s NVMe, again
   the router selects it. This trades a small per-token stall for not reading most of
   the file before the first token.
 
-### Phase 4 step 1: faster load pipeline (2026-10-07, T4 verified; A6000 pending)
+### Phase 4 step 1: faster load pipeline (2026-10-07, T4 and A6000 measured)
 
 Two changes to `WeightLoadPipeline` (src/model/loading.rs):
 
@@ -423,6 +423,38 @@ up as `pinned_wait_ms` (the host waiting for the GPU). What remains is GPU-side:
 plus the Q6_K dequant kernels (772 ms). Cold numbers on the T4 only measure its EBS
 volume (~134 MB/s, 32.5 s for Mistral in both builds); the cold/warm Kolibri table
 needs the A6000.
+
+#### Phase 4 step 1 on an RTX A6000 (2026-10-07)
+
+Runpod Secure Cloud RTX A6000 in CA-MTL-3, **a different host from the table above**: the
+container disk reads only 4.3 GB/s with `O_DIRECT` (11.3 GB/s before), pinned H2D
+25.5 GB/s, 31 vCPUs, so cold numbers compare only within this table. Same harness,
+p2 short prompt, first token, n=3 interleaved, medians; Reflex with
+`REFLEX_QUANT_RESIDENT=1`, sm_86, default 8 fill threads after the change.
+
+| | Reflex before (cb590cd) | Reflex after (db9328a) | llama.cpp |
+|---|---|---|---|
+| short prompt, cold: TTFT | 71.6 s | **19.7 s** | 41.3 s |
+| short prompt, cold: wall | 72.9 s | 21.4 s | 41.7 s |
+| short prompt, warm: TTFT | 7.6 s | **3.7 s** | 7.1 s |
+| short prompt, warm: wall | 8.5 s | 4.5 s | 7.5 s |
+| 627-token prompt, cold (n=1): TTFT | 73.7 s | 22.3 s | 42.3 s |
+
+- Same 20 tokens before and after; first token 1678 (p2) and 127907 (p5) match
+  llama.cpp in every run.
+- `model_load_ms` cold 71.1 s -> 19.2 s (fill 0.68 -> 2.56 GB/s from a 4.3 GB/s disk);
+  warm 7.07 s -> 3.27 s (fill 26 GB/s; `pinned_wait_ms` ~1.2 s means the PCIe copy,
+  `h2d_gpu_ms` ~2.6 s, is now the limit, as intended).
+- **Fill threads (cold load, one run each): 2: 39.5 s, 4: 28.7 s, 8: 19.5 s, 16: 13.6 /
+  14.1 s, 24: 14.7 s, 32: 12.6 s.** Cold keeps improving well past the default of 8,
+  because each thread holds one page-fault read in flight. Warm goes the other way:
+  8 threads 3.09-3.45 s (n=6), 16 threads 3.38-3.91 s (n=4): more memcpy threads
+  compete with the H2D DMA for host memory bandwidth (`h2d_gpu_ms` 2.4 -> 2.8 s).
+- `MADV_WILLNEED` made no measurable difference, cold or warm (18.6 s vs 18.8-20.0 s
+  cold at 8 threads).
+- Next idea, not done: decouple I/O depth from copy threads (e.g. prefetch threads that
+  only touch pages ahead of the fill, or `O_DIRECT` reads when `mincore` says the file
+  isn't cached), so cold gets 16-32 reads in flight while warm keeps ~8 copy threads.
 
 ## Phase 5: verification and benchmarks
 
