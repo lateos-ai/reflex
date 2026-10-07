@@ -1,11 +1,14 @@
 # Design: Kolibri-1 MoE support
 
-**Status: Phase 3 done (2026-10-07): the real Kolibri-1 Q4_K_M runs on one A100
-80 GB with `REFLEX_QUANT_RESIDENT=1` (45.4 GB peak VRAM) and matches llama.cpp token
-for token on 5 German/English prompts up to 627 tokens, once llama.cpp computes with
-f32 activations like Reflex (see [Phase 3 step 2 results](#phase-3-step-2-results-2026-10-07)).
-Cold start on real hardware is still unmeasured. Next: Phase 4 (lazy expert upload),
-which the expert-usage numbers below support for short prompts.**
+**Status (2026-10-07): Phases 1-3 and Phase 4 step 1 done.** The real Kolibri-1 Q4_K_M
+runs with `REFLEX_QUANT_RESIDENT=1` (45.4 GiB peak VRAM, so it fits a 48 GB card) and
+matches llama.cpp token for token on 5 German/English prompts up to 627 tokens, once
+llama.cpp computes with f32 activations like Reflex (see
+[Phase 3 step 2 results](#phase-3-step-2-results-2026-10-07)). After the parallel load
+pipeline, a cold first token on an RTX A6000 takes 19.7 s against llama.cpp's 41.3 s on
+the same host ([Phase 4 step 1](#phase-4-step-1-on-an-rtx-a6000-2026-10-07)). Next: an
+A6000 measurement of the prefetch readers, then Phase 4 step 2 (lazy expert upload),
+which the expert-usage numbers below support for short prompts.
 Every convention
 below was read from Aleph Alpha's own checkpoint and inference code and from a real
 GGUF header, and cross-checked between two independent implementations. See
@@ -398,7 +401,7 @@ Two changes to `WeightLoadPipeline` (src/model/loading.rs):
   is on the wire. A chunk of 8 MB or more is copied by several threads
   (`REFLEX_LOAD_THREADS`, default min(cores, 8)), and a `MADV_WILLNEED` window of
   256 MB runs ahead of the fill inside a large tensor (`REFLEX_LOAD_READAHEAD=0`
-  disables it). Pinned memory is now 2 x 64 MB instead of 2 x the largest tensor.
+  disabled it; both were later replaced by `REFLEX_LOAD_READERS`, see below). Pinned memory is now 2 x 64 MB instead of 2 x the largest tensor.
   Rejected: `O_DIRECT` (warm loads would run at disk speed) and `cuMemHostRegister`
   on the mmap (registration faults and pins on one thread, so cold gains nothing;
   memlock and container limits at 47 GB).
@@ -452,7 +455,10 @@ p2 short prompt, first token, n=3 interleaved, medians; Reflex with
   compete with the H2D DMA for host memory bandwidth (`h2d_gpu_ms` 2.4 -> 2.8 s).
 - `MADV_WILLNEED` made no measurable difference, cold or warm (18.6 s vs 18.8-20.0 s
   cold at 8 threads).
-- Next idea, not done: decouple I/O depth from copy threads (e.g. prefetch threads that
+- Since done, not yet measured on an A6000: prefetch reader threads
+  (`REFLEX_LOAD_READERS`, default 16) touch pages up to 1 GB ahead of the fill and copy
+  nothing, replacing `MADV_WILLNEED`; T4 tests and tokens unchanged. The original idea:
+  decouple I/O depth from copy threads (e.g. prefetch threads that
   only touch pages ahead of the fill, or `O_DIRECT` reads when `mincore` says the file
   isn't cached), so cold gets 16-32 reads in flight while warm keeps ~8 copy threads.
 

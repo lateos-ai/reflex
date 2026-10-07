@@ -67,6 +67,7 @@ build options and output formats: [docs/reference.md](docs/reference.md).
 | Llama / Mistral (`llama`) | TinyLlama-1.1B |
 | Qwen3.5 hybrid Gated DeltaNet (`qwen35`, `qwen35moe`) | Qwen3.5-0.8B; a random-weight `qwen35moe` checkpoint |
 | DeepSeek-V2/V3 MLA (`deepseek2`) | DeepSeek-V2-Lite; a synthetic fixture |
+| Kolibri-1 MoE (`kolibri1`) | Aleph Alpha's Kolibri-1 78B, `Q4_K_M` (needs `REFLEX_QUANT_RESIDENT=1`); a synthetic fixture |
 
 Each architecture counted as supported only after its generated tokens matched an
 independent implementation (llama.cpp, or a CPU reference) on real hardware.
@@ -81,6 +82,10 @@ independent implementation (llama.cpp, or a CPU reference) on real hardware.
   imported KV cache); longer requests fail with a clear `context_overflow` error.
 - **`system1`** works on every architecture; on the Qwen3.5 hybrid models each candidate
   must be a single token.
+- **Models too big for `f16`**: `REFLEX_QUANT_RESIDENT=1` keeps `Q4_K`/`Q6_K` matrix weights
+  quantized on the GPU instead (dense path and Kolibri-1). Kolibri-1's 47.5 GB `Q4_K_M`
+  then fits a 48 GB card. See [quantized-resident weights](docs/design/quantized-resident-weights.md)
+  and [Kolibri-1](docs/design/kolibri.md).
 - DeepSeek's Q-LoRA query compression and MTP heads are not supported.
 
 ## How it compares

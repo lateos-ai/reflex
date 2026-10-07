@@ -15,8 +15,9 @@ once — see each platform's linked README for the measured numbers and any cave
 
 A GGUF model file. The project's own benchmarks/fixtures center on `Qwen3-0.6B-Q4_K_M`
 (~379MB) — e.g. `unsloth/Qwen3-0.6B-GGUF` on Hugging Face. Reflex auto-detects dense,
-MoE, hybrid (Qwen3.5 Gated DeltaNet), and MLA (DeepSeek-V2/V3) architectures from GGUF
-metadata; no flag needed.
+MoE, hybrid (Qwen3.5 Gated DeltaNet), MLA (DeepSeek-V2/V3) and Kolibri-1 architectures from
+GGUF metadata; no flag needed (Kolibri-1's 78B `Q4_K_M` also needs
+`REFLEX_QUANT_RESIDENT=1` to fit on one GPU).
 
 An NVIDIA GPU with a known compute capability, since a from-source build defaults to
 portable PTX (small driver-JIT cost) unless you pin `REFLEX_CUDA_ARCH=sm_XX` for a true
