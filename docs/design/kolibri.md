@@ -389,6 +389,41 @@ At this size, reading the file dominates cold start: ~16 s at 3 GB/s NVMe, again
   the router selects it. This trades a small per-token stall for not reading most of
   the file before the first token.
 
+### Phase 4 step 1: faster load pipeline (2026-10-07, T4 verified; A6000 pending)
+
+Two changes to `WeightLoadPipeline` (src/model/loading.rs):
+
+- **Parallel chunked fill.** Tensors are staged in chunks of at most 64 MB through the
+  two reused pinned buffers, so a big tensor's next chunk fills while the previous one
+  is on the wire. A chunk of 8 MB or more is copied by several threads
+  (`REFLEX_LOAD_THREADS`, default min(cores, 8)), and a `MADV_WILLNEED` window of
+  256 MB runs ahead of the fill inside a large tensor (`REFLEX_LOAD_READAHEAD=0`
+  disables it). Pinned memory is now 2 x 64 MB instead of 2 x the largest tensor.
+  Rejected: `O_DIRECT` (warm loads would run at disk speed) and `cuMemHostRegister`
+  on the mmap (registration faults and pins on one thread, so cold gains nothing;
+  memlock and container limits at 47 GB).
+- **No host sync per norm tensor.** Tensors with no dequant kernel (`F32` norms) used
+  `htod_sync_copy`, which synchronizes the compute stream: every norm drained the
+  whole pipeline. They now take the same staging slots plus an async device copy.
+
+T4 (g4dn.xlarge, 4 vCPUs, PCIe 3), warm page cache, `model_load_ms` medians, two
+interleaved rounds:
+
+| model | before | parallel fill | + no norm sync |
+|---|---|---|---|
+| Mistral 7B Q4_K_M, quant-resident | 2306 ms | 1837 ms | **1738 ms (-25%)** |
+| Mistral 7B Q4_K_M, f16 | 3427 ms | 3237 ms | **3066 ms (-11%)** |
+| Qwen3-4B Q4_K_M, quant-resident | 1098 ms | 895 ms | **805 ms (-27%)** |
+| Qwen3-0.6B Q4_K_M (both modes) | 223-233 ms | 223-233 ms | 223-229 ms (unchanged) |
+
+Same tokens as before on Qwen3-0.6B, Qwen3-4B, Mistral 7B, Qwen3.5-0.8B and the MLA
+fixture in every mode that fits the T4. On Mistral the fill now runs at 6 GB/s on 4
+threads, as fast as the T4's PCIe (`h2d_gpu_ms` 687 ms), and the old ~0.9 s stall shows
+up as `pinned_wait_ms` (the host waiting for the GPU). What remains is GPU-side: H2D
+plus the Q6_K dequant kernels (772 ms). Cold numbers on the T4 only measure its EBS
+volume (~134 MB/s, 32.5 s for Mistral in both builds); the cold/warm Kolibri table
+needs the A6000.
+
 ## Phase 5: verification and benchmarks
 
 - Correctness: byte-exact greedy agreement with the patched llama.cpp via

@@ -171,8 +171,11 @@ buffers and `kernel_done` events are skipped. The pinned double-buffer and the a
 on the forked stream stay, so the host `memcpy` of tensor N+1 still overlaps the H2D of
 tensor N, and the two existing rules still hold: no blocking per-tensor copy, and no
 per-tensor staging allocation. `F32`-resident tensors (norms, any unsupported format)
-keep today's dequant path unchanged. Later idea, not in the prototype: register the
-mmap with `cuMemHostRegister` and skip the pinned `memcpy` entirely.
+keep today's dequant path unchanged. (Since Kolibri-1 Phase 4 step 1 the pinned
+buffers hold chunks of at most 64 MB filled by several threads; see
+`docs/design/kolibri.md`. `cuMemHostRegister` on the mmap was considered there and
+rejected: registration faults and pins the pages on one thread, so a cold load gains
+nothing.)
 
 **`LazyTokenEmbedding`.** Unchanged: the embedding lookup is a host-side gather and only
 needs a few rows. When the LM head is tied and quantized, the full-vocabulary upload

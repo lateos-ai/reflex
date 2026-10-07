@@ -191,9 +191,16 @@ Rules that follow from measured regressions:
   owned `Vec` at load (127.6 MB for Qwen3-0.6B) was the largest single part of model
   load, about 103 ms of 231 ms on a T4, mostly first-touch page faults on the new
   allocation rather than file reads.
-- **Keep the pipelined upload.** `WeightLoadPipeline` double-buffers each tensor's raw
-  bytes through pinned host memory and uploads on a separate stream, so tensor N+1's
-  copy overlaps tensor N's dequant kernel. Replacing it with a blocking copy per tensor,
+- **Keep the pipelined upload.** `WeightLoadPipeline` stages each tensor's raw bytes
+  through two reused pinned host buffers, in chunks of at most 64 MB, and uploads on a
+  separate stream, so one chunk's fill overlaps the previous chunk's copy and tensor
+  N+1's copy overlaps tensor N's dequant kernel. Chunks of 8 MB or more are filled by
+  several threads (`REFLEX_LOAD_THREADS`, default min(cores, 8)) with a
+  `MADV_WILLNEED` readahead hint ahead of them (`REFLEX_LOAD_READAHEAD=0` disables it);
+  one fill thread was the bottleneck on large models, and small models never use more.
+  Tensors with no dequant kernel (`F32` norms) take the same slots plus an async
+  device-to-device copy; a `htod_sync_copy` there synchronizes the compute stream and
+  drains the pipeline at every norm. Replacing it with a blocking copy per tensor,
   or allocating the staging buffers per tensor, reintroduces a host/device race or
   serializes the pipeline. The f16 dequant kernels go through the same pipeline; only
   the output element type differs.

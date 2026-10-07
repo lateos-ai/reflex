@@ -532,6 +532,7 @@ impl Model {
         let f16_act_stats = device
             .alloc_zeros::<u32>(2)
             .map_err(|e| crate::gpu_err!(e, "alloc f16 activation stats: {e}"))?;
+        pipeline.end_load();
         Ok(Model {
             device,
             cublas,

@@ -125,11 +125,20 @@ lazy, silently relocated into `prompt_eval_ms` on `generate`/`check`'s first cal
 instead of removed — a net regression documented in item 6's own numbers); don't
 reintroduce it.
 
-That per-tensor load loop runs through `WeightLoadPipeline`, which double-buffers each
-tensor's raw quantized bytes through pinned host memory and uploads them on a forked
-copy stream so tensor N+1's H2D transfer overlaps tensor N's dequant kernel — **don't
-"simplify" it back to a blocking `htod_sync_copy` per tensor**, and don't make its two
-staging buffers per-tensor allocations: both were measured, and the reasons each
+That per-tensor load loop runs through `WeightLoadPipeline`, which stages each
+tensor's raw quantized bytes through two reused pinned host buffers in chunks of at
+most 64 MB and uploads them on a forked copy stream, so chunk N+1's fill overlaps chunk
+N's H2D and tensor N+1's transfer overlaps tensor N's dequant kernel. A chunk of 8 MB or
+more is filled by several threads (`REFLEX_LOAD_THREADS`, default min(cores, 8);
+`MADV_WILLNEED` readahead ahead of the fill, `REFLEX_LOAD_READAHEAD=0` turns it off):
+on a 47.5 GB model one host memcpy thread was the whole load's bottleneck (Kolibri
+Phase 4 step 1, docs/design/kolibri.md); small models never wake the fill threads.
+Tensors with no dequant kernel (`F32` norms, the host fallback) go through the same
+staging slots plus an async device-to-device copy (`upload_host_bytes`), **not**
+`htod_sync_copy`: that synchronizes the compute stream, so every norm drained the whole
+pipeline (~0.9 s of a 2.3 s Mistral 7B load on a T4).
+**Don't "simplify" it back to a blocking `htod_sync_copy` per tensor**, and don't make
+its staging buffers per-tensor allocations: both were measured, and the reasons each
 alternative is wrong (a host/device race in one case, a cross-stream dependency that
 serializes the pipeline in the other) are written up in HISTORY.md's "Pipelined model
 load (item 5)" entry. `Model` keeps its `dequant_kernels`/`dequant_pipeline` alive past

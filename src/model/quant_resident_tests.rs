@@ -265,6 +265,107 @@ fn quant_resident_lm_head_matches_f32() {
     }
 }
 
+/// The pipeline's chunked, multi-threaded staging against the host bytes, byte
+/// for byte: sizes below the parallel-fill threshold, one chunk split across
+/// the fill threads, and several 64 MB chunks with a ragged tail, through
+/// `upload_raw`, `dequantize` (Q8_0, against the host dequant) and
+/// `upload_host_bytes` (F32 and F16 tensors).
+/// Real fixtures are too small to reach the multi-chunk path, and the
+/// LM-head test above would pass with a staging bug that corrupts both its
+/// sides the same way. Run: `cargo test --release -- --ignored pipeline_stages`
+#[test]
+#[ignore]
+fn pipeline_stages_large_tensors_byte_exact() {
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let mut pipeline = WeightLoadPipeline::new(&device).expect("pipeline");
+
+    let sizes = [1000usize, 3 << 20, (9 << 20) + 5, (150 << 20) + 12345];
+    let bufs: Vec<Vec<u8>> = sizes
+        .iter()
+        .enumerate()
+        .map(|(k, &n)| {
+            (0..n as u64)
+                .map(|i| (i.wrapping_mul(2654435761).wrapping_add(k as u64 * 977) >> 7) as u8)
+                .collect()
+        })
+        .collect();
+    let total: usize = sizes
+        .iter()
+        .map(|n| n.next_multiple_of(QUANT_ARENA_ALIGN))
+        .sum();
+    let mut arena = QuantArena {
+        buf: Arc::new(unsafe { device.alloc::<u8>(total) }.expect("alloc arena")),
+        used: 0,
+    };
+    let placed: Vec<(usize, usize)> = bufs
+        .iter()
+        .map(|b| pipeline.upload_raw(&mut arena, b).expect("upload_raw"))
+        .collect();
+    device.synchronize().expect("sync");
+    let back = device
+        .dtoh_sync_copy(arena.buf.as_ref())
+        .expect("dtoh arena");
+    for (b, &(off, len)) in bufs.iter().zip(&placed) {
+        assert_eq!(len, b.len());
+        assert!(back[off..off + len] == b[..], "upload_raw of {len} bytes");
+    }
+
+    // ~80 MB of Q8_0 blocks: two chunks into one device staging slot.
+    let blocks = (80 << 20) / 34 + 3;
+    let mut q8 = Vec::with_capacity(blocks * 34);
+    for b in 0..blocks {
+        let d = half::f16::from_f32(((b % 97) as f32 + 1.0) / 64.0);
+        q8.extend_from_slice(&d.to_le_bytes());
+        q8.extend((0..32).map(|j| ((b * 7 + j * 13) % 251) as u8));
+    }
+    let n = (blocks * 32) as u64;
+    let kernels = load_dequant_kernels(&device).expect("dequant kernels");
+    let got = dequantize_tensor_to_device(&mut pipeline, &kernels, GgmlType::Q8_0, &q8, n)
+        .expect("dequantize");
+    let got = device.dtoh_sync_copy(&got).expect("dtoh dequant");
+    let want_q8 = dequant::dequantize(GgmlType::Q8_0, &q8, n).expect("host dequant");
+    assert_eq!(got.len(), want_q8.len());
+    let bad = got
+        .iter()
+        .zip(&want_q8)
+        .position(|(a, b)| a.to_bits() != b.to_bits());
+    assert!(bad.is_none(), "dequantize mismatch at element {bad:?}");
+
+    // Tensors with no dequant kernel (`upload_host_bytes`): F32 as is, F16
+    // through the host fallback, small (a norm) and multi-chunk, alternating
+    // with Q8_0 dequants so both device slots are reused across kinds.
+    for &elems in &[4096usize, (20 << 20) + 3] {
+        let f32s: Vec<f32> = (0..elems).map(|i| (i as f32 * 0.37).sin()).collect();
+        let f32_bytes: Vec<u8> = f32s.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f16_bytes: Vec<u8> = f32s
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect();
+        for (ty, raw) in [(GgmlType::F32, &f32_bytes), (GgmlType::F16, &f16_bytes)] {
+            let got = dequantize_tensor_to_device(&mut pipeline, &kernels, ty, raw, elems as u64)
+                .expect("host-path upload");
+            let q = dequantize_tensor_to_device(&mut pipeline, &kernels, GgmlType::Q8_0, &q8, n)
+                .expect("dequantize");
+            let got = device.dtoh_sync_copy(&got).expect("dtoh host-path");
+            let want = dequant::dequantize(ty, raw, elems as u64).expect("host dequant");
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                    && got.len() == want.len(),
+                "{ty:?} upload of {elems} elements"
+            );
+            let q = device.dtoh_sync_copy(&q).expect("dtoh dequant");
+            assert!(
+                q.iter()
+                    .zip(&want_q8)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "Q8_0 dequant after {ty:?} upload"
+            );
+        }
+    }
+}
+
 const KOLIBRI_Q4KM: &str = "test-data/tiny-kolibri1.gguf";
 
 /// Kolibri-1 with `REFLEX_QUANT_RESIDENT=1`: every matmul tensor of layer 0
