@@ -339,13 +339,51 @@ the four fixture prompts plus a 627-token German ChatML reading-comprehension pr
   `nvidia-smi` to show the memory free. Pass prompts byte-exactly (`$(cat file)`
   drops the trailing newline the ChatML prompts end with).
 
+### Cold start on an RTX A6000 (2026-10-07)
+
+Runpod Secure Cloud RTX A6000 48 GB (PCIe Gen4 x16, measured pinned H2D 19.7 GB/s),
+local NVMe container disk (O_DIRECT read 11.3 GB/s), container memory limit 49 GB.
+Reflex `REFLEX_QUANT_RESIDENT=1` (sm_86 cubin) vs stock patched llama.cpp (`REF_NGL=99`,
+all layers on the GPU). Short prompt = p2 (5 tokens), first token only, n=3 each.
+"Cold" = the GGUF evicted from the page cache (`posix_fadvise(DONTNEED)`, verified with
+`mincore`: 0.0 GB cached); "warm" = 47.3 to 47.5 GB cached. Time to first token is each
+engine's own figure (Reflex from process start, llama.cpp from `main()`); wall is
+launch to exit, same harness for both.
+
+| | Reflex TTFT | Reflex wall | llama.cpp TTFT | llama.cpp wall |
+|---|---|---|---|---|
+| short prompt, cold | 13.6 s (13.4–13.7) | 14.6 s | 14.9 s (14.7–15.3) | 15.3 s |
+| short prompt, warm | 7.5 s (7.3–7.6) | 8.6 s | 7.0 s (6.8–7.3) | 7.4 s |
+| 627-token prompt, cold (n=1) | 16.8 s | 17.9 s | 14.9 s | 15.2 s |
+
+- Both engines produce the same first token in every run; the f32-activation spot check
+  on this machine matched 20/20 again. Peak VRAM with the 627-token prompt and 20
+  generated tokens: 45,600 of 49,140 MiB, so the model fits a 48 GB card as is.
+- **Reflex wins cold by ~1.3 s, loses warm by ~0.5 s, and loses the long prompt by
+  ~2 s.** At this size, cold start is all loading: `model_load_ms` is 13.1 s cold and
+  7.1 s warm of Reflex's 13.6 / 7.5 s.
+- **The load is bound by one host thread copying the mmap into the pinned staging
+  buffers**, not by the disk or PCIe: `pinned_fill_ms` 11.9 s cold (47 GB at ~4 GB/s,
+  page-faulting from a disk that reads at 11.3 GB/s) and 6.1 s warm (~7.7 GB/s, one
+  memcpy thread), against `h2d_gpu_ms` 2.4 s (~19.4 GB/s). A load that kept the disk
+  and the PCIe link busy at the same time would take ~4.2 s cold and ~2.4 s warm.
+- **Long prompts**: Reflex's 627-token prefill took 2.75 s, against ~0.16 s for the
+  5-token prompt. Each of the ~200 experts a layer touches runs as its own small group,
+  and every Q6_K group above one row is dequantized into scratch first (no multi-row
+  Q6_K kernel yet).
+
 ## Phase 4: cold-start work specific to a 47.5 GB model
 
 At this size, reading the file dominates cold start: ~16 s at 3 GB/s NVMe, against
 ~2 s of PCIe 4 transfer. Expert weights are ~97% of the file.
 
-- **Measure first**: for a set of real prompts, record how many distinct experts per
-  layer prefill and the first token actually touch.
+- **Measured** (Phase 3 step 2): 4–5% of experts per layer before the first token for
+  a 5-token prompt, ~18% at 36 tokens, 52% at 627 tokens.
+- **Before lazy upload, fix the load pipeline itself** (see the A6000 numbers above):
+  the pinned staging copy runs on one thread at 4 GB/s cold / 7.7 GB/s warm while the
+  disk does 11.3 GB/s and PCIe 19.7 GB/s. Options: several fill threads, reading with
+  O_DIRECT straight into the pinned buffers, or registering the mmap with
+  `cuMemHostRegister` and skipping the copy. This helps every model, not just Kolibri.
 - If the fraction is small, **upload experts lazily**: map the file, upload
   attention/shared/router weights eagerly, and upload an expert's slice the first time
   the router selects it. This trades a small per-token stall for not reading most of
