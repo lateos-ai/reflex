@@ -1,10 +1,11 @@
 # Design: Kolibri-1 MoE support
 
-**Status: Phase 3 step 1 done (2026-10-06): with `REFLEX_QUANT_RESIDENT=1`, every
-Kolibri-1 matmul tensor (stacked experts included) stays as raw Q4_K/Q6_K blocks on the
-GPU, verified on the synthetic fixture (T4). The forward pass (Phase 2) matches the
-patched llama.cpp token for token there. Next: one run of the real Q4_K_M model on an
-80 GB GPU.**
+**Status: Phase 3 done (2026-10-07): the real Kolibri-1 Q4_K_M runs on one A100
+80 GB with `REFLEX_QUANT_RESIDENT=1` (45.4 GB peak VRAM) and matches llama.cpp token
+for token on 5 German/English prompts up to 627 tokens, once llama.cpp computes with
+f32 activations like Reflex (see [Phase 3 step 2 results](#phase-3-step-2-results-2026-10-07)).
+Cold start on real hardware is still unmeasured. Next: Phase 4 (lazy expert upload),
+which the expert-usage numbers below support for short prompts.**
 Every convention
 below was read from Aleph Alpha's own checkpoint and inference code and from a real
 GGUF header, and cross-checked between two independent implementations. See
@@ -281,6 +282,62 @@ file whose types the quantized-resident path already has kernels for. No small r
   16 tokens; peak VRAM 279 vs 183 MiB (process total, CUDA context included);
   `prompt_eval_ms` ~31 vs ~13; first token ~427 vs ~409 ms, `model_load_ms` ~220 for
   both (this fixture's load is dominated by fixed costs, not weight bytes).
+
+### Phase 3 step 2 results (2026-10-07)
+
+Real `Hob-forge/Kolibri-1-GGUF` `Kolibri-1-Q4_K_M.gguf` (47,454,113,472 bytes) on a
+ThunderCompute A100-SXM4-80GB, Reflex built with `REFLEX_CUDA_ARCH=sm_80`, the
+reference llama.cpp `836d571` + the kolibri1 patch built with CUDA for sm_80. Prompts:
+the four fixture prompts plus a 627-token German ChatML reading-comprehension prompt
+(`ref_prompts/p5.txt` in `tiny-kolibri1-src.tar.gz`), 20 greedy tokens each.
+
+- **It runs and fits**: all 501 matmul tensors quantized-resident (47.07 GB arena),
+  peak VRAM 45.4 GiB. Output is coherent (p5 opens a `<think>` block and answers in
+  German).
+- **Against stock llama.cpp** (CUDA, all layers on the GPU): p1, p4 and p5 match 20/20
+  (`--weights f32` and f16 alike). p3 differs at step 19, where llama.cpp CUDA and
+  llama.cpp CPU disagree with each other and Reflex sides with the CPU (CPU top-1/top-2
+  gap there 0.14). p2 differs from step 1, with llama.cpp's gap at 1.1.
+- **Cause of the p2 difference: llama.cpp's 8-bit activation quantization, not
+  Reflex.** For llama.cpp, Q4_K/Q6_K matmuls quantize the activations to Q8_1 (CUDA
+  MMVQ/MMQ) or Q8_K (CPU); Reflex reads f32 activations. With 384 experts the router's
+  top-6 boundary is very tight (6th-vs-7th biased-logit margins of 0.001 to 0.05 are
+  common), so that rounding flips expert picks, and the flips compound over 50 layers.
+  Evidence, all on the 6-token context `Die Hauptstadt von Deutschland ist Deutschland`:
+  - Expert sets identical in all 6 tokens through layer 7; the first difference is at
+    layer 8 at a Reflex margin of 0.0011. llama.cpp CPU vs llama.cpp CUDA start
+    differing even earlier (layer 5) and differ as much in later layers.
+  - llama.cpp's own top logits move with kernel choice alone: " Deutschland" 11.97 /
+    " ist" 8.30 (CUDA), 11.70 / 10.53 (CPU), and "," on top with fusion and CUDA graphs
+    disabled. Reflex f16 vs f32 differ by < 0.004.
+  - llama.cpp patched to dequantize to f32 and run an f32 GEMM instead
+    (`llama-no-q8.patch` in the src tarball, `LLAMA_NO_Q8=1`, with
+    `GGML_CUDA_DISABLE_GRAPHS=1 GGML_CUDA_DISABLE_FUSION=1`) gives " ist" 12.76 /
+    "," 11.96 / " Deutschland" 9.59, next to Reflex's 13.50 / 12.06 / 9.26, and
+    **matches Reflex 20/20 on all five prompts**.
+  So exact-token agreement with *stock* llama.cpp is not a meaningful target for this
+  model; the f32-activation build is the reference to compare against.
+- **Experts touched** (`REFLEX_EXPERT_TRACE=1`, distinct experts per layer, mean over
+  layers):
+
+  | Prompt | Before first token | After 19 more tokens |
+  |---|---|---|
+  | 4–5 tokens | 4–5% | 7% |
+  | 36–39 tokens | 17–18% | 20–21% |
+  | 627 tokens | 52% | 53% |
+
+  Expert bytes are ~97% of the file, so lazy upload (Phase 4) would skip most of the
+  load for short prompts and about half for long ones.
+- **Cold start: not measurable on this instance.** Host-to-device copies ran at
+  ~0.86 GB/s (47 GB in 54 s of `h2d_gpu_ms`; disk reads at 2.7 GB/s), so both
+  engines took ~60 s to first token (Reflex `model_load_ms` ~58.5 s, llama.cpp
+  first token ~59 s). This GPU appears to be attached over the network; cold-start
+  numbers need a machine with a local PCIe GPU.
+- **Harness notes**: a Reflex process exits without tearing down its CUDA context,
+  and on this instance the driver took several seconds to release 47 GB, so
+  back-to-back runs hit `CUDA_ERROR_OUT_OF_MEMORY` until each run waited for
+  `nvidia-smi` to show the memory free. Pass prompts byte-exactly (`$(cat file)`
+  drops the trailing newline the ChatML prompts end with).
 
 ## Phase 4: cold-start work specific to a 47.5 GB model
 

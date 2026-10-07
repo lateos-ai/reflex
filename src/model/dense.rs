@@ -944,6 +944,33 @@ impl Model {
         self.gemm_view(x, &view, in_features, out_features, rows)
     }
 
+    /// One `REFLEX_EXPERT_TRACE` line (see [`expert_trace_enabled`]).
+    /// `router_logits` holds `rows` rows of `bias.len()` logits. Besides the
+    /// picks, prints each row's margin between the `k`-th and `(k+1)`-th
+    /// biased logit: a margin near zero is a routing near-tie, where another
+    /// implementation's rounding can pick a different expert.
+    fn print_expert_trace(router_logits: &[f32], bias: &[f32], k: usize, normalize: bool) {
+        let mut experts = Vec::new();
+        let mut margins = Vec::new();
+        for row in router_logits.chunks(bias.len()) {
+            if let Ok(routed) = route_sigmoid_logit_add(row, bias, k, normalize) {
+                experts.extend(routed.iter().map(|&(e, _)| e.to_string()));
+            }
+            let mut biased: Vec<f32> = row.iter().zip(bias).map(|(l, b)| l + b).collect();
+            biased.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            margins.push(match biased.get(k) {
+                Some(next) => format!("{:.4}", biased[k - 1] - next),
+                None => "inf".to_string(),
+            });
+        }
+        eprintln!(
+            "REFLEX_EXPERT_TRACE rows={} experts={} topk_margin={}",
+            router_logits.len() / bias.len(),
+            experts.join(","),
+            margins.join(",")
+        );
+    }
+
     /// Kolibri-1 decode step for one layer; see [`KolibriLayerWeights`] for the
     /// data flow. The shared expert seeds the FFN accumulator, the routed
     /// experts add onto it, and `post_ffw_norm` is applied to the sum before
@@ -997,6 +1024,9 @@ impl Model {
         })?;
         let routed =
             route_sigmoid_logit_add(&router_logits, &layer.exp_probs_b, k, layer.normalize_top_k)?;
+        if expert_trace_enabled() {
+            Self::print_expert_trace(&router_logits, &layer.exp_probs_b, k, layer.normalize_top_k);
+        }
         self.moe_ffn_routed(
             &ffn_normed,
             &routed,
@@ -1406,6 +1436,9 @@ impl Model {
             ReflexError::Other("forward_layer_kolibri_batched: no expert_used_count".to_string())
         })?;
         let num_experts = layer.exp_probs_b.len();
+        if expert_trace_enabled() {
+            Self::print_expert_trace(&router_logits, &layer.exp_probs_b, k, layer.normalize_top_k);
+        }
         self.moe_ffn_grouped(
             &ffn_normed,
             rows,

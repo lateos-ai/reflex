@@ -297,8 +297,18 @@ impl QuantArena {
     }
 }
 
+/// `REFLEX_EXPERT_TRACE=1`: Kolibri-1 layers print each forward call's
+/// routed experts to stderr, one `REFLEX_EXPERT_TRACE rows=N experts=...` line
+/// per layer in layer order (all rows of a batched prefill on one line), for
+/// measuring how many distinct experts a prompt touches
+/// (docs/design/kolibri.md, Phase 4). Off by default.
+pub(super) fn expert_trace_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("REFLEX_EXPERT_TRACE").is_ok_and(|v| v == "1"))
+}
+
 /// `REFLEX_QUANT_RESIDENT=1` turns on quantized-resident weights for the
-/// dense path (Q4_K only for now). Read once per load.
+/// dense path and Kolibri-1. Read once per load.
 pub(super) fn quant_resident_enabled() -> bool {
     std::env::var("REFLEX_QUANT_RESIDENT").is_ok_and(|v| v == "1")
 }
