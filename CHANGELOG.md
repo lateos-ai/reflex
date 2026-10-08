@@ -60,6 +60,11 @@ What has been built, in order. Measurements live in
 
 ## 2026-10-02
 
+- **Runpod comparison against llama.cpp, finished**: two more llama.cpp cold runs bring
+  both engines to n=5 on the L4 (engine load 0.49 s vs. 0.95 s, ~1.9x; end-to-end still
+  inconclusive), and the `--no-warmup` variant (n=3, 0.92 s) shows llama-server's warmup
+  is not where its startup time goes. See
+  [docs/runpod-llamacpp-comparison.md](docs/runpod-llamacpp-comparison.md#results).
 - **Faster model load: the token embedding stays in the file mapping.** The table used to
   be copied out of the mmap at load (127.6 MB for Qwen3-0.6B Q4_K_M), which took ~103 ms of
   ~231 ms model load on a T4. Rows are now read straight from the mapping when used. On a
