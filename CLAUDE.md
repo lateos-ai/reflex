@@ -114,7 +114,13 @@ above a row crossover, dequantized device-to-device into a reused scratch buffer
 `--weights` dtype (f16 scratch + `cublasGemmEx`, or f32 + `Sgemm`); a Q6_K LM head stays
 quantized too (`gemv_q6k_kernel`). Every other matrix weight follows `--weights`. Design,
 results and open gaps: `docs/design/quantized-resident-weights.md` — read it before
-touching weight residency, the matmul kernels or `WeightLoadPipeline`. If the full vocab table is ever needed device-resident
+touching weight residency, the matmul kernels or `WeightLoadPipeline`. On top of it,
+**`REFLEX_LAZY_EXPERTS=1`** (Kolibri-1 only) reserves the stacked-expert arena space
+without copying and uploads each routed expert once, the first time a layer routes to it
+(`Model::ensure_experts`, `LazyExperts`), through the same pinned pipeline; prefetch
+readers are off in that mode and the fill threads outlive the load. That is one copy per
+weight per process, not a per-call copy. Design and numbers: `docs/design/kolibri.md`
+Phase 4 step 2. If the full vocab table is ever needed device-resident
 (a tied `lm_head`'s first full-vocab-logits call, or `load_hybrid`/`load_mla`'s eager
 tied case — see `Model::lm_head_resident`), it goes through the same on-device
 `dequantize_tensor_to_device` path every other weight tensor uses, **not** a host-side

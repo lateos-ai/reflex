@@ -5,6 +5,13 @@ What has been built, in order. Measurements live in
 
 ## 2026-10-07
 
+- **Lazy expert upload for Kolibri-1** (opt-in `REFLEX_LAZY_EXPERTS=1`, with
+  `REFLEX_QUANT_RESIDENT=1`): the load reserves the experts' GPU space but copies none
+  of them; each layer uploads its routed experts the first time it needs them, so a
+  short prompt reads a fraction of the 47.5 GB file before its first token. Output is
+  identical to the eager load (tokens and System1 scores, verified on a T4 on the tiny
+  Kolibri fixture, where a 20-token generation uploaded 72 of 96 experts). Timing on
+  the real model: see [docs/design/kolibri.md](docs/design/kolibri.md), Phase 4 step 2.
 - **`POST /v1/classify` in the OpenAI sidecar**: Reflex's System1 candidate scoring over
   HTTP. A request names a `prompt` (or chat `messages`) and up to 64 `labels`; the engine
   runs one prefill, scores each label as a continuation, and the response carries each
