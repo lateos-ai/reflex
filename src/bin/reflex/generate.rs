@@ -371,6 +371,7 @@ pub fn run(args: Vec<String>) {
             );
         }
         crate::report_f16_activation_stats(&model);
+        crate::report_lazy_experts(&model);
         reflex_engine::fast_exit(0);
     }
 
@@ -444,5 +445,6 @@ pub fn run(args: Vec<String>) {
         );
     }
     crate::report_f16_activation_stats(&model);
+    crate::report_lazy_experts(&model);
     reflex_engine::fast_exit(0);
 }

@@ -72,6 +72,15 @@ pub(crate) fn load_model(
     reflex_engine::model::Model::load_with_options(device, file, &opts)
 }
 
+/// With `REFLEX_LAZY_EXPERTS=1` on a Kolibri-1 model, prints
+/// `REFLEX_LAZY_EXPERTS resident=<n> total=<m>` on stderr: how many experts
+/// the run so far has uploaded, out of all of them. Nothing otherwise.
+pub(crate) fn report_lazy_experts(model: &reflex_engine::model::Model) {
+    if let Some((resident, total)) = model.lazy_expert_counts() {
+        eprintln!("REFLEX_LAZY_EXPERTS resident={resident} total={total}");
+    }
+}
+
 /// After a run on an f16 model: warns on stderr if any prefill activation
 /// exceeded f16's range and was clamped (the output then differs from what f32
 /// weights give), and prints `REFLEX_F16_ACT_STATS max_abs=<x> saturated=<n>`

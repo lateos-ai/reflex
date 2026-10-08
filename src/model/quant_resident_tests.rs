@@ -546,3 +546,103 @@ fn kolibri1_quant_resident_generate_matches_dequantized() {
         );
     }
 }
+
+/// [`load_model`] with `REFLEX_QUANT_RESIDENT=1` and `REFLEX_LAZY_EXPERTS=1`
+/// for the load only (run single-threaded, as above).
+fn load_model_lazy(device: Arc<CudaDevice>, file: &GgufFile, dtype: WeightsDtype) -> Model {
+    std::env::set_var("REFLEX_LAZY_EXPERTS", "1");
+    let model = load_model(device, file, dtype, true);
+    std::env::remove_var("REFLEX_LAZY_EXPERTS");
+    model
+}
+
+/// Kolibri-1 with `REFLEX_LAZY_EXPERTS=1` (docs/design/kolibri.md, Phase 4
+/// step 2): no expert is on the GPU after the load, a 1–2 token prompt
+/// uploads only some of them, and lazily uploaded experts give exactly the
+/// eager model's results: greedy ids (batched prefill, then decode),
+/// sequential prefill (the per-token layer path) and System1 scores. Run
+/// single-threaded (`--test-threads=1 kolibri1_`).
+#[test]
+#[ignore]
+fn kolibri1_lazy_experts_match_eager() {
+    let file = GgufFile::open(KOLIBRI_Q4KM).expect("open Kolibri fixture");
+    let prompts = [
+        "Die Hauptstadt von Deutschland ist",
+        "The quick brown fox jumps over the lazy dog while the river runs past the old mill, and the miller counts his sacks of flour one by one before the sun goes down over the hills.",
+    ];
+    let candidates: Vec<System1Candidate> = [" Berlin", " Paris", " die Stadt"]
+        .iter()
+        .map(|t| System1Candidate {
+            text: t.to_string(),
+        })
+        .collect();
+    for dtype in [WeightsDtype::F32, WeightsDtype::F16] {
+        let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+        let eager = load_model(device.clone(), &file, dtype, true);
+        assert_eq!(
+            eager.lazy_expert_counts(),
+            None,
+            "eager load has no lazy layers"
+        );
+        let gen = |m: &Model, p: &str| {
+            m.generate(p, 12, None, &SamplingParams::default(), |_| {}, |_, _| {})
+                .expect("generate")
+                .0
+        };
+
+        // Residency: nothing after the load, some but not all after a short prompt.
+        let lazy = load_model_lazy(device.clone(), &file, dtype);
+        let (resident, total) = lazy.lazy_expert_counts().expect("lazy layers");
+        assert_eq!(
+            resident, 0,
+            "{dtype}: no expert should be uploaded by the load"
+        );
+        let LayerWeights::Kolibri(l0) = &lazy.layers[0] else {
+            panic!("layer 0 is not a Kolibri layer");
+        };
+        assert_eq!(total, lazy.layers.len() * l0.exp_probs_b.len());
+        assert_eq!(gen(&lazy, "Hi").first(), gen(&eager, "Hi").first());
+        let (after_short, _) = lazy.lazy_expert_counts().unwrap();
+        eprintln!("{dtype}: {after_short}/{total} experts resident after a short prompt");
+        assert!(
+            after_short > 0 && after_short < total,
+            "{dtype}: a short prompt should upload some experts, not all ({after_short}/{total})"
+        );
+
+        // Same greedy ids, on the model that already has some experts.
+        for p in prompts {
+            assert_eq!(
+                gen(&lazy, p),
+                gen(&eager, p),
+                "{dtype}: greedy ids differ for {p:?}"
+            );
+        }
+
+        // Sequential prefill on a fresh lazy model (only the per-token layer
+        // path uploads experts there): the same last hidden state, bit for bit.
+        let lazy = load_model_lazy(device.clone(), &file, dtype);
+        let (ids_l, hidden_l, _, _, _) = lazy
+            .prefill_dense(prompts[1], None, 0)
+            .expect("prefill_dense lazy");
+        let (ids_e, hidden_e, _, _, _) = eager
+            .prefill_dense(prompts[1], None, 0)
+            .expect("prefill_dense eager");
+        assert_eq!(ids_l, ids_e);
+        assert_eq!(
+            lazy.device.dtoh_sync_copy(&hidden_l).unwrap(),
+            eager.device.dtoh_sync_copy(&hidden_e).unwrap(),
+            "{dtype}: sequential prefill hidden state differs (lazy vs eager)"
+        );
+
+        // System1 on a fresh lazy model: identical scores.
+        let lazy = load_model_lazy(device, &file, dtype);
+        let s_l = lazy
+            .system1_evaluate(prompts[0], &candidates, 1.0)
+            .expect("system1 lazy");
+        let s_e = eager
+            .system1_evaluate(prompts[0], &candidates, 1.0)
+            .expect("system1 eager");
+        let scores = |r: &System1Response| r.results.iter().map(|c| c.score).collect::<Vec<_>>();
+        assert_eq!(scores(&s_l), scores(&s_e), "{dtype}: System1 scores differ");
+    }
+}

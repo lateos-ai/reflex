@@ -531,6 +531,61 @@ requests per case, ready 4.25 s after launch with the file cached):
   data before it is trusted. The scores themselves are deterministic: identical across
   all cold, warm and stdio runs.
 
+### Phase 4 step 2: lazy expert upload (design, 2026-10-07)
+
+**Why.** With the load pipeline fixed, a cold first token on an A6000 is 8.5 s, nearly all
+of it reading 47.5 GB. A 5-token prompt routes to 4–5% of each layer's experts before the
+first token, so ~95% of the expert bytes, ~92% of the file, are read for nothing.
+
+**What.** Opt-in `REFLEX_LAZY_EXPERTS=1`, effective only with `REFLEX_QUANT_RESIDENT=1` on
+Kolibri-1 (any other model prints a notice and loads eagerly).
+
+- **Load.** Every non-expert tensor loads as today. The three stacked expert tensors per
+  layer (`ffn_{gate,up,down}_exps`) get their arena space reserved, so offsets and the
+  one-allocation arena are unchanged, but nothing is copied. Each layer keeps the
+  tensors' mmap byte ranges (`gguf::SharedBytes`) and a per-expert resident flag. The
+  prefetch readers are off: they walk the data section in file order and would read the
+  skipped expert bytes.
+- **Forward.** Routing is already host-side (the router logits come back with
+  `dtoh_sync_copy` and the top-k runs on the CPU), so each layer knows its experts before
+  any expert matmul. The decode layer passes its 6 routed experts, the batched layer the
+  union over its rows, to `Model::ensure_experts`, which uploads the ones not yet
+  resident and marks them. All of an expert's three slices go together.
+- **Upload.** Each expert slice is a contiguous byte range in the file and in the arena
+  (`expert_idx * len / expert_count`, the same arithmetic as `quant_expert_weight`). The
+  missing slices of one layer are packed into the existing pinned slots, filled in
+  parallel by the existing fill workers (one slice per job, so cold page faults run
+  several reads at once), and copied with `memcpy_htod_async` on the copy stream; the
+  compute stream waits on the last copy's event, exactly like `stage_h2d`. The kernels
+  read byte-identical blocks, so the output is identical to the eager load.
+- **Fill workers outlive the load** in this mode. They are still copy helpers for one
+  job at a time, not a request pool (Non-goals unchanged).
+
+**Expected.** A 5-token prompt needs the ~1.4 GB of non-expert weights plus ~2.3 GB of
+experts (≈19 experts × ~2.4 MB × 50 layers) instead of 47.5 GB. Each layer stalls the
+GPU while its missing experts arrive, so a long prompt (52% of experts at 627 tokens)
+may end up slower than the eager pipeline, which overlaps copies with dequant work;
+that gets measured, not assumed.
+
+**Not in this step.** Filling the remaining experts in the background (what a warm
+`stdio` process would want), predicting the next layer's experts, and any model other
+than Kolibri-1. A LoRA-targeted expert stack loads eagerly in f32 as today (it is
+merged at load), and only the other stacks are lazy.
+
+**Verification.** `kolibri1_lazy_experts_match_eager` on the tiny Kolibri fixture: no
+expert is resident after the load, a 1–2 token prompt uploads some but not all, and
+lazy and eager give identical greedy ids (batched prefill, then decode), an identical
+sequential-prefill hidden state, and identical System1 scores, in f32 and f16.
+`REFLEX_LAZY_EXPERTS resident=<n> total=<m>` on stderr after `generate`/`system1`
+reports how many experts a run uploaded.
+
+**T4 results (2026-10-07).** The test passes, as do the existing Kolibri,
+quantized-resident, pipeline, prefill-batching and f16 GPU tests. On the Q4_K_M
+fixture (6 layers × 16 experts, top-4), `generate` of 20 tokens and `system1` give the
+same token ids and scores lazy and eager, with 72/96 and 45/96 experts uploaded. The
+A6000 timing on the real model is still to come. On an A6000: cold and warm first token, a
+627-token prompt, and System1 cold, lazy against eager on the same host.
+
 ## Phase 5: verification and benchmarks
 
 - Correctness: byte-exact greedy agreement with the patched llama.cpp via
