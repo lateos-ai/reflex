@@ -10,8 +10,12 @@ What has been built, in order. Measurements live in
   of them; each layer uploads its routed experts the first time it needs them, so a
   short prompt reads a fraction of the 47.5 GB file before its first token. Output is
   identical to the eager load (tokens and System1 scores, verified on a T4 on the tiny
-  Kolibri fixture, where a 20-token generation uploaded 72 of 96 experts). Timing on
-  the real model: see [docs/design/kolibri.md](docs/design/kolibri.md), Phase 4 step 2.
+  Kolibri fixture, and on the real model). On an RTX A6000, a 5-token prompt's cold first
+  token drops from 8.55 s to **2.33 s** (llama.cpp: 16.8 s on the same host) after
+  uploading 4.9% of the experts; warm, 3.51 -> 1.21 s; a cold System1 decision 8.4 ->
+  2.9 s. A 627-token prompt touches half the experts and gains only ~1 s, since each
+  layer waits for its uploads. Details in
+  [docs/design/kolibri.md](docs/design/kolibri.md), Phase 4 step 2.
 - **`POST /v1/classify` in the OpenAI sidecar**: Reflex's System1 candidate scoring over
   HTTP. A request names a `prompt` (or chat `messages`) and up to 64 `labels`; the engine
   runs one prefill, scores each label as a continuation, and the response carries each

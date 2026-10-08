@@ -1,6 +1,6 @@
 # Design: Kolibri-1 MoE support
 
-**Status (2026-10-07): Phases 1-3 and Phase 4 step 1 done.** The real Kolibri-1 Q4_K_M
+**Status (2026-10-08): Phases 1-3 and Phase 4 steps 1-2 done.** The real Kolibri-1 Q4_K_M
 runs with `REFLEX_QUANT_RESIDENT=1` (45.4 GiB peak VRAM, so it fits a 48 GB card) and
 matches llama.cpp token for token on 5 German/English prompts up to 627 tokens, once
 llama.cpp computes with f32 activations like Reflex (see
@@ -9,8 +9,11 @@ pipeline and prefetch readers, a cold first token on an RTX A6000 takes 8.5 s ag
 llama.cpp's 17.2 s on the same host, and 3.8-4.0 s vs 7.6 s with the file in the page
 cache ([readers and System1](#prefetch-readers-and-system1-on-an-rtx-a6000-2026-10-07);
 an earlier, slower-disk host measured 19.7 vs 41.3 s cold). A warm System1
-classification takes ~0.2 s. Next: Phase 4 step 2 (lazy expert upload), which the
-expert-usage numbers below support for short prompts.
+classification takes ~0.2 s. With opt-in lazy expert upload (`REFLEX_LAZY_EXPERTS=1`,
+Phase 4 step 2) a short prompt's cold first token drops to 2.3 s, 7.2x faster than
+llama.cpp on the same host, and a cold System1 decision to ~2.9 s
+([lazy upload results](#lazy-expert-upload-on-an-rtx-a6000-2026-10-08)). Next: overlap
+the expert uploads with compute so long prompts gain too.
 Every convention
 below was read from Aleph Alpha's own checkpoint and inference code and from a real
 GGUF header, and cross-checked between two independent implementations. See
@@ -583,8 +586,46 @@ reports how many experts a run uploaded.
 quantized-resident, pipeline, prefill-batching and f16 GPU tests. On the Q4_K_M
 fixture (6 layers × 16 experts, top-4), `generate` of 20 tokens and `system1` give the
 same token ids and scores lazy and eager, with 72/96 and 45/96 experts uploaded. The
-A6000 timing on the real model is still to come. On an A6000: cold and warm first token, a
+A6000 timing on the real model is below. On an A6000: cold and warm first token, a
 627-token prompt, and System1 cold, lazy against eager on the same host.
+
+#### Lazy expert upload on an RTX A6000 (2026-10-08)
+
+The same US-TX-1 host as the readers table above (same IP; 6.1 GB/s disk, 15.3-CPU
+quota). Public `master` at `0ca45e7`, sm_86, `REFLEX_QUANT_RESIDENT=1`; "eager" is the
+default load (prefetch readers on), "lazy" adds `REFLEX_LAZY_EXPERTS=1`. Same harness:
+first token, n=3 interleaved medians unless noted; llama.cpp is stock `836d571` + the
+kolibri1 patch.
+
+| | Reflex eager | Reflex lazy | llama.cpp | experts uploaded (lazy) |
+|---|---|---|---|---|
+| p2 (5 tokens), cold: TTFT | 8.55 s | **2.33 s** (2.31–2.41) | 16.80 s | 942 / 19,200 (4.9%) |
+| p2, cold: wall | 10.4 s | 2.8 s | 17.1 s | |
+| p2, warm: TTFT | 3.51 s | **1.21 s** (1.13–1.21) | 8.55 s | |
+| p2, warm: wall | 5.4 s | 1.7 s | 8.9 s | |
+| p3 (~37 tokens), cold, n=2 | 8.48, 8.85 s | **3.97, 4.09 s** | | 3,333 (17.4%) |
+| p5 (627 tokens), cold, n=2 | 11.16, 11.11 s | **9.96, 10.10 s** | 19.07 s (n=1) | 9,934 (51.7%) |
+| System1, cold, n=2 (process start to result) | 8.46, 8.34 s | **2.76, 2.97 s** | | 1,654 (8.6%) |
+| System1, warm cache, n=2 | 3.73, 4.08 s | **1.47, 1.42 s** | | |
+
+- **Same output.** 20 greedy tokens are identical lazy and eager on p2 and p5, and the
+  System1 scores are identical to every printed digit.
+- **A short prompt now reaches its first token 3.7x faster cold** (8.55 -> 2.33 s) and
+  **7.2x faster than llama.cpp**. `model_load_ms` drops from ~8.0 s to ~0.9 s (the non-expert
+  weights only), and the expert uploads move into `prompt_eval_ms` (0.16 ->
+  ~0.95 s cold).
+- **Warm (file in page cache)**: 3.51 -> 1.21 s, against llama.cpp's 8.55 s.
+- **Long prompts still gain, barely.** At 627 tokens lazy uploads half the experts and
+  wins by ~1.1 s, but its `prompt_eval_ms` is 8.7 s against eager's 2.8 s: each layer
+  waits for its own ~200 experts to arrive (~24 GB at ~3 GB/s) with nothing overlapping
+  the copies. Prefetching the next layer's experts during the current layer's compute,
+  or switching to the eager pipeline above some prompt length, would recover that.
+- **System1 classification**: 2.8–3.0 s from a cold process to a decision (was 8.3–8.5
+  s), 1.4–1.5 s with the file cached.
+- **Warm process (`reflex stdio`, lazy, page cache dropped first)**: ready 1.37 s after
+  launch. The first request of each kind pays for its experts (1.57 s English sentiment,
+  0.87 s German, 1.02 s 4-way routing); after that the p50 is 202 / 216 / 245 ms, in line
+  with the eager process's 190–229 ms in the session above.
 
 ## Phase 5: verification and benchmarks
 
