@@ -577,7 +577,13 @@ expert is resident after the load, a 1–2 token prompt uploads some but not all
 lazy and eager give identical greedy ids (batched prefill, then decode), an identical
 sequential-prefill hidden state, and identical System1 scores, in f32 and f16.
 `REFLEX_LAZY_EXPERTS resident=<n> total=<m>` on stderr after `generate`/`system1`
-reports how many experts a run uploaded. On an A6000: cold and warm first token, a
+reports how many experts a run uploaded.
+
+**T4 results (2026-10-07).** The test passes, as do the existing Kolibri,
+quantized-resident, pipeline, prefill-batching and f16 GPU tests. On the Q4_K_M
+fixture (6 layers × 16 experts, top-4), `generate` of 20 tokens and `system1` give the
+same token ids and scores lazy and eager, with 72/96 and 45/96 experts uploaded. The
+A6000 timing on the real model is still to come. On an A6000: cold and warm first token, a
 627-token prompt, and System1 cold, lazy against eager on the same host.
 
 ## Phase 5: verification and benchmarks
