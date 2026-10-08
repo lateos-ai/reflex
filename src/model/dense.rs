@@ -104,6 +104,10 @@ pub(super) struct KolibriLayerWeights {
     pub(super) attn_mode: AttnMode,
     /// `expert_weights_norm` (off in real Kolibri-1).
     pub(super) normalize_top_k: bool,
+    /// `REFLEX_LAZY_EXPERTS=1`: the expert stacks still to upload, one expert
+    /// at a time as the router picks it (see [`Model::ensure_experts`]).
+    /// `None` when every expert was loaded up front.
+    pub(super) lazy: Option<LazyExperts>,
 }
 
 /// Kolibri-1's per-layer matmul tensors (`blk.{i}.<name>.weight`): the ones
@@ -289,7 +293,21 @@ impl Model {
             .ok_or_else(|| ReflexError::Other("missing moe_scatter_add_kernel".to_string()))?;
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
-        pipeline.prefetch_from(file);
+        // Lazy expert upload (docs/design/kolibri.md, Phase 4 step 2):
+        // Kolibri-1 with quantized-resident weights only.
+        let lazy_experts = lazy_experts_enabled() && quant_resident_enabled() && kolibri.is_some();
+        if lazy_experts_enabled() && !lazy_experts {
+            eprintln!(
+                "note: REFLEX_LAZY_EXPERTS=1 needs REFLEX_QUANT_RESIDENT=1 and a Kolibri-1 model; loading every weight up front"
+            );
+        }
+        if lazy_experts {
+            // The prefetch readers walk the data section in file order, so
+            // they would read the expert bytes this load skips.
+            pipeline.keep_fill_workers = true;
+        } else {
+            pipeline.prefetch_from(file);
+        }
         if profile_on {
             pipeline.profile = Some(LoadProfile::default());
         }
@@ -378,8 +396,28 @@ impl Model {
         // `matmul` = an `nn.Linear` weight that may stay quantized; norms and
         // everything else follow `policy` (f32, or the `--weights` dtype for a
         // matrix weight).
+        // Expert stacks reserved but not uploaded (lazy mode), collected per
+        // layer and moved into that layer's `KolibriLayerWeights::lazy`.
+        let lazy_pending: RefCell<Vec<LazyStackedTensor>> = RefCell::new(Vec::new());
         let mut load_weight_kind = |name: &str, matmul: bool| -> Result<Weight, ReflexError> {
             match arena.as_mut() {
+                Some(a) if matmul && lazy_experts && name.ends_with("_exps.weight") => {
+                    match reserve_expert_stack_quant(policy, file, name, a, layer_quant_types)? {
+                        Some((w, stack)) => {
+                            lazy_pending.borrow_mut().push(stack);
+                            Ok(w)
+                        }
+                        None => load_weight_device_quant(
+                            &mut pipeline,
+                            &dequant_kernels,
+                            policy,
+                            file,
+                            name,
+                            a,
+                            layer_quant_types,
+                        ),
+                    }
+                }
                 Some(a) if matmul => load_weight_device_quant(
                     &mut pipeline,
                     &dequant_kernels,
@@ -470,6 +508,10 @@ impl Model {
                         window: if sliding { kc.sliding_window } else { 0 },
                     },
                     normalize_top_k: kc.normalize_top_k,
+                    lazy: LazyExperts::new(
+                        lazy_pending.borrow_mut().drain(..).collect(),
+                        kc.expert_count,
+                    ),
                 }))
             } else if expert_used_count.is_some() {
                 LayerWeights::Moe(MoeLayerWeights {
@@ -982,6 +1024,70 @@ impl Model {
     /// data flow. The shared expert seeds the FFN accumulator, the routed
     /// experts add onto it, and `post_ffw_norm` is applied to the sum before
     /// the residual add.
+    /// Uploads whichever of `experts` this lazily loaded layer doesn't have
+    /// on the GPU yet (all of each one's stacked slices), and marks them
+    /// resident. The compute stream waits for the copies, so the expert
+    /// matmuls that follow read the real weights. Byte-identical to the
+    /// eager load, so the output is too (docs/design/kolibri.md, Phase 4
+    /// step 2).
+    pub(super) fn ensure_experts(
+        &self,
+        lazy: &LazyExperts,
+        experts: impl Iterator<Item = usize>,
+    ) -> Result<(), ReflexError> {
+        let mut resident = lazy.resident.borrow_mut();
+        let mut missing: Vec<usize> = Vec::new();
+        for e in experts {
+            if e >= resident.len() {
+                return Err(crate::reflex_err!(
+                    Other,
+                    "ensure_experts: expert {e} of {}",
+                    resident.len()
+                ));
+            }
+            if !resident[e] && !missing.contains(&e) {
+                missing.push(e);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        missing.sort_unstable();
+        let mut slices = Vec::with_capacity(missing.len() * lazy.stacks.len());
+        for &e in &missing {
+            for st in &lazy.stacks {
+                let start = e * st.expert_len;
+                slices.push((
+                    st.device_base + start as u64,
+                    &st.bytes[start..start + st.expert_len],
+                ));
+            }
+        }
+        self.dequant_pipeline.borrow_mut().upload_slices(&slices)?;
+        for e in missing {
+            resident[e] = true;
+        }
+        Ok(())
+    }
+
+    /// `(resident, total)` experts over every lazily loaded layer, or `None`
+    /// when this model loaded its experts up front.
+    pub fn lazy_expert_counts(&self) -> Option<(usize, usize)> {
+        let mut any = false;
+        let (mut r, mut t) = (0, 0);
+        for layer in &self.layers {
+            if let LayerWeights::Kolibri(l) = layer {
+                if let Some(lazy) = &l.lazy {
+                    let (lr, lt) = lazy.counts();
+                    r += lr;
+                    t += lt;
+                    any = true;
+                }
+            }
+        }
+        any.then_some((r, t))
+    }
+
     pub(super) fn forward_layer_kolibri(
         &self,
         layer: &KolibriLayerWeights,
@@ -1031,6 +1137,9 @@ impl Model {
         })?;
         let routed =
             route_sigmoid_logit_add(&router_logits, &layer.exp_probs_b, k, layer.normalize_top_k)?;
+        if let Some(lazy) = &layer.lazy {
+            self.ensure_experts(lazy, routed.iter().map(|&(e, _)| e))?;
+        }
         if expert_trace_enabled() {
             Self::print_expert_trace(&router_logits, &layer.exp_probs_b, k, layer.normalize_top_k);
         }
@@ -1443,6 +1552,17 @@ impl Model {
             ReflexError::Other("forward_layer_kolibri_batched: no expert_used_count".to_string())
         })?;
         let num_experts = layer.exp_probs_b.len();
+        if let Some(lazy) = &layer.lazy {
+            // Every expert any row routes to: the union `moe_ffn_grouped`
+            // is about to read. Routing is cheap host work, so it runs twice.
+            let mut needed = Vec::new();
+            for row in router_logits.chunks(num_experts) {
+                let routed =
+                    route_sigmoid_logit_add(row, &layer.exp_probs_b, k, layer.normalize_top_k)?;
+                needed.extend(routed.into_iter().map(|(e, _)| e));
+            }
+            self.ensure_experts(lazy, needed.into_iter())?;
+        }
         if expert_trace_enabled() {
             Self::print_expert_trace(&router_logits, &layer.exp_probs_b, k, layer.normalize_top_k);
         }

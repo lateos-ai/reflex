@@ -173,6 +173,14 @@ follows `--weights`. The rules below still hold: the scratch path is device to d
 so weights are never copied host-to-device per call. See
 [design/quantized-resident-weights.md](design/quantized-resident-weights.md).
 
+**Opt-in on top of that: `REFLEX_LAZY_EXPERTS=1`** (Kolibri-1 only; anything else
+prints a notice and loads eagerly). The load reserves each layer's stacked-expert space
+in the arena but copies nothing; after routing, a layer uploads the routed experts it
+doesn't have yet, once each, through the same pinned pipeline, and they stay resident.
+That is still one host-to-device copy per weight for the process lifetime, not a copy
+per call. The prefetch readers are off in this mode. See
+[design/kolibri.md](design/kolibri.md) (Phase 4 step 2).
+
 Rules that follow from measured regressions:
 
 - **Never copy weights host-to-device per call.** An early version re-uploaded weight
