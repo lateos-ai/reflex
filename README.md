@@ -84,7 +84,9 @@ independent implementation (llama.cpp, or a CPU reference) on real hardware.
   must be a single token.
 - **Models too big for `f16`**: `REFLEX_QUANT_RESIDENT=1` keeps `Q4_K`/`Q6_K` matrix weights
   quantized on the GPU instead (dense path and Kolibri-1). Kolibri-1's 47.5 GB `Q4_K_M`
-  then fits a 48 GB card. See [quantized-resident weights](docs/design/quantized-resident-weights.md)
+  then fits a 48 GB card. Adding `REFLEX_LAZY_EXPERTS=1` uploads each expert only when
+  the router first picks it: a short prompt's cold first token on an RTX A6000 goes from
+  8.6 s to 2.3 s. See [quantized-resident weights](docs/design/quantized-resident-weights.md)
   and [Kolibri-1](docs/design/kolibri.md).
 - DeepSeek's Q-LoRA query compression and MTP heads are not supported.
 
