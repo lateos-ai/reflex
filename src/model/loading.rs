@@ -313,6 +313,95 @@ pub(super) fn quant_resident_enabled() -> bool {
     std::env::var("REFLEX_QUANT_RESIDENT").is_ok_and(|v| v == "1")
 }
 
+/// `REFLEX_LAZY_EXPERTS=1` (with `REFLEX_QUANT_RESIDENT=1`, Kolibri-1 only):
+/// a routed expert's weights are copied to the GPU the first time the router
+/// picks it, not at load (docs/design/kolibri.md, Phase 4 step 2). Read once
+/// per load.
+pub(super) fn lazy_experts_enabled() -> bool {
+    std::env::var("REFLEX_LAZY_EXPERTS").is_ok_and(|v| v == "1")
+}
+
+/// One per-expert-stacked tensor whose arena space is reserved but not
+/// filled (`REFLEX_LAZY_EXPERTS=1`): its bytes in the GGUF mmap, the device
+/// address of expert 0's slice, and the bytes per expert. Expert `e` is
+/// `bytes[e * expert_len..][..expert_len]` in the file and lands at
+/// `device_base + e * expert_len`, the same slicing as
+/// `Model::quant_expert_weight`.
+pub(super) struct LazyStackedTensor {
+    pub(super) bytes: crate::gguf::SharedBytes,
+    pub(super) device_base: sys::CUdeviceptr,
+    pub(super) expert_len: usize,
+}
+
+/// A Kolibri-1 layer's lazily uploaded expert stacks: where to copy each
+/// expert from, and which experts are on the device so far. An expert's
+/// slices in every stack are uploaded together, so one flag covers them.
+pub(super) struct LazyExperts {
+    pub(super) stacks: Vec<LazyStackedTensor>,
+    pub(super) resident: RefCell<Vec<bool>>,
+}
+
+impl LazyExperts {
+    pub(super) fn new(stacks: Vec<LazyStackedTensor>, expert_count: usize) -> Option<Self> {
+        (!stacks.is_empty()).then(|| Self {
+            stacks,
+            resident: RefCell::new(vec![false; expert_count]),
+        })
+    }
+
+    /// `(resident, total)` experts in this layer.
+    pub(super) fn counts(&self) -> (usize, usize) {
+        let r = self.resident.borrow();
+        (r.iter().filter(|&&x| x).count(), r.len())
+    }
+}
+
+/// The lazy counterpart of [`load_weight_device_quant`] for a 3-D per-expert
+/// stack: reserves the tensor's arena space and returns its [`Weight`] (same
+/// offsets as an eager load) plus where to copy each expert from later, but
+/// copies nothing. `Ok(None)` when the tensor wouldn't be quantized-resident
+/// (wrong type, a LoRA target) or doesn't split evenly by expert; the caller
+/// then loads it eagerly.
+pub(super) fn reserve_expert_stack_quant(
+    policy: &WeightPolicy,
+    file: &GgufFile,
+    name: &str,
+    arena: &mut QuantArena,
+    allowed: &[GgmlType],
+) -> Result<Option<(Weight, LazyStackedTensor)>, ReflexError> {
+    let info = file
+        .tensor_info(name)
+        .ok_or_else(|| crate::reflex_err!(Gguf, "missing weight '{name}'"))?;
+    if !allowed.contains(&info.ggml_type) || info.shape.len() != 3 || policy.keep_f32.contains(name)
+    {
+        return Ok(None);
+    }
+    let expert_count = info.shape[2] as usize;
+    let bytes = file.tensor_bytes_shared(info)?;
+    let len = bytes.len();
+    if expert_count == 0 || len % expert_count != 0 {
+        return Ok(None);
+    }
+    let offset = arena.reserve(len)?;
+    let device_base = *arena.buf.device_ptr() + offset as u64;
+    Ok(Some((
+        Weight {
+            data: WeightData::Quant {
+                ty: info.ggml_type,
+                arena: arena.buf.clone(),
+                offset,
+                len,
+            },
+            shape: info.shape.clone(),
+        },
+        LazyStackedTensor {
+            bytes,
+            device_base,
+            expert_len: len / expert_count,
+        },
+    )))
+}
+
 /// `REFLEX_LOAD_PROFILE=1` prints a `REFLEX_LOAD_PROFILE` line splitting
 /// `model_load_ms` into its parts (dense path). Off by default: it adds GPU
 /// timing events per tensor and a device sync at the end of the load.
@@ -1207,6 +1296,39 @@ impl FillWorkers {
             }
         }
     }
+
+    /// Runs independent copies spread round-robin over the workers and the
+    /// calling thread. Returns only once every copy has landed; a job whose
+    /// worker is gone is copied here instead.
+    ///
+    /// # Safety
+    /// Every job's `dst` must be valid for `len` bytes, and no two jobs (or
+    /// a job and its source) may overlap.
+    unsafe fn copy_jobs(&self, jobs: Vec<FillJob>) {
+        let lanes = self.jobs.len() + 1;
+        let mut sent = 0usize;
+        let mut mine = Vec::new();
+        for (i, job) in jobs.into_iter().enumerate() {
+            let lane = i % lanes;
+            if lane == 0 {
+                mine.push(job);
+                continue;
+            }
+            let (src, dst, len) = (job.src, job.dst, job.len);
+            match self.jobs[lane - 1].send(job) {
+                Ok(()) => sent += 1,
+                Err(_) => std::ptr::copy_nonoverlapping(src, dst, len),
+            }
+        }
+        for job in mine {
+            std::ptr::copy_nonoverlapping(job.src, job.dst, job.len);
+        }
+        for _ in 0..sent {
+            if self.done.recv().is_err() {
+                break;
+            }
+        }
+    }
 }
 
 /// Pipelined host-to-device upload for the per-tensor load path
@@ -1291,8 +1413,13 @@ pub(super) struct WeightLoadPipeline {
     pub(super) next: usize,
     /// Fill threads, the loading thread included (`REFLEX_LOAD_THREADS`).
     fill_threads: usize,
-    /// Spawned on the first chunk big enough to split, dropped by `end_load`.
+    /// Spawned on the first chunk big enough to split, dropped by `end_load`
+    /// unless `keep_fill_workers`.
     fill_workers: Option<FillWorkers>,
+    /// Keep the fill threads past `end_load`: lazy expert upload
+    /// (`REFLEX_LAZY_EXPERTS=1`) keeps filling after the bulk load, one layer's
+    /// missing experts at a time.
+    pub(super) keep_fill_workers: bool,
     /// The GGUF data section, set by [`Self::prefetch_from`]; the readers
     /// start with the first chunk big enough to split (so never for a small
     /// model) and stop at `end_load`.
@@ -1324,6 +1451,7 @@ impl WeightLoadPipeline {
             next: 0,
             fill_threads: fill_thread_count(),
             fill_workers: None,
+            keep_fill_workers: false,
             prefetch_source: None,
             reader_threads: reader_thread_count(),
             prefetcher: None,
@@ -1334,9 +1462,12 @@ impl WeightLoadPipeline {
     /// Lets the fill threads exit once the model's bulk load is done (the
     /// pipeline itself stays on `Model` for `lm_head_resident`, which
     /// respawns them if it needs them; no fill is in flight between calls),
-    /// and stops the prefetch readers.
+    /// and stops the prefetch readers. With `keep_fill_workers` the fill
+    /// threads stay for lazy expert upload.
     pub(super) fn end_load(&mut self) {
-        self.fill_workers = None;
+        if !self.keep_fill_workers {
+            self.fill_workers = None;
+        }
         if let (Some(p), Some(pf)) = (&mut self.profile, &self.prefetcher) {
             p.prefetched_bytes = pf.touched_bytes();
         }
@@ -1677,6 +1808,95 @@ impl WeightLoadPipeline {
             p.tensors_quant += 1;
         }
         Ok((offset, bytes.len()))
+    }
+
+    /// Copies each `(dst, src)` slice host to device through the pinned
+    /// slots (lazy expert upload, `REFLEX_LAZY_EXPERTS=1`). Slices are packed
+    /// into chunks of at most [`STAGE_CHUNK_BYTES`]; a chunk's slices are
+    /// copied into the pinned buffer one per fill job, so cold page faults
+    /// for different slices run at the same time, then each goes to the
+    /// device with its own async copy on `copy_stream`. Same per-chunk host
+    /// wait as [`Self::stage_h2d`], and the compute stream waits on the last
+    /// chunk, so any later kernel sees the bytes.
+    pub(super) fn upload_slices(
+        &mut self,
+        slices: &[(sys::CUdeviceptr, &[u8])],
+    ) -> Result<(), ReflexError> {
+        let mut last_slot = None;
+        let mut i = 0;
+        while i < slices.len() {
+            let mut total = slices[i].1.len();
+            let mut j = i + 1;
+            while j < slices.len() && total + slices[j].1.len() <= STAGE_CHUNK_BYTES {
+                total += slices[j].1.len();
+                j += 1;
+            }
+            let group = &slices[i..j];
+            let slot = self.next_pinned % 2;
+            self.next_pinned += 1;
+            if self.pinned_used[slot] {
+                unsafe { sys::lib().cuEventSynchronize(self.pinned_done[slot]) }
+                    .result()
+                    .map_err(|e| {
+                        crate::gpu_err!(e, "lazy upload: await slot {slot}'s prior H2D copy: {e}")
+                    })?;
+            }
+            unsafe { self.pinned[slot].ensure_capacity(total)? };
+            let base = self.pinned[slot].ptr;
+            let mut jobs = Vec::with_capacity(group.len());
+            let mut off = 0;
+            for (_, src) in group {
+                jobs.push(FillJob {
+                    src: src.as_ptr(),
+                    dst: unsafe { base.add(off) },
+                    len: src.len(),
+                });
+                off += src.len();
+            }
+            self.fill_jobs(jobs);
+            let mut off = 0;
+            for (dst, src) in group {
+                let staged = unsafe { std::slice::from_raw_parts(base.add(off), src.len()) };
+                unsafe { result::memcpy_htod_async(*dst, staged, self.copy_stream) }
+                    .map_err(|e| crate::gpu_err!(e, "lazy upload: async H2D copy: {e}"))?;
+                off += src.len();
+            }
+            unsafe { result::event::record(self.pinned_done[slot], self.copy_stream) }
+                .map_err(|e| crate::gpu_err!(e, "lazy upload: record pinned_done: {e}"))?;
+            self.pinned_used[slot] = true;
+            last_slot = Some(slot);
+            i = j;
+        }
+        let Some(slot) = last_slot else {
+            return Ok(());
+        };
+        unsafe {
+            result::stream::wait_event(
+                *self.device.cu_stream(),
+                self.pinned_done[slot],
+                sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+        }
+        .map_err(|e| crate::gpu_err!(e, "lazy upload: wait for copy: {e}"))
+    }
+
+    /// Runs `jobs` (disjoint copies into one pinned buffer) on the fill
+    /// threads, the calling thread included; returns once all have landed.
+    fn fill_jobs(&mut self, jobs: Vec<FillJob>) {
+        if jobs.len() > 1 && self.fill_threads > 1 && self.fill_workers.is_none() {
+            self.fill_workers = FillWorkers::spawn(self.fill_threads - 1);
+            if self.fill_workers.is_none() {
+                self.fill_threads = 1;
+            }
+        }
+        match &self.fill_workers {
+            Some(w) if jobs.len() > 1 => unsafe { w.copy_jobs(jobs) },
+            _ => {
+                for job in jobs {
+                    unsafe { std::ptr::copy_nonoverlapping(job.src, job.dst, job.len) };
+                }
+            }
+        }
     }
 }
 
