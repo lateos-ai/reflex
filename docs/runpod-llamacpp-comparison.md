@@ -1,9 +1,8 @@
 # Reflex vs. llama.cpp cold-start comparison on Runpod Serverless
 
-**Status: first run done 2026-10-01, partial.** Reflex has n=5 successful cold
-invocations, llama.cpp n=3 (two more hit a platform gateway timeout and serverless L4
-capacity then ran out). See [Results](#results) for what the numbers do and don't
-support.
+**Status: done.** n=5 successful cold invocations per engine, from two sessions on the
+same GPU SKU (2026-10-01 and 2026-10-02), plus the `--no-warmup` variant (n=3). See
+[Results](#results) for what the numbers do and don't support.
 
 ## Why this comparison
 
@@ -189,20 +188,59 @@ the same way. These are recorded as platform failures, not engine failures. A si
 llama.cpp run was started as a replacement but got no worker before L4 stock ran out,
 and was stopped.
 
-The optional `--no-warmup` variant was not run.
+### Second session (2026-10-02): the last two llama.cpp runs, and `--no-warmup`
+
+Run 03:00–03:15 UTC, same GPU SKU (L4, pinned), same images, CUDA floor 12.8, FlashBoot
+off, `workersMin=0`, `workersMax=1`, data center unpinned (every worker landed in
+EU-RO-1). The idle timeout was raised to 60 s so worker logs could be read after each
+request; every run was still forced cold the same way `bench_cold_runpod.sh` does it
+(`workersMax` to 0, 25 s wait, back to 1). Wall clock was timed around a single `curl`
+from the same client rather than through `bench_cold_runpod.sh`'s `/usr/bin/time` loop.
+The `--no-warmup` variant ran as a third endpoint with
+`LLAMA_ARGS="-ngl 99 -c 4096 -np 1 --no-warmup"`.
+
+| run | engine | wall clock | engine-ready |
+|---|---|---|---|
+| 1 | Reflex (control) | 35.92 s | 0.44 s |
+| 2 | llama.cpp | 28.12 s | 0.88 s |
+| 3 | llama.cpp `--no-warmup` | 45.58 s | 0.98 s |
+| 4 | Reflex (control) | 28.66 s | not captured (log API stalled) |
+| 5 | llama.cpp | 60.77 s | 1.05 s |
+| 6 | llama.cpp `--no-warmup` | 113.63 s (image pulled fresh) | 0.92 s |
+| 7 | llama.cpp `--no-warmup` | 57.57 s | 0.86 s |
+| 8 | Reflex (control) | 36.21 s | 0.40 s |
+
+Reflex run 1 ran before the CUDA floor was raised from 12.0 to 12.8 on its endpoint; the
+worker still landed on an L4 in EU-RO-1. `workersMax=1` was again exceeded: `--no-warmup`
+runs 3, 6 and 7 each started a second worker (the run 6 extra one sat `THROTTLED`).
+
+### Combined (both sessions)
+
+| | n | engine-ready median (range) | wall clock median (range) |
+|---|---|---|---|
+| Reflex | 5 (2026-10-01) | **0.49 s** (0.39–0.61) | 53.12 s (24.06–73.16) |
+| Reflex, same-day controls | 2 (2026-10-02) | 0.40 s, 0.44 s | 28.66–36.21 s (n=3) |
+| llama.cpp | 5 (3 + 2) | **0.95 s** (0.88–1.37) | 60.77 s (28.12–138.68) |
+| llama.cpp `--no-warmup` | 3 | **0.92 s** (0.86–0.98) | 57.57 s (45.58–113.63) |
 
 ### What the numbers support
 
 - **Engine load: Reflex ~0.5 s vs. llama.cpp ~0.95 s on an L4, about 1.9x** (medians,
-  n=5 vs. n=3; Reflex 0.39–0.61 s, llama.cpp 0.92–1.37 s). This is the like-for-like
-  engine comparison. It is consistent with the local T4 numbers in the pre-check above.
+  n=5 each; Reflex 0.39–0.61 s, llama.cpp 0.88–1.37 s). This is the like-for-like
+  engine comparison. It is consistent with the local T4 numbers in the pre-check above,
+  and with the second session's same-day Reflex controls (0.40 s, 0.44 s).
+- **llama-server's warmup is not where its time goes.** With `--no-warmup` its engine-ready
+  median was 0.92 s (n=3) against 0.95 s with warmup, a difference inside the run-to-run
+  spread. Its log shows most of the time in loading the model (~0.45 s from
+  `load_model` to the tokenizer warning) and thread-pool and slot setup after it.
 - **End-to-end wall clock: no conclusion.** Platform overhead dominates: scheduling a
   worker, pulling or loading the image, creating the container, and the gateway noticing
   the worker is healthy. Even with a cached image, Reflex ranged 24–73 s for a ~0.5 s
   engine load. The time from engine-ready to the response arriving alone ranged from
   roughly 7 s to 58 s across runs (approximate: the request's start is inferred from
-  the cold-reset step's fixed sleep). Neither the n=5 vs. n=3 medians (53 s vs. 68 s) nor the
-  ranges support an end-to-end ratio.
+  the cold-reset step's fixed sleep). Neither the n=5 medians (53 s vs. 61 s) nor the
+  ranges support an end-to-end ratio; the second session alone shows llama.cpp's fastest
+  cold request (28.12 s) beating two of three Reflex controls.
 - **Image size showed up directly.** Two of the five llama.cpp workers landed on hosts
   without the 7.79 GB image and pulled it (~55 s in round 1). No Reflex worker in the
   measured runs needed a full pull: either the host had the image or Runpod loaded it
