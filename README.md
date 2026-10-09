@@ -58,6 +58,10 @@ cargo run --release --bin reflex -- generate model.gguf "Once upon a time" --max
 `reflex <subcommand>` with no arguments prints that subcommand's usage. All subcommands,
 build options and output formats: [docs/reference.md](docs/reference.md).
 
+No GPU of your own? Reflex is listed on the
+[Runpod Hub](https://console.runpod.io/hub/listing/lateos-ai/reflex): deploy it as a
+serverless endpoint in one click, no build required ([worker docs](.runpod/README.md)).
+
 ## Supported models and limits
 
 | Architecture (GGUF `general.architecture`) | Tested with |
@@ -124,7 +128,7 @@ window is idle power. [Details](docs/benchmarks.md#energy).
 | AWS, scale to zero (Spot, local socket) | [docs/aws-deployment.md](docs/aws-deployment.md) |
 | AWS, always warm (load balancer, HTTPS) | [docs/aws-deployment-warm.md](docs/aws-deployment-warm.md) |
 | Runpod serverless, load-balancing endpoint | [serverless/runpod](serverless/runpod/README.md) |
-| Runpod Hub, queue-based worker | [.runpod](.runpod/README.md) |
+| Runpod Hub, queue-based worker (one-click deploy) | [Hub listing](https://console.runpod.io/hub/listing/lateos-ai/reflex) · [.runpod](.runpod/README.md) |
 | Modal | [.modal](.modal/README.md) |
 | Kubernetes (one Job per invocation) | [docs/reference.md](docs/reference.md#kubernetes) |
 | Embedding in another program | C FFI (`include/reflex_engine.h`), local IPC (`reflex stdio`/`uds`) |
