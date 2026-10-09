@@ -43,6 +43,7 @@ requirement() {
     *::qwen3moe_fixture_*) echo "|test-data/tiny-qwen3moe.gguf|fixture missing" ;;
     *::qwen35moe_fixture_*) echo "|test-data/tiny-qwen35moe.gguf|fixture missing" ;;
     model::mla_batching_tests::*|*::online_attention_matches_legacy_kernels_mla) echo "|test-data/deepseek-tiny-mla.gguf|fixture missing" ;;
+    model::gemma4_model_tests::*) echo "|test-data/tiny-gemma4.gguf|fixture missing" ;;
     *) echo "$DENSE_GGUF|$DENSE_GGUF|DENSE_GGUF path does not exist" ;;
   esac
 }

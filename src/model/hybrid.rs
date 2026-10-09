@@ -585,6 +585,7 @@ impl Model {
                 gdn_gated_norm_k,
             }),
             mla: None,
+            gemma4: None,
         })
     }
 

@@ -3,7 +3,6 @@
 //! the GPU (`#[ignore]`d like every other GPU test; run with
 //! `cargo test --release -- --ignored gemma4_`).
 
-use super::gemma4::*;
 use super::*;
 use rand::{Rng, SeedableRng};
 

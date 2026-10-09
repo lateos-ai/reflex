@@ -1,11 +1,12 @@
 # Design: Gemma 4 support (`gemma4`)
 
-**Status (2026-10-09): Phase 1 (tokenizer) done; Phase 2 (kernels) written, not yet
-run on a GPU.** Reflex encodes text exactly like Gemma 4's own tokenizer on 25 test
-strings (see [Phase 1 results](#phase-1-results-2026-10-09)). The new kernels
-(`kernels_cuda/gemma4.cu`) have host references checked on the CPU, and `#[ignore]`d GPU
-tests (`cargo test --release -- --ignored gemma4_`) that still need a GPU host. The model
-itself still fails at load with `UnsupportedArchitecture`.
+**Status (2026-10-09): Phases 1-3 written; nothing has run on a GPU yet.** The
+tokenizer matches Gemma 4's own on 25 test strings
+([Phase 1 results](#phase-1-results-2026-10-09)). The kernels (`kernels_cuda/gemma4.cu`)
+and the model path (`src/model/gemma4.rs`: loading, batched prefill, decode,
+`generate`/`system1`/`check`) are written and pass every CPU-side check, but have not
+been compiled with `nvcc` or run. Next: build the synthetic fixture and run the GPU tests
+and `reflex check` against llama.cpp (Phase 4).
 
 Goal: run Google's Gemma 4 text models on Reflex. They are released under Apache 2.0.
 The target is `gemma-4-31B-it`, and development uses `gemma-4-12B-it`, which has the
@@ -134,7 +135,8 @@ and head dims up to 1024. New kernels:
 1. **Tokenizer** (CPU only). Done; see below.
 2. **Kernels**: the three above, each tested against a host reference. Written
    (`src/model/gemma4.rs`, `src/model/gemma4_kernel_tests.rs`); GPU run pending.
-3. **Model path**: `Gemma4Config` and its parser (per-layer arrays, rejects the
+3. **Model path** (written, see [Phase 3 notes](#phase-3-notes-2026-10-09)):
+   `Gemma4Config` and its parser (per-layer arrays, rejects the
    out-of-scope variants), `load_gemma4`, single-token forward and batched prefill, and
    `generate`/`system1`/`check`. `system1` scores multi-token labels the way the dense
    path does, on soft-capped logits. Synthetic fixture: a tiny
@@ -172,6 +174,34 @@ and head dims up to 1024. New kernels:
 - Fixture: `test-data/gemma4-tokenizer.gguf` is the 12B Q8_0 file's metadata section,
   rewritten with an empty tensor table (15.8 MB, gitignored). sha256
   `2a18b8fb866c81222a327686b473df5a3906f271c045982e6f4ad1c09be88e14`.
+
+## Phase 3 notes (2026-10-09)
+
+- `Model::load_with_options` sends `gemma4` to `Model::load_gemma4`. `Model.gemma4:
+  Option<Gemma4Model>` holds the per-layer weights and kernels, and
+  `ArchitectureKind::Gemma4` lets callers tell the path apart. `--export-kv`,
+  `--import-kv` and `--lora` return clear errors. `REFLEX_QUANT_RESIDENT=1` prints a
+  notice and loads normal weights. `REFLEX_ATTN_KERNEL=legacy` is rejected, because the
+  legacy kernels hardcode a `1/sqrt(head_dim)` scale.
+- One layer function, `Model::forward_gemma4_layer`, serves both prefill (`rows` = prompt
+  length, cuBLAS GEMMs, sliding window masked per row in the online attention kernel)
+  and decode (`rows == 1`, GEMVs, window applied by narrowing the K/V views, as the
+  dense path does). Each layer's K/V cache is sized from that layer's own shape.
+- The tied LM head stays lazy (`LmHead::TiedLazy`). `system1` gathers only the candidate
+  rows and applies the soft-cap to them on the host. Generation forces the full head
+  resident on its first token and applies the soft-cap on the GPU. Multi-token labels
+  are teacher-forced through the shared post-prompt KV headroom, the same way as on the
+  dense path.
+- `layer_output_scale` is read to the host at load and applied with `scale_kernel`.
+  When it's absent the default is 1.0, as in llama.cpp.
+- Tests:
+  - `gemma4_config_tests`: host-only, real 12B and 31B header values, and each rejected
+    variant.
+  - `gemma4_model_tests`: `#[ignore]`d GPU tests, run against `REFLEX_GEMMA4_GGUF` or
+    `test-data/tiny-gemma4.gguf`. They check that batched prefill past the sliding window
+    matches sequential decode, that `system1` scores match the full-vocab soft-capped
+    logits for 1-token and multi-token labels, and that generation runs end to end.
+    `scripts/gpu_nightly_tests.sh` reports them as SKIP when the fixture is absent.
 
 ## Risks
 

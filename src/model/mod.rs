@@ -86,6 +86,7 @@ mod mla;
 use self::config::*;
 pub use self::config::{parse_model_config, LayerConfig, MoeMetaConfig, RopeType};
 use self::dense::*;
+use self::gemma4::*;
 use self::hybrid::*;
 use self::kernels::*;
 use self::loading::*;
@@ -98,7 +99,11 @@ mod attention_online_tests;
 #[cfg(test)]
 mod f16_kernel_tests;
 #[cfg(test)]
+mod gemma4_config_tests;
+#[cfg(test)]
 mod gemma4_kernel_tests;
+#[cfg(test)]
+mod gemma4_model_tests;
 #[cfg(test)]
 mod hybrid_batching_tests;
 #[cfg(test)]
@@ -258,6 +263,9 @@ pub struct Model {
     /// `Some` iff this is a DeepSeek-V2/V3 MLA model (see `Self::load_mla`); like
     /// `hybrid`, `cfg`/`layers`/`expert_used_count` are unused garbage in that case.
     mla: Option<MlaModel>,
+    /// `Some` iff this is a Gemma 4 model (see `Self::load_gemma4`); like
+    /// `hybrid`, `cfg`/`layers`/`expert_used_count` are unused in that case.
+    gemma4: Option<Gemma4Model>,
 }
 
 /// Which forward path a loaded [`Model`] dispatches to -- used by callers
@@ -269,6 +277,7 @@ pub enum ArchitectureKind {
     Dense,
     Hybrid,
     Mla,
+    Gemma4,
 }
 
 /// One candidate continuation to score against a shared prompt, for
@@ -316,6 +325,8 @@ impl Model {
             ArchitectureKind::Hybrid
         } else if self.mla.is_some() {
             ArchitectureKind::Mla
+        } else if self.gemma4.is_some() {
+            ArchitectureKind::Gemma4
         } else {
             ArchitectureKind::Dense
         }
@@ -364,6 +375,11 @@ impl Model {
     /// whose shape doesn't match that weight's, is a hard error -- never a
     /// silent skip.
     pub fn apply_lora(&mut self, path: &std::path::Path) -> Result<usize, ReflexError> {
+        if self.gemma4.is_some() {
+            return Err(ReflexError::Lora(
+                "--lora is not supported for Gemma 4 models yet".to_string(),
+            ));
+        }
         if self.mla.is_some() {
             return Err(ReflexError::Lora(
                 "--lora is not supported for DeepSeek-V2/V3 MLA models in this round -- only dense/MoE Qwen3 \
@@ -595,6 +611,9 @@ impl Model {
         if architecture == "deepseek2" {
             return Self::load_mla(device, file, &policy);
         }
+        if architecture == "gemma4" {
+            return Self::load_gemma4(device, file, &policy);
+        }
         // `kolibri1` also goes through the dense/MoE path, as its own layer
         // variant (`LayerWeights::Kolibri`).
         Self::load_dense(device, file, &policy)
@@ -691,6 +710,17 @@ impl Model {
         if let Some(m) = &self.mla {
             return self.forward_prompt_mla(m, prompt);
         }
+        if let Some(g) = &self.gemma4 {
+            let (generated, text) = self.generate_gemma4_impl(
+                g,
+                prompt,
+                1,
+                &SamplingParams::default(),
+                |_logits| {},
+                |_id, _text| {},
+            )?;
+            return Ok((generated[0], text));
+        }
         let (generated, text, _k_caches, _v_caches, _seq_len) = self.generate_dense_impl(
             prompt,
             None,
@@ -742,7 +772,7 @@ impl Model {
     ) -> Result<(Vec<u32>, String), ReflexError> {
         match imported {
             Some(crate::kv_io::ImportedKv::Dense(cache)) => {
-                if self.hybrid.is_some() || self.mla.is_some() {
+                if self.hybrid.is_some() || self.mla.is_some() || self.gemma4.is_some() {
                     return Err(ReflexError::KvCache("imported KV cache file is dense/MoE format, but this model is not a dense/MoE Qwen3 model".to_string()));
                 }
                 let (generated, text, _, _, _) = self.generate_dense_impl(
@@ -801,6 +831,16 @@ impl Model {
                         on_token,
                     )?;
                     return Ok((generated, text));
+                }
+                if let Some(g) = &self.gemma4 {
+                    return self.generate_gemma4_impl(
+                        g,
+                        prompt,
+                        max_new_tokens,
+                        sampling,
+                        on_first_token,
+                        on_token,
+                    );
                 }
                 if let Some(m) = &self.mla {
                     let (generated, text, _, _) = self.generate_mla_impl(
@@ -948,6 +988,9 @@ impl Model {
         }
         if let Some(m) = &self.mla {
             return self.system1_evaluate_mla(m, prompt, candidates, temperature);
+        }
+        if let Some(g) = &self.gemma4 {
+            return self.system1_evaluate_gemma4(g, prompt, candidates, temperature);
         }
         self.system1_evaluate_dense(prompt, candidates, temperature)
     }
