@@ -105,13 +105,20 @@ COPY --from=builder /build/sidecar/openai-adapter/target/release/reflex-openai-a
 # this repo, which is exactly what Runpod's Hub build pipeline operates on. A
 # build-time fetch keeps the same "baked into the image, zero runtime/cold-start
 # download" property the `runpod-lb` target's COPY achieves for a local build, without
-# requiring a 379MB binary in git history (GitHub hard-rejects any pushed file over
-# 100MB without Git LFS). This exact URL was verified byte-for-byte identical to
-# serverless/runpod/model.gguf (same size, same leading bytes) before being used
-# here -- if the model is ever changed, re-verify a new URL the same way rather
-# than trusting a filename match alone.
+# requiring a 639MB binary in git history (GitHub hard-rejects any pushed file over
+# 100MB without Git LFS).
+#
+# Q8_0, not Q4_K_M: this listing leads with classification (see hub.json), and
+# bit-width is the one thing a classifier sees that a chat model mostly hides. On a
+# sub-3B model Q8_0 preserves the fine-grained logits `system1_evaluate` softmaxes
+# over, where a Q4_K_M can move a near-tie label; classification is a single prefill
+# with no generation, so the extra bandwidth costs one load, not per-token decode.
+# The same repo:file pair is `src/hf.rs`'s verified `--quickstart` model
+# (`QUICKSTART_REPO`/`QUICKSTART_FILE`, ~639MB, checked real by that module's own
+# network test), so it is a known-resolvable URL, not a filename guess. If the model
+# is ever changed, re-verify the new URL rather than trusting a filename match alone.
 RUN mkdir -p /models && curl -fSL \
-    "https://huggingface.co/unsloth/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf" \
+    "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf" \
     -o /models/model.gguf
 ENV GGUF_PATH=/models/model.gguf
 
