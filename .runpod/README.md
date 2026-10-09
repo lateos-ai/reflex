@@ -46,6 +46,45 @@ holding that `classification` object, like a non-streaming chat job:
            "labels": [" positive", " negative"]}}
 ```
 
+The worker bakes **Qwen3-0.6B-Q8_0** (not the Q4_K_M the `runpod-lb` image uses): the
+listing leads with classification, and on a sub-3B model Q8_0 preserves the fine-grained
+logits the label softmax reads where a 4-bit quant can move a near-tie. No generation
+happens, so the extra bandwidth is paid once at load, not per decoded token.
+
+### Classifier caller contract
+
+`POST /v1/classify` scores labels, it does not generate one. Three things decide whether
+its numbers mean anything, all of them the caller's to get right:
+
+- **Send `prompt`, not `messages`.** With `messages`, labels are scored at the start of
+  the assistant's reply, and Qwen3 opens every reply with a ` thinking` block that a label
+  is not expected at. On the sentiment fixture, `messages` rated it `positive` at 0.89
+  while a plain `prompt` rated the correct `" negative"` at 0.91. End the `prompt` where
+  the label naturally follows (`... Sentiment:`).
+- **Use one-token labels, and mind the leading space.** A label is the literal text that
+  follows the prompt, so it usually wants a leading space (`" negative"`, not
+  `"negative"`). `score` sums the label's raw token logits, so a longer label wins on
+  length alone; the response carries a `warning` and each label's `tokens` when they
+  differ. `A`/`B`/`C` or verified single-token words are safest.
+- **`probability` is over the label set, not the vocabulary.** It sums to 1 across the
+  labels you sent and says nothing about how likely the true class is outside them --
+  the softmax is a fixed, deterministic transform of the scores, so it will happily
+  return a confident winner for a prompt that fits none of the labels. The engine
+  applies no cutoff; threshold on `probability` and `entropy` (bits; 0 is certain,
+  `log2(labels.len())` is uniform) in the caller, and route the uncertain band to
+  human review or a larger model. Label-order bias is also uncorrected: calibrate on
+  held-out data and do not trust the listed order.
+
+Strategy B from the general classifier playbook -- grammar-constrained JSON output for
+multi-label extraction -- is **not** implemented here: `system1_evaluate` is scoring
+only, and Reflex has no grammar-constrained sampling yet (it is a queued backlog item).
+Use chat completions with a prompt that demands JSON if you need it, and parse
+defensively.
+
+The Hub smoke tests (`tests.json`) only assert the job completes; they do not assert the
+predicted label. Check accuracy locally with `reflex system1` on real data before
+trusting a deployment.
+
 `handler` is a Runpod **generator** handler started with `return_aggregate_stream`, the
 same convention `runpod-workers/worker-vllm` uses:
 
@@ -201,6 +240,14 @@ the PTX JIT the v0.2.2 image paid is no longer in the catalog path. The GHCR ima
 publishes is `ghcr.io/lateos-ai/reflex-runpod-hub`, digest (verified 2026-10-09)
 `sha256:6ecb8e1f0200c2736141014eadc9ad38bee7560fad52b48e02dbacd31d510f33`. The v0.2.2 note
 above is kept for history.
+
+**Update, 2026-10-09 (classifier release, `v0.2.5-runpod-hub`):** the worker now bakes
+Qwen3-0.6B-**Q8_0** (was Q4_K_M) and the listing leads with classification; `hub.json` is
+retitled, `.runpod/README.md`'s "Classifier caller contract" documents how to use it, and
+`tests.json` gains a 4-label routing smoke test. `POST /v1/classify` and `handler.py`'s
+`labels` branch are the same code that has been on `master` since `v0.2.3`; this release is
+packaging, doc and model-quant only. `v0.2.4-runpod-hub` is the adoption/Hub-refresh release
+(#16), not this one.
 
 `iconUrl` in `hub.json` points at a real hosted asset (`.runpod/icon.jpg` on `master`), not
 the old `TODO:` placeholder. The GPU-selection fields in `hub.json`/`tests.json` are kept as

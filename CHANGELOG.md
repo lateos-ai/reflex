@@ -3,6 +3,19 @@
 What has been built, in order. Measurements live in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+## 2026-10-09
+
+- **Runpod Hub worker repackaged as a classifier listing** (`v0.2.5-runpod-hub`). The
+  queue-based Hub worker now bakes **Qwen3-0.6B-Q8_0** (was Q4_K_M; `.runpod/Dockerfile`)
+  and leads with `POST /v1/classify`: a job whose `input` has `labels` scores every label
+  as a continuation of `prompt` in one prefill and returns per-label probabilities and
+  entropy, generating nothing. Chat completions stay available on the same endpoint.
+  `.runpod/README.md` gains a caller contract -- send `prompt` not `messages` for Qwen3's
+  ` thinking` bias, use one-token labels with a leading space, and treat `probability` as
+  relative to the label set so thresholds/escalation stay the caller's job -- and
+  `tests.json` adds a 4-label routing smoke test. No engine change; `serverless/runpod/`
+  (load-balancing) is untouched.
+
 ## 2026-10-07
 
 - **Lazy expert upload for Kolibri-1** (opt-in `REFLEX_LAZY_EXPERTS=1`, with
