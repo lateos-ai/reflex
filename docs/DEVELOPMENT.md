@@ -250,6 +250,10 @@ in `test-data/` locally:
   `Hob-forge/Kolibri-1-GGUF`'s `Kolibri-1-Q4_K_M.gguf` (the first ~4.8 MB, read with an
   HTTP range request) rewritten with an empty tensor table. It carries the real
   Kolibri-1 vocab and merges for the tokenizer golden test.
+- `test-data/gemma4-tokenizer.gguf` is the same thing for Gemma 4: the metadata section
+  of `ggml-org/gemma-4-12B-it-GGUF`'s `gemma-4-12B-it-Q8_0.gguf` (~16 MB) with an empty
+  tensor table, for the `gemma4` tokenizer golden test (see
+  [design/gemma4.md](design/gemma4.md)).
 - `test-data/tiny-kolibri1.gguf` (Q4_K_M) and `tiny-kolibri1-f32.gguf` are a synthetic
   `kolibri1` model: 6 layers (layer 4 full attention), 16 experts with top-4, a nonzero
   router bias, a 16-token sliding window and the real Kolibri-1 tokenizer. Mainline
