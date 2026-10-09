@@ -1,9 +1,11 @@
 # Design: Gemma 4 support (`gemma4`)
 
-**Status (2026-10-09): Phase 1 (tokenizer) done; nothing runs on the GPU yet.** Reflex
-encodes text exactly like Gemma 4's own tokenizer on 25 test strings (see
-[Phase 1 results](#phase-1-results-2026-10-09)). The model itself still fails at load
-with `UnsupportedArchitecture`.
+**Status (2026-10-09): Phase 1 (tokenizer) done; Phase 2 (kernels) written, not yet
+run on a GPU.** Reflex encodes text exactly like Gemma 4's own tokenizer on 25 test
+strings (see [Phase 1 results](#phase-1-results-2026-10-09)). The new kernels
+(`kernels_cuda/gemma4.cu`) have host references checked on the CPU, and `#[ignore]`d GPU
+tests (`cargo test --release -- --ignored gemma4_`) that still need a GPU host. The model
+itself still fails at load with `UnsupportedArchitecture`.
 
 Goal: run Google's Gemma 4 text models on Reflex. They are released under Apache 2.0.
 The target is `gemma-4-31B-it`, and development uses `gemma-4-12B-it`, which has the
@@ -130,7 +132,8 @@ and head dims up to 1024. New kernels:
 ## Phases
 
 1. **Tokenizer** (CPU only). Done; see below.
-2. **Kernels**: the three above, each tested against a host reference.
+2. **Kernels**: the three above, each tested against a host reference. Written
+   (`src/model/gemma4.rs`, `src/model/gemma4_kernel_tests.rs`); GPU run pending.
 3. **Model path**: `Gemma4Config` and its parser (per-layer arrays, rejects the
    out-of-scope variants), `load_gemma4`, single-token forward and batched prefill, and
    `generate`/`system1`/`check`. `system1` scores multi-token labels the way the dense
