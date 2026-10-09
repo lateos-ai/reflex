@@ -77,6 +77,7 @@ use std::thread::ScopedJoinHandle;
 
 mod config;
 mod dense;
+mod gemma4;
 mod hybrid;
 mod kernels;
 mod loading;
@@ -96,6 +97,8 @@ use crate::error::ReflexError;
 mod attention_online_tests;
 #[cfg(test)]
 mod f16_kernel_tests;
+#[cfg(test)]
+mod gemma4_kernel_tests;
 #[cfg(test)]
 mod hybrid_batching_tests;
 #[cfg(test)]
