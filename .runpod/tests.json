@@ -24,6 +24,14 @@
         "labels": [" positive", " negative"]
       },
       "timeout": 120000
+    },
+    {
+      "name": "smoke-classify-routing",
+      "input": {
+        "prompt": "I was charged twice for my subscription this month. Department:",
+        "labels": [" billing", " tech_support", " sales", " legal"]
+      },
+      "timeout": 120000
     }
   ],
   "config": {
