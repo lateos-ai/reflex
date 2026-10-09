@@ -1,12 +1,12 @@
 # Design: Gemma 4 support (`gemma4`)
 
-**Status (2026-10-09): Phases 1-3 written; nothing has run on a GPU yet.** The
-tokenizer matches Gemma 4's own on 25 test strings
-([Phase 1 results](#phase-1-results-2026-10-09)). The kernels (`kernels_cuda/gemma4.cu`)
-and the model path (`src/model/gemma4.rs`: loading, batched prefill, decode,
-`generate`/`system1`/`check`) are written and pass every CPU-side check, but have not
-been compiled with `nvcc` or run. Next: build the synthetic fixture and run the GPU tests
-and `reflex check` against llama.cpp (Phase 4).
+**Status (2026-10-09): Phases 1-4 done; the 12B is verified, the 31B hasn't been run.**
+On an RTX A40, Gemma 4 12B-it `Q8_0` generates the same greedy tokens as llama.cpp running
+with f32 activations, on 4/4 prompts of 20 tokens, including one past the 1,024-token
+sliding window. `system1` scores match llama.cpp's within 0.06. The first token comes
+1.45x sooner than with `llama-simple`. As a classifier, Gemma 4 suits warm mode
+(~74 ms per decision), not one process per decision (~2.1 s). See
+[Phase 4 results](#phase-4-results-2026-10-09).
 
 Goal: run Google's Gemma 4 text models on Reflex. They are released under Apache 2.0.
 The target is `gemma-4-31B-it`, and development uses `gemma-4-12B-it`, which has the
@@ -133,8 +133,8 @@ and head dims up to 1024. New kernels:
 ## Phases
 
 1. **Tokenizer** (CPU only). Done; see below.
-2. **Kernels**: the three above, each tested against a host reference. Written
-   (`src/model/gemma4.rs`, `src/model/gemma4_kernel_tests.rs`); GPU run pending.
+2. **Kernels**: the three above, each tested against a host reference
+   (`src/model/gemma4_kernel_tests.rs`); both pass on the A40.
 3. **Model path** (written, see [Phase 3 notes](#phase-3-notes-2026-10-09)):
    `Gemma4Config` and its parser (per-layer arrays, rejects the
    out-of-scope variants), `load_gemma4`, single-token forward and batched prefill, and
@@ -143,7 +143,7 @@ and head dims up to 1024. New kernels:
    `Gemma4ForConditionalGeneration` checkpoint with random weights, run through
    llama.cpp's unmodified `convert_hf_to_gguf.py`, including global layers without
    `attn_v` and a real `rope_freqs`, and checked with `llama-simple` first.
-4. **12B on a 48 GB GPU**: `reflex check` against llama.cpp greedy on several prompts,
+4. **12B on a 48 GB GPU** (done, see [Phase 4 results](#phase-4-results-2026-10-09)): `reflex check` against llama.cpp greedy on several prompts,
    `system1` scores against llama.cpp's soft-capped logits, and a regression rerun of
    the existing models. Then cold-start and classifier benchmarks: cold `system1`, and
    warm `/v1/classify` p50/p95 for 1-token and multi-token labels.
@@ -203,16 +203,113 @@ and head dims up to 1024. New kernels:
     logits for 1-token and multi-token labels, and that generation runs end to end.
     `scripts/gpu_nightly_tests.sh` reports them as SKIP when the fixture is absent.
 
+## Phase 4 results (2026-10-09)
+
+Runpod secure-cloud RTX A40 (48 GB, sm_86, EU-SE-1, 9 vCPUs, CUDA 12.8 host). Reflex
+was built with `REFLEX_CUDA_ARCH=sm_86`. llama.cpp `79e2e74` was built with CUDA, and
+the reference program `ref_g4.cpp` prints greedy ids, first-step logits and
+`system1`-style candidate scores through `llama.h`.
+
+**Kernels.** Both `gemma4_kernel_tests` pass. The RoPE test's tolerance scales with
+position: theta is an f32 the size of the position, so at position 60,000 one ulp of it
+is ~0.007 rad, and device and host `powf` may differ by an ulp. llama.cpp computes theta
+the same way.
+
+**Synthetic fixture.** `test-data/tiny-gemma4.gguf` is written directly with llama.cpp's
+`gguf-py`, not converted from a fake HF checkpoint. It copies every metadata key and the
+real 262,144-token tokenizer from the 12B header and uses the real tensor names. Both
+engines read the same GGUF, so the comparison doesn't depend on the converter. llama.cpp
+loads it and generates. With f32 weights, Reflex matches llama.cpp **20/20 on all 4
+prompts**: two plain, one chat-format, and one of 982 tokens against an 8-token window.
+This is now the GPU test `gemma4_model_fixture_matches_llamacpp`. Batched vs sequential
+prefill on the fixture, f32: rel L2 1.9e-6.
+
+**Real 12B (`gemma-4-12B-it-Q8_0.gguf`, f16 weights).**
+
+| Prompt | Stock llama.cpp | llama.cpp, f32 activations |
+|---|---|---|
+| "The capital of France is" | 20/20 | 20/20 |
+| "Once upon a time" | differs at token 1 (llama.cpp's own top-2 gap 0.12) | 20/20 |
+| Chat-format question | first 15 agree | 20/20 |
+| 1,122 tokens (past the 1,024 window) | differs at token 1 | 20/20 |
+
+Stock llama.cpp quantizes activations to 8 bits (Q8_1) for its `Q8_0` matmuls, and
+Reflex doesn't. That moved the long prompt's logits:
+
+| ~1,566-token natural prompt, first-token logits | 1174 | 109615 | 669 | 1030 | 799 |
+|---|---|---|---|---|---|
+| Reflex, f16 weights | 25.658 | 22.935 | 22.602 | 22.029 | 21.615 |
+| llama.cpp, f32 activations (`LLAMA_NO_Q8=1`) | 25.644 | 22.904 | 22.579 | 22.023 | 21.617 |
+| stock llama.cpp, flash attention | 25.762 | 22.142 | 22.610 | 22.046 | 21.578 |
+| stock llama.cpp, no flash attention | 25.600 | 22.128 | 22.423 | 21.870 | 21.548 |
+
+How the cause was found, ruling out alternatives one at a time:
+- **Not the sliding window.** Moving Reflex's window by +-1 changed token 109615 by only
+  0.05-0.3, and removing the window flipped the top-1.
+- **Not Reflex's f16 activation cast.** Prefilling one token at a time with f32
+  activations gave the same 22.93.
+- **llama.cpp disagrees with itself.** Turning flash attention on or off moves its
+  logits by up to 1.6 on a degenerate repeated-sentence prompt.
+- **f32 activations close the gap.** llama.cpp with `llama-no-q8.patch` (from the
+  Kolibri work; applies to `79e2e74` unchanged) agrees with Reflex within 0.03 on every
+  token. So, as for Kolibri-1, **the llama.cpp reference for quantized Gemma 4 files is
+  the f32-activation build**. The patch is archived in `test-data/tiny-gemma4-src.tar.gz`.
+
+Other checks on the 12B:
+- **`system1`:** label token ids identical to llama.cpp's. Scores within 0.003
+  (1-token) and 0.06 (multi-token) of the f32-activation build, e.g. " the city of
+  Paris" 69.012 vs 68.959. Reflex's own gather-plus-host-soft-cap path equals its
+  full-vocab soft-capped logits to 1e-6.
+- **Tokenizer:** all 25 golden strings identical to llama.cpp's own `llama-tokenize`.
+- **f16 activation range:** largest prefill activation 2,063, 32x below f16's limit, none
+  clamped. The "f16 activation range" risk below didn't materialize.
+- **Batched vs sequential prefill, f16, 1,038 tokens:** rel L2 7.5e-3, same greedy
+  token. The test's f16 bound for Gemma 4 is 2e-2; the shared 5e-3 bound was tuned on
+  smaller Qwen/MLA models.
+
+**No regressions.** `reflex check` on Qwen3-0.6B, TinyLlama-1.1B, Qwen3.5-0.8B and the
+MLA fixture, f32 and f16, 2 prompts each: token ids and logit checksums identical between
+`master` and this branch (16/16). `scripts/gpu_nightly_tests.sh` plus the Kolibri tests:
+every GPU test with its prerequisites passes (32), 7 skip for absent files.
+
+**Benchmarks** (median of n=5; wall time measured from outside the process, launch to
+exit; first token for "The capital of France is"):
+
+| | Reflex | llama.cpp `llama-simple` |
+|---|---|---|
+| First token, model file in page cache | **2.41 s** (engine 2.01 s, load 1.41 s) | 3.49 s |
+| First token, after evicting the file's pages | **2.47 s** | 5.27 s |
+
+The container can't drop the host page cache, and evicting the file's pages with
+`posix_fadvise` only reaches this container's view. Reads after eviction ran at 1.7 vs
+2.1 GB/s cached, so the second row is not a true cold-disk number.
+
+Classifier, prompt "Review: The battery died after two days. Sentiment:":
+
+| | 1-token labels (2) | 2-token labels (3) |
+|---|---|---|
+| Cold: one `reflex system1` process per decision | 2.13 s wall (1.72 s engine) | 2.38 s |
+| **Warm: `reflex stdio`, per request** (30 requests, p50 / p95) | **73.6 / 74.2 ms** | 233.6 / 233.8 ms |
+| Warm, Qwen3-0.6B on the same A40 | 6.5 / 6.6 ms | 20.7 / 21.5 ms |
+
+A Gemma 4 12B classifier belongs in warm mode: about 74 ms per decision once loaded.
+Multi-token labels cost one extra decode step per label beyond the first token. Model
+quality on a bare prompt is its own question: the instruction-tuned 12B scores
+" positive" (16.77) above " negative" (12.43) for that review, and llama.cpp gives the
+same scores.
+
+**Not done:** the 31B (61 GB in f16, so it needs an 80 GB card or quantized-resident
+support on this path), and a true cold-disk measurement.
+
 ## Risks
 
-- **f16 activation range.** Prefill casts activations to f16 for GEMMs, which saturates
-  at ±65504, and Gemma models are known for large activations. `f16_activation_stats`
-  will show it. The fallback is `--weights f32`: 12B in f32 is about 48 GB, so it needs
-  an 80 GB card.
+- **f16 activation range.** Resolved on the 12B: the largest prefill activation was
+  2,063, and none were clamped (Phase 4). Re-check on the 31B. The fallback is still
+  `--weights f32`, but the 12B in f32 (about 48 GB) doesn't fit a 48 GB card.
 - **VRAM.** 12B in f16 is about 24 GB, so it needs a 48 GB card. 31B in f16 is about
   61 GB, so it needs 80 GB. On top of that comes the KV cache: f32, sized to
   prompt + max tokens, at about 1.6 MB per token across the 31B's sliding layers.
-- **Cold start.** The weight load dominates: about 24 GB to read and upload for the 12B.
-  Expect seconds, not the ~0.5 s of a 0.6B model. Gemma 4 is likely a warm-mode
-  (`reflex stdio`/sidecar) classifier rather than a per-decision cold process. Phase 4
-  measures this.
+- **Cold start.** Measured in Phase 4: 2.4 s to first token with the file cached
+  (load 1.4 s), against llama.cpp's 3.5 s. As expected, Gemma 4 is a warm-mode
+  (`reflex stdio`/sidecar) classifier at ~74 ms per decision, not a per-decision cold
+  process.

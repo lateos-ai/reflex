@@ -72,6 +72,7 @@ serverless endpoint in one click, no build required ([worker docs](.runpod/READM
 | Qwen3.5 hybrid Gated DeltaNet (`qwen35`, `qwen35moe`) | Qwen3.5-0.8B; a random-weight `qwen35moe` checkpoint |
 | DeepSeek-V2/V3 MLA (`deepseek2`) | DeepSeek-V2-Lite; a synthetic fixture |
 | Kolibri-1 MoE (`kolibri1`) | Aleph Alpha's Kolibri-1 78B, `Q4_K_M` (needs `REFLEX_QUANT_RESIDENT=1`); a synthetic fixture |
+| Gemma 4 dense, text only (`gemma4`) | Gemma 4 12B-it `Q8_0`; a synthetic fixture. The 31B uses the same architecture but hasn't been run yet. E2B/E4B and 26B-A4B are not supported |
 
 Each architecture counted as supported only after its generated tokens matched an
 independent implementation (llama.cpp, or a CPU reference) on real hardware.

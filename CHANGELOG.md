@@ -5,6 +5,24 @@ What has been built, in order. Measurements live in
 
 ## 2026-10-09
 
+- **Gemma 4 support** (`gemma4`, dense 12B/31B, text only). The new path is
+  `src/model/gemma4.rs` with its own kernels (`kernels_cuda/gemma4.cu`), plus a third
+  tokenizer mode (`tokenizer.ggml.model = "gemma4"`). Other architectures' code paths and
+  kernels are unchanged; on an A40 their `reflex check` output is identical to before,
+  checksums included. Verified on an A40:
+  - **Synthetic fixture:** greedy tokens identical to llama.cpp, 20/20 on 4 prompts
+    (one 982 tokens long against an 8-token window).
+  - **Real Gemma 4 12B-it `Q8_0`:** 4/4 prompts identical to llama.cpp running with
+    f32 activations, including a 1,122-token prompt past the 1,024-token window. Stock
+    llama.cpp's 8-bit activation quantization moves some logits by up to ~0.8, so it
+    disagrees on near-ties.
+  - **`system1`:** multi-token labels supported, scores within 0.06 of llama.cpp's.
+  - **Tokenizer:** identical ids on 25 strings to HF `tokenizers` and `llama-tokenize`.
+
+  First token after 2.41 s vs llama.cpp's 3.49 s (`llama-simple`, file in page cache,
+  n=5). As a classifier, about 74 ms per decision warm (`reflex stdio`) and about 2.1 s
+  as a cold process. Details: [docs/design/gemma4.md](docs/design/gemma4.md).
+
 - **Runpod Hub worker repackaged as a classifier listing** (`v0.2.4-runpod-hub`). The
   queue-based Hub worker now bakes **Qwen3-0.6B-Q8_0** (was Q4_K_M; `.runpod/Dockerfile`)
   and leads with `POST /v1/classify`: a job whose `input` has `labels` scores every label

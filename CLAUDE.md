@@ -194,6 +194,21 @@ rotation, `rope_norm_kernel`/`rope_norm_yarn_kernel`), not the `LLAMA_ROPE_TYPE_
 `llama_model_rope_type` in llama.cpp's `llama-model.cpp`; don't assume RoPE convention
 is architecture-independent when adding another model family later.
 
+`general.architecture == "gemma4"` dispatches to `Model::load_gemma4`
+(`src/model/gemma4.rs`, `Model.gemma4: Option<Gemma4Model>`, `ArchitectureKind::Gemma4`),
+another separate path: Gemma 4 changes head dim (256 sliding / 512 global), KV heads, RoPE
+base and the V source (global layers have no `attn_v`; V = `Wk·x`) from layer to layer,
+which the dense path's single `LayerConfig` can't express. One layer function
+(`forward_gemma4_layer`) serves batched prefill and decode. Gemma-specific math, all
+verified token-for-token against llama.cpp: attention scale 1.0, weightless V RMSNorm,
+NEOX RoPE with per-pair `rope_freqs` divisors on global layers (`kernels_cuda/gemma4.cu`),
+GeGLU, sandwich norms, per-layer `layer_output_scale`, embeddings × sqrt(hidden), final
+logit soft-cap 30. Dense 12B/31B text only; E2B/E4B, 26B-A4B, KV export/import, LoRA and
+`REFLEX_ATTN_KERNEL=legacy` are rejected. **Compare against llama.cpp with f32
+activations** (`llama-no-q8.patch`, `LLAMA_NO_Q8=1`, in `test-data/tiny-gemma4-src.tar.gz`):
+stock llama.cpp's 8-bit activation quantization moves Q8_0 Gemma 4 logits by up to ~0.8
+on long prompts. Design, results and numbers: `docs/design/gemma4.md`.
+
 ### MoE routing (`src/moe.rs`)
 `route_top_k`: softmax over all experts, select top-k, renormalize. No new
 CUDA kernels were needed for MoE — it reuses `gemv`/`silu_and_mul` unchanged via

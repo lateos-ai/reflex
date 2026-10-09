@@ -151,12 +151,16 @@ fn gemma4_rope_kernel_matches_host_reference() {
                 )
                 .expect("rope_ff");
             let got = device.dtoh_sync_copy(&t).expect("dtoh");
-            // Large positions make theta large; device and host argument
-            // reduction can then differ by a few ulps of theta.
+            // theta = position * powf(...) is an f32 the size of the position,
+            // so device and host (whose powf may differ by an ulp) can differ
+            // by a couple of ulps of theta itself: ~0.007 rad at position 60k.
+            // llama.cpp computes theta the same way, in f32.
+            let max_pos = (start_pos + rows) as f32;
+            let tol = 1e-4 + 2.0 * max_pos * f32::EPSILON;
             assert_close(
                 &got,
                 &want,
-                2e-3,
+                tol,
                 &format!("{name} start_pos={start_pos} rows={rows}"),
             );
             if n_dims < head_dim {

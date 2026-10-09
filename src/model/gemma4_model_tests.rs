@@ -75,7 +75,31 @@ fn gemma4_model_batched_prefill_matches_sequential() {
 
     let seq = model.device.dtoh_sync_copy(&sequential_last).expect("dtoh");
     let bat = model.device.dtoh_sync_copy(&batched_last).expect("dtoh");
-    assert_prefill_hidden_close(&seq, &bat, model.weights_dtype(), "gemma4 last hidden");
+    match model.weights_dtype() {
+        WeightsDtype::F32 => {
+            assert_prefill_hidden_close(&seq, &bat, WeightsDtype::F32, "gemma4 last hidden")
+        }
+        // The batched path casts activations to f16 for cuBLAS and the
+        // sequential GEMV doesn't, and Gemma 4's residual stream is large
+        // (max |x| ~2,000 on the 12B), so the gap is wider than the shared
+        // 5e-3 bound tuned on Qwen/MLA. Measured on an A40 (2026-10-09): rel L2
+        // 2.6e-3 on the 6-layer fixture, 7.5e-3 on the 48-layer 12B (f32 on
+        // the fixture: 1.9e-6). The greedy-token check below is the real gate.
+        WeightsDtype::F16 => {
+            let diff: f64 = seq
+                .iter()
+                .zip(&bat)
+                .map(|(a, b)| ((a - b) as f64).powi(2))
+                .sum();
+            let norm: f64 = seq.iter().map(|&a| (a as f64).powi(2)).sum();
+            let rel_l2 = (diff / norm.max(f64::MIN_POSITIVE)).sqrt();
+            eprintln!("gemma4 last hidden (f16): rel_l2={rel_l2:e}");
+            assert!(
+                rel_l2 < 2e-2,
+                "gemma4 f16 batched vs sequential rel_l2 {rel_l2:e}"
+            );
+        }
+    }
 
     let seq_logits = model.gemma4_logits(m, &sequential_last).expect("logits");
     let bat_logits = model.gemma4_logits(m, &batched_last).expect("logits");
@@ -168,4 +192,90 @@ fn gemma4_model_generates_without_error() {
         .expect("generate");
     eprintln!("generated {ids:?}: {text:?}");
     assert!(!ids.is_empty() && ids.len() <= 8);
+}
+
+/// llama.cpp's greedy ids on the synthetic fixture (`ref_g4`, llama.cpp
+/// `79e2e74`, CUDA, f32 KV cache; the fixture's weights are f32, so no
+/// activation quantization is involved). Prompt 4 is 982 tokens against an
+/// 8-token window, so both prefill and decode cross the window many times.
+const FIXTURE_GOLDEN: &[(&str, &[u32])] = &[
+    (
+        "The capital of France is",
+        &[
+            138141, 35380, 127857, 163455, 117512, 254398, 128339, 40519, 40519, 64265, 121990,
+            240122, 192664, 56923, 115897, 115897, 115897, 139008, 12745, 12745,
+        ],
+    ),
+    (
+        "Once upon a time",
+        &[
+            196934, 196934, 196934, 68131, 244994, 170739, 25413, 223441, 102510, 156779, 159726,
+            184390, 113461, 124561, 30575, 105432, 191487, 76435, 144804, 228716,
+        ],
+    ),
+    (
+        "<|turn>user\nWhat is the capital of France? Answer in one word.<turn|>\n<|turn>model\n",
+        &[
+            108420, 130291, 115956, 99790, 103859, 231876, 110471, 41671, 68382, 29783, 107293,
+            219875, 199964, 173758, 36498, 134669, 221815, 16906, 57582, 235021,
+        ],
+    ),
+    (
+        "LONG",
+        &[
+            71224, 158275, 19594, 122660, 130350, 108302, 66346, 255331, 1417, 33385, 37481, 37481,
+            261751, 120206, 257423, 201482, 138647, 29824, 140288, 140288,
+        ],
+    ),
+];
+
+/// Token-for-token greedy agreement with llama.cpp on the synthetic fixture,
+/// with f32 weights. Runs only against `test-data/tiny-gemma4.gguf` (the
+/// golden ids are that file's).
+#[test]
+#[ignore]
+fn gemma4_model_fixture_matches_llamacpp() {
+    if !std::path::Path::new(TINY_FIXTURE).exists() {
+        eprintln!("Skipping gemma4_model_fixture_matches_llamacpp: {TINY_FIXTURE} not present");
+        return;
+    }
+    let file = GgufFile::open(TINY_FIXTURE).expect("open fixture");
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let opts = LoadOptions {
+        weights: WeightsDtype::F32,
+        lora_adapter: None,
+    };
+    let model = Model::load_with_options(device, &file, &opts).expect("load fixture");
+    let long = "The quick brown fox jumps over the lazy dog while the cat watches. ".repeat(70);
+    let mut failures = Vec::new();
+    for &(prompt, want) in FIXTURE_GOLDEN {
+        let prompt = if prompt == "LONG" {
+            long.as_str()
+        } else {
+            prompt
+        };
+        let (got, _) = model
+            .generate(
+                prompt,
+                want.len(),
+                None,
+                &SamplingParams::default(),
+                |_| {},
+                |_, _| {},
+            )
+            .expect("generate");
+        let agree = got.iter().zip(want).take_while(|(a, b)| a == b).count();
+        eprintln!(
+            "{} prompt tokens: {agree}/{} agree",
+            model.encoded_prompt_len(prompt).unwrap_or(0) + 1,
+            want.len()
+        );
+        if got != want {
+            failures.push(format!(
+                "{:?}\n  reflex:    {got:?}\n  llama.cpp: {want:?}",
+                &prompt[..prompt.len().min(40)]
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "mismatches:\n{}", failures.join("\n"));
 }
