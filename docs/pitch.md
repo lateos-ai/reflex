@@ -1,5 +1,10 @@
 # Reflex — pitch cheat-sheet
 
+> **Internal cheat-sheet, partly superseded.** Do not use this file in a listing, a
+> post, or a Hub description. Where any number or limit here disagrees with
+> [`README.md`](../README.md) (especially weight storage and supported
+> architectures) or [`docs/benchmarks.md`](benchmarks.md), those win.
+
 **Internal doc.** What to know, what to say, and what *not* to claim. Every number
 here is a real measurement from this repo's own cold-start benchmark unless it is
 explicitly labeled a *citation*. When in doubt, under-claim — the whole product is built
@@ -55,8 +60,9 @@ The pieces that produce the cold-start number:
 
 **Target metric:** energy-to-first-token from cold start (joules + ms, process launch to
 first token) — not warm tokens/sec. **Target models:** Qwen and DeepSeek families.
-**Four architectures supported:** dense Qwen3, Qwen3-MoE, Qwen3.5 hybrid (Gated
-DeltaNet), DeepSeek-V2/V3 (MLA).
+**Architectures supported** (matching the [README](../README.md#supported-models-and-limits)
+table): dense Qwen3, Qwen3-MoE, Llama/Mistral, Qwen3.5 hybrid (Gated DeltaNet),
+DeepSeek-V2/V3 (MLA), and Kolibri-1.
 
 ---
 
@@ -90,8 +96,8 @@ column** yet — don't imply one exists.
 ### Also true, useful for credibility
 - It reads GGUF directly (no conversion step), and can pull from the Hub.
 - Multi-arch **fatbin** build: one image, many GPU generations, no per-arch rebuild.
-- Embeddings surfaces: C FFI, PyO3, line-JSON IPC (`stdio`/`uds`), Docker; an
-  OpenAI-compatible HTTP **sidecar** exists out-of-tree.
+- Embeddings surfaces: C FFI, line-JSON IPC (`stdio`/`uds`), Docker; the Python (PyO3)
+  bindings do not currently build; an OpenAI-compatible HTTP **sidecar** exists out-of-tree.
 
 ---
 
@@ -122,17 +128,18 @@ column** yet — don't imply one exists.
   (per-second billing) make the value explicit.
 - **Credibility:** every claim is traceable to a raw log; the project publishes its
   losses and caveats (including a comparison it deliberately reports as a loss).
-- **Progress:** four model architectures (dense, MoE, hybrid Gated-DeltaNet, MLA) are
-  implemented and real-hardware-verified; embeddability (FFI/Python/IPC/containers) is
-  in place; a ~2.6× cold-start improvement landed in a single concentrated perf round.
+- **Progress:** six model architectures (dense Qwen3, Qwen3-MoE, Llama/Mistral, hybrid
+  Gated-DeltaNet, MLA, Kolibri-1) are implemented and real-hardware-verified;
+  embeddability (C FFI/IPC/containers) is in place (Python bindings do not currently
+  build); a ~2.6× cold-start improvement landed in a single concentrated perf round.
 - **Defensibility, stated honestly:** the moat is execution speed + a measurement-first
   culture on an axis incumbents don't optimize for — not a patent. Say that plainly.
 
 ### Procurement / ops track
-- **Deployment shape:** one binary, GGUF in, token/result out; Docker image and C
-  FFI/Python/IPC embedding surfaces exist.
-- **Resource shape:** weights are held GPU-resident in `f32`, so VRAM ≈ 4 bytes × total
-  params — plan ~3–3.5 B params max on a 16 GB T4. (See limits below.)
+- **Deployment shape:** one binary, GGUF in, token/result out; Docker image and C FFI/IPC
+  embedding surfaces exist (the Python bindings do not currently build).
+- **Resource shape:** weights are held GPU-resident; see the README's weight-storage
+  paragraph for the default `f16` vs. opt-in `f32` split.
 - **No network surface in-core:** HTTP, if needed, is an optional sidecar; the engine
   itself never opens a socket. That's a deliberate security/simplicity property.
 - **Bring your own model:** GGUF from llama.cpp's own converters; Qwen/DeepSeek family.
@@ -154,7 +161,7 @@ cargo build --release --bin reflex            # AOT kernels compiled at build ti
 | "Isn't llama.cpp already fast and already AOT?" | Yes. Against its raw completion path we're ~**1.13×**, not 10×. Our larger wins are against runtime-JIT serving stacks and against *total cold lifecycle* (teardown, energy instrumentation). Don't oversell the llama.cpp row. |
 | "vLLM is far faster at throughput." | Correct, and we don't compete there. vLLM wins warm/steady-state; Reflex wins cold start (~48–150×). Different axes. |
 | "Why batch size 1?" | Deliberate. Reflex is built for single-shot/interactive/cold calls. Concurrency, queues, and multi-tenancy belong in a **host orchestrator**, not the engine — that's a stated non-goal, not a missing feature. |
-| "Doesn't it use a ton of VRAM?" | Yes — every weight is dequantized once and held `f32` on the GPU, so ~4 bytes × params regardless of the source quant. ~3–3.5 B params on 16 GB. It's a real cost; f16 residency is planned, not done. |
+| "Doesn't it use a ton of VRAM?" | It depends on the weight mode. The default is `f16` matrix weights (dequantized once at load, ~2 bytes per parameter); `--weights f32` keeps the exact `f32` reference (~4 bytes per parameter). Norms, routers, activations and the KV cache are `f32` in both modes. See the README's weight-storage paragraph; f16 is no longer merely planned. |
 | "Cold start stops mattering once you keep servers warm." | True for steady traffic. The addressable case is bursty / scale-to-zero / single-shot, where warm capacity is waste and cold latency is the invoice. |
 | "How does it compare to Jev / always-warm managed APIs?" | Different product (a managed decision API, not a generative engine). Cold-to-decision we **lose** by construction (~2.5–18× slower on T4) because they never load anything. Warm compute-only we're within ~1.3–2×; over the network ~10% apart at p50. Say it as a loss. |
 | "Can I trust these numbers?" | Every figure is external `/usr/bin/time -v`, with n and p50/p95 stated, raw logs kept, and the caveats (including session-to-session variance) published alongside. |
@@ -192,7 +199,8 @@ cargo build --release --bin reflex            # AOT kernels compiled at build ti
 `batch_size` is always 1. No request queue/scheduler, no continuous batching, no
 multi-tenant LoRA router, no KV-cache manager, no in-core HTTP/gRPC server. Multi-tenancy
 and persistent state live in a host orchestrator. The allowed local surface is
-sequential, non-network IPC (`stdio`/`uds`) plus in-process bindings (C FFI, PyO3).
+sequential, non-network IPC (`stdio`/`uds`) plus in-process bindings (C FFI; the PyO3
+bindings do not currently build).
 
 ## 9. Quick facts for Q&A
 
@@ -203,8 +211,9 @@ sequential, non-network IPC (`stdio`/`uds`) plus in-process bindings (C FFI, PyO
   cubin, `REFLEX_CUDA_ARCHS=...` for a multi-arch fatbin.
 - **Verified hardware to date:** ThunderCompute A6000, AWS T4 (`g4dn.xlarge`), L40,
   A100 (80 GB, for DeepSeek-V2-Lite MLA).
-- **Embedding:** C FFI (`libreflex_engine`), PyO3 (`--features python`), stdio/UDS IPC,
-  Docker; OpenAI-compatible HTTP sidecar out-of-tree.
+- **Embedding:** C FFI (`libreflex_engine`), stdio/UDS IPC, Docker; the PyO3
+  (`--features python`) bindings do not currently build; OpenAI-compatible HTTP sidecar
+  out-of-tree.
 - **Benchmark provenance:** `scripts/bench_cold_common.sh`; chart at
   `docs/cold-start-t4.svg`; raw logs under `bench-results/` (gitignored).
 

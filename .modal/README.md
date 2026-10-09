@@ -8,13 +8,18 @@ GPU, 2026-09-27.**
 
 ## What this is
 
-- **`Dockerfile`**: same builder recipe as the root `Dockerfile`'s `adapter` target (compile
-  `reflex --features ipc` and `sidecar/openai-adapter` in one `nvidia/cuda:12.4.1-devel`
-  stage, copy both binaries plus the baked-in model into a `nvidia/cuda:12.4.1-runtime`
-  stage). The only real difference: `REFLEX_CUDA_ARCH` defaults to `sm_89` (Ada
-  Lovelace), not `sm_86` -- see the Dockerfile's own comment for why Modal's exact,
-  non-pooled GPU selection makes a pinned cubin safe here in a way it isn't for
-  Runpod's mixed-architecture serverless pools.
+- **`Dockerfile`**: same builder recipe and slim runtime stage as the root `Dockerfile`
+  (compile `reflex --features ipc` and `sidecar/openai-adapter` in one
+  `nvidia/cuda:12.4.1-devel` stage, copy both binaries plus the baked-in model into the
+  slim `nvidia/cuda:12.4.1-base` + `libcublas-12-4` stage). **One deliberate difference:**
+  `REFLEX_CUDA_ARCH` defaults to `sm_89` (Ada Lovelace) -- a pinned cubin, not the root
+  Dockerfile's multi-arch fatbin. Modal's `gpu="L4"` requests one exact SKU, so a pinned
+  cubin is safe here and gives up nothing; Runpod's mixed-architecture `AMPERE_16` pool is
+  exactly the case that requires the fatbin (a single cubin panics on its Ada cards). A
+  fatbin would also carry a native `sm_89` image (no JIT on the L4), so the only thing the
+  pin buys is a smaller module; it is kept because it is the measured, verified
+  configuration (see "Real measured numbers" below). If `app.py`'s GPU choice ever changes
+  to a different architecture, this default must change with it.
 - **`app.py`**: a `modal.App` that builds `image` from that Dockerfile
   (`Image.from_dockerfile`, `add_python="3.12"` since the runtime stage has no Python of
   its own -- Modal's container init needs an interpreter to run `@modal.enter()`/
@@ -67,6 +72,23 @@ comparison has since run as Phase 3, see
 per engine under a shared harness: Reflex median 7.7s vs. vLLM median 190.7s, ~25x). This
 single Phase 1 run (7.1s) is superseded as the citable number by Phase 3's `n=3` sample;
 it stays here as the original packaging-verification result.
+
+## Re-measured on the slim-base image (2026-10-09, real Modal L4)
+
+Re-run after the Dockerfile moved to the slim `base` + `libcublas-12-4` runtime stage
+(the `.modal/Dockerfile` parity change), same methodology as Phase 1: ephemeral
+`modal run`, client-side wall clock, no warm-container reuse.
+
+| Run | Local submit → `/healthz` 200 | Total: local submit → first token |
+|---|---|---|
+| 1 | 5.9s | **6.5s** |
+| 2 | 8.0s | **8.8s** |
+| 3 | 7.5s | **8.1s** |
+
+**Median 8.1s** total (`n=3`), consistent with Phase 3's 7.7s median. The first run after
+the image build (28.4s) is excluded: it pulled the freshly built image to the worker,
+which later runs don't pay. GPU confirmed as `NVIDIA L4 (sm_89)`; the pinned `sm_89`
+cubin loaded with no runtime JIT and no compute-capability panic, on the slim image.
 
 ## Cost
 

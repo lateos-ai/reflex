@@ -121,15 +121,22 @@ window is idle power. [Details](docs/benchmarks.md#energy).
 
 ## Deploying
 
+For a scale-to-zero endpoint, start with the **[serverless deployment
+guide](docs/deploy-serverless.md)** — one page, Runpod first. The job Reflex is built
+for is a single cold decision (`POST /v1/classify`), not a warm chat pool; see the
+[sidecar's classify section](sidecar/openai-adapter/README.md#post-v1classify). The
+table below is the long form.
+
 | Target | Where |
 |---|---|
+| **Serverless / scale-to-zero (start here)** | **[docs/deploy-serverless.md](docs/deploy-serverless.md)** |
 | Docker (one multi-target `Dockerfile`: `reflex`, `adapter`, `runpod-lb`) | [docs/reference.md](docs/reference.md#docker) |
-| OpenAI-compatible HTTP (`/v1/chat/completions`) | [sidecar/openai-adapter](sidecar/openai-adapter/README.md) |
+| OpenAI-compatible HTTP (`/v1/chat/completions`, `/v1/classify`) | [sidecar/openai-adapter](sidecar/openai-adapter/README.md) |
 | AWS, scale to zero (Spot, local socket) | [docs/aws-deployment.md](docs/aws-deployment.md) |
 | AWS, always warm (load balancer, HTTPS) | [docs/aws-deployment-warm.md](docs/aws-deployment-warm.md) |
 | Runpod serverless, load-balancing endpoint | [serverless/runpod](serverless/runpod/README.md) |
 | Runpod Hub, queue-based worker (one-click deploy) | [Hub listing](https://console.runpod.io/hub/listing/lateos-ai/reflex) · [.runpod](.runpod/README.md) |
-| Modal | [.modal](.modal/README.md) |
+| Modal (Modal Server, L4) | [.modal](.modal/README.md) |
 | Kubernetes (one Job per invocation) | [docs/reference.md](docs/reference.md#kubernetes) |
 | Embedding in another program | C FFI (`include/reflex_engine.h`), local IPC (`reflex stdio`/`uds`) |
 

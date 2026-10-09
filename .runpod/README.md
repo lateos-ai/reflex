@@ -192,6 +192,16 @@ fatbin kernels and the slim runtime, so every fresh worker still pays the PTX JI
 **`v0.2.3-runpod-hub`** brings the fatbin build, the Ada-inclusive `gpuIds`, streaming, and
 the `ADAPTER_ARGS` deploy field.
 
+**Update, checked 2026-10-09:** the listing has moved to **`v0.2.3-runpod-hub`**. The Hub
+console (listing page <https://console.runpod.io/hub/lateos-ai/reflex>) now shows the
+v0.2.3 release promoted from `master` at tag `v0.2.3-runpod-hub`, completed 2026-10-08,
+with the fatbin/slim-runtime description and its test results passing. The build-image
+digest is not exposed in the listing UI; the release name is what the Hub builds from, so
+the PTX JIT the v0.2.2 image paid is no longer in the catalog path. The GHCR image the Hub
+publishes is `ghcr.io/lateos-ai/reflex-runpod-hub`, digest (verified 2026-10-09)
+`sha256:6ecb8e1f0200c2736141014eadc9ad38bee7560fad52b48e02dbacd31d510f33`. The v0.2.2 note
+above is kept for history. See `docs/ADOPTION_PLAN.md` task A01.
+
 `iconUrl` in `hub.json` points at a real hosted asset (`.runpod/icon.jpg` on `master`), not
 the old `TODO:` placeholder. The GPU-selection fields in `hub.json`/`tests.json` are kept as
 advisory intent only (real evidence above shows the Hub test scheduler does not honor them).
