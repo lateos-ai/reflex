@@ -326,6 +326,9 @@ pub fn run(args: Vec<String>) {
                 kv_io::export_mla_kv(export_path, &cache).expect("failed to export MLA KV cache");
                 (token_id, text)
             }
+            ArchitectureKind::Gemma4 => {
+                crate::fail("--export-kv failed", "not supported for Gemma 4 models yet")
+            }
         };
         let elapsed = t0.elapsed();
         let energy_measurement = sampler.measure();

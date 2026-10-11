@@ -1,8 +1,11 @@
 //! Tokenizer extraction from GGUF metadata, plus from-scratch encode/decode
-//! for two real tokenizer schemes: llama.cpp's SentencePiece-derived scheme
-//! (`tokenizer.ggml.model == "llama"`, Phase 21.5.1) and GPT-2-style
+//! for three real tokenizer schemes: llama.cpp's SentencePiece-derived scheme
+//! (`tokenizer.ggml.model == "llama"`, Phase 21.5.1), GPT-2-style
 //! byte-level BPE (`tokenizer.ggml.model == "gpt2"`, Phase 21.14 — Qwen3
-//! architecture support). [`Tokenizer::encode`]/[`Tokenizer::decode`]
+//! architecture support), and Gemma 4's BPE over raw UTF-8 with
+//! SentencePiece-style spaces (`tokenizer.ggml.model == "gemma4"`, see
+//! [`Tokenizer::encode_gemma4`]; it decodes like the SentencePiece scheme).
+//! [`Tokenizer::encode`]/[`Tokenizer::decode`]
 //! dispatch on `self.architecture`; see [`Tokenizer::encode_gpt2`]'s own doc
 //! for how the two schemes actually differ (regex pre-tokenization and a
 //! byte-to-unicode alphabet remap, not just a vocab swap) and what's shared
@@ -245,7 +248,8 @@ impl Tokenizer {
     /// Encode `text` to token ids. Dispatches on `self.architecture`
     /// (`tokenizer.ggml.model`, real GGUF values confirmed: `"llama"`
     /// SentencePiece-derived, `"gpt2"` byte-level BPE, Phase 21.14 —
-    /// see [`Self::encode_gpt2`]) — every other value falls back to the
+    /// see [`Self::encode_gpt2`] — and `"gemma4"`, see
+    /// [`Self::encode_gemma4`]) — every other value falls back to the
     /// SentencePiece path unchanged, this module's original Phase 21.5.1
     /// scope.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
@@ -292,10 +296,10 @@ impl Tokenizer {
     /// special tokens (this struct's `special_tokens` field) are matched
     /// separately, before this ever runs on their text.
     fn encode_plain(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
-        if self.architecture == "gpt2" {
-            self.encode_gpt2(text)
-        } else {
-            self.encode_sentencepiece(text)
+        match self.architecture.as_str() {
+            "gpt2" => self.encode_gpt2(text),
+            "gemma4" => self.encode_gemma4(text),
+            _ => self.encode_sentencepiece(text),
         }
     }
 
@@ -567,6 +571,150 @@ impl Tokenizer {
             let merged = format!("{}{}", symbols[i], symbols[i + 1]);
             symbols.splice(i..=i + 1, [merged]);
         }
+    }
+
+    /// Encode `text` for `tokenizer.ggml.model == "gemma4"`: BPE over raw
+    /// UTF-8 with SentencePiece-style spaces, as llama.cpp's
+    /// `LLAMA_VOCAB_PRE_TYPE_GEMMA4` does it (`llama-vocab.cpp`):
+    ///
+    /// 1. Every space becomes [`WORD_BOUNDARY`]. No dummy prefix is added
+    ///    (`add_space_prefix` is false for this vocab).
+    /// 2. The text is split into runs of newlines and runs of everything else
+    ///    (regex `[^\n]+|[\n]+`). Real Gemma 4 vocabs have no merge or token
+    ///    that mixes a newline with any other character, so this split never
+    ///    separates anything a merge could have joined.
+    /// 3. A newline run that is itself a vocab token becomes that token.
+    ///    Every other run starts as one symbol per character and is merged by
+    ///    merge rank ([`Self::bpe_merge_ranked`]).
+    /// 4. A final symbol that is not a vocab token becomes one `<0xXX>`
+    ///    byte-fallback token per UTF-8 byte.
+    ///
+    /// Unlike the gpt2 path there is no word-level pre-split on spaces, so a
+    /// whole line is one BPE word; hence the heap-based merge rather than
+    /// [`Self::bpe_merge`]'s quadratic rescans. Verified id-for-id against HF
+    /// `tokenizers` on Gemma 4's `tokenizer.json` (see the
+    /// `test_gemma4_encode_matches_reference_if_fixture_present` test).
+    fn encode_gemma4(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
+        let escaped: String = text
+            .chars()
+            .map(|ch| if ch == ' ' { WORD_BOUNDARY } else { ch })
+            .collect();
+        let mut ids = Vec::new();
+        let mut rest = escaped.as_str();
+        while let Some(first) = rest.chars().next() {
+            let is_newline_run = first == '\n';
+            let len = rest
+                .find(|c: char| (c == '\n') != is_newline_run)
+                .unwrap_or(rest.len());
+            let (word, tail) = rest.split_at(len);
+            rest = tail;
+
+            if is_newline_run {
+                if let Some(&id) = self.token_to_id.get(word) {
+                    ids.push(id);
+                    continue;
+                }
+            }
+            for symbol in self.bpe_merge_ranked(word) {
+                if let Some(&id) = self.token_to_id.get(symbol) {
+                    ids.push(id);
+                    continue;
+                }
+                for &b in symbol.as_bytes() {
+                    let bt = byte_fallback_token(b);
+                    let id = self.token_to_id.get(&bt).copied().ok_or_else(|| {
+                        crate::reflex_err!(
+                            Tokenizer,
+                            "gemma4 symbol {symbol:?} not in vocab and byte-fallback token '{bt}' also missing"
+                        )
+                    })?;
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Lowest-rank-first BPE over `word`, starting from one symbol per
+    /// character, returned as slices of `word` in order. Same result as
+    /// [`Self::bpe_merge`] (lowest rank wins, ties go to the leftmost pair),
+    /// but with llama.cpp's `llm_tokenizer_bpe_session` structure: a linked
+    /// list of symbols plus a min-heap of candidate pairs, where a popped pair
+    /// is skipped if either side has changed since it was pushed. That keeps
+    /// a long word at O(n log n) instead of a full rescan per merge.
+    fn bpe_merge_ranked<'a>(&self, word: &'a str) -> Vec<&'a str> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        struct Symbol {
+            start: usize,
+            end: usize,
+            prev: Option<usize>,
+            next: Option<usize>,
+            alive: bool,
+        }
+        let n = word.chars().count();
+        let mut symbols: Vec<Symbol> = word
+            .char_indices()
+            .enumerate()
+            .map(|(i, (start, ch))| Symbol {
+                start,
+                end: start + ch.len_utf8(),
+                prev: i.checked_sub(1),
+                next: (i + 1 < n).then_some(i + 1),
+                alive: true,
+            })
+            .collect();
+
+        // Heap entries: (rank, left index, left end, right end). The two ends
+        // identify the exact pair the rank was looked up for.
+        let mut heap: BinaryHeap<Reverse<(usize, usize, usize, usize)>> = BinaryHeap::new();
+        let push_pair = |heap: &mut BinaryHeap<_>, symbols: &[Symbol], left: usize| {
+            let Some(right) = symbols[left].next else {
+                return;
+            };
+            let (l, r) = (&symbols[left], &symbols[right]);
+            let key = (
+                word[l.start..l.end].to_string(),
+                word[r.start..r.end].to_string(),
+            );
+            if let Some(&rank) = self.merge_rank.get(&key) {
+                heap.push(Reverse((rank, left, l.end, r.end)));
+            }
+        };
+        for i in 0..n.saturating_sub(1) {
+            push_pair(&mut heap, &symbols, i);
+        }
+
+        while let Some(Reverse((_, left, left_end, right_end))) = heap.pop() {
+            let l = &symbols[left];
+            if !l.alive || l.end != left_end {
+                continue;
+            }
+            let Some(right) = l.next else { continue };
+            if symbols[right].end != right_end {
+                continue;
+            }
+            let after = symbols[right].next;
+            symbols[left].end = right_end;
+            symbols[left].next = after;
+            symbols[right].alive = false;
+            if let Some(a) = after {
+                symbols[a].prev = Some(left);
+            }
+            if let Some(p) = symbols[left].prev {
+                push_pair(&mut heap, &symbols, p);
+            }
+            push_pair(&mut heap, &symbols, left);
+        }
+
+        let mut out = Vec::new();
+        let mut cur = (n > 0).then_some(0);
+        while let Some(i) = cur {
+            out.push(&word[symbols[i].start..symbols[i].end]);
+            cur = symbols[i].next;
+        }
+        out
     }
 
     /// Decode token ids back to text. Dispatches on `self.architecture`,
@@ -1628,6 +1776,191 @@ mod tests {
                 "token ids differ from HF tokenizers for {text:?}"
             );
             assert_eq!(tok.decode(&ids), text, "round trip failed for {text:?}");
+        }
+    }
+
+    /// [`Tokenizer::bpe_merge_ranked`] (the heap-based merge the gemma4 path
+    /// uses) must give the same symbols as [`Tokenizer::bpe_merge`]'s
+    /// rescanning loop: lowest rank first, ties to the leftmost pair.
+    /// Includes repeated letters, where one merge can invalidate a queued
+    /// pair on either side.
+    #[test]
+    fn test_bpe_merge_ranked_matches_rescanning_merge() {
+        let tok = build_synthetic_tokenizer();
+        for word in [
+            "",
+            "h",
+            "hello",
+            "helloworld",
+            "lll",
+            "llll",
+            "lllll",
+            "hellllo",
+            "wwoorrlldd",
+            "worldhello",
+            "hehehe",
+            "xhellox",
+            "wor",
+            "olleh",
+        ] {
+            let mut symbols: Vec<String> = word.chars().map(|c| c.to_string()).collect();
+            tok.bpe_merge(&mut symbols);
+            let ranked: Vec<String> = tok
+                .bpe_merge_ranked(word)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(ranked, symbols, "merge mismatch for {word:?}");
+        }
+    }
+
+    /// Gemma 4's tokenizer (`tokenizer.ggml.model = "gemma4"`). Golden ids
+    /// from HF `tokenizers` 0.23.2 on `google/gemma-4-12B-it`'s
+    /// `tokenizer.json` (`add_special_tokens=False`), which also matched a
+    /// Python port of llama.cpp's `LLAMA_VOCAB_PRE_TYPE_GEMMA4` tokenize on
+    /// every string. Covers spaces (leading, repeated, trailing), newline
+    /// runs (including one longer than any newline token), tabs, digits,
+    /// contractions, accented Latin, CJK, emoji, control characters, code,
+    /// a literal `▁`, and the chat-template, thinking and tool-call markers.
+    ///
+    /// `test-data/gemma4-tokenizer.gguf` is the metadata section of
+    /// `ggml-org/gemma-4-12B-it-GGUF`'s `gemma-4-12B-it-Q8_0.gguf` with the
+    /// tensor table dropped (~16 MB, gitignored); see docs/DEVELOPMENT.md's
+    /// test-fixture section. Skips if absent.
+    #[test]
+    fn test_gemma4_encode_matches_reference_if_fixture_present() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test-data")
+            .join("gemma4-tokenizer.gguf");
+        if !path.exists() {
+            eprintln!(
+                "Skipping test_gemma4_encode_matches_reference_if_fixture_present: \
+                 test-data/gemma4-tokenizer.gguf not present"
+            );
+            return;
+        }
+        let file = GgufFile::open(&path).expect("open gemma4 tokenizer GGUF");
+        let tok = Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf on gemma4");
+        assert_eq!(tok.architecture, "gemma4");
+        assert_eq!(tok.vocab_size(), 262_144);
+        assert_eq!(tok.merge_count(), 514_906);
+        assert_eq!(tok.prompt_bos(), Some(2), "Gemma 4 always adds <bos>");
+        assert_eq!(tok.eos_token_id, Some(1));
+
+        let golden: &[(&str, &[u32])] = &[
+            (
+                "Once upon a time",
+                &[14946, 3324, 496, 990],
+            ),
+            (
+                "Hello, world!",
+                &[9259, 236764, 1902, 236888],
+            ),
+            (
+                "The capital of France is",
+                &[818, 5279, 529, 7001, 563],
+            ),
+            (
+                " leading space",
+                &[5830, 2557],
+            ),
+            (
+                "  two leading spaces and   three inside",
+                &[138, 13498, 5830, 9952, 532, 139, 19891, 4888],
+            ),
+            (
+                "trailing spaces   ",
+                &[136697, 9952, 139],
+            ),
+            (
+                "line1\nline2\n\nline3\n\n\n\nend\n",
+                &[1257, 236770, 107, 1257, 236778, 108, 1257, 236800, 110, 643, 107],
+            ),
+            (
+                "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n",
+                &[137, 115],
+            ),
+            (
+                "tabs\tand\t\tmore\t",
+                &[39218, 255968, 624, 255969, 5576, 255968],
+            ),
+            (
+                "The year 2026 has 365 days, or 366 in a leap year. 3.14159",
+                &[818, 1051, 236743, 236778, 236771, 236778, 236825, 815, 236743, 236800, 236825, 236810, 2668, 236764, 653, 236743, 236800, 236825, 236825, 528, 496, 42681, 1051, 236761, 236743, 236800, 236761, 236770, 236812, 236770, 236810, 236819],
+            ),
+            (
+                "don't can't won't I'll we've IT'S",
+                &[13246, 236789, 236745, 740, 236789, 236745, 2810, 236789, 236745, 564, 236789, 859, 692, 236789, 560, 9053, 236789, 236773],
+            ),
+            (
+                "Größenänderung, Straße, naïve café — ÄÖÜ ẞ",
+                &[9322, 237001, 16207, 48494, 1228, 236764, 80176, 236764, 120362, 33443, 2192, 31083, 238255, 238194, 65894],
+            ),
+            (
+                "日本語のテキストと中文文本，한국어 텍스트",
+                &[94951, 236945, 95830, 237032, 55041, 57489, 236900, 114216, 237430, 236743, 243007, 34718],
+            ),
+            (
+                "Emoji: 👋🏽 🇩🇪 🧑‍💻 ✨",
+                &[127268, 236787, 155818, 242713, 236743, 246841, 245562, 236743, 247027, 237243, 244862, 73687],
+            ),
+            (
+                "fn main() {\n    println!(\"Hallo, Welt!\");\n}\n",
+                &[15059, 1689, 825, 642, 107, 140, 4629, 36492, 45890, 236764, 30335, 21265, 107, 236783, 107],
+            ),
+            (
+                "def f(x):\n\treturn x**2  # square\n",
+                &[2063, 517, 236769, 236781, 1473, 107, 255968, 2060, 1123, 1018, 236778, 138, 236865, 6281, 107],
+            ),
+            (
+                "Review: The battery died after two days. Sentiment:",
+                &[30852, 236787, 669, 10055, 8390, 1308, 1156, 2668, 236761, 162249, 236787],
+            ),
+            (
+                "\u{0}\u{1} control \u{7f} chars",
+                &[238, 249732, 2256, 236743, 251541, 56256],
+            ),
+            (
+                "x",
+                &[236781],
+            ),
+            (
+                " ",
+                &[236743],
+            ),
+            (
+                "▁already▁escaped",
+                &[3016, 41685],
+            ),
+            (
+                "<bos><|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n",
+                &[2, 105, 2364, 107, 3689, 563, 236743, 236778, 236862, 236778, 236881, 106, 107, 105, 4368, 107],
+            ),
+            (
+                "<|turn>system\n<|think|>You are terse.<turn|>\n<|turn>user\nWie spät ist es in München?<turn|>\n<|turn>model\n<|channel>thought\nCheck the time zone.<channel|>Es ist 14:30 Uhr.<turn|>",
+                &[105, 9731, 107, 98, 3048, 659, 17514, 236761, 106, 107, 105, 2364, 107, 64008, 233648, 3526, 1115, 528, 67772, 236881, 106, 107, 105, 4368, 107, 100, 45518, 107, 6845, 506, 990, 10202, 236761, 101, 14796, 3526, 236743, 236770, 236812, 236787, 236800, 236771, 32880, 236761, 106],
+            ),
+            (
+                "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_response>",
+                &[48, 6639, 236787, 828, 236779, 19323, 236782, 13319, 236787, 52, 50429, 52, 236783, 49, 50],
+            ),
+            (
+                "<eos>",
+                &[1],
+            ),
+        ];
+        for &(text, expected) in golden {
+            let ids = tok
+                .encode(text)
+                .unwrap_or_else(|e| panic!("encode({text:?}) failed: {e}"));
+            assert_eq!(
+                ids, expected,
+                "token ids differ from the reference for {text:?}"
+            );
+            // A literal `▁` in the input decodes as a space, as in llama.cpp.
+            if !text.contains('\u{2581}') {
+                assert_eq!(tok.decode(&ids), text, "round trip failed for {text:?}");
+            }
         }
     }
 }
