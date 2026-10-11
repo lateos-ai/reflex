@@ -54,9 +54,12 @@ if [[ -z "$results_dir" || ! -d "$results_dir" ]]; then
   exit 1
 fi
 
+# A missing field yields an empty string, never a failure: under `set -euo pipefail` a
+# failed grep inside `v=$(extract_...)` would abort the whole script mid-table. Energy
+# fields are only present when the binary was built with `--features nvml`.
 extract_field() {
   # $1 = file, $2 = field name (as it appears "field=value" in the line)
-  grep -o "$2=[0-9.]*" "$1" | head -1 | cut -d= -f2
+  grep -o "$2=[0-9.]*" "$1" | head -1 | cut -d= -f2 || true
 }
 
 extract_phase_field() {
@@ -64,13 +67,13 @@ extract_phase_field() {
   # Anchors to the specific `REFLEX_PHASE_OK phase=<name> ` line, so it can't
   # accidentally read a different phase's field (the plain `extract_field`
   # above would match `energy_joules=` as a substring of `joules=`).
-  grep "REFLEX_PHASE_OK phase=$2 " "$1" | head -1 | grep -o "$3=[0-9.]*" | cut -d= -f2
+  grep "REFLEX_PHASE_OK phase=$2 " "$1" | head -1 | grep -o "$3=[0-9.]*" | cut -d= -f2 || true
 }
 
 extract_total_joules() {
   # $1 = file; reads the aggregate line's `joules=`, anchored to the result
   # line so it never picks up a preceding phase line's `energy_joules=`.
-  grep '^REFLEX_GENERATE_OK' "$1" | grep -o ' joules=[0-9.]*' | head -1 | cut -d= -f2
+  grep '^REFLEX_GENERATE_OK' "$1" | grep -o ' joules=[0-9.]*' | head -1 | cut -d= -f2 || true
 }
 
 percentile() {
