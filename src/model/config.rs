@@ -934,3 +934,254 @@ pub(super) fn parse_kolibri_config(file: &GgufFile) -> Result<(KolibriConfig, us
         block_count,
     ))
 }
+
+/// One Gemma 4 layer's attention shape. Sliding-window and global layers
+/// differ in every field (docs/design/gemma4.md's "Confirmed conventions").
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Gemma4LayerShape {
+    /// `attention.sliding_window_pattern[i]`: `true` = sliding-window layer.
+    pub(super) sliding: bool,
+    /// `attention.key_length_swa` (sliding) or `attention.key_length`
+    /// (global); `value_length` is required to match.
+    pub(super) head_dim: usize,
+    /// `attention.head_count_kv[i]` (a per-layer array in real files).
+    pub(super) num_kv_heads: usize,
+    /// `rope.dimension_count_swa` / `rope.dimension_count`: how many of each
+    /// head's dims RoPE covers.
+    pub(super) n_rot: usize,
+    /// `rope.freq_base_swa` / `rope.freq_base`.
+    pub(super) rope_base: f32,
+}
+
+/// Shape and hyperparameters of a Gemma 4 (`gemma4`) text model, read by
+/// [`parse_gemma4_config`].
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Gemma4Config {
+    pub(super) hidden_size: usize,
+    pub(super) num_q_heads: usize,
+    pub(super) ffn_hidden_size: usize,
+    pub(super) rmsnorm_eps: f32,
+    /// `attention.sliding_window`, llama.cpp's `LLAMA_SWA_TYPE_STANDARD`:
+    /// query `i` sees key `j` iff `i - j < sliding_window`.
+    pub(super) sliding_window: usize,
+    /// `final_logit_softcapping`: logits become `cap * tanh(logits / cap)`.
+    pub(super) final_logit_softcap: Option<f32>,
+    pub(super) layers: Vec<Gemma4LayerShape>,
+}
+
+/// Reads `file`'s [`Gemma4Config`]. Rejects, rather than guesses at, every
+/// variant this path does not implement: per-layer token embeddings and
+/// cross-layer KV sharing (E2B/E4B), MoE blocks (26B-A4B), RoPE scaling,
+/// differing K/V head lengths, a FFN width that changes per layer, and a
+/// `rope_freqs.weight` that doesn't cover the global layers' RoPE dims.
+pub(super) fn parse_gemma4_config(file: &GgufFile) -> Result<Gemma4Config, ReflexError> {
+    let key = |suffix: &str| format!("gemma4.{suffix}");
+    let required = |suffix: &str| {
+        u64_meta(file, &key(suffix))
+            .map(|n| n as usize)
+            .ok_or_else(|| crate::reflex_err!(Gguf, "missing {} metadata key", key(suffix)))
+    };
+    let required_f32 = |suffix: &str| {
+        f32_meta(file, &key(suffix))
+            .ok_or_else(|| crate::reflex_err!(Gguf, "missing {} metadata key", key(suffix)))
+    };
+    let unsupported_if_nonzero = |suffix: &str, what: &str| -> Result<(), ReflexError> {
+        match u64_meta(file, &key(suffix)) {
+            Some(n) if n > 0 => Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "{} = {n} is not supported: {what} (Gemma 4 E2B/E4B/26B-A4B) are out of scope; only the dense 12B/31B text models are",
+                key(suffix)
+            )),
+            _ => Ok(()),
+        }
+    };
+
+    let block_count = required("block_count")?;
+    let hidden_size = required("embedding_length")?;
+    let num_q_heads = required("attention.head_count")?;
+    unsupported_if_nonzero(
+        "embedding_length_per_layer_input",
+        "per-layer token embeddings",
+    )?;
+    unsupported_if_nonzero(
+        "attention.shared_kv_layers",
+        "KV caches shared across layers",
+    )?;
+    unsupported_if_nonzero("expert_count", "mixture-of-experts blocks")?;
+    if let Some(scaling) = file
+        .metadata
+        .get(&key("rope.scaling.type"))
+        .and_then(GgufValue::as_str)
+    {
+        if scaling != "none" {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "{} = {scaling:?} is not supported",
+                key("rope.scaling.type")
+            ));
+        }
+    }
+
+    // A scalar applies to every layer; an array gives one value per layer.
+    let per_layer = |suffix: &str| -> Result<Vec<usize>, ReflexError> {
+        match file.metadata.get(&key(suffix)) {
+            Some(GgufValue::Array(items)) => {
+                if items.len() != block_count {
+                    return Err(crate::reflex_err!(
+                        Gguf,
+                        "{} has {} entries but block_count is {block_count}",
+                        key(suffix),
+                        items.len()
+                    ));
+                }
+                items
+                    .iter()
+                    .map(|v| {
+                        v.as_u64().map(|n| n as usize).ok_or_else(|| {
+                            crate::reflex_err!(Gguf, "{} has non-integer entry {v:?}", key(suffix))
+                        })
+                    })
+                    .collect()
+            }
+            Some(v) => v
+                .as_u64()
+                .map(|n| vec![n as usize; block_count])
+                .ok_or_else(|| crate::reflex_err!(Gguf, "{} is not an integer", key(suffix))),
+            None => Err(crate::reflex_err!(
+                Gguf,
+                "missing {} metadata key",
+                key(suffix)
+            )),
+        }
+    };
+    let kv_heads = per_layer("attention.head_count_kv")?;
+    let ffn = per_layer("feed_forward_length")?;
+    let ffn_hidden_size = ffn[0];
+    if ffn.iter().any(|&n| n != ffn_hidden_size) {
+        return Err(crate::reflex_err!(
+            UnsupportedArchitecture,
+            "{} varies per layer, which is not supported",
+            key("feed_forward_length")
+        ));
+    }
+
+    let pattern_key = key("attention.sliding_window_pattern");
+    let sliding: Vec<bool> = match file.metadata.get(&pattern_key) {
+        Some(GgufValue::Array(items)) if items.len() == block_count => items
+            .iter()
+            .map(|v| match v {
+                GgufValue::Bool(b) => Ok(*b),
+                other => Err(crate::reflex_err!(
+                    Gguf,
+                    "{pattern_key} has non-boolean entry {other:?}"
+                )),
+            })
+            .collect::<Result<_, _>>()?,
+        Some(GgufValue::Array(items)) => {
+            return Err(crate::reflex_err!(
+                Gguf,
+                "{pattern_key} has {} entries but block_count is {block_count}",
+                items.len()
+            ))
+        }
+        _ => {
+            return Err(crate::reflex_err!(
+                Gguf,
+                "missing or malformed {pattern_key} (expected a per-layer bool array)"
+            ))
+        }
+    };
+    let sliding_window = required("attention.sliding_window")?;
+    if sliding_window == 0 {
+        return Err(crate::reflex_err!(
+            Gguf,
+            "{} must be > 0",
+            key("attention.sliding_window")
+        ));
+    }
+
+    // (head_dim, n_rot, rope_base) for one layer type; `swa` picks the
+    // sliding-layer keys.
+    let layer_type = |swa: bool| -> Result<(usize, usize, f32), ReflexError> {
+        let s = if swa { "_swa" } else { "" };
+        let head_dim = required(&format!("attention.key_length{s}"))?;
+        let v = required(&format!("attention.value_length{s}"))?;
+        if v != head_dim {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "{} ({v}) != {} ({head_dim}) is not supported",
+                key(&format!("attention.value_length{s}")),
+                key(&format!("attention.key_length{s}"))
+            ));
+        }
+        let n_rot = required(&format!("rope.dimension_count{s}"))?;
+        if n_rot == 0 || !n_rot.is_multiple_of(2) || n_rot > head_dim {
+            return Err(crate::reflex_err!(
+                Gguf,
+                "{} = {n_rot} must be even and in 2..={head_dim}",
+                key(&format!("rope.dimension_count{s}"))
+            ));
+        }
+        let rope_base = required_f32(&format!("rope.freq_base{s}"))?;
+        Ok((head_dim, n_rot, rope_base))
+    };
+    let swa_shape = if sliding.iter().any(|&s| s) {
+        Some(layer_type(true)?)
+    } else {
+        None
+    };
+    let global_shape = if sliding.iter().any(|&s| !s) {
+        Some(layer_type(false)?)
+    } else {
+        None
+    };
+
+    let mut layers = Vec::with_capacity(block_count);
+    for (i, (&is_sliding, &num_kv_heads)) in sliding.iter().zip(&kv_heads).enumerate() {
+        let (head_dim, n_rot, rope_base) = if is_sliding { swa_shape } else { global_shape }
+            .expect("computed for every layer type present");
+        if num_kv_heads == 0 || !num_q_heads.is_multiple_of(num_kv_heads) {
+            return Err(crate::reflex_err!(
+                Gguf,
+                "layer {i}: {} ({num_q_heads}) must be a nonzero multiple of {} ({num_kv_heads})",
+                key("attention.head_count"),
+                key("attention.head_count_kv")
+            ));
+        }
+        layers.push(Gemma4LayerShape {
+            sliding: is_sliding,
+            head_dim,
+            num_kv_heads,
+            n_rot,
+            rope_base,
+        });
+    }
+
+    if let Some((_, n_rot, _)) = global_shape {
+        let info = file.tensor_info("rope_freqs.weight").ok_or_else(|| {
+            crate::reflex_err!(
+                Gguf,
+                "missing rope_freqs.weight (Gemma 4's global layers need it)"
+            )
+        })?;
+        if info.element_count() as usize != n_rot / 2 {
+            return Err(crate::reflex_err!(
+                Gguf,
+                "rope_freqs.weight has {} entries, expected {} ({}/2)",
+                info.element_count(),
+                n_rot / 2,
+                key("rope.dimension_count")
+            ));
+        }
+    }
+
+    Ok(Gemma4Config {
+        hidden_size,
+        num_q_heads,
+        ffn_hidden_size,
+        rmsnorm_eps: f32_meta(file, &key("attention.layer_norm_rms_epsilon")).unwrap_or(1e-6),
+        sliding_window,
+        final_logit_softcap: f32_meta(file, &key("final_logit_softcapping")).filter(|&c| c != 0.0),
+        layers,
+    })
+}

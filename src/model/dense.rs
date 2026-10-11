@@ -689,6 +689,7 @@ impl Model {
             tokenizer,
             hybrid: None,
             mla: None,
+            gemma4: None,
         })
     }
 
@@ -2010,6 +2011,12 @@ impl Model {
         }
         if self.mla.is_some() {
             return Err(ReflexError::Other("--export-kv on an MLA model needs forward_prompt_capture_kv_mla, not this function".to_string()));
+        }
+        if self.gemma4.is_some() {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "--export-kv is not supported for Gemma 4 models yet"
+            ));
         }
         let (generated, text, k_caches, v_caches, seq_len) = self.generate_dense_impl(
             prompt,

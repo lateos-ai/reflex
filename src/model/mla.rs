@@ -456,6 +456,7 @@ impl Model {
                 mla_concat_qcur_batch_k,
                 mla_write_kv_cache_batch_k,
             }),
+            gemma4: None,
         })
     }
 
