@@ -69,10 +69,10 @@ serverless endpoint in one click, no build required ([worker docs](.runpod/READM
 | Dense Qwen3 (`qwen3`) | Qwen3-0.6B |
 | Qwen3-MoE (`qwen3moe`) | synthetic fixtures (real `qwen3moe` tensor layout, top-k routing) |
 | Llama / Mistral (`llama`) | TinyLlama-1.1B |
-| Qwen3.5 hybrid Gated DeltaNet (`qwen35`, `qwen35moe`) | Qwen3.5-0.8B; a random-weight `qwen35moe` checkpoint |
+| Qwen3.5 hybrid Gated DeltaNet (`qwen35`, `qwen35moe`) | Qwen3.5-0.8B; Qwen3.8-27B `Q8_0` (f16 weights, 80 GB GPU); a random-weight `qwen35moe` checkpoint |
 | DeepSeek-V2/V3 MLA (`deepseek2`) | DeepSeek-V2-Lite; a synthetic fixture |
 | Kolibri-1 MoE (`kolibri1`) | Aleph Alpha's Kolibri-1 78B, `Q4_K_M` (needs `REFLEX_QUANT_RESIDENT=1`); a synthetic fixture |
-| Gemma 4 dense, text only (`gemma4`) | Gemma 4 12B-it `Q8_0`; a synthetic fixture. The 31B uses the same architecture but hasn't been run yet. E2B/E4B and 26B-A4B are not supported |
+| Gemma 4 dense, text only (`gemma4`) | Gemma 4 12B-it and 31B-it `Q8_0` (the 31B needs an 80 GB GPU); a synthetic fixture. E2B/E4B and 26B-A4B are not supported |
 
 Each architecture counted as supported only after its generated tokens matched an
 independent implementation (llama.cpp, or a CPU reference) on real hardware.

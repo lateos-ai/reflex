@@ -207,7 +207,13 @@ logit soft-cap 30. Dense 12B/31B text only; E2B/E4B, 26B-A4B, KV export/import, 
 `REFLEX_ATTN_KERNEL=legacy` are rejected. **Compare against llama.cpp with f32
 activations** (`llama-no-q8.patch`, `LLAMA_NO_Q8=1`, in `test-data/tiny-gemma4-src.tar.gz`):
 stock llama.cpp's 8-bit activation quantization moves Q8_0 Gemma 4 logits by up to ~0.8
-on long prompts. Design, results and numbers: `docs/design/gemma4.md`.
+on long prompts. For long prompts also use an f32 KV cache with flash attention off
+(`GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32`, `ref.cpp`'s `REF_KV_F32=1 REF_NO_FA=1`, in
+`test-data/large-model-verify-src.tar.gz`): llama.cpp's f16 flash attention moves the
+31B's logits by ~0.5, and it ignores an f32 KV type while it's on. Compare with EOS-only
+stopping, because Reflex stops only at `<eos>` and llama.cpp also at `<turn|>`. Verified:
+12B on an A40, 31B on an A100 80 GB (f16 weights); run the 31B's GPU tests with
+`--test-threads=1`. Design, results and numbers: `docs/design/gemma4.md`.
 
 ### MoE routing (`src/moe.rs`)
 `route_top_k`: softmax over all experts, select top-k, renormalize. No new

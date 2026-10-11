@@ -3,11 +3,27 @@
 What has been built, in order. Measurements live in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+## 2026-10-11
+
+- **Gemma 4 31B and Qwen3.8-27B verified** on an A100 80 GB, both `Q8_0` with f16
+  weights. No code changed.
+  - **Gemma 4 31B-it:** greedy tokens identical to llama.cpp running fully in f32 on 5/5
+    prompts (up to 1,262 tokens, past the 1,024-token window), and on a natural
+    2,641-token prompt. `system1` scores within 0.03. For long prompts the reference
+    needs an f32 KV cache with flash attention off on top of f32 activations: llama.cpp's
+    f16 flash attention moves the 31B's logits by up to ~0.5 there.
+  - **Qwen3.8-27B** (`qwen35`): 4/4 prompts identical to llama.cpp with f32 activations,
+    including a 981-token prompt. The prompt ids match too, so the GGUF's
+    `add_bos_token = false` is honored. Single-token `system1` scores within 0.007
+    (the hybrid path still accepts only single-token labels).
+
+  Gemma 4 details: [docs/design/gemma4.md](docs/design/gemma4.md#31b-results-2026-10-11).
+
 ## 2026-10-09
 
 - **Gemma 4 support** (`gemma4`, dense, text only; verified on the 12B, the 31B is
-  not run yet: its header parses, but it needs an 80 GB card in f16). The new path is
-  `src/model/gemma4.rs` with its own kernels (`kernels_cuda/gemma4.cu`), plus a third
+  not run yet: its header parses, but it needs an 80 GB card in f16; verified
+  2026-10-11, above). The new path is `src/model/gemma4.rs` with its own kernels (`kernels_cuda/gemma4.cu`), plus a third
   tokenizer mode (`tokenizer.ggml.model = "gemma4"`). Other architectures' code paths and
   kernels are unchanged; on an A40 their `reflex check` output is identical to before,
   checksums included. Verified on an A40:

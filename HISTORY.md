@@ -3648,3 +3648,52 @@ threads 39.5 s, 4: 28.7 s, 8: 19.5 s, 16: ~13.9 s, 32: 12.6 s. Warm is best at 8
 `MADV_WILLNEED` made no measurable difference. So cold wants many reads in flight and
 warm wants few copy threads, and one knob can't serve both. Next step: separate reader
 threads that only fault pages in ahead of the copy.
+
+### Gemma 4 31B and Qwen3.8-27B verified on an A100 80 GB (2026-10-11)
+
+ThunderCompute instance (A100-SXM4-80GB, sm_80, 8 vCPU, 64 GB RAM, 100 GB disk, Ubuntu
+22.04, driver 610.43.02; instance deleted after the run). The CUDA 12.8 toolkit, cmake
+and rustup were installed by hand; rustup couldn't edit the read-only `~/.bashrc`, so
+`rustup default stable` was needed. Reflex was built from a clone of the **public**
+repo at `46fcb29` (identical code to private master `c1c6423`). The private tree and the
+fixture tarballs were not copied to the host, so the MLA golden-token re-check
+(`deepseek-tiny-mla.gguf`, Known debt) is still pending. llama.cpp was at `79e2e74`.
+
+The harness was rewritten from scratch rather than copied from `tiny-gemma4-src.tar.gz`,
+and archived as `test-data/large-model-verify-src.tar.gz`:
+- `ref.cpp`, a generic `llama.h` program printing prompt ids, greedy ids, the first
+  step's top-5 and `system1` logit sums;
+- an 8-line `LLAMA_NO_Q8` hunk in `ggml_cuda_mul_mat` that sends quantized weights to
+  cuBLAS, combined with upstream's own `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32`;
+- `cmp.sh`, plus small scripts for each experiment.
+
+**Gemma 4 31B-it `Q8_0`, f16 weights (about 61 GB):**
+- **Greedy tokens:** 5/5 prompts identical to fully-f32 llama.cpp. That includes 982
+  and 1,262 tokens, past the 1,024 window. A natural 2,641-token prompt matches 10/10,
+  with the top logit 20.054 vs 20.020.
+- **`system1`:** 8 candidates within 0.03.
+- **GPU tests:** batched-vs-sequential (rel L2 3.3e-3), `system1` self-consistency and
+  generate all pass. They need `--test-threads=1`: two parallel 61 GB loads exhausted
+  the 80 GB card, and one test failed the first time.
+
+Two findings about the reference:
+1. **f32 activations alone aren't enough on long prompts.** They left a 0.54 top-logit
+   gap at 982 tokens. llama.cpp's f16 flash attention is the cause, and while flash
+   attention is on it ignores an f32 KV type. With flash attention off and an f32 KV
+   cache, llama.cpp is within 0.012 of Reflex (17.162 vs 17.174). With flash attention
+   off and an f16 KV cache, it flips its own top-1.
+2. **Reflex stops only at `<eos>`; llama.cpp also stops at `<turn|>`.** With EOS-only
+   stopping on both sides, the chat prompt matches 17/17.
+
+**Qwen3.8-27B `Q8_0` (`qwen35`), f16 weights (about 54 GB):**
+- 4/4 prompts × 20 tokens identical to llama.cpp with f32 activations, prompt ids
+  included. The real file has `add_bos_token=false`, and the `prompt_bos` fix handles it.
+- Single-token `system1` within 0.007. Multi-token labels are still rejected on the
+  hybrid path.
+
+**Same-host first-token timings** (file in page cache, median of 3):
+- Gemma 4 31B: Reflex 15.0 s vs `llama-simple` 19.0 s.
+- Qwen3.8-27B: Reflex 12.1 s vs 15.5 s.
+
+The GPU is network-attached and loading the weights dominates, so only the ratio
+counts. Results: `docs/design/gemma4.md` "31B results (2026-10-11)".
