@@ -5,7 +5,8 @@ What has been built, in order. Measurements live in
 
 ## 2026-10-09
 
-- **Gemma 4 support** (`gemma4`, dense 12B/31B, text only). The new path is
+- **Gemma 4 support** (`gemma4`, dense, text only; verified on the 12B, the 31B is
+  not run yet: its header parses, but it needs an 80 GB card in f16). The new path is
   `src/model/gemma4.rs` with its own kernels (`kernels_cuda/gemma4.cu`), plus a third
   tokenizer mode (`tokenizer.ggml.model = "gemma4"`). Other architectures' code paths and
   kernels are unchanged; on an A40 their `reflex check` output is identical to before,
