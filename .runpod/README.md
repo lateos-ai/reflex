@@ -229,9 +229,25 @@ still 404s. The listed release at that check was **`v0.2.2-runpod-hub`** (build 
 `registry.runpod.net/lateos-ai-reflex-master-runpod-dockerfile:16370973d`), which predates the
 fatbin kernels and the slim runtime, so every fresh worker still pays the PTX JIT.
 **`v0.2.3-runpod-hub`** brings the fatbin build, the Ada-inclusive `gpuIds`, streaming, and
-the `ADAPTER_ARGS` deploy field. **`v0.2.4-runpod-hub`** (this classifier release) adds the
-Q8_0 model, the classifier-led listing, and the routing smoke test; `POST /v1/classify` and
-the `labels` branch of `handler.py` are on `master`/`public` only from that sync onward.
+the `ADAPTER_ARGS` deploy field.
+
+**Update, checked 2026-10-09:** the listing has moved to **`v0.2.3-runpod-hub`**. The Hub
+console (listing page <https://console.runpod.io/hub/lateos-ai/reflex>) now shows the
+v0.2.3 release promoted from `master` at tag `v0.2.3-runpod-hub`, completed 2026-10-08,
+with the fatbin/slim-runtime description and its test results passing. The build-image
+digest is not exposed in the listing UI; the release name is what the Hub builds from, so
+the PTX JIT the v0.2.2 image paid is no longer in the catalog path. The GHCR image the Hub
+publishes is `ghcr.io/lateos-ai/reflex-runpod-hub`, digest (verified 2026-10-09)
+`sha256:6ecb8e1f0200c2736141014eadc9ad38bee7560fad52b48e02dbacd31d510f33`. The v0.2.2 note
+above is kept for history.
+
+**Update, 2026-10-09 (classifier release, `v0.2.5-runpod-hub`):** the worker now bakes
+Qwen3-0.6B-**Q8_0** (was Q4_K_M) and the listing leads with classification; `hub.json` is
+retitled, `.runpod/README.md`'s "Classifier caller contract" documents how to use it, and
+`tests.json` gains a 4-label routing smoke test. `POST /v1/classify` and `handler.py`'s
+`labels` branch are the same code that has been on `master` since `v0.2.3`; this release is
+packaging, doc and model-quant only. `v0.2.4-runpod-hub` is the adoption/Hub-refresh release
+(#16), not this one.
 
 `iconUrl` in `hub.json` points at a real hosted asset (`.runpod/icon.jpg` on `master`), not
 the old `TODO:` placeholder. The GPU-selection fields in `hub.json`/`tests.json` are kept as

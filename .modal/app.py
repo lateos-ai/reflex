@@ -40,7 +40,7 @@ image = modal.Image.from_dockerfile(
     DOCKERFILE,
     context_dir=REPO_ROOT,
     build_args={"REFLEX_CUDA_ARCH": "sm_89"},
-    # Dockerfile's runtime stage is a plain nvidia/cuda:*-runtime-* base with no
+    # Dockerfile's runtime stage is a slim nvidia/cuda:*-base* image with no
     # Python -- Modal's own container init needs an interpreter to run this file's
     # @modal.enter()/@modal.exit() lifecycle methods, so it must be added here since
     # the Dockerfile itself has no reason to install one otherwise.

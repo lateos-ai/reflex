@@ -318,6 +318,19 @@ The CUDA major/minor version in both Docker stages must stay consistent with
 `Cargo.toml`'s pinned `cudarc` feature (`"cuda-12000"`, i.e. CUDA 12.x) — a mismatch is
 a build-time/runtime library version mismatch this Dockerfile can't catch for you.
 
+### Published images
+
+Two images are published to GHCR for the serverless deployment paths. **Pin a
+digest, not `:latest`** — `:latest` is a moving alias, repointed on every rebuild
+from `master`. Verified 2026-10-09:
+
+| Image | Digest |
+|---|---|
+| `ghcr.io/lateos-ai/reflex-runpod` (root `Dockerfile`, `--target runpod-lb`) | `sha256:219edd36bd6b9bf8271d4ae91793eac205c625794e55ed325570318ce31af9b7` |
+| `ghcr.io/lateos-ai/reflex-runpod-hub` (`.runpod/Dockerfile`) | `sha256:6ecb8e1f0200c2736141014eadc9ad38bee7560fad52b48e02dbacd31d510f33` |
+
+The full operator walkthrough is [`docs/deploy-serverless.md`](deploy-serverless.md).
+
 For a cost-optimized AWS pattern built on this same image (Spot GPU instances, an Auto
 Scaling Group with minimum capacity 0, and a `reflex uds` sidecar reachable over a local
 Unix Domain Socket instead of a network load balancer), see

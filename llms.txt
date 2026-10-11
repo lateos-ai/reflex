@@ -42,6 +42,14 @@ machine with no CUDA toolkit (no subcommand actually runs on this build). Run `r
 arguments for the subcommand list (`system1`, `bench`, `check`, `stdio`/`uds` IPC modes,
 etc.) and `reflex <subcommand>` for its usage; `docs/DEVELOPMENT.md` covers building and testing.
 
+## Serverless / scale-to-zero (start here)
+
+[`docs/deploy-serverless.md`](docs/deploy-serverless.md) is the one operator page:
+Runpod load-balancing first, then the Hub queue worker and AWS scale-to-zero. The job
+Reflex is built for is a single cold decision (`POST /v1/classify`), not warm chat.
+Pin a published image digest, not `:latest` (digests in
+[`docs/reference.md`](docs/reference.md#published-images)).
+
 ## Docker (any host with `nvidia-container-toolkit`)
 
 ```
@@ -119,6 +127,11 @@ output — omit it on Linux/macOS. Builds from `.modal/Dockerfile` (same builder
 See [`.modal/README.md`](.modal/README.md) for real measured numbers (~7-8s cold start,
 `n=3`) and [`docs/modal-phase3-comparison.md`](docs/modal-phase3-comparison.md) for a
 controlled comparison against plain vLLM on the same platform (~25x faster).
+
+**Modal Server, measured 2026-10-09:** the image uses the slim runtime with a pinned
+`sm_89` cubin (Modal's `gpu="L4"` is one exact SKU, so the fatbin isn't needed); `n=3`
+cold starts gave 8.1s median local submit → first token. See
+[`docs/deploy-serverless.md`](docs/deploy-serverless.md).
 
 ## Non-goals, so an agent doesn't propose them
 

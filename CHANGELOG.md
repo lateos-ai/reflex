@@ -24,7 +24,7 @@ What has been built, in order. Measurements live in
   n=5). As a classifier, about 74 ms per decision warm (`reflex stdio`) and about 2.1 s
   as a cold process. Details: [docs/design/gemma4.md](docs/design/gemma4.md).
 
-- **Runpod Hub worker repackaged as a classifier listing** (`v0.2.4-runpod-hub`). The
+- **Runpod Hub worker repackaged as a classifier listing** (`v0.2.5-runpod-hub`). The
   queue-based Hub worker now bakes **Qwen3-0.6B-Q8_0** (was Q4_K_M; `.runpod/Dockerfile`)
   and leads with `POST /v1/classify`: a job whose `input` has `labels` scores every label
   as a continuation of `prompt` in one prefill and returns per-label probabilities and
