@@ -99,6 +99,8 @@ use crate::error::ReflexError;
 #[cfg(test)]
 mod attention_online_tests;
 #[cfg(test)]
+mod attention_tiled_tests;
+#[cfg(test)]
 mod f16_kernel_tests;
 #[cfg(test)]
 mod gemma4_config_tests;

@@ -38,10 +38,10 @@ impl AttnImpl {
 }
 
 /// `attention_online_kernel`'s scalar arguments. Must match `struct AttnParams` in
-/// `kernels_cuda/attention_online.cu` field for field.
+/// `kernels_cuda/attention_online.cu` (and `attention_tiled.cu`) field for field.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-struct AttnParams {
+pub(super) struct AttnParams {
     k_pos_stride: u64,
     k_head_stride: u64,
     v_pos_stride: u64,
@@ -77,6 +77,28 @@ pub(super) struct OnlineAttnShape {
     /// Sliding window: query position `i` sees key `j` iff `i - j < window`.
     /// `0` = plain causal attention.
     pub(super) window: usize,
+}
+
+impl OnlineAttnShape {
+    /// The kernel arguments for this shape, unsplit (`num_splits` 1). For
+    /// `attention_tiled.cu`, which ignores the split fields.
+    pub(super) fn unsplit_params(&self) -> AttnParams {
+        AttnParams {
+            k_pos_stride: self.k_pos_stride as u64,
+            k_head_stride: self.k_head_stride as u64,
+            v_pos_stride: self.v_pos_stride as u64,
+            v_head_stride: self.v_head_stride as u64,
+            num_q_heads: self.num_q_heads as u32,
+            group_size: self.group_size as u32,
+            qk_dim: self.qk_dim as u32,
+            v_dim: self.v_dim as u32,
+            start_pos: self.start_pos as u32,
+            num_splits: 1,
+            split_len: (self.start_pos + self.rows) as u32,
+            window: self.window as u32,
+            scale: self.scale,
+        }
+    }
 }
 
 /// `attention_online.cu`'s block size, in warps, and widest supported head.
