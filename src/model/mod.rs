@@ -82,6 +82,7 @@ mod hybrid;
 mod kernels;
 mod loading;
 mod mla;
+mod prefill_profile;
 
 use self::config::*;
 pub use self::config::{parse_model_config, LayerConfig, MoeMetaConfig, RopeType};
@@ -92,6 +93,7 @@ use self::kernels::*;
 use self::loading::*;
 pub use self::loading::{F16ActivationStats, LoadOptions, WeightsDtype};
 use self::mla::*;
+use self::prefill_profile::*;
 use crate::error::ReflexError;
 
 #[cfg(test)]
