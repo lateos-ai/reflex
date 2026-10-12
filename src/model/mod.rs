@@ -82,6 +82,7 @@ mod hybrid;
 mod kernels;
 mod loading;
 mod mla;
+mod prefill_profile;
 
 use self::config::*;
 pub use self::config::{parse_model_config, LayerConfig, MoeMetaConfig, RopeType};
@@ -92,10 +93,13 @@ use self::kernels::*;
 use self::loading::*;
 pub use self::loading::{F16ActivationStats, LoadOptions, WeightsDtype};
 use self::mla::*;
+use self::prefill_profile::*;
 use crate::error::ReflexError;
 
 #[cfg(test)]
 mod attention_online_tests;
+#[cfg(test)]
+mod attention_tiled_tests;
 #[cfg(test)]
 mod f16_kernel_tests;
 #[cfg(test)]
@@ -120,6 +124,8 @@ mod moe_fixture_tests;
 mod prefill_batching_tests;
 #[cfg(test)]
 mod quant_resident_tests;
+#[cfg(test)]
+mod rmsnorm_tests;
 #[cfg(test)]
 mod rope_type_tests;
 #[cfg(test)]

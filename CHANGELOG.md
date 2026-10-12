@@ -5,6 +5,26 @@ What has been built, in order. Measurements live in
 
 ## 2026-10-12
 
+- **Long-prompt prefill 4-7x faster on Gemma 4, and faster prefill everywhere.** Two
+  causes, measured with a new per-phase profiler (`REFLEX_PREFILL_PROFILE=1`):
+  - `rmsnorm_kernel` recomputed each row's sum of squares in every thread (rows x
+    hidden^2 work). It now runs one block per row with the same summation order, so
+    outputs are bit-identical for every architecture (`reflex check` unchanged on 12
+    configurations). This was 40-68% of Gemma 4 prefill. Qwen3-0.6B warm prefill at 449
+    tokens: 67.5 -> 53.9 ms.
+  - Gemma 4 prefill attention now uses a tiled f32 kernel that reuses each K/V tile
+    across a block of query rows and the query heads of a GQA group. Decode and other
+    architectures are unchanged.
+
+  On an RTX A40, 12B prefill at 3,713 tokens: 13.4 s -> 1.87 s. 31B
+  (`REFLEX_QUANT_RESIDENT=1`): 33.1 s -> 4.66 s. First token on a 2,641-token prompt:
+  12B 10.1 s -> 3.4 s, 31B 23.0 s -> 6.1 s. That is faster than llama.cpp computing in
+  f32 and 1.3-1.6x behind stock llama.cpp. Greedy tokens against the fully-f32 llama.cpp
+  reference are unchanged: 12B 12/12, 31B 5/6 (the known 982-token near-tie). PTX builds
+  without a warm driver cache JIT the new module once, ~340 ms; cubin and fatbin builds,
+  including the Docker image, don't. Details:
+  [Long-prompt prefill](docs/design/gemma4.md#long-prompt-prefill-2026-10-12).
+
 - **Gemma 4 on 48 GB cards: quantized-resident `Q8_0`** (`REFLEX_QUANT_RESIDENT=1`,
   opt-in). Gemma 4's `Q8_0` layer weights and tied LM head stay quantized on the GPU,
   read by new `gemv_q8_0` kernels. Above 16 prompt rows they are dequantized into a

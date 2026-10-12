@@ -193,7 +193,8 @@ and head dims up to 1024. New kernels:
   `REFLEX_ATTN_KERNEL=legacy` is rejected, because the legacy kernels hardcode a
   `1/sqrt(head_dim)` scale.
 - One layer function, `Model::forward_gemma4_layer`, serves both prefill (`rows` = prompt
-  length, cuBLAS GEMMs, sliding window masked per row in the online attention kernel)
+  length, cuBLAS GEMMs, sliding window masked per row in the attention kernel: the
+  tiled prefill kernel since 2026-10-12, see [Long-prompt prefill](#long-prompt-prefill-2026-10-12))
   and decode (`rows == 1`, GEMVs, window applied by narrowing the K/V views, as the
   dense path does). Each layer's K/V cache is sized from that layer's own shape.
 - The tied LM head stays lazy (`LmHead::TiedLazy`). `system1` gathers only the candidate
@@ -381,6 +382,150 @@ parallel, two 61 GB loads exhaust the 80 GB card and one test fails.
 Reflex 15.0 s to the first token vs `llama-simple` 19.0 s. ThunderCompute attaches the
 GPU over the network, and loading 61 GB dominates both, so only the ratio means anything;
 these numbers don't compare with the A40's.
+
+## Long-prompt prefill (2026-10-12)
+
+Runpod RTX A40 (sm_86), Reflex `8485f1c` built with `REFLEX_CUDA_ARCH=sm_86`, llama.cpp
+`79e2e74`. The 12B ran with f16 weights and the 31B with `REFLEX_QUANT_RESIDENT=1`. The
+prompts are llama.cpp's `README.md` followed by `docs/build.md`, cut by bytes. Rows are
+the actual token counts. The scripts and raw outputs are archived in
+`test-data/large-model-verify-src.tar.gz` (`prefill-2026-10-12/`).
+
+**Measured with `REFLEX_PREFILL_PROFILE=1`.** This records a timing event at every phase
+boundary of `forward_gemma4_layer` and prints GPU ms per phase for sliding and global
+layers, plus the host enqueue time and the wall time. Off by default.
+
+**Prefill time** (GPU total, second run of two; the two runs agree within 1%):
+
+| Tokens | 12B Reflex | 12B llama.cpp (FA / no FA / f32 ref) | 31B Reflex | 31B llama.cpp (FA / no FA / f32 ref) |
+|---|---|---|---|---|
+| 246 | 0.49 s | 0.10 / 0.10 / 0.27 s | 1.41 s | 0.20 / 0.22 / 0.60 s |
+| 502 | 1.01 s | 0.17 / 0.18 / 0.40 s | 2.63 s | 0.39 / 0.42 / 0.89 s |
+| 1,184 | 2.85 s | 0.41 / 0.46 / 1.04 s | 7.45 s | 0.93 / 1.06 / 2.37 s |
+| 2,110 | 5.99 s | 0.73 / 0.83 / 1.83 s | 15.5 s | 1.68 / 1.95 / 4.21 s |
+| 2,763 | 8.75 s | 0.94 / 1.09 / 2.29 s | | 2.19 / 2.57 / 5.24 s |
+| 3,713 | 13.4 s | 1.27 / 1.50 / 3.12 s | 33.1 s | 2.98 / 3.52 / 7.15 s |
+
+llama.cpp is `llama-bench -n 0 -r 2`. FA and no FA are stock builds, with 8-bit
+activations. "f32 ref" is the reference Reflex is checked against: `LLAMA_NO_Q8=1`,
+`GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32`, no flash attention. Its KV cache is f16, because
+llama-bench has no f32 KV option.
+
+**Where the time goes** (12B; sliding + global layers):
+
+| Tokens | RMSNorm (hidden width) | Attention | Everything else | Host enqueue / wall |
+|---|---|---|---|---|
+| 246 | 330 ms (68%) | 45 ms (9%) | 112 ms | 300 / 492 ms |
+| 502 | 676 ms (67%) | 165 ms (16%) | 173 ms | 614 / 1,018 ms |
+| 1,184 | 1,572 ms (55%) | 863 ms (30%) | 418 ms | 1,799 / 2,866 ms |
+| 2,110 | 2,835 ms (47%) | 2,435 ms (41%) | 723 ms | 3,576 / 6,050 ms |
+| 2,763 | 3,803 ms (43%) | 4,079 ms (47%) | 865 ms | 5,477 / 8,779 ms |
+| 3,713 | 5,182 ms (39%) | 6,912 ms (52%) | 1,303 ms | 7,879 / 13,593 ms |
+
+The 31B splits the same way: RMSNorm 58-63% up to 502 tokens and 40% at 3,713;
+attention 8% rising to 52%.
+
+The RMSNorm figure is four times the `ffn_tail` phase. That phase is one full-width
+RMSNorm (`post_ffw_norm`) plus an add and a scale, which cost about 0.2 ms each. Each
+layer runs four full-width norms (`attn_norm`, `post_attention_norm`, `ffn_norm`,
+`post_ffw_norm`), and each of the other three sits in one of the other phases.
+
+Findings:
+
+1. **RMSNorm is the largest cost up to ~2,000 tokens, and it isn't Gemma-specific.**
+   `rmsnorm_kernel` (`src/kernels_cuda/rmsnorm.cu`) runs one thread per *output
+   element*, and each thread recomputes its row's whole sum of squares. A
+   `[rows, hidden]` norm therefore does `rows × hidden²` loads instead of `rows × hidden`.
+   At hidden 3,840 that is ~20 ms per norm at 2,763 rows (12B), and 3.8 s of the 8.75 s
+   prefill. Every architecture uses this kernel, so their prefills pay the same cost.
+   The per-head Q/K/V norms (width 256/512) cost much less: 185 ms at 2,763 rows,
+   including RoPE. This also explains why prefill was ~2 ms per token even at 449
+   tokens.
+2. **Attention takes the lead past ~2,000 tokens.** The online kernel gives every
+   (query row, head) pair its own block, with no reuse of K/V across rows or across the
+   q heads that share a KV head. Global layers suffer most: 16 q heads read the one KV
+   head separately, at head dim 512. At 3,713 tokens a global layer's attention costs
+   496 ms, against 74 ms for a sliding one.
+3. **The sliding window is applied (suspect b).** The kernel starts each row at
+   `seq_len − window`. Sliding-layer attention grows ~2x from 2,110 to 3,713 tokens; the
+   full quadratic would be 3.1x.
+4. **Host work, syncs and the KV cache are not the cause (suspects c and d).** GPU time
+   accounts for the whole wall time. The host enqueue time is large only because the
+   launch queue fills and the host waits on the GPU. The KV-cache copies take 9 ms at
+   3,713 tokens, and the embedding gather 30-40 ms.
+5. **The GEMMs are fine.** Everything other than norms and attention takes 0.87 s at
+   2,763 tokens on the 12B, about 45% of the A40's f16 tensor-core peak, close to
+   llama.cpp's whole prefill (0.94 s).
+
+### Fixes and results
+
+**RMSNorm** (`rmsnorm.cu`, every architecture). The kernel now runs one block per row.
+The block stages the row in shared memory, and one thread computes the sum of squares,
+in the same index order as before. Outputs are **bit-identical**. `reflex check` token
+ids and logit checksums are unchanged on 12 configurations: Qwen3-0.6B (f32, f16,
+quantized-resident), the MLA, qwen3moe, qwen35moe, Kolibri and Kolibri-f32 fixtures, both
+tiny Gemma 4 fixtures, and the 12B in both modes. A GPU test
+(`rmsnorm_tests`) checks the kernel bit for bit against a host emulation of its
+arithmetic, and the old kernel passes the same test.
+
+**Tiled prefill attention** (`attention_tiled.cu`, Gemma 4 prefill only). A block takes
+M query vectors that share a KV head: `M / group` rows times the `group` query heads of a
+GQA group, with M = 64 at head dim 256 and 32 at 512. It walks K/V in 64-position tiles
+staged in shared memory, so each loaded K/V element serves all M queries. The softmax is
+online per tile. The kernel is f32 SIMT with `expf`, like the online kernel, and the same
+mask; only the summation order differs. Decode and every other architecture keep
+`attention_online_kernel`, so their outputs don't change (`reflex check` byte-identical,
+as above). The tiny Gemma 4 fixtures' head dims aren't 256/512, so they also stay on the
+online kernel; the real models exercise the new one. A GPU test (`attention_tiled_tests`)
+compares tiled and online on 7 shapes: 12B and 31B sliding and global layers, across the
+window edge, a resumed prefill, and a GQA group split across blocks. The largest
+difference is 6.7e-6.
+
+**Prefill time** (A40, GPU total):
+
+| Tokens | 12B before | 12B RMSNorm fix | 12B both | 31B before | 31B both | llama.cpp 12B / 31B (stock FA; f32 ref) |
+|---|---|---|---|---|---|---|
+| 246 | 0.49 s | 0.16 s | **0.13 s** | 1.41 s | **0.44 s** | 0.10 / 0.20 s; 0.27 / 0.60 s |
+| 502 | 1.01 s | 0.34 s | **0.22 s** | 2.63 s | **0.64 s** | 0.17 / 0.39 s; 0.40 / 0.89 s |
+| 1,184 | 2.85 s | 1.26 s | **0.55 s** | 7.45 s | **1.43 s** | 0.41 / 0.93 s; 1.04 / 2.37 s |
+| 2,110 | 5.99 s | 3.14 s | **1.04 s** | 15.5 s | **2.71 s** | 0.73 / 1.68 s; 1.83 / 4.21 s |
+| 3,713 | 13.4 s | 8.15 s | **1.87 s** | 33.1 s | **4.66 s** | 1.27 / 2.98 s; 3.12 / 7.15 s |
+
+Prefill is now 0.4-0.5 ms per token on the 12B from 500 tokens up, instead of growing
+from 2 to 3.6 ms. That is faster than llama.cpp's f32 reference and 1.3-1.6x behind
+stock llama.cpp (8-bit activations, f16 flash attention). At 3,713 tokens on the 12B,
+attention is 0.70 s (37%), the GEMMs and the rest 0.98 s, and the hidden-width norms
+~0.19 s.
+
+**First token on the 2,641-token prompt** (`reflex generate`, process start to first
+token, file in page cache): 12B f16 **3.40 s** (was 10.1 s), 31B with
+`REFLEX_QUANT_RESIDENT=1` **6.12 s** (was 23.0 s).
+
+**Other architectures** (RMSNorm fix only): Qwen3-0.6B warm prefill (`reflex bench`, A40,
+f16) 8.0 / 14.2 / 67.5 ms -> 7.2 / 10.6 / 53.9 ms at 29 / 113 / 449 tokens.
+
+**Greedy tokens against the fully-f32 llama.cpp reference** (the `cmp_q8.sh` harness, 6
+prompts, 20 tokens, 10 on the 2,641-token one):
+
+- 12B, f16 weights and quantized-resident: 12/12, as before. On the long prompts the
+  top-1 logit is closer to the reference than before: 18.880 vs 18.874 (was 18.826) at
+  982 tokens, 15.322 vs 15.301 (was 15.206) at 1,262, and 7.729 vs 7.728 (was 7.773) at
+  2,641.
+- 31B, quantized-resident: 5/6, as before. The 2,641-token prompt matches 10/10 (top-1
+  20.048 vs 20.092; was 20.055). The miss is the same near-tie on the 982-token prompt as
+  in the [Q8_0 results](quantized-resident-weights.md#q8_0-on-gemma-4-results-2026-10-12):
+  17.342 vs 17.336 in the reference, which picks differently on an A40 and an A100.
+
+**Cold start.** The new module adds JIT time only to PTX builds (the plain `cargo build`
+default). With the driver's JIT cache disabled, `modules_ms` grows from ~985 to ~1,330 ms
+on the 12B; with the cache, only the first run on a machine pays it. Cubin and fatbin
+builds, including the Docker image's default `sm_75..sm_90` fatbin, pay nothing. Loading
+the module on a background thread didn't help: the driver serialized the JIT against the
+main thread's module loads, and then against the weight upload's calls.
+
+**Next.** The GEMM side is now the larger share. The tiled kernel stays on f32 SIMT; TF32
+or f16 tensor cores would cut attention further, but they move numerics away from the
+f32 reference.
 
 ## Risks
 

@@ -38,10 +38,10 @@ impl AttnImpl {
 }
 
 /// `attention_online_kernel`'s scalar arguments. Must match `struct AttnParams` in
-/// `kernels_cuda/attention_online.cu` field for field.
+/// `kernels_cuda/attention_online.cu` (and `attention_tiled.cu`) field for field.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-struct AttnParams {
+pub(super) struct AttnParams {
     k_pos_stride: u64,
     k_head_stride: u64,
     v_pos_stride: u64,
@@ -77,6 +77,28 @@ pub(super) struct OnlineAttnShape {
     /// Sliding window: query position `i` sees key `j` iff `i - j < window`.
     /// `0` = plain causal attention.
     pub(super) window: usize,
+}
+
+impl OnlineAttnShape {
+    /// The kernel arguments for this shape, unsplit (`num_splits` 1). For
+    /// `attention_tiled.cu`, which ignores the split fields.
+    pub(super) fn unsplit_params(&self) -> AttnParams {
+        AttnParams {
+            k_pos_stride: self.k_pos_stride as u64,
+            k_head_stride: self.k_head_stride as u64,
+            v_pos_stride: self.v_pos_stride as u64,
+            v_head_stride: self.v_head_stride as u64,
+            num_q_heads: self.num_q_heads as u32,
+            group_size: self.group_size as u32,
+            qk_dim: self.qk_dim as u32,
+            v_dim: self.v_dim as u32,
+            start_pos: self.start_pos as u32,
+            num_splits: 1,
+            split_len: (self.start_pos + self.rows) as u32,
+            window: self.window as u32,
+            scale: self.scale,
+        }
+    }
 }
 
 /// `attention_online.cu`'s block size, in warps, and widest supported head.
@@ -213,18 +235,22 @@ impl Model {
         hidden_size: usize,
         eps: f32,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let n = x.len() as u32;
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(x.len())
             .map_err(|e| crate::gpu_err!(e, "rmsnorm alloc out: {e}"))?;
 
-        let threads = 256u32;
-        let blocks = n.div_ceil(threads).max(1);
+        // One block per row (see rmsnorm.cu), staging the row in shared memory
+        // when it fits the default 48 KB (less the kernel's static shared float).
+        let row_bytes = hidden_size * std::mem::size_of::<f32>();
         let launch_cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: 0,
+            grid_dim: (rows.clamp(1, 1 << 20) as u32, 1, 1),
+            block_dim: (hidden_size.next_multiple_of(32).clamp(32, 256) as u32, 1, 1),
+            shared_mem_bytes: if row_bytes <= 47 * 1024 {
+                row_bytes as u32
+            } else {
+                0
+            },
         };
         unsafe {
             self.rmsnorm_k
