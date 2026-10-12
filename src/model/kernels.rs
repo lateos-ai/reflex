@@ -345,7 +345,7 @@ impl Model {
     /// quantized-resident Q8_0 weight (`gemv_q8_0_kernel`, the Gemma 4 path),
     /// launched in chunks of [`GEMV_Q8_0_MAX_ROWS`] rows -- each chunk reads
     /// the weight's bytes once for all its rows. `rows == 1` is the decode
-    /// GEMV.
+    /// GEMV, which takes `gemv_q8_0_direct_kernel` (no shared-memory staging).
     pub(super) fn gemv_q8_0(
         &self,
         x: &CudaSlice<f32>,
@@ -354,15 +354,9 @@ impl Model {
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let in_features = w.shape[0] as usize;
         let out_features = w.shape[1] as usize;
-        let kernel = &self
-            .q8_0_k
-            .as_ref()
-            .ok_or_else(|| {
-                ReflexError::Other(
-                    "internal: Q8_0 weight but gemv_q8_0_kernel not loaded".to_string(),
-                )
-            })?
-            .gemv;
+        let kernels = self.q8_0_k.as_ref().ok_or_else(|| {
+            ReflexError::Other("internal: Q8_0 weight but gemv_q8_0_kernel not loaded".to_string())
+        })?;
         let w_ptr = w.quant_ptr().ok_or_else(|| {
             ReflexError::Other("internal: gemv_q8_0 on a dequantized weight".to_string())
         })?;
@@ -379,20 +373,55 @@ impl Model {
             .map_err(|e| crate::gpu_err!(e, "gemv_q8_0 alloc y: {e}"))?;
         let threads = 256u32;
         let warps_per_block = threads / WARP_SIZE;
+        let grid = ((out_features as u32).div_ceil(warps_per_block).max(1), 1, 1);
+        let staged_grid = (
+            (out_features as u32)
+                .div_ceil(warps_per_block * GEMV_Q8_0_ROWS_PER_WARP)
+                .max(1),
+            1,
+            1,
+        );
+        if rows == 1 {
+            let mut dev_y = dev_y;
+            let cfg = LaunchConfig {
+                grid_dim: grid,
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                kernels
+                    .gemv_direct
+                    .function
+                    .clone()
+                    .launch(
+                        cfg,
+                        (
+                            x,
+                            w_ptr,
+                            &mut dev_y,
+                            in_features as u32,
+                            out_features as u32,
+                        ),
+                    )
+                    .map_err(|e| crate::gpu_err!(e, "gemv_q8_0_direct launch: {e}"))?;
+            }
+            return Ok(dev_y);
+        }
         let x_base = *x.device_ptr();
         let y_base = *dev_y.device_ptr();
         let mut r0 = 0usize;
         while r0 < rows {
             let r = (rows - r0).min(GEMV_Q8_0_MAX_ROWS);
             let launch_cfg = LaunchConfig {
-                grid_dim: ((out_features as u32).div_ceil(warps_per_block).max(1), 1, 1),
+                grid_dim: staged_grid,
                 block_dim: (threads, 1, 1),
                 shared_mem_bytes: (r * GEMV_Q8_0_TILE * 4) as u32,
             };
             let x_ptr = x_base + (r0 * in_features * 4) as u64;
             let y_ptr = y_base + (r0 * out_features * 4) as u64;
             unsafe {
-                kernel
+                kernels
+                    .gemv
                     .function
                     .clone()
                     .launch(
@@ -2220,6 +2249,10 @@ pub(super) const GEMV_Q4K_MAX_ROWS: usize = 8;
 /// `kernels_cuda/gemv_q8_0.cu`.
 pub(super) const GEMV_Q8_0_MAX_ROWS: usize = 16;
 
+/// Output rows per warp in `gemv_q8_0_kernel` -- must equal
+/// `GEMV_Q8_0_ROWS_PER_WARP` in `kernels_cuda/gemv_q8_0.cu`.
+pub(super) const GEMV_Q8_0_ROWS_PER_WARP: u32 = 4;
+
 /// Elements of `x` per row that `gemv_q8_0_kernel` stages in shared memory at
 /// a time -- must equal `Q8_0_TILE` in `kernels_cuda/gemv_q8_0.cu`; the
 /// launch passes `rows * GEMV_Q8_0_TILE` floats of dynamic shared memory.
@@ -2228,8 +2261,11 @@ pub(super) const GEMV_Q8_0_TILE: usize = 512;
 /// The `kernels_cuda/gemv_q8_0.cu` kernels, loaded only when the Gemma 4 path
 /// keeps Q8_0 weights quantized (`REFLEX_QUANT_RESIDENT=1`).
 pub(super) struct Q8_0Kernels {
-    /// `gemv_q8_0_kernel`: decode GEMV and the fused few-row prefill path.
+    /// `gemv_q8_0_kernel`: the fused 2-16 row prefill path (`x` staged in
+    /// shared memory, 4 output rows per warp).
     pub(super) gemv: AotKernel,
+    /// `gemv_q8_0_direct_kernel`: the one-row decode GEMV.
+    pub(super) gemv_direct: AotKernel,
     /// `dequantize_q8_0_coalesced_kernel`: the `--weights f32` prefill scratch.
     pub(super) dequant_f32: AotKernel,
     /// `dequantize_q8_0_coalesced_f16_kernel`: the `--weights f16` scratch.
@@ -2244,6 +2280,7 @@ impl Q8_0Kernels {
             "gemv_q8_0",
             &[
                 "gemv_q8_0_kernel",
+                "gemv_q8_0_direct_kernel",
                 "dequantize_q8_0_coalesced_kernel",
                 "dequantize_q8_0_coalesced_f16_kernel",
             ],
@@ -2255,6 +2292,7 @@ impl Q8_0Kernels {
         };
         Ok(Self {
             gemv: next()?,
+            gemv_direct: next()?,
             dequant_f32: next()?,
             dequant_f16: next()?,
         })
