@@ -72,7 +72,7 @@ serverless endpoint in one click, no build required ([worker docs](.runpod/READM
 | Qwen3.5 hybrid Gated DeltaNet (`qwen35`, `qwen35moe`) | Qwen3.5-0.8B; Qwen3.8-27B `Q8_0` (f16 weights, 80 GB GPU); a random-weight `qwen35moe` checkpoint |
 | DeepSeek-V2/V3 MLA (`deepseek2`) | DeepSeek-V2-Lite; a synthetic fixture |
 | Kolibri-1 MoE (`kolibri1`) | Aleph Alpha's Kolibri-1 78B, `Q4_K_M` (needs `REFLEX_QUANT_RESIDENT=1`); a synthetic fixture |
-| Gemma 4 dense, text only (`gemma4`) | Gemma 4 12B-it and 31B-it `Q8_0` (the 31B needs an 80 GB GPU); a synthetic fixture. E2B/E4B and 26B-A4B are not supported |
+| Gemma 4 dense, text only (`gemma4`) | Gemma 4 12B-it and 31B-it `Q8_0` (the 31B needs an 80 GB GPU, or 48 GB with `REFLEX_QUANT_RESIDENT=1`); a synthetic fixture. E2B/E4B and 26B-A4B are not supported |
 
 Each architecture counted as supported only after its generated tokens matched an
 independent implementation (llama.cpp, or a CPU reference) on real hardware.
@@ -88,8 +88,10 @@ independent implementation (llama.cpp, or a CPU reference) on real hardware.
 - **`system1`** works on every architecture; on the Qwen3.5 hybrid models each candidate
   must be a single token.
 - **Models too big for `f16`**: `REFLEX_QUANT_RESIDENT=1` keeps `Q4_K`/`Q6_K` matrix weights
-  quantized on the GPU instead (dense path and Kolibri-1). Kolibri-1's 47.5 GB `Q4_K_M`
-  then fits a 48 GB card. Adding `REFLEX_LAZY_EXPERTS=1` uploads each expert only when
+  quantized on the GPU instead (dense path and Kolibri-1), and `Q8_0` ones on Gemma 4.
+  Kolibri-1's 47.5 GB `Q4_K_M` then fits a 48 GB card, and so does Gemma 4 31B `Q8_0`
+  (37.9 GB peak at 2,641 tokens). On Gemma 4 it also speeds up cold start and decode,
+  but short warm prompts are slower than with `f16` weights. Adding `REFLEX_LAZY_EXPERTS=1` uploads each expert only when
   the router first picks it: a short prompt's cold first token on an RTX A6000 goes from
   8.6 s to 2.3 s. See [quantized-resident weights](docs/design/quantized-resident-weights.md)
   and [Kolibri-1](docs/design/kolibri.md).

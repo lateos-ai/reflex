@@ -3,6 +3,8 @@
 //! `gemma-4-12B-it-Q8_0.gguf`) or, when that is unset, the synthetic
 //! `test-data/tiny-gemma4.gguf`, and skip if neither exists:
 //! `REFLEX_GEMMA4_GGUF=<path> cargo test --release -- --ignored gemma4_model_`.
+//! With `REFLEX_QUANT_RESIDENT=1` and a Q8_0 file, the same tests run on the
+//! quantized-resident path.
 
 use super::prefill_batching_tests::assert_prefill_hidden_close;
 use super::*;
@@ -275,6 +277,217 @@ fn gemma4_model_fixture_matches_llamacpp() {
                 "{:?}\n  reflex:    {got:?}\n  llama.cpp: {want:?}",
                 &prompt[..prompt.len().min(40)]
             ));
+        }
+    }
+    assert!(failures.is_empty(), "mismatches:\n{}", failures.join("\n"));
+}
+
+/// A Q8_0 copy of the tiny fixture, made by llama.cpp's own quantizer:
+/// `llama-quantize test-data/tiny-gemma4.gguf test-data/tiny-gemma4-q8_0.gguf Q8_0`.
+const TINY_Q8_0_FIXTURE: &str = "test-data/tiny-gemma4-q8_0.gguf";
+
+/// Loads `file` in `dtype` with `REFLEX_QUANT_RESIDENT` set to `quant` for
+/// the load only (so run these tests single-threaded).
+fn load_with_flag(file: &GgufFile, dtype: WeightsDtype, quant: bool) -> Model {
+    if quant {
+        std::env::set_var("REFLEX_QUANT_RESIDENT", "1");
+    } else {
+        std::env::remove_var("REFLEX_QUANT_RESIDENT");
+    }
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let opts = LoadOptions {
+        weights: dtype,
+        lora_adapter: None,
+    };
+    let model = Model::load_with_options(device, file, &opts);
+    std::env::remove_var("REFLEX_QUANT_RESIDENT");
+    model.expect("load Gemma 4 Q8_0 fixture")
+}
+
+/// `REFLEX_QUANT_RESIDENT=1` on a Q8_0 Gemma 4 file: every layer matmul stays
+/// Q8_0 (flag off: none does), the tied LM head goes resident as Q8_0, and
+/// System1 scores are the same before and after that (row gather of exact
+/// rows vs the full Q8_0 GEMV). Greedy ids match the flag-off `--weights f32`
+/// path, which holds the same exact values: on a short prompt (every matmul
+/// on `gemv_q8_0`) in both `--weights` modes, and on a prompt past the
+/// window (prefill on the scratch path) with `--weights f32`. Run
+/// single-threaded: `cargo test --release -- --ignored --test-threads=1 gemma4_quant_resident`
+#[test]
+#[ignore]
+fn gemma4_quant_resident_matches_dequantized() {
+    if !std::path::Path::new(TINY_Q8_0_FIXTURE).exists() {
+        eprintln!(
+            "Skipping gemma4_quant_resident_matches_dequantized: {TINY_Q8_0_FIXTURE} not present"
+        );
+        return;
+    }
+    let file = GgufFile::open(TINY_Q8_0_FIXTURE).expect("open Q8_0 fixture");
+    let gen = |model: &Model, prompt: &str| {
+        model
+            .generate(
+                prompt,
+                12,
+                None,
+                &SamplingParams::default(),
+                |_| {},
+                |_, _| {},
+            )
+            .expect("generate")
+            .0
+    };
+    let quant_matmuls = |model: &Model| {
+        let m = model.gemma4.as_ref().expect("gemma4 model");
+        m.layers
+            .iter()
+            .flat_map(|l| {
+                [
+                    Some(&l.attn_q),
+                    Some(&l.attn_k),
+                    l.attn_v.as_ref(),
+                    Some(&l.attn_output),
+                    Some(&l.ffn_gate),
+                    Some(&l.ffn_up),
+                    Some(&l.ffn_down),
+                ]
+            })
+            .flatten()
+            .map(|w| w.quant_ptr().is_some())
+            .collect::<Vec<_>>()
+    };
+
+    let plain = load_with_flag(&file, WeightsDtype::F32, false);
+    assert!(
+        quant_matmuls(&plain).iter().all(|q| !q),
+        "flag off must not keep weights quantized"
+    );
+    let short = "The capital of France is";
+    let long = prompt_past_window(&plain, plain.gemma4.as_ref().unwrap().cfg.sliding_window);
+    assert!(plain.encoded_prompt_len(&long).unwrap() > quant_fused_max_rows());
+    let want_short = gen(&plain, short);
+    let want_long = gen(&plain, &long);
+    drop(plain);
+
+    let candidates: Vec<System1Candidate> = [" Paris", " London", " the city of Paris"]
+        .iter()
+        .map(|t| System1Candidate {
+            text: t.to_string(),
+        })
+        .collect();
+    for dtype in [WeightsDtype::F32, WeightsDtype::F16] {
+        let model = load_with_flag(&file, dtype, true);
+        assert!(
+            quant_matmuls(&model).iter().all(|&q| q),
+            "{dtype}: every layer matmul should be Q8_0-resident"
+        );
+        let lazy = model
+            .system1_evaluate(short, &candidates, 1.0)
+            .expect("system1 (lazy head)");
+        assert!(
+            model
+                .lm_head_resident()
+                .expect("lm head")
+                .quant_ptr()
+                .is_some(),
+            "{dtype}: the tied LM head should go resident as Q8_0"
+        );
+        let resident = model
+            .system1_evaluate(short, &candidates, 1.0)
+            .expect("system1 (resident head)");
+        for (a, b) in lazy.results.iter().zip(&resident.results) {
+            assert!(
+                (a.score - b.score).abs() <= 1e-4 * (1.0 + b.score.abs()),
+                "{dtype} {:?}: System1 score {} with a lazy head, {} with the Q8_0 head",
+                a.text,
+                a.score,
+                b.score
+            );
+        }
+        assert_eq!(gen(&model, short), want_short, "{dtype}: short prompt");
+        if dtype == WeightsDtype::F32 {
+            assert_eq!(
+                gen(&model, &long),
+                want_long,
+                "{dtype}: prompt past the window"
+            );
+        }
+    }
+}
+
+/// llama.cpp's greedy ids on the Q8_0 fixture ([`TINY_Q8_0_FIXTURE`]), from
+/// the fully-f32 reference (`ref.cpp` on llama.cpp `79e2e74` with
+/// `LLAMA_NO_Q8=1 GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32 GGML_CUDA_DISABLE_GRAPHS=1
+/// GGML_CUDA_DISABLE_FUSION=1 REF_KV_F32=1 REF_NO_FA=1 REF_EOS_ONLY=1`, RTX
+/// A40, 2026-10-12). Same prompts as [`FIXTURE_GOLDEN`].
+const Q8_0_FIXTURE_GOLDEN: &[(&str, &[u32])] = &[
+    (
+        "The capital of France is",
+        &[
+            138141, 35380, 127857, 127857, 127857, 127857, 105145, 91647, 5788, 138428, 122867,
+            131596, 131596, 65102, 81447, 53001, 123139, 102247, 158869, 130306,
+        ],
+    ),
+    (
+        "Once upon a time",
+        &[
+            196934, 196934, 196934, 68131, 244994, 170739, 25413, 223441, 102510, 156779, 159726,
+            52330, 168138, 168138, 197082, 112886, 164105, 76071, 11130, 193581,
+        ],
+    ),
+    (
+        "<|turn>user\nWhat is the capital of France? Answer in one word.<turn|>\n<|turn>model\n",
+        &[
+            135159, 104270, 50135, 72905, 196470, 103119, 176507, 190927, 246311, 160299, 123361,
+            189707, 46416, 209455, 187757, 11463, 178879, 75520, 143820, 4172,
+        ],
+    ),
+    (
+        "LONG",
+        &[
+            71224, 158275, 19594, 207110, 77310, 121990, 131403, 35380, 62594, 40077, 53667, 37908,
+            239612, 204924, 128966, 175361, 186213, 12384, 193172, 247820,
+        ],
+    ),
+];
+
+/// `REFLEX_QUANT_RESIDENT=1` on the Q8_0 fixture agrees token for token with
+/// llama.cpp computing in f32, in both `--weights` modes: decode and short
+/// prefill on `gemv_q8_0`, the 982-token prompt's prefill on the scratch path.
+#[test]
+#[ignore]
+fn gemma4_quant_resident_fixture_matches_llamacpp() {
+    if !std::path::Path::new(TINY_Q8_0_FIXTURE).exists() {
+        eprintln!(
+            "Skipping gemma4_quant_resident_fixture_matches_llamacpp: {TINY_Q8_0_FIXTURE} not present"
+        );
+        return;
+    }
+    let file = GgufFile::open(TINY_Q8_0_FIXTURE).expect("open Q8_0 fixture");
+    let long = "The quick brown fox jumps over the lazy dog while the cat watches. ".repeat(70);
+    let mut failures = Vec::new();
+    for dtype in [WeightsDtype::F32, WeightsDtype::F16] {
+        let model = load_with_flag(&file, dtype, true);
+        for &(prompt, want) in Q8_0_FIXTURE_GOLDEN {
+            let prompt = if prompt == "LONG" {
+                long.as_str()
+            } else {
+                prompt
+            };
+            let (got, _) = model
+                .generate(
+                    prompt,
+                    want.len(),
+                    None,
+                    &SamplingParams::default(),
+                    |_| {},
+                    |_, _| {},
+                )
+                .expect("generate");
+            if got != want {
+                failures.push(format!(
+                    "{dtype} {:?}\n  reflex:    {got:?}\n  llama.cpp: {want:?}",
+                    &prompt[..prompt.len().min(40)]
+                ));
+            }
         }
     }
     assert!(failures.is_empty(), "mismatches:\n{}", failures.join("\n"));
