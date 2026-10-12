@@ -3,6 +3,32 @@
 What has been built, in order. Measurements live in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+## 2026-10-12
+
+- **Gemma 4 on 48 GB cards: quantized-resident `Q8_0`** (`REFLEX_QUANT_RESIDENT=1`,
+  opt-in). Gemma 4's `Q8_0` layer weights and tied LM head stay quantized on the GPU,
+  read by new `gemv_q8_0` kernels. Above 16 prompt rows they are dequantized into a
+  reused f16 scratch for cuBLAS. Other architectures' outputs are unchanged (`reflex
+  check` identical, checksums included). Verified on an RTX A40 against llama.cpp
+  computing fully in f32:
+  - **31B-it `Q8_0` now runs on a 48 GB card:** 37.9 GB peak at 2,641 tokens. Greedy
+    tokens identical on 5/6 prompts up to 2,641 tokens. The sixth, a 982-token
+    repeated-sentence prompt, starts with a near-tie that the llama.cpp reference resolves
+    differently on an A40 and an A100; Reflex agrees with the A100 run. `system1`
+    within 0.022.
+  - **12B-it:** 11.1 GB resident instead of 20.9. 18/18 prompt and mode combinations
+    identical to the reference, and `system1` scores closer to it than with f16 weights.
+  - **Faster cold start, 12B:** model load 1.0 s instead of 1.5-2.3 s (the f16 path's 328
+    per-tensor allocations cost 0.6-1.5 s). First token 1.99 s instead of 2.49 s wall
+    (llama.cpp 3.85 s). Cold `system1` 1.38 s instead of 1.81 s. The 31B's first token
+    is 3.6 s against llama.cpp's 8.4 s.
+  - **Decode 22% faster** on the 12B (44.8 vs 57.7 ms/token).
+  - **Slower:** warm prefill, by ~65 ms on long prompts, and warm 1-token `system1`
+    (109 vs 73 ms). The fused kernel can't match f16 cuBLAS on tensor cores above ~4
+    prompt rows.
+
+  Details: [quantized-resident weights](docs/design/quantized-resident-weights.md#q8_0-on-gemma-4-results-2026-10-12).
+
 ## 2026-10-11
 
 - **Gemma 4 31B and Qwen3.8-27B verified** on an A100 80 GB, both `Q8_0` with f16

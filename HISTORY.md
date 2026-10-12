@@ -3697,3 +3697,55 @@ Two findings about the reference:
 
 The GPU is network-attached and loading the weights dominates, so only the ratio
 counts. Results: `docs/design/gemma4.md` "31B results (2026-10-11)".
+
+### Gemma 4 quantized-resident `Q8_0`: the 31B on a 48 GB card (2026-10-12)
+
+`REFLEX_QUANT_RESIDENT=1` now covers the Gemma 4 path, for `Q8_0`, the format ggml-org
+ships. The layer matmuls and the tied LM head stay as raw `Q8_0` blocks. The kernels
+are new in `kernels_cuda/gemv_q8_0.cu`: a direct decode GEMV, a staged 2-16 row kernel
+with 4 output rows per warp, and coalesced dequant kernels. Above 16 prompt rows each
+projection is dequantized into a reused f16 scratch and goes through the same
+`cublasGemmEx` call as the flag-off path. The kernels live in `Model::q8_0_k`, which
+only `load_gemma4` fills.
+
+Verified on a Runpod RTX A40, flag on, against fully-f32 llama.cpp:
+- **31B:** runs on the 48 GB card. 37.9 GB peak at 2,641 tokens.
+- **12B:** 11.1 GB resident instead of 20.9.
+- **Greedy tokens:** 12B 18/18, 31B 5/6. The miss is a near-tie on the 982-token
+  repeated-sentence prompt, which llama.cpp resolves one way on the A40 and the other
+  way on the A100; Reflex matches the A100 run.
+- **`system1`:** closer to the reference than with f16 weights.
+
+The full numbers and tables are in `docs/design/quantized-resident-weights.md`, "Q8_0 on
+Gemma 4: results".
+
+What was learned, beyond the numbers:
+
+1. **The load-time prediction was wrong, in the good direction.** The design said "a
+   few percent", because the H2D bytes don't change. The load profile showed that the
+   flag-off path's 328 per-tensor f16 `cuMemAlloc`s cost 0.6-1.5 s on the 12B
+   (`out_alloc_ms`). One arena removes that cost: the 12B loads in 1.0 s instead of
+   1.5-2.3 s. Measure before predicting, as the Q4_K prototype already showed for
+   `token_embd`.
+2. **The first kernel was slower than the f16 weights it replaced.**
+   - Decode: 59.4 vs 57.7 ms/token. Short warm `system1`: 160 vs 73 ms.
+   - A micro-benchmark on the real shapes found two separate causes. Decode was
+     latency-bound: barriers between 512-element shared-memory tiles left too few
+     loads in flight. The direct kernel fixes it at 445-476 GB/s. The multi-row
+     kernel was bound by shared-memory reads, one per FMA; 4 output rows per warp
+     made it 1.7-2.2x faster.
+   - Even now it loses to f16 cuBLAS on tensor cores above ~4 rows, so warm
+     short-prompt `system1` stays 1.5x slower (109 vs 73 ms). Closing that needs a
+     Marlin-style fused dequant tensor-core GEMM.
+3. **Harness gotchas (archived in `test-data/large-model-verify-src.tar.gz`):**
+   - The archive's `llama-no-q8-79e2e74.patch` is prose, not a git patch;
+     `tiny-gemma4-src/llama-no-q8.patch` is the applicable one.
+   - `$(cat file)` strips a prompt's trailing newline, so prompt files and in-code
+     prompts can disagree.
+   - `git archive` from this Windows checkout writes CRLF files, so LF patches won't
+     apply on the pod.
+   - `reflex bench --candidate " positive"` fails on Gemma 4 on master too: the
+     candidate doesn't tokenize cleanly after bench's filler prompt.
+
+The pending MLA golden-token re-check (`add_bos_token`) was closed on the same host: 8/8
+against llama.cpp, first token still `94216`/`" NavLink"`.

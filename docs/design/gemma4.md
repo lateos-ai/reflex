@@ -9,6 +9,11 @@ sliding window. `system1` scores match llama.cpp's within 0.06. The first token 
 [Phase 4 results](#phase-4-results-2026-10-09). On an A100 80 GB, the 31B-it `Q8_0`
 (f16 weights) matches llama.cpp running fully in f32 on 5/5 prompts, up to 1,262
 tokens, and `system1` within 0.03. See [31B results](#31b-results-2026-10-11).
+**2026-10-12:** with `REFLEX_QUANT_RESIDENT=1` the Q8_0 weights stay quantized on the GPU,
+and the 31B runs on a 48 GB A40 (37.9 GB peak at 2,641 tokens). The 12B then needs 11 GB
+resident instead of 21. Tokens match the fully-f32 llama.cpp reference except one
+near-tie that reference doesn't reproduce across GPUs. See
+[quantized-resident weights](quantized-resident-weights.md#q8_0-on-gemma-4-results-2026-10-12).
 
 Goal: run Google's Gemma 4 text models on Reflex. They are released under Apache 2.0.
 The target is `gemma-4-31B-it`, and development uses `gemma-4-12B-it`, which has the
@@ -149,9 +154,9 @@ and head dims up to 1024. New kernels:
    `system1` scores against llama.cpp's soft-capped logits, and a regression rerun of
    the existing models. Then cold-start and classifier benchmarks: cold `system1`, and
    warm `/v1/classify` p50/p95 for 1-token and multi-token labels.
-5. **31B** (done, see [31B results](#31b-results-2026-10-11)): in f16 on an 80 GB GPU. To fit a 24–48 GB card, `REFLEX_QUANT_RESIDENT=1`
-   would have to be extended to this path, with a Q4_K_M file. ggml-org ships only
-   Q4_0/Q8_0, which quantized-resident mode does not keep resident.
+5. **31B** (done, see [31B results](#31b-results-2026-10-11)): in f16 on an 80 GB GPU.
+   Since 2026-10-12, `REFLEX_QUANT_RESIDENT=1` keeps the Q8_0 files' weights quantized,
+   which fits the 31B on a 48 GB card (see the status note above).
 
 ## Phase 1 results (2026-10-09)
 
@@ -184,8 +189,9 @@ and head dims up to 1024. New kernels:
   `ArchitectureKind::Gemma4` lets callers tell the path apart. `--export-kv`,
   `--import-kv` and `--lora` return clear errors. `REFLEX_QUANT_RESIDENT=1` printed a
   notice and loaded normal weights; it now keeps Q8_0 weights quantized (see
-  [quantized-resident weights](quantized-resident-weights.md#q8_0-on-the-gemma-4-path-design-2026-10-12)). `REFLEX_ATTN_KERNEL=legacy` is rejected, because the
-  legacy kernels hardcode a `1/sqrt(head_dim)` scale.
+  [quantized-resident weights](quantized-resident-weights.md#q8_0-on-the-gemma-4-path-design-2026-10-12)).
+  `REFLEX_ATTN_KERNEL=legacy` is rejected, because the legacy kernels hardcode a
+  `1/sqrt(head_dim)` scale.
 - One layer function, `Model::forward_gemma4_layer`, serves both prefill (`rows` = prompt
   length, cuBLAS GEMMs, sliding window masked per row in the online attention kernel)
   and decode (`rows == 1`, GEMVs, window applied by narrowing the K/V views, as the
@@ -384,7 +390,8 @@ these numbers don't compare with the A40's.
   llama.cpp, so the cast does no visible harm there either. The fallback is still
   `--weights f32`, but the 12B in f32 (about 48 GB) doesn't fit a 48 GB card.
 - **VRAM.** 12B in f16 is about 24 GB, so it needs a 48 GB card. 31B in f16 is about
-  61 GB, so it needs 80 GB. On top of that comes the KV cache: f32, sized to
+  61 GB, so it needs 80 GB. With `REFLEX_QUANT_RESIDENT=1` (Q8_0 kept quantized) they
+  need about 13.5 and 33.6 GB before the KV cache. On top of that comes the KV cache: f32, sized to
   prompt + max tokens, at about 1.6 MB per token across the 31B's sliding layers.
 - **Cold start.** Measured in Phase 4: 2.4 s to first token with the file cached
   (load 1.4 s), against llama.cpp's 3.5 s. As expected, Gemma 4 is a warm-mode

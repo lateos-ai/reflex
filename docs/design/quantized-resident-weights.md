@@ -165,8 +165,10 @@ reuses the existing `dequantize_q6k_kernel`. Q6_K matters for the LM head and fo
 
 ### Q8_0 on the Gemma 4 path (design, 2026-10-12)
 
-**Status: built on branch `gemma4-q8-resident` (2026-10-12); host checks pass, GPU
-verification pending.** Goal: Gemma 4 31B-it Q8_0 on a 48 GB card and the 12B
+**Status: built and verified on an RTX A40 (2026-10-12); see
+[Q8_0 on Gemma 4: results](#q8_0-on-gemma-4-results-2026-10-12). The design below is kept
+as written; two of its predictions were wrong (load time, the first kernels' speed), and the
+results say how.** Goal: Gemma 4 31B-it Q8_0 on a 48 GB card and the 12B
 on a 24 GB card, behind `REFLEX_QUANT_RESIDENT=1`. ggml-org ships Gemma 4 only as
 Q4_0/Q8_0, so Q4_K residency doesn't apply to it.
 
@@ -729,3 +731,163 @@ At 7B the flag is a clear win on what this engine optimizes for:
 - **What still loses:** warm prefill is slower at every prompt length (2.3x at 29 tokens,
   1.1x at 449), the same open multi-row Q4_K kernel gap as on Qwen3.
 - **Weights type:** with the flag on, `--weights f16` beats `f32` on every column.
+
+## Q8_0 on Gemma 4: results (2026-10-12)
+
+Runpod secure-cloud RTX A40 (48 GB, 46,068 MiB usable, sm_86, driver 570.195.03, 9 vCPUs,
+CUDA 12.8), Reflex built with `REFLEX_CUDA_ARCH=sm_86`, llama.cpp `79e2e74`. Models:
+ggml-org's `gemma-4-12B-it-Q8_0.gguf` and `gemma-4-31B-it-Q8_0.gguf`. "Flag off" is the
+default `--weights f16`; the 31B doesn't fit 48 GB that way, so it only runs flag on. Wall
+times are medians, launch to exit, model file in the page cache unless marked "evicted"
+(`posix_fadvise`, so not a true cold disk).
+
+The reference is llama.cpp computing fully in f32 (`LLAMA_NO_Q8=1
+GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32 GGML_CUDA_DISABLE_GRAPHS=1 GGML_CUDA_DISABLE_FUSION=1`,
+`ref.cpp` with `REF_KV_F32=1 REF_NO_FA=1 REF_EOS_ONLY=1`). It was built with
+`tiny-gemma4-src`'s `llama-no-q8.patch`. The `large-model-verify-src` patch is a
+hand-written description, not something `git apply` accepts; both send every quantized
+matmul to the f32 cuBLAS path.
+
+### Correctness
+
+- **12B, greedy tokens:** 6 prompts (5, 6, 20, 982, 1,262 and 2,641 tokens; 20 tokens each,
+  10 for the last) in three configurations: flag off (f16), flag on (f16) and flag on
+  (f32 scratch). **18/18 identical to the reference.** First-token top logits with the flag
+  on are within 0.1 of llama.cpp's (largest gap 0.096, on the 1,262-token prompt), and
+  flag on with f32 scratch is the closest on the 2,641-token prompt (7.734 against 7.728).
+- **31B, greedy tokens (flag on, f16 and f32):** 5/6 prompts identical, including 1,262
+  and 2,641 tokens (top logit 20.055 against 20.092). The 982-token repeated-sentence prompt
+  differs at the first token, and that token is a near-tie the reference itself does not
+  reproduce across GPUs:
+
+  | 982-token prompt, first token | "1" (236770) | "7" (236832) |
+  |---|---|---|
+  | Reflex 31B, flag on, f16 | **17.248** | 16.722 |
+  | Reflex 31B, flag on, f32 | **17.218** | 16.709 |
+  | llama.cpp fully f32, A100 (2026-10-11) | **17.162** | 16.865 |
+  | llama.cpp fully f32, this A40 | 17.336 | **17.342** |
+
+  Reflex agrees with the A100 reference and with itself across both modes; llama.cpp's
+  own score for "7" moved by 0.48 between the two GPUs. After the first token both sides
+  settle into the same repeated `" own"` (Reflex "1", "0", "0", then `" own"`; llama.cpp
+  "7", "0", then `" own"`).
+- **`system1`** (8 candidates per model, 1-4 tokens; all token ids identical to
+  llama.cpp's). Largest |Reflex − reference|:
+
+  | | 12B flag off | 12B flag on | 31B flag on |
+  |---|---|---|---|
+  | 1-token labels | 0.045 | 0.019 | 0.010 |
+  | multi-token labels | 0.31 | 0.10 | 0.022 |
+
+  The flag moves scores toward the f32 reference, because the Q8_0 weights are used
+  exactly instead of rounded to f16.
+- **Q8_0 fixture:** `test-data/tiny-gemma4-q8_0.gguf` (llama.cpp's `llama-quantize` of the
+  f32 fixture, sha256 `48b19840…5ff09a`) matches the reference 4/4 prompts in both
+  `--weights` modes, up to 982 tokens. Now a GPU test,
+  `gemma4_quant_resident_fixture_matches_llamacpp`.
+- **Tests and regressions:**
+  - New GPU tests pass: the three Q8_0 kernel tests and the two fixture model tests.
+  - The Gemma 4 model tests pass with the flag on against both real files, which shows
+    the 31B runs on the 48 GB card.
+  - The whole GPU suite: 42 pass, 3 skip (no real Qwen3.5 hybrid, IQ or
+    DeepSeek-V2-Lite file on the pod).
+  - `reflex check` on Qwen3-0.6B, the MLA, Kolibri and f32 Gemma 4 fixtures, flag
+    off and on, f32 and f16, 2 prompts each: 32/32 identical to `93bb4ba`, logit
+    checksums included.
+
+### Memory
+
+| | 12B flag off | 12B flag on | 31B flag on |
+|---|---|---|---|
+| resident after load (`reflex bench`) | 20,942 MiB | **11,086 MiB** | **29,710 MiB** |
+| peak, `generate` on a 2,641-token prompt (LM head resident) | 25,913 MiB | **15,257 MiB** | **37,881 MiB** |
+
+The 31B leaves ~8 GB free on the A40 at 2,641 tokens. The 12B at 15.3 GB should fit a
+24 GB card with room for several thousand more tokens; that was not run on a 24 GB card.
+
+### Load time: larger win than predicted
+
+The design expected "a few percent", reasoning that the flag doesn't change the bytes
+moved. The load profile shows the per-tensor f16 allocations were the largest cost:
+
+| 12B, `REFLEX_LOAD_PROFILE=1`, `system1`, 3 runs | flag off | flag on |
+|---|---|---|
+| `model_load_ms` | 1,536-2,278 | **957-1,017** |
+| `out_alloc_ms` (328 `cuMemAlloc`s of f16 outputs) | **632-1,468** | 0 |
+| pinned fill (11.6 GB) | 681-789 | 650-719 |
+| H2D, GPU time | 498-602 | 545-620 |
+| dequant kernels, GPU time (overlapped) | 248 | 0 |
+
+The 31B with the flag on loads in 1,935-2,548 ms (31.1 GB at ~22 GB/s pinned fill).
+
+### Cold start (final kernels)
+
+| | 12B flag off | 12B flag on | 31B flag on | llama.cpp `llama-simple` |
+|---|---|---|---|---|
+| first token, wall (n=5; 31B n=3) | 2,490 ms | **1,990 ms** | **3,636 ms** | 12B 3,849 / 31B 8,411 ms |
+| first token, wall, evicted | 2,441 ms | 2,138 ms | 4,505 ms | 12B 5,208 / 31B 11,553 ms |
+| first token, engine (`process_start_to_first_token_ms`) | 1,917 ms | 1,515 ms | 2,460 ms | |
+| cold `system1`, 2 one-token labels (`result_ms`) | 1,807 ms | **1,376 ms** | 2,464 ms | |
+| cold `system1`, 3 two-token labels | 1,966 ms | 1,483 ms | 2,822 ms | |
+
+With the flag on, the 31B's first token arrives 2.3x sooner than llama.cpp's on the same card.
+
+### Warm: decode, prefill, warm `system1` (final kernels)
+
+| | 12B flag off | 12B flag on | 31B flag on |
+|---|---|---|---|
+| decode ms/token at 29 / 113 / 449 tokens of context | 57.7 / 59.8 / 68.4 | **44.8 / 47.0 / 55.5** | 103 / 106 / 117 |
+| warm prefill, 29 / 113 / 449 tokens | **101 / 238 / 926 ms** | 165 / 305 / 993 ms | 416 / 760 / 2,438 ms |
+| warm `reflex stdio` `system1`, 1-token labels, p50 | **73.4 ms** | 109.2 ms | 234.9 ms |
+| warm `reflex stdio` `system1`, 2-token labels, p50 | 233.0 ms | 234.0 ms | 531.1 ms |
+
+- **Decode is 22% faster** with the flag on (half the weight bytes; ~16 ms/token of
+  non-matmul work is unchanged).
+- **Long prefill costs ~65 ms more** (12B): above 16 rows every projection is dequantized
+  into the f16 scratch on every prompt, 33 GB of traffic, before the same cuBLAS GEMMs.
+- **Short warm `system1` is still 1.5x slower** (109 vs 73 ms). A 12-token prompt runs
+  on the fused kernel, which loses to f16 cuBLAS on tensor cores above ~4 rows (below).
+  With 2-token labels, the faster decode step makes up for it. Cold `system1` is
+  24% faster either way, because the load dominates.
+- **Fused-row threshold:** at 29 rows the fused kernel is far slower than the scratch path
+  (245 vs 165 ms warm prefill with `REFLEX_QUANT_FUSED_MAX_ROWS=32`), so Q8_0 keeps the
+  shared default of 16.
+
+### Kernels: what the first version got wrong
+
+The first `gemv_q8_0_kernel` (one output row per warp, `x` staged through shared memory for
+every row count) was **slower than the f16 weights it replaces**. Decode ran at 59.4 ms per
+token against 57.7, and warm `system1` at 160 ms against 73. A micro-benchmark on the real
+shapes (weight GB/s, A40):
+
+| rows | first kernel | final | f16 GEMV / cuBLAS |
+|---|---|---|---|
+| 1 (decode) | 273-342 | **445-476** (`gemv_q8_0_direct_kernel`) | 566-586 |
+| 4 | 163-214 | 255-300 (4 output rows per warp) | 527-552 |
+| 12 | 78-101 | 137-175 | 520-542 |
+
+- **Decode:** the per-tile `__syncthreads` left each warp only ~17 bytes of loads in flight
+  per lane per tile. The direct kernel reads `x` from global memory (one row stays in
+  L1), with no barriers, unrolled over 4-block steps. Per matmul it is ~1.5x faster than
+  the f16 GEMV.
+- **2-16 rows:** the kernel was bound by shared-memory reads (one `x` read per FMA), and
+  its time grew linearly with rows. Giving each warp 4 output rows reuses each `x` read
+  for 4 FMAs: 1.7-2.2x faster. The other variants measured (1, 2, 4 and 8 rows per warp;
+  8 or 16 input rows per launch) were all slower or tied. Even the best one stays behind
+  f16 cuBLAS above ~4 rows: FP32 FMAs on CUDA cores against tensor cores.
+- A lane's accumulation order is the same in all variants, so results were bit-identical
+  across the kernel changes.
+
+### What this says
+
+1. **The goal is met.** The 31B Q8_0 runs on a 48 GB card (37.9 GB peak at 2,641
+   tokens) and matches the f32 reference everywhere except a reference-unstable near-tie.
+   The 12B needs 11 GB resident instead of 21.
+2. **Cold start improves on every measure, mostly from the load.** The f16 path's
+   per-tensor allocations cost 0.6-1.5 s on the 12B.
+3. **Warm short prefill is the open gap.** Beating f16 cuBLAS at 5-16 rows needs a fused
+   dequantize-in-registers tensor-core GEMM (Marlin-style), feeding f16 weights and
+   activations into MMA. It would round weights to f16 like the flag-off path, so it
+   needs its own numerics check. For a warm Gemma 4 classifier, flag off is still the
+   faster choice when the model fits in f16 (109 vs 73 ms).
+4. **Not done:** the 12B on an actual 24 GB card, and Q4_0 files.
