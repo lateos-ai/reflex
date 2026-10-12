@@ -123,6 +123,8 @@ mod prefill_batching_tests;
 #[cfg(test)]
 mod quant_resident_tests;
 #[cfg(test)]
+mod rmsnorm_tests;
+#[cfg(test)]
 mod rope_type_tests;
 #[cfg(test)]
 mod system1_tests;

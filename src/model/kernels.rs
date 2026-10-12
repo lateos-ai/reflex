@@ -213,18 +213,22 @@ impl Model {
         hidden_size: usize,
         eps: f32,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let n = x.len() as u32;
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(x.len())
             .map_err(|e| crate::gpu_err!(e, "rmsnorm alloc out: {e}"))?;
 
-        let threads = 256u32;
-        let blocks = n.div_ceil(threads).max(1);
+        // One block per row (see rmsnorm.cu), staging the row in shared memory
+        // when it fits the default 48 KB (less the kernel's static shared float).
+        let row_bytes = hidden_size * std::mem::size_of::<f32>();
         let launch_cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: 0,
+            grid_dim: (rows.clamp(1, 1 << 20) as u32, 1, 1),
+            block_dim: (hidden_size.next_multiple_of(32).clamp(32, 256) as u32, 1, 1),
+            shared_mem_bytes: if row_bytes <= 47 * 1024 {
+                row_bytes as u32
+            } else {
+                0
+            },
         };
         unsafe {
             self.rmsnorm_k
