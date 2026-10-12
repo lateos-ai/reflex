@@ -134,13 +134,13 @@ impl WeightPolicy {
 /// A weight tensor's device buffer. `F32` is every tensor in `--weights f32`
 /// mode and the non-matrix tensors in both modes; `F16` is a matrix weight in
 /// `--weights f16` mode; `Quant` is a matrix weight kept as its raw GGUF blocks
-/// (`REFLEX_QUANT_RESIDENT=1`, dense path) and read by the quantized matmul
+/// (`REFLEX_QUANT_RESIDENT=1`: dense path, Kolibri-1, Gemma 4) and read by the quantized matmul
 /// kernels. Every matmul wrapper in `kernels.rs` dispatches on this enum.
 pub(super) enum WeightData {
     F32(CudaSlice<f32>),
     F16(CudaSlice<half::f16>),
-    /// Raw GGUF blocks of type `ty` (Q4_K for layer weights, Q6_K for the LM
-    /// head) at `offset..offset + len` in a shared device buffer,
+    /// Raw GGUF blocks of type `ty` (Q4_K/Q6_K on the dense and Kolibri-1
+    /// paths, Q8_0 on the Gemma 4 path) at `offset..offset + len` in a shared device buffer,
     /// byte-identical to the file.
     Quant {
         ty: GgmlType,
@@ -308,7 +308,7 @@ pub(super) fn expert_trace_enabled() -> bool {
 }
 
 /// `REFLEX_QUANT_RESIDENT=1` turns on quantized-resident weights for the
-/// dense path and Kolibri-1. Read once per load.
+/// dense path, Kolibri-1 (Q4_K/Q6_K) and Gemma 4 (Q8_0). Read once per load.
 pub(super) fn quant_resident_enabled() -> bool {
     std::env::var("REFLEX_QUANT_RESIDENT").is_ok_and(|v| v == "1")
 }
@@ -403,10 +403,70 @@ pub(super) fn reserve_expert_stack_quant(
 }
 
 /// `REFLEX_LOAD_PROFILE=1` prints a `REFLEX_LOAD_PROFILE` line splitting
-/// `model_load_ms` into its parts (dense path). Off by default: it adds GPU
+/// `model_load_ms` into its parts (dense and Gemma 4 paths). Off by default: it adds GPU
 /// timing events per tensor and a device sync at the end of the load.
 pub(super) fn load_profile_enabled() -> bool {
     std::env::var("REFLEX_LOAD_PROFILE").is_ok_and(|v| v == "1")
+}
+
+/// The loader's own wall-time parts of `model_load_ms`, for
+/// [`report_load_profile`].
+pub(super) struct LoadTimes {
+    pub(super) quant_resident: bool,
+    pub(super) modules_ms: f64,
+    pub(super) weights_enqueue_ms: f64,
+    pub(super) token_embd_ms: f64,
+    pub(super) init_join_wait_ms: f64,
+}
+
+/// Prints the `REFLEX_LOAD_PROFILE` line if `pipeline` was profiling (see
+/// [`load_profile_enabled`]); a no-op otherwise. Drains the device first, so
+/// call it once, at the end of a load.
+pub(super) fn report_load_profile(
+    device: &Arc<CudaDevice>,
+    pipeline: &mut WeightLoadPipeline,
+    times: LoadTimes,
+) -> Result<(), ReflexError> {
+    let Some(mut p) = pipeline.profile.take() else {
+        return Ok(());
+    };
+    let LoadTimes {
+        quant_resident,
+        modules_ms,
+        weights_enqueue_ms,
+        token_embd_ms,
+        init_join_wait_ms,
+    } = times;
+    // Drain everything queued so the GPU-side totals are complete.
+    // Profile mode only: the normal load never blocks here.
+    let t_drain = std::time::Instant::now();
+    device
+        .synchronize()
+        .map_err(|e| crate::gpu_err!(e, "load profile: synchronize: {e}"))?;
+    unsafe { result::stream::synchronize(pipeline.copy_stream) }
+        .map_err(|e| crate::gpu_err!(e, "load profile: sync copy stream: {e}"))?;
+    let drain_ms = t_drain.elapsed().as_secs_f64() * 1000.0;
+    let (h2d_gpu_ms, dequant_gpu_ms) = p.gpu_ms();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    eprintln!(
+        "REFLEX_LOAD_PROFILE quant_resident={} modules_ms={modules_ms:.2} weights_enqueue_ms={weights_enqueue_ms:.2}                  pinned_wait_ms={:.2} pinned_fill_ms={:.2} fill_threads={} fill_gbps={:.2} readers={} prefetched_mb={:.1} staging_grow_ms={:.2} out_alloc_ms={:.2} launch_ms={:.2}                  h2d_gpu_ms={h2d_gpu_ms:.2} dequant_gpu_ms={dequant_gpu_ms:.2} token_embd_ms={token_embd_ms:.2}                  init_join_wait_ms={init_join_wait_ms:.2} drain_ms={drain_ms:.2} tensors_f32={} tensors_quant={} tensors_host={}                  h2d_mb={:.1} f32_mb={:.1}",
+        quant_resident,
+        ms(p.pinned_wait),
+        ms(p.pinned_fill),
+        pipeline.fill_threads(),
+        p.fill_bytes as f64 / 1e9 / p.pinned_fill.as_secs_f64().max(1e-9),
+        pipeline.reader_threads(),
+        p.prefetched_bytes as f64 / 1e6,
+        ms(p.staging_grow),
+        ms(p.out_alloc),
+        ms(p.launch),
+        p.tensors_f32,
+        p.tensors_quant,
+        p.tensors_host,
+        p.h2d_bytes as f64 / 1e6,
+        p.f32_bytes as f64 / 1e6,
+    );
+    Ok(())
 }
 
 /// Accumulators for `REFLEX_LOAD_PROFILE`. Host-side parts are wall time on

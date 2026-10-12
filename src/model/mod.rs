@@ -182,6 +182,10 @@ pub struct Model {
     dequant_q4k_coalesced_f16_k: Option<AotKernel>,
     /// `gemv_q6k_kernel` (same module), for a quantized-resident LM head.
     gemv_q6k_k: Option<AotKernel>,
+    /// `kernels_cuda/gemv_q8_0.cu`, loaded only when the Gemma 4 path keeps
+    /// Q8_0 weights quantized (`REFLEX_QUANT_RESIDENT=1`). `None` everywhere
+    /// else, so no other architecture can reach a Q8_0 kernel.
+    q8_0_k: Option<Q8_0Kernels>,
     /// Reused scratch for the quantized-resident prefill path above the fused
     /// kernel's row threshold (dequantize one weight, then cuBLAS), in the
     /// model's `--weights` dtype: `F16` read by `cublasGemmEx`, `F32` by
@@ -1110,6 +1114,34 @@ impl Model {
                     });
                     return Ok(cell.get().expect("just set"));
                 }
+                if self.q8_0_k.is_some() && self.token_embd.ggml_type == GgmlType::Q8_0 {
+                    // Quantized-resident Gemma 4: the raw Q8_0 blocks (about
+                    // half the f16 size) for `gemv_q8_0_kernel`, through the
+                    // pinned chunked pipeline (1-1.5 GB for real Gemma 4).
+                    let raw: &[u8] = &self.token_embd.raw;
+                    let cap = raw.len().next_multiple_of(QUANT_ARENA_ALIGN);
+                    let buf = unsafe { self.device.alloc::<u8>(cap) }
+                        .map_err(|e| crate::gpu_err!(e, "alloc quantized LM head: {e}"))?;
+                    let mut arena = QuantArena {
+                        buf: Arc::new(buf),
+                        used: 0,
+                    };
+                    let (offset, len) = self
+                        .dequant_pipeline
+                        .borrow_mut()
+                        .upload_raw(&mut arena, raw)
+                        .map_err(|e| e.rewrap(format!("upload quantized LM head: {e}")))?;
+                    let _ = cell.set(Weight {
+                        data: WeightData::Quant {
+                            ty: GgmlType::Q8_0,
+                            arena: arena.buf,
+                            offset,
+                            len,
+                        },
+                        shape: shape.clone(),
+                    });
+                    return Ok(cell.get().expect("just set"));
+                }
                 let data = dequantize_matrix_to_device(
                     &mut self.dequant_pipeline.borrow_mut(),
                     &self.dequant_kernels,
@@ -1172,7 +1204,14 @@ impl Model {
         // The same element values the fully resident LM head would hold, so a
         // System1 score doesn't depend on whether something forced it first.
         let upload_err = |e| crate::gpu_err!(e, "gemv_gather_lm_head upload compact rows: {e}");
+        // A head that will go resident as raw Q8_0 blocks (see
+        // `lm_head_resident`) computes with the exact Q8_0 values, so the rows
+        // stay exact f32 here too, whatever `--weights` says.
+        let q8_0_head = self.q8_0_k.is_some() && self.token_embd.ggml_type == GgmlType::Q8_0;
         let data = match self.weights_dtype {
+            _ if q8_0_head => {
+                WeightData::F32(self.device.htod_sync_copy(&compact).map_err(upload_err)?)
+            }
             WeightsDtype::F16 => {
                 let compact: Vec<half::f16> =
                     compact.into_iter().map(half::f16::from_f32).collect();

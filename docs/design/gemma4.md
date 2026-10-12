@@ -182,8 +182,9 @@ and head dims up to 1024. New kernels:
 - `Model::load_with_options` sends `gemma4` to `Model::load_gemma4`. `Model.gemma4:
   Option<Gemma4Model>` holds the per-layer weights and kernels, and
   `ArchitectureKind::Gemma4` lets callers tell the path apart. `--export-kv`,
-  `--import-kv` and `--lora` return clear errors. `REFLEX_QUANT_RESIDENT=1` prints a
-  notice and loads normal weights. `REFLEX_ATTN_KERNEL=legacy` is rejected, because the
+  `--import-kv` and `--lora` return clear errors. `REFLEX_QUANT_RESIDENT=1` printed a
+  notice and loaded normal weights; it now keeps Q8_0 weights quantized (see
+  [quantized-resident weights](quantized-resident-weights.md#q8_0-on-the-gemma-4-path-design-2026-10-12)). `REFLEX_ATTN_KERNEL=legacy` is rejected, because the
   legacy kernels hardcode a `1/sqrt(head_dim)` scale.
 - One layer function, `Model::forward_gemma4_layer`, serves both prefill (`rows` = prompt
   length, cuBLAS GEMMs, sliding window masked per row in the online attention kernel)

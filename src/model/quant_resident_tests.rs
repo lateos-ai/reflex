@@ -646,3 +646,238 @@ fn kolibri1_lazy_experts_match_eager() {
         assert_eq!(scores(&s_l), scores(&s_e), "{dtype}: System1 scores differ");
     }
 }
+
+const TINY_GEMMA4: &str = "test-data/tiny-gemma4.gguf";
+
+/// Synthetic Q8_0 blocks for an `[in_f, out_f]` weight (`out_f` rows of
+/// `in_f / 32` blocks): f16 scales that are negative, zero, subnormal or
+/// normal, and int8 quants covering the whole range, -128 included.
+fn synthetic_q8_0(in_f: usize, out_f: usize, seed: u64) -> Vec<u8> {
+    let blocks = in_f / QK_LEGACY * out_f;
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut out = Vec::with_capacity(blocks * Q8_0_BLOCK_BYTES);
+    for b in 0..blocks {
+        let d = match b % 16 {
+            0 => half::f16::from_bits(0),
+            1 => half::f16::from_bits((next() % 0x3FF + 1) as u16), // subnormal
+            _ => {
+                let v = ((next() >> 40) as f32 / (1u64 << 24) as f32) * 0.02 + 1e-4;
+                half::f16::from_f32(if next() & 1 == 0 { v } else { -v })
+            }
+        };
+        out.extend_from_slice(&d.to_le_bytes());
+        out.extend((0..32).map(|_| next() as u8));
+    }
+    out
+}
+
+/// A quantized-resident Q8_0 [`Weight`] holding `bytes` (its own device
+/// buffer, 256-byte aligned like an arena).
+fn q8_0_weight(device: &Arc<CudaDevice>, bytes: &[u8], in_f: usize, out_f: usize) -> Weight {
+    Weight {
+        data: WeightData::Quant {
+            ty: GgmlType::Q8_0,
+            arena: Arc::new(device.htod_sync_copy(bytes).expect("upload Q8_0 blocks")),
+            offset: 0,
+            len: bytes.len(),
+        },
+        shape: vec![in_f as u64, out_f as u64],
+    }
+}
+
+/// `x[rows, in_f] @ w^T` on the host, in f64, `w` row-major `[out_f, in_f]`.
+fn host_matmul(x: &[f32], w: &[f32], rows: usize, in_f: usize, out_f: usize) -> Vec<f32> {
+    let mut y = vec![0f32; rows * out_f];
+    for r in 0..rows {
+        let xr = &x[r * in_f..(r + 1) * in_f];
+        for o in 0..out_f {
+            let wo = &w[o * in_f..(o + 1) * in_f];
+            y[r * out_f + o] = xr
+                .iter()
+                .zip(wo)
+                .map(|(a, b)| *a as f64 * *b as f64)
+                .sum::<f64>() as f32;
+        }
+    }
+    y
+}
+
+/// The tiny Gemma 4 fixture (f32 weights) loaded flag off in `dtype`, with
+/// the Q8_0 kernels attached by hand: a `Model` to launch them through on
+/// synthetic weights. `None` (with a skip message) if the fixture is absent.
+fn q8_0_test_model(device: &Arc<CudaDevice>, dtype: WeightsDtype) -> Option<Model> {
+    if !std::path::Path::new(TINY_GEMMA4).exists() {
+        eprintln!("Skipping: {TINY_GEMMA4} not present");
+        return None;
+    }
+    let file = GgufFile::open(TINY_GEMMA4).expect("open tiny Gemma 4 fixture");
+    let mut model = load_model(device.clone(), &file, dtype, false);
+    assert!(
+        model.q8_0_k.is_none(),
+        "flag off must not load Q8_0 kernels"
+    );
+    model.q8_0_k = Some(Q8_0Kernels::load(device).expect("load gemv_q8_0 module"));
+    Some(model)
+}
+
+/// `gemv_q8_0_kernel` (decode and the fused multi-row path) against a host
+/// f64 reference on the exact Q8_0 values, on synthetic weights: the tiny
+/// fixture's row length (64), a ragged last shared-memory tile (800 = 512 +
+/// 288), real Gemma 4 widths (3840, 5376), output counts that leave the last
+/// thread block partly idle, and 1-33 input rows (16-row chunking). Run:
+/// `cargo test --release -- --ignored --test-threads=1 quant_resident_q8_0`
+#[test]
+#[ignore]
+fn quant_resident_q8_0_gemv_matches_host() {
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let Some(model) = q8_0_test_model(&device, WeightsDtype::F16) else {
+        return;
+    };
+    let shapes = [(64usize, 40usize), (800, 37), (3840, 72), (5376, 24)];
+    for (k, &(in_f, out_f)) in shapes.iter().enumerate() {
+        let bytes = synthetic_q8_0(in_f, out_f, k as u64 + 1);
+        let w_host = dequant::dequantize(GgmlType::Q8_0, &bytes, (in_f * out_f) as u64)
+            .expect("host dequant");
+        let wq = q8_0_weight(&device, &bytes, in_f, out_f);
+        for rows in [1usize, 2, 7, 8, 15, 16, 17, 33] {
+            let x_host = activations(rows * in_f, (k * 100 + rows) as u64);
+            let x = device.htod_sync_copy(&x_host).expect("upload x");
+            let want = host_matmul(&x_host, &w_host, rows, in_f, out_f);
+            let got = model.gemv_q8_0(&x, &wq, rows).expect("gemv_q8_0");
+            let got = device.dtoh_sync_copy(&got).expect("dtoh");
+            let d = rel_max_diff(&got, &want);
+            assert!(
+                d < 1e-4,
+                "in={in_f} out={out_f} rows={rows}: relative max diff {d}"
+            );
+            if rows == 1 {
+                let via_gemv = device
+                    .dtoh_sync_copy(&model.gemv(&x, &wq).expect("Model::gemv"))
+                    .expect("dtoh");
+                assert_eq!(via_gemv, got, "Model::gemv must take gemv_q8_0");
+            }
+        }
+    }
+}
+
+/// The coalesced Q8_0 dequant kernels: f32 output bit-identical to the host
+/// dequant (itself byte-exact with gguf-py, and with `dequantize_q8_0_kernel`
+/// per `pipeline_stages_large_tensors_byte_exact`), f16 output equal to its
+/// round-to-nearest-even (`dequantize_q8_0_f16_kernel`'s rounding). 37 rows
+/// of 864 elements: 999 blocks, not a multiple of the 8 one CUDA block covers.
+#[test]
+#[ignore]
+fn quant_resident_q8_0_dequant_coalesced_bit_exact() {
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let Some(model) = q8_0_test_model(&device, WeightsDtype::F16) else {
+        return;
+    };
+    let k = model.q8_0_k.as_ref().expect("attached");
+    let bytes = synthetic_q8_0(864, 37, 99);
+    let num_blocks = bytes.len() / Q8_0_BLOCK_BYTES;
+    let n = num_blocks * QK_LEGACY;
+    let want = dequant::dequantize(GgmlType::Q8_0, &bytes, n as u64).expect("host dequant");
+    let src = device.htod_sync_copy(&bytes).expect("upload");
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut out32 = device.alloc_zeros::<f32>(n).expect("alloc");
+    let mut out16 = device.alloc_zeros::<half::f16>(n).expect("alloc");
+    unsafe {
+        k.dequant_f32
+            .function
+            .clone()
+            .launch(cfg, (&src, &mut out32, num_blocks as u32))
+            .expect("launch f32");
+        k.dequant_f16
+            .function
+            .clone()
+            .launch(cfg, (&src, &mut out16, num_blocks as u32))
+            .expect("launch f16");
+    }
+    let got32 = device.dtoh_sync_copy(&out32).expect("dtoh");
+    let got16 = device.dtoh_sync_copy(&out16).expect("dtoh");
+    for i in 0..n {
+        assert_eq!(got32[i].to_bits(), want[i].to_bits(), "f32 element {i}");
+        assert_eq!(
+            got16[i].to_bits(),
+            half::f16::from_f32(want[i]).to_bits(),
+            "f16 element {i}"
+        );
+    }
+}
+
+/// `Model::gemm` on a Q8_0 weight: up to the fused threshold it equals
+/// `gemv_q8_0` exactly; above it (dequantize into the `--weights` scratch,
+/// then cuBLAS) it is bit-identical to `Model::gemm` on the same weight
+/// stored in that dtype -- the same values and the same cuBLAS call, so a
+/// long prefill matches the flag-off path exactly. Both `--weights` modes.
+#[test]
+#[ignore]
+fn quant_resident_q8_0_gemm_matches_dequantized() {
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    for dtype in [WeightsDtype::F32, WeightsDtype::F16] {
+        let Some(model) = q8_0_test_model(&device, dtype) else {
+            return;
+        };
+        let (in_f, out_f) = (3840usize, 136usize);
+        let bytes = synthetic_q8_0(in_f, out_f, 7);
+        let w_host = dequant::dequantize(GgmlType::Q8_0, &bytes, (in_f * out_f) as u64)
+            .expect("host dequant");
+        let wq = q8_0_weight(&device, &bytes, in_f, out_f);
+        let data = match dtype {
+            WeightsDtype::F32 => WeightData::F32(device.htod_sync_copy(&w_host).expect("upload")),
+            WeightsDtype::F16 => {
+                let h: Vec<half::f16> = w_host.iter().map(|&v| half::f16::from_f32(v)).collect();
+                WeightData::F16(device.htod_sync_copy(&h).expect("upload"))
+            }
+        };
+        let wd = Weight {
+            data,
+            shape: vec![in_f as u64, out_f as u64],
+        };
+        let fused_max = quant_fused_max_rows();
+        for rows in [2usize, fused_max, fused_max + 1, fused_max + 40] {
+            let x = device
+                .htod_sync_copy(&activations(rows * in_f, rows as u64))
+                .expect("upload x");
+            let got = device
+                .dtoh_sync_copy(&model.gemm(&x, &wq, rows).expect("gemm on Q8_0"))
+                .expect("dtoh");
+            let want = if rows <= fused_max {
+                model.gemv_q8_0(&x, &wq, rows).expect("gemv_q8_0")
+            } else {
+                model
+                    .gemm(&x, &wd, rows)
+                    .expect("gemm on dequantized weight")
+            };
+            let want = device.dtoh_sync_copy(&want).expect("dtoh");
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{dtype} rows={rows}: Q8_0 gemm differs from its reference (max rel diff {})",
+                rel_max_diff(&got, &want)
+            );
+        }
+    }
+}
+
+/// Every Q8_0 row of the real Gemma 4 12B/31B shapes is a multiple of 16
+/// bytes, so arena offsets (256-aligned) keep every row 16-byte aligned and
+/// every block 2-byte aligned -- what `gemv_q8_0_kernel`'s loads assume.
+#[test]
+fn gemma4_q8_0_rows_are_16_byte_aligned() {
+    for in_f in [3840usize, 4096, 5376, 8192, 15360, 16384, 21504] {
+        assert_eq!(in_f % QK_LEGACY, 0, "{in_f}");
+        assert_eq!((in_f / QK_LEGACY * Q8_0_BLOCK_BYTES) % 16, 0, "{in_f}");
+    }
+}

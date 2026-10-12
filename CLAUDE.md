@@ -108,7 +108,10 @@ mapped for its lifetime) — don't reintroduce a `to_vec()` copy: it was ~103 ms
 
 **Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense path, plus Kolibri-1 including its stacked
 experts and Q6_K tensors, one expert at a time via `Model::quant_expert_weight`; other
-MoE models, hybrid and MLA print a notice and keep their normal storage). Q4_K matmul weights stay as raw GGUF blocks in one device
+MoE models, hybrid and MLA print a notice and keep their normal storage; Gemma 4 keeps
+Q8_0 instead -- layer matmuls and the tied LM head, `gemv_q8_0` in `kernels_cuda/gemv_q8_0.cu`,
+the same fused-then-scratch prefill split, kernels in `Model::q8_0_k`, which only
+`load_gemma4` fills). Q4_K matmul weights stay as raw GGUF blocks in one device
 arena (`WeightData::Quant`), read by `gemv_q4k`/the fused multi-row prefill kernel, or,
 above a row crossover, dequantized device-to-device into a reused scratch buffer in the
 `--weights` dtype (f16 scratch + `cublasGemmEx`, or f32 + `Sgemm`); a Q6_K LM head stays

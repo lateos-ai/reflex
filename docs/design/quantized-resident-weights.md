@@ -163,6 +163,186 @@ reuses the existing `dequantize_q6k_kernel`. Q6_K matters for the LM head and fo
 `attn_v`/`ffn_down`. Q8_0 (34-byte blocks of 32) is the easiest of the three and covers
 `--outtype q8_0` conversions such as the DeepSeek-V2-Lite GGUF.
 
+### Q8_0 on the Gemma 4 path (design, 2026-10-12)
+
+**Status: built on branch `gemma4-q8-resident` (2026-10-12); host checks pass, GPU
+verification pending.** Goal: Gemma 4 31B-it Q8_0 on a 48 GB card and the 12B
+on a 24 GB card, behind `REFLEX_QUANT_RESIDENT=1`. ggml-org ships Gemma 4 only as
+Q4_0/Q8_0, so Q4_K residency doesn't apply to it.
+
+**What the files hold** (read from the `ggml-org/gemma-4-{12B,31B}-it-GGUF` Q8_0 headers):
+
+| | 12B | 31B |
+|---|---|---|
+| Q8_0 matrix tensors (`attn_q/k/v/output`, `ffn_gate/up/down`) | 328 | 410 |
+| their elements | 10.90 G | 29.29 G |
+| as Q8_0 / as f16 | **11.58 GB** / 21.80 GB | **31.12 GB** / 58.57 GB |
+| `token_embd` (tied LM head), Q8_0 / f16 | 1.07 / 2.01 GB | 1.50 / 2.82 GB |
+| F32 tensors (norms, `rope_freqs`, `layer_output_scale`) | < 10 MB | < 10 MB |
+
+No Q4_0, Q6_K or F16 tensors. Every row length (3840, 4096, 5376, 8192, 15360, 16384,
+21504) is a multiple of 32, and every Q8_0 row is a multiple of 16 bytes, so rows start
+16-byte aligned in the arena. Blocks inside a row are 34 bytes apart, so only 2-byte
+aligned.
+
+**Which tensors stay Q8_0.**
+
+- **All seven layer matmuls**, in one `QuantArena` (one `cuMemAlloc` of 11.6 / 31.1 GB),
+  through `load_weight_device_quant` with `allowed = [Q8_0]`. Norms and the other F32
+  tensors take today's path.
+- **The tied LM head, yes.** It stays lazy (`LmHead::TiedLazy`). When `generate` first
+  needs full-vocab logits, `lm_head_resident` uploads `token_embd`'s raw Q8_0 bytes into
+  a QuantArena of their own through `WeightLoadPipeline::upload_raw`, the pinned
+  chunked path, not `htod_sync_copy`. Today it dequantizes them to f16 instead. That
+  saves 0.9 / 1.3 GB of VRAM and halves the LM head's bytes per decode token. An untied
+  Q8_0 `output.weight` (none in the real files) would go into the load arena.
+- **System1's candidate gather on a not-yet-resident head** keeps uploading only the
+  candidates' rows. With the flag on, those rows are uploaded as exact f32
+  (`token_embd.row`, as now), not rounded to f16, so a System1 score is the same whether
+  or not something has forced the Q8_0 head resident (the property
+  `gemv_gather_lm_head` already promises).
+- Embedding lookup: unchanged (host-side gather from the mmap).
+
+**Decode kernel (`gemv_q8_0_kernel`, new `kernels_cuda/gemv_q8_0.cu`).**
+
+- Same geometry as `gemv_q4k_kernel`: one warp per output row, 8 warps per 256-thread
+  block, `f32` activations, warp-shuffle reduction, up to `R` input rows per launch.
+- 4 lanes per 34-byte block, 8 blocks (256 elements, 272 contiguous bytes) per warp
+  iteration. Lane quarter `q` reads `d` (one 2-byte load, shared by the 4 lanes) and its 8
+  quant bytes with four 2-byte loads, the alignment the 34-byte stride allows. llama.cpp's
+  `get_int_b2` does the same.
+- Each weight is decoded with `dequantize_q8_0_kernel`'s exact expression,
+  `(float)qs[j] * d`. That product of an f16 and an int8 is exact in f32, so the values
+  are the f32-resident path's bit for bit, **and more exact than the f16 default** (which
+  rounds them to f16). Expect flag-on decode logits to land slightly closer to the
+  fully-f32 llama.cpp reference than flag-off ones.
+- **`x` is staged through shared memory, by tile.** The Q4_K results above show what goes
+  wrong otherwise: each warp re-reads every input row from L2, so for 8 rows of
+  `ffn_gate` that is ~30x the weight bytes. The block loads `x[0..R][k0..k0+512]` once
+  into shared memory (32 KB at `R = 16`), then its 8 warps read it from there. That
+  cuts L2 traffic for `x` by 8x.
+- **`R = 16` per launch** (Q4_K uses 8). Sixteen accumulators plus eight decoded weights
+  fit in registers. System1's ~12-token prompt then makes **one** pass over the Q8_0
+  bytes: 11.6 / 31.1 GB read, against the 21.8 / 58.6 GB the f16 default's cuBLAS
+  reads. If the kernel is close to bandwidth-bound, flag-on short prefill should be
+  *faster* than flag-off, which wasn't true for Q4_K. Measuring that is the main risk
+  item (below).
+- `gemv_gather` on a Q8_0-resident head: like Q6_K, the full-vocab GEMV, then a host
+  pick.
+
+**Prefill.** `Model::gemm` gains a Q8_0 arm:
+
+1. `rows <= quant_fused_max_rows()`: the fused kernel above, in chunks of 16 rows. The
+   knob is shared with Q4_K (`REFLEX_QUANT_FUSED_MAX_ROWS`, default 16). The A40 run
+   measures 16/32/64 rows: by bandwidth, fused passes (11.6 GB each on the 12B) beat
+   the scratch path (read 11.6, write 21.8, then GEMM reads 21.8 GB) up to about 4
+   passes. If the measured crossover differs from Q4_K's, Q8_0 gets its own default.
+2. Above that: **dequantize into the reused scratch buffer, then the existing cuBLAS
+   path**. That is `cublasGemmEx` with an f16 scratch under `--weights f16`, or `Sgemm`
+   with an f32 scratch under `--weights f32`. The new `dequantize_q8_0_coalesced{,_f16}`
+   kernel uses one thread per element, the lesson from Q4_K's first scratch path. It
+   writes `__float2half_rn((float)qs[j] * d)`, the same rounding as the load-time
+   `dequantize_q8_0_f16_kernel`. So **a long prefill with the flag on is bit-identical
+   to the flag-off default**: same f16 weights, same GEMM call. The scratch is sized to
+   the largest tensor (`ffn_gate`/`ffn_up`: 118 MB f16 for the 12B, 231 MB for the 31B).
+   Extra cost per long prefill: one dequant pass, about 33 / 90 GB of traffic, roughly
+   50 / 130 ms on an A40. That is small next to the GEMMs of a 1,000-token prompt,
+   which are compute-bound.
+
+A fused tensor-core (MMQ-style) kernel is not in scope: it needs int8 activations,
+which is exactly the Q8_1 activation quantization that moves Gemma 4's logits by up
+to ~0.8 (docs/design/gemma4.md).
+
+**VRAM** (GB; KV cache is f32 and every layer is sized to the full context, as today):
+
+| | 12B flag off (f16) | 12B flag on | 31B flag off (f16) | 31B flag on |
+|---|---|---|---|---|
+| layer weights | 21.80 | **11.58** | 58.57 | **31.12** |
+| LM head once resident (`generate`) | 2.01 | 1.07 | 2.82 | 1.50 |
+| prefill scratch (f16) | 0 | 0.12 | 0 | 0.23 |
+| CUDA context, cuBLAS, misc (estimate) | ~0.7 | ~0.7 | ~0.7 | ~0.7 |
+| **subtotal before KV** | **~24.5** | **~13.5** | **~62.1** | **~33.6** |
+| KV cache per token | 0.69 MB | 0.69 MB | 1.80 MB | 1.80 MB |
+| prefill activations per prompt token (transient, estimate) | ~0.25 MB | ~0.25 MB | ~0.35 MB | ~0.35 MB |
+
+- **31B on a 48 GB card** (A40: 46,068 MiB, ~48.3 GB): about 14 GB left after the
+  weights. At ~2.15 MB per token that is a prompt plus generation of **~6,000 tokens**.
+  Every prompt from the 31B verification (up to 2,641 tokens) fits.
+- **12B on a 24 GB card** (A10G/L4/3090/4090, ~23.5 GB usable): ~10 GB left, about
+  **10,000 tokens**. Flag off, the 12B doesn't fit 24 GB at all.
+- Above those lengths the KV cache dominates. Sizing the sliding layers' KV cache to the
+  1,024-token window (a ring buffer) would cap the 31B's sliding-layer KV at 1.7 GB.
+  That is a separate change, not part of this one.
+
+**Expected load time: correcting the "half the bytes" premise.** Today's path already
+copies the raw Q8_0 bytes host to device and dequantizes them on the GPU
+(`WeightLoadPipeline`). So the disk reads, the pinned fill and the H2D copy stay at
+12.65 / 32.6 GB either way. The flag removes:
+
+- 328 / 410 per-tensor `cuMemAlloc`s of the f16 outputs. One arena allocation replaces
+  them.
+- 21.8 / 58.6 GB of dequant writes on the GPU. These overlap the H2D copies today, and
+  the load was host-bound in every profile so far.
+- On `generate`'s first token, the tied head's 2.0 / 2.8 GB f16 dequant. The 1.1 /
+  1.5 GB upload stays.
+
+So `model_load_ms` should drop only by the allocation and drain share, probably a few
+percent. The 12B's 1.41 s load on the A40 moved 12.7 GB, which is host/PCIe-bound. The
+cold-start case rests on fitting the model at all, decode (bytes per token
+23.8 → 12.7 GB for the 12B, a ~1.9x lower floor: ~34 → ~18 ms on an A40), and short
+prefill (above). Not on load time. To see the split, `REFLEX_LOAD_PROFILE=1` gets wired
+into `load_gemma4` (dense path only today).
+
+**Wiring.**
+
+- `load_gemma4_inner`: with the flag on, build the arena from the 7 per-layer matmul
+  names plus `output.weight`, keeping tensors of type Q8_0. If none qualify (an f16 or
+  Q4_K_M file), print a one-line notice and load normally.
+- Load the new module's kernels into one `Option<Q8_0Kernels>` field on `Model`
+  (`gemv_q8_0`, `dequantize_q8_0_coalesced`, `_f16`). Every other constructor sets it
+  to `None`, so the dense, MoE, hybrid, MLA and Kolibri paths can't reach a Q8_0 arm.
+  Those arms are only reachable when this field is `Some`.
+- `Model::gemv`, `Model::gemm`, `gemm_quant_scratch` and `lm_head_resident` gain Q8_0
+  arms. Unsupported combinations still return a `ReflexError`.
+- `gemma4.rs` itself barely changes: `gemma4_mm` already routes through `gemv`/`gemm`.
+  LoRA and KV export/import stay rejected on Gemma 4, so `materialize_f32` needs no Q8_0
+  arm.
+
+**Tests.**
+
+- Host-reference kernel tests (`#[ignore]`d GPU, in `quant_resident_tests.rs` beside the
+  Q4_K ones), on synthetic Q8_0 blocks with random `d` (including subnormal and negative
+  values) and random `x`:
+  - `gemv_q8_0` for rows 1–16 and 17–33 (chunking), at in-features of 64 (the tiny
+    fixture), 3840 and 5376, against a host loop over `dequant::dequantize`.
+  - The coalesced dequant against `dequantize_q8_0_kernel`, `f32` bit-exact.
+  - The f16 variant against `__float2half_rn` of the same values.
+  - The scratch GEMM against `Model::gemm` on the f16 weight.
+- A host-only test that every Q8_0 row length in the 12B/31B shapes is 16-byte aligned
+  (it guards the arena-alignment assumption).
+- Model-level, against a new fixture `test-data/tiny-gemma4-q8_0.gguf`
+  (`llama-quantize tiny-gemma4.gguf … Q8_0`, made on the GPU host by llama.cpp's own
+  quantizer, recipe added to the src tarball). Flag-on batched prefill matches
+  sequential, and flag-on System1 scores match flag-on full-vocab logits.
+
+**Risks.**
+
+- **Short-prompt prefill (the known one).** If the fused kernel isn't near bandwidth,
+  System1 on Gemma 4 gets slower with the flag on, as it did for Q4_K. The shared-memory
+  `x` tile and `R = 16` are aimed straight at that. It is measured on the A40 before any
+  claim is made.
+- **2-byte loads.** If they keep decode below bandwidth, the alternative is to repack
+  rows at load into an aligned layout (`d` array plus `qs` array) inside the arena. That
+  means the arena no longer holds the file's bytes. Not planned unless measured.
+- **Numerics.** Flag-on decode uses exact Q8_0 weights and flag-off uses f16-rounded
+  ones. Greedy tokens should hold against the fully-f32 reference, and logits should
+  move toward it. Checksums against flag off will move.
+
+**Out of scope here:** Q4_0 (the other ggml-org format; an 18-byte-block kernel of the
+same shape would follow easily), Q4_K/Q6_K residency on Gemma 4 for third-party Q4_K_M
+files (the kernels exist, but no file is planned for verification), the MoE/MLA/hybrid
+paths, and a windowed KV cache.
+
 ## 3. Interactions
 
 **`WeightLoadPipeline`.** For a quantized tensor there is no dequant kernel. Step 4's
