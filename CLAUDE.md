@@ -202,7 +202,12 @@ is architecture-independent when adding another model family later.
 another separate path: Gemma 4 changes head dim (256 sliding / 512 global), KV heads, RoPE
 base and the V source (global layers have no `attn_v`; V = `Wk·x`) from layer to layer,
 which the dense path's single `LayerConfig` can't express. One layer function
-(`forward_gemma4_layer`) serves batched prefill and decode. Gemma-specific math, all
+(`forward_gemma4_layer`) serves batched prefill and decode. Prefill attention runs the
+tiled `kernels_cuda/attention_tiled.cu` (head dims 256/512, Gemma-only; decode and every
+other architecture keep `attention_online.cu`), and `REFLEX_PREFILL_PROFILE=1` prints a
+per-phase GPU split of a prefill (see `docs/design/gemma4.md`, "Long-prompt prefill";
+`rmsnorm_kernel` was 40-68% of it until made one block per row, bit-identically).
+Gemma-specific math, all
 verified token-for-token against llama.cpp: attention scale 1.0, weightless V RMSNorm,
 NEOX RoPE with per-pair `rope_freqs` divisors on global layers (`kernels_cuda/gemma4.cu`),
 GeGLU, sandwich norms, per-layer `layer_output_scale`, embeddings × sqrt(hidden), final
