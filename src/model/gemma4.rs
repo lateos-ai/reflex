@@ -8,6 +8,19 @@
 use super::*;
 use crate::error::ReflexError;
 
+/// Gemma 4's per-layer matmul tensors (`blk.{i}.<name>.weight`): the ones
+/// `REFLEX_QUANT_RESIDENT=1` keeps as raw Q8_0 blocks. Global layers have no
+/// `attn_v`.
+pub(super) const GEMMA4_MATMUL_TENSORS: [&str; 7] = [
+    "attn_q",
+    "attn_k",
+    "attn_v",
+    "attn_output",
+    "ffn_gate",
+    "ffn_up",
+    "ffn_down",
+];
+
 /// One Gemma 4 layer's weights (`blk.{i}.*` in the GGUF). The math is in
 /// [`Model::forward_gemma4_layer`].
 pub(super) struct Gemma4LayerWeights {
@@ -86,12 +99,8 @@ impl Model {
                 "REFLEX_ATTN_KERNEL=legacy is not supported for Gemma 4: the legacy kernels fix the attention scale at 1/sqrt(head_dim), and Gemma 4 uses 1.0"
             ));
         }
-        if quant_resident_enabled() {
-            eprintln!(
-                "note: REFLEX_QUANT_RESIDENT=1 is not supported for Gemma 4 yet; using {} weights",
-                policy.matrix_dtype
-            );
-        }
+        let profile_on = load_profile_enabled();
+        let t_modules = std::time::Instant::now();
 
         let rmsnorm_k = aot::load_kernel(
             &device,
@@ -167,14 +176,69 @@ impl Model {
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
         pipeline.prefetch_from(file);
-        let mut load_weight = |name: &str| -> Result<Weight, ReflexError> {
-            load_weight_device(&mut pipeline, &dequant_kernels, policy, file, name)
-        };
+        if profile_on {
+            pipeline.profile = Some(LoadProfile::default());
+        }
 
         let hidden_size = g4_cfg.hidden_size;
         let num_q_heads = g4_cfg.num_q_heads;
         let ffn = g4_cfg.ffn_hidden_size;
         let block_count = g4_cfg.layers.len();
+
+        // Quantized-resident Q8_0 (docs/design/quantized-resident-weights.md,
+        // "Q8_0 on the Gemma 4 path"): every Q8_0 layer matmul (and an untied
+        // Q8_0 `output.weight`) stays as raw blocks in one arena; a tied Q8_0
+        // LM head goes resident the same way on first use
+        // (`Model::lm_head_resident`).
+        let quant_on = quant_resident_enabled();
+        let mut arena = if quant_on {
+            let mut names: Vec<String> = (0..block_count)
+                .flat_map(|i| {
+                    GEMMA4_MATMUL_TENSORS
+                        .iter()
+                        .map(move |t| format!("blk.{i}.{t}.weight"))
+                })
+                .collect();
+            names.push("output.weight".to_string());
+            QuantArena::for_tensors(&device, file, &names, |name, ty| {
+                ty == GgmlType::Q8_0 && !policy.keep_f32.contains(name)
+            })?
+        } else {
+            None
+        };
+        let q8_0_embd = file
+            .tensor_info("token_embd.weight")
+            .is_some_and(|i| i.ggml_type == GgmlType::Q8_0);
+        let q8_0_k = if quant_on && (arena.is_some() || q8_0_embd) {
+            Some(Q8_0Kernels::load(&device)?)
+        } else {
+            if quant_on {
+                eprintln!(
+                    "note: REFLEX_QUANT_RESIDENT=1 keeps only Q8_0 weights on the Gemma 4 path, and this file has none; using {} weights",
+                    policy.matrix_dtype
+                );
+            }
+            None
+        };
+        let modules_ms = t_modules.elapsed().as_secs_f64() * 1000.0;
+        let t_weights = std::time::Instant::now();
+
+        // `matmul`: a layer matmul that may stay quantized; everything else
+        // follows `policy`.
+        let mut load_weight_kind = |name: &str, matmul: bool| -> Result<Weight, ReflexError> {
+            match arena.as_mut() {
+                Some(a) if matmul => load_weight_device_quant(
+                    &mut pipeline,
+                    &dequant_kernels,
+                    policy,
+                    file,
+                    name,
+                    a,
+                    &[GgmlType::Q8_0],
+                ),
+                _ => load_weight_device(&mut pipeline, &dequant_kernels, policy, file, name),
+            }
+        };
         let mut layers = Vec::with_capacity(block_count);
         for (i, shape) in g4_cfg.layers.iter().enumerate() {
             eprint!("\rLoading weights: layer {}/{block_count}", i + 1);
@@ -182,7 +246,7 @@ impl Model {
             let q_dim = num_q_heads * shape.head_dim;
             let kv_dim = shape.num_kv_heads * shape.head_dim;
             let mut matrix = |t: &str, rows: usize, cols: usize| -> Result<Weight, ReflexError> {
-                let w = load_weight(&name(t))?;
+                let w = load_weight_kind(&name(t), true)?;
                 if w.shape.len() != 2 || w.shape[0] as usize != rows || w.shape[1] as usize != cols
                 {
                     return Err(crate::reflex_err!(
@@ -215,34 +279,36 @@ impl Model {
                 None => 1.0,
             };
             layers.push(Gemma4LayerWeights {
-                attn_norm: load_weight(&name("attn_norm"))?,
+                attn_norm: load_weight_kind(&name("attn_norm"), false)?,
                 attn_q,
                 attn_k,
                 attn_v,
                 attn_output,
-                attn_q_norm: load_weight(&name("attn_q_norm"))?,
-                attn_k_norm: load_weight(&name("attn_k_norm"))?,
-                post_attention_norm: load_weight(&name("post_attention_norm"))?,
-                ffn_norm: load_weight(&name("ffn_norm"))?,
+                attn_q_norm: load_weight_kind(&name("attn_q_norm"), false)?,
+                attn_k_norm: load_weight_kind(&name("attn_k_norm"), false)?,
+                post_attention_norm: load_weight_kind(&name("post_attention_norm"), false)?,
+                ffn_norm: load_weight_kind(&name("ffn_norm"), false)?,
                 ffn_gate,
                 ffn_up,
                 ffn_down,
-                post_ffw_norm: load_weight(&name("post_ffw_norm"))?,
+                post_ffw_norm: load_weight_kind(&name("post_ffw_norm"), false)?,
                 output_scale,
             });
         }
         eprintln!();
 
         let rope_freqs = if g4_cfg.layers.iter().any(|l| !l.sliding) {
-            Some(load_weight("rope_freqs.weight")?)
+            Some(load_weight_kind("rope_freqs.weight", false)?)
         } else {
             None
         };
+        let weights_enqueue_ms = t_weights.elapsed().as_secs_f64() * 1000.0;
         let max_head_dim = g4_cfg.layers.iter().map(|l| l.head_dim).max().unwrap_or(1);
         let ones = device
             .htod_sync_copy(&vec![1.0f32; max_head_dim])
             .map_err(|e| crate::gpu_err!(e, "gemma4 ones upload: {e}"))?;
 
+        let t_embd = std::time::Instant::now();
         let token_embd_info = file
             .tensor_info("token_embd.weight")
             .ok_or_else(|| ReflexError::Gguf("missing weight 'token_embd.weight'".to_string()))?;
@@ -251,11 +317,23 @@ impl Model {
             file.tensor_bytes_shared(token_embd_info)?,
             &token_embd_info.shape,
         )?;
-        let output_norm = load_weight("output_norm.weight")?;
+        let token_embd_ms = t_embd.elapsed().as_secs_f64() * 1000.0;
+        let output_norm = load_weight_kind("output_norm.weight", false)?;
         // Real Gemma 4 files tie the LM head to `token_embd`. Keep it lazy
         // like the dense path: `system1` only gathers the candidates' rows, so
         // a classifier never pays for the full 262,144-row upload.
         let lm_head = match file.tensor_info("output.weight") {
+            Some(info) if info.ggml_type == GgmlType::Q8_0 && arena.is_some() => {
+                LmHead::Resident(load_weight_device_quant(
+                    &mut pipeline,
+                    &dequant_kernels,
+                    policy,
+                    file,
+                    "output.weight",
+                    arena.as_mut().expect("checked by the guard"),
+                    &[GgmlType::Q8_0],
+                )?)
+            }
             Some(info) => {
                 let data = dequantize_matrix_to_device(
                     &mut pipeline,
@@ -278,9 +356,22 @@ impl Model {
         };
 
         pipeline.end_load();
+        let t_join = std::time::Instant::now();
         let (tokenizer, cublas) = init.join().map_err(|_| {
             ReflexError::Other("background load-init thread panicked".to_string())
         })??;
+        let init_join_wait_ms = t_join.elapsed().as_secs_f64() * 1000.0;
+        report_load_profile(
+            &device,
+            &mut pipeline,
+            LoadTimes {
+                quant_resident: arena.is_some(),
+                modules_ms,
+                weights_enqueue_ms,
+                token_embd_ms,
+                init_join_wait_ms,
+            },
+        )?;
         let f16_act_stats = device
             .alloc_zeros::<u32>(2)
             .map_err(|e| crate::gpu_err!(e, "alloc f16 activation stats: {e}"))?;
@@ -312,6 +403,7 @@ impl Model {
             dequant_q4k_coalesced_k: None,
             dequant_q4k_coalesced_f16_k: None,
             gemv_q6k_k: None,
+            q8_0_k,
             quant_scratch: RefCell::new(None),
             moe_gather_k,
             moe_scatter_add_k,

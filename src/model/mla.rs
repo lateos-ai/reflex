@@ -418,6 +418,7 @@ impl Model {
             dequant_q4k_coalesced_k: None,
             dequant_q4k_coalesced_f16_k: None,
             gemv_q6k_k: None,
+            q8_0_k: None,
             quant_scratch: RefCell::new(None),
             moe_gather_k,
             moe_scatter_add_k,

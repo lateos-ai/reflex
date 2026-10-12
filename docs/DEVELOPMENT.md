@@ -169,8 +169,10 @@ kernels (`gemv_q4k`, the fused multi-row prefill kernel), or, for longer prompts
 a reused device scratch buffer that cuBLAS then reads. That scratch buffer has the
 `--weights` dtype: `f16` (read by `cublasGemmEx`) by default, `f32` (`Sgemm`) with
 `--weights f32`. A Q6_K LM head is kept as raw blocks too. Every other matrix weight
-follows `--weights`. The rules below still hold: the scratch path is device to device,
-so weights are never copied host-to-device per call. See
+follows `--weights`. On the Gemma 4 path the flag keeps Q8_0 weights instead (the layer
+matmuls and the tied LM head; `gemv_q8_0`, the same fused-then-scratch prefill split),
+which is what fits the 31B Q8_0 on a 48 GB card. The rules below still hold: the
+scratch path is device to device, so weights are never copied host-to-device per call. See
 [design/quantized-resident-weights.md](design/quantized-resident-weights.md).
 
 **Opt-in on top of that: `REFLEX_LAZY_EXPERTS=1`** (Kolibri-1 only; anything else

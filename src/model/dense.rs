@@ -613,37 +613,17 @@ impl Model {
         })??;
         let init_join_wait_ms = t_join.elapsed().as_secs_f64() * 1000.0;
 
-        if let Some(mut p) = pipeline.profile.take() {
-            // Drain everything queued so the GPU-side totals are complete.
-            // Profile mode only: the normal load never blocks here.
-            let t_drain = std::time::Instant::now();
-            device
-                .synchronize()
-                .map_err(|e| crate::gpu_err!(e, "load profile: synchronize: {e}"))?;
-            unsafe { result::stream::synchronize(pipeline.copy_stream) }
-                .map_err(|e| crate::gpu_err!(e, "load profile: sync copy stream: {e}"))?;
-            let drain_ms = t_drain.elapsed().as_secs_f64() * 1000.0;
-            let (h2d_gpu_ms, dequant_gpu_ms) = p.gpu_ms();
-            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-            eprintln!(
-                "REFLEX_LOAD_PROFILE quant_resident={} modules_ms={modules_ms:.2} weights_enqueue_ms={weights_enqueue_ms:.2}                  pinned_wait_ms={:.2} pinned_fill_ms={:.2} fill_threads={} fill_gbps={:.2} readers={} prefetched_mb={:.1} staging_grow_ms={:.2} out_alloc_ms={:.2} launch_ms={:.2}                  h2d_gpu_ms={h2d_gpu_ms:.2} dequant_gpu_ms={dequant_gpu_ms:.2} token_embd_ms={token_embd_ms:.2}                  init_join_wait_ms={init_join_wait_ms:.2} drain_ms={drain_ms:.2} tensors_f32={} tensors_quant={} tensors_host={}                  h2d_mb={:.1} f32_mb={:.1}",
-                arena.is_some(),
-                ms(p.pinned_wait),
-                ms(p.pinned_fill),
-                pipeline.fill_threads(),
-                p.fill_bytes as f64 / 1e9 / p.pinned_fill.as_secs_f64().max(1e-9),
-                pipeline.reader_threads(),
-                p.prefetched_bytes as f64 / 1e6,
-                ms(p.staging_grow),
-                ms(p.out_alloc),
-                ms(p.launch),
-                p.tensors_f32,
-                p.tensors_quant,
-                p.tensors_host,
-                p.h2d_bytes as f64 / 1e6,
-                p.f32_bytes as f64 / 1e6,
-            );
-        }
+        report_load_profile(
+            &device,
+            &mut pipeline,
+            LoadTimes {
+                quant_resident: arena.is_some(),
+                modules_ms,
+                weights_enqueue_ms,
+                token_embd_ms,
+                init_join_wait_ms,
+            },
+        )?;
 
         let f16_act_stats = device
             .alloc_zeros::<u32>(2)
@@ -665,6 +645,7 @@ impl Model {
             dequant_q4k_coalesced_k,
             dequant_q4k_coalesced_f16_k,
             gemv_q6k_k,
+            q8_0_k: None,
             quant_scratch: RefCell::new(None),
             moe_gather_k,
             moe_scatter_add_k,

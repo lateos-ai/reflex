@@ -331,11 +331,115 @@ impl Model {
             WeightData::Quant {
                 ty: GgmlType::Q6K, ..
             } => self.gemv_q6k(x, w),
+            WeightData::Quant {
+                ty: GgmlType::Q8_0, ..
+            } => self.gemv_q8_0(x, w, 1),
             WeightData::Quant { ty, .. } => Err(crate::reflex_err!(
                 Other,
                 "internal: no GEMV for quantized-resident {ty:?}"
             )),
         }
+    }
+
+    /// `y[rows, out_features] = x[rows, in_features] @ w^T` straight from a
+    /// quantized-resident Q8_0 weight (`gemv_q8_0_kernel`, the Gemma 4 path),
+    /// launched in chunks of [`GEMV_Q8_0_MAX_ROWS`] rows -- each chunk reads
+    /// the weight's bytes once for all its rows. `rows == 1` is the decode
+    /// GEMV, which takes `gemv_q8_0_direct_kernel` (no shared-memory staging).
+    pub(super) fn gemv_q8_0(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let in_features = w.shape[0] as usize;
+        let out_features = w.shape[1] as usize;
+        let kernels = self.q8_0_k.as_ref().ok_or_else(|| {
+            ReflexError::Other("internal: Q8_0 weight but gemv_q8_0_kernel not loaded".to_string())
+        })?;
+        let w_ptr = w.quant_ptr().ok_or_else(|| {
+            ReflexError::Other("internal: gemv_q8_0 on a dequantized weight".to_string())
+        })?;
+        if x.len() != rows * in_features || !in_features.is_multiple_of(QK_LEGACY) {
+            return Err(crate::reflex_err!(
+                Other,
+                "gemv_q8_0: x.len()={} rows={rows} in_features={in_features} (must be rows*in_features, a multiple of {QK_LEGACY})",
+                x.len()
+            ));
+        }
+        let dev_y = self
+            .device
+            .alloc_zeros::<f32>(rows * out_features)
+            .map_err(|e| crate::gpu_err!(e, "gemv_q8_0 alloc y: {e}"))?;
+        let threads = 256u32;
+        let warps_per_block = threads / WARP_SIZE;
+        let grid = ((out_features as u32).div_ceil(warps_per_block).max(1), 1, 1);
+        let staged_grid = (
+            (out_features as u32)
+                .div_ceil(warps_per_block * GEMV_Q8_0_ROWS_PER_WARP)
+                .max(1),
+            1,
+            1,
+        );
+        if rows == 1 {
+            let mut dev_y = dev_y;
+            let cfg = LaunchConfig {
+                grid_dim: grid,
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                kernels
+                    .gemv_direct
+                    .function
+                    .clone()
+                    .launch(
+                        cfg,
+                        (
+                            x,
+                            w_ptr,
+                            &mut dev_y,
+                            in_features as u32,
+                            out_features as u32,
+                        ),
+                    )
+                    .map_err(|e| crate::gpu_err!(e, "gemv_q8_0_direct launch: {e}"))?;
+            }
+            return Ok(dev_y);
+        }
+        let x_base = *x.device_ptr();
+        let y_base = *dev_y.device_ptr();
+        let mut r0 = 0usize;
+        while r0 < rows {
+            let r = (rows - r0).min(GEMV_Q8_0_MAX_ROWS);
+            let launch_cfg = LaunchConfig {
+                grid_dim: staged_grid,
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: (r * GEMV_Q8_0_TILE * 4) as u32,
+            };
+            let x_ptr = x_base + (r0 * in_features * 4) as u64;
+            let y_ptr = y_base + (r0 * out_features * 4) as u64;
+            unsafe {
+                kernels
+                    .gemv
+                    .function
+                    .clone()
+                    .launch(
+                        launch_cfg,
+                        (
+                            x_ptr,
+                            w_ptr,
+                            y_ptr,
+                            in_features as u32,
+                            out_features as u32,
+                            r as u32,
+                        ),
+                    )
+                    .map_err(|e| crate::gpu_err!(e, "gemv_q8_0 launch: {e}"))?;
+            }
+            r0 += r;
+        }
+        Ok(dev_y)
     }
 
     /// One-row GEMV straight from a quantized-resident Q6_K weight
@@ -501,10 +605,12 @@ impl Model {
                 // once per 8 rows; above it, dequantize into scratch and use
                 // cuBLAS.
                 GgmlType::Q4K if rows <= quant_fused_max_rows() => self.gemv_q4k(x, w, rows),
+                // Same for Q8_0 (Gemma 4), 16 rows per pass.
+                GgmlType::Q8_0 if rows <= quant_fused_max_rows() => self.gemv_q8_0(x, w, rows),
                 // No multi-row Q6_K kernel yet: one row is the decode GEMV,
                 // anything more goes through the scratch path.
                 GgmlType::Q6K if rows == 1 => self.gemv_q6k(x, w),
-                GgmlType::Q4K | GgmlType::Q6K => {
+                GgmlType::Q4K | GgmlType::Q6K | GgmlType::Q8_0 => {
                     self.gemm_quant_scratch(x, w, *ty, *len, in_features, out_features, rows)
                 }
                 _ => Err(crate::reflex_err!(
@@ -524,7 +630,7 @@ impl Model {
     /// cast + `cublasGemmEx` for `f16`). Q4_K uses the coalesced dequant
     /// kernel (one thread block per Q4_K block); Q6_K the load-time dequant
     /// kernel (one thread per block), which writes the same values the load
-    /// would have.
+    /// would have; Q8_0 its coalesced kernel (one thread per element).
     #[allow(clippy::too_many_arguments)]
     fn gemm_quant_scratch(
         &self,
@@ -541,6 +647,7 @@ impl Model {
             ReflexError::Other("internal: quantized weight without a device pointer".to_string())
         })?;
         let dtype = self.weights_dtype;
+        let mut block_elems = QK_K;
         let (dq, num_blocks, launch_cfg) = match ty {
             GgmlType::Q4K => {
                 let (kernel, kernel_name) = match dtype {
@@ -580,6 +687,30 @@ impl Model {
                 };
                 (dq, num_blocks, cfg)
             }
+            GgmlType::Q8_0 => {
+                let k = self.q8_0_k.as_ref().ok_or_else(|| {
+                    ReflexError::Other(
+                        "internal: Q8_0 weight but the gemv_q8_0 module is not loaded".to_string(),
+                    )
+                })?;
+                let dq = match dtype {
+                    WeightsDtype::F32 => &k.dequant_f32,
+                    WeightsDtype::F16 => &k.dequant_f16,
+                };
+                block_elems = QK_LEGACY;
+                let num_blocks = len / Q8_0_BLOCK_BYTES;
+                let threads = 256u32;
+                let cfg = LaunchConfig {
+                    grid_dim: (
+                        ((num_blocks * QK_LEGACY) as u32).div_ceil(threads).max(1),
+                        1,
+                        1,
+                    ),
+                    block_dim: (threads, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                (dq, num_blocks, cfg)
+            }
             other => {
                 return Err(crate::reflex_err!(
                     Other,
@@ -587,11 +718,11 @@ impl Model {
                 ))
             }
         };
-        if num_blocks * QK_K != n {
+        if num_blocks * block_elems != n {
             return Err(crate::reflex_err!(
                 Other,
                 "internal: {ty:?} weight holds {} elements, expected {in_features}x{out_features}",
-                num_blocks * QK_K
+                num_blocks * block_elems
             ));
         }
 
@@ -2113,6 +2244,60 @@ pub(super) fn gemm_ex_f16_raw(
 /// Rows per `gemv_q4k_kernel` launch -- must equal `GEMV_Q4K_MAX_ROWS` in
 /// `kernels_cuda/gemv_q4k.cu`.
 pub(super) const GEMV_Q4K_MAX_ROWS: usize = 8;
+
+/// Rows per `gemv_q8_0_kernel` launch -- must equal `GEMV_Q8_0_MAX_ROWS` in
+/// `kernels_cuda/gemv_q8_0.cu`.
+pub(super) const GEMV_Q8_0_MAX_ROWS: usize = 16;
+
+/// Output rows per warp in `gemv_q8_0_kernel` -- must equal
+/// `GEMV_Q8_0_ROWS_PER_WARP` in `kernels_cuda/gemv_q8_0.cu`.
+pub(super) const GEMV_Q8_0_ROWS_PER_WARP: u32 = 4;
+
+/// Elements of `x` per row that `gemv_q8_0_kernel` stages in shared memory at
+/// a time -- must equal `Q8_0_TILE` in `kernels_cuda/gemv_q8_0.cu`; the
+/// launch passes `rows * GEMV_Q8_0_TILE` floats of dynamic shared memory.
+pub(super) const GEMV_Q8_0_TILE: usize = 512;
+
+/// The `kernels_cuda/gemv_q8_0.cu` kernels, loaded only when the Gemma 4 path
+/// keeps Q8_0 weights quantized (`REFLEX_QUANT_RESIDENT=1`).
+pub(super) struct Q8_0Kernels {
+    /// `gemv_q8_0_kernel`: the fused 2-16 row prefill path (`x` staged in
+    /// shared memory, 4 output rows per warp).
+    pub(super) gemv: AotKernel,
+    /// `gemv_q8_0_direct_kernel`: the one-row decode GEMV.
+    pub(super) gemv_direct: AotKernel,
+    /// `dequantize_q8_0_coalesced_kernel`: the `--weights f32` prefill scratch.
+    pub(super) dequant_f32: AotKernel,
+    /// `dequantize_q8_0_coalesced_f16_kernel`: the `--weights f16` scratch.
+    pub(super) dequant_f16: AotKernel,
+}
+
+impl Q8_0Kernels {
+    pub(super) fn load(device: &Arc<CudaDevice>) -> Result<Self, ReflexError> {
+        let mut fns = aot::load_kernel_module(
+            device,
+            include_bytes!(env!("REFLEX_KERNEL_GEMV_Q8_0")),
+            "gemv_q8_0",
+            &[
+                "gemv_q8_0_kernel",
+                "gemv_q8_0_direct_kernel",
+                "dequantize_q8_0_coalesced_kernel",
+                "dequantize_q8_0_coalesced_f16_kernel",
+            ],
+        )?
+        .into_iter();
+        let mut next = || {
+            fns.next()
+                .ok_or_else(|| crate::reflex_err!(Cuda, "missing kernel in module gemv_q8_0"))
+        };
+        Ok(Self {
+            gemv: next()?,
+            gemv_direct: next()?,
+            dequant_f32: next()?,
+            dequant_f16: next()?,
+        })
+    }
+}
 
 /// Largest prefill row count the quantized-resident path runs through the
 /// fused `gemv_q4k_kernel` before switching to dequantize-to-scratch + cuBLAS
