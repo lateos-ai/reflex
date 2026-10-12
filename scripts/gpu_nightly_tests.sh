@@ -44,7 +44,8 @@ requirement() {
     *::qwen35moe_fixture_*) echo "|test-data/tiny-qwen35moe.gguf|fixture missing" ;;
     model::mla_batching_tests::*|*::online_attention_matches_legacy_kernels_mla) echo "|test-data/deepseek-tiny-mla.gguf|fixture missing" ;;
     *::gemma4_quant_resident_matches_dequantized) echo "|test-data/tiny-gemma4-q8_0.gguf|fixture missing (llama-quantize tiny-gemma4.gguf to Q8_0)" ;;
-    model::gemma4_model_tests::*|*::quant_resident_q8_0_*) echo "|test-data/tiny-gemma4.gguf|fixture missing" ;;
+    model::gemma4_model_tests::*|*::quant_resident_q8_0_*|model::attention_tiled_tests::*) echo "|test-data/tiny-gemma4.gguf|fixture missing" ;;
+    model::rmsnorm_tests::*) echo "|test-data/tiny-qwen3moe.gguf|fixture missing" ;;
     *) echo "$DENSE_GGUF|$DENSE_GGUF|DENSE_GGUF path does not exist" ;;
   esac
 }

@@ -479,9 +479,12 @@ impl Model {
     /// Gemma 4's scale of 1.0. A sliding layer's window narrows the K/V
     /// views for a decode step (like [`Self::attention`]) and is masked per
     /// row inside the kernel for a prefill (like [`Self::attention_prefill`]).
+    /// Prefill uses the tiled kernel ([`Gemma4Kernels::attention_prefill_tiled`]),
+    /// decode the online one.
     #[allow(clippy::too_many_arguments)]
     fn gemma4_attention(
         &self,
+        m: &Gemma4Model,
         q: &CudaSlice<f32>,
         k_cache: &CudaSlice<f32>,
         v_cache: &CudaSlice<f32>,
@@ -501,25 +504,27 @@ impl Model {
         };
         let k = k_cache.slice(first * kv_stride..seq_len * kv_stride);
         let v = v_cache.slice(first * kv_stride..seq_len * kv_stride);
-        self.attention_online(
-            q,
-            &k,
-            &v,
-            OnlineAttnShape {
-                rows,
-                start_pos: start_pos - first,
-                num_q_heads,
-                group_size: num_q_heads / num_kv_heads,
-                qk_dim: head_dim,
-                v_dim: head_dim,
-                k_pos_stride: kv_stride,
-                k_head_stride: head_dim,
-                v_pos_stride: kv_stride,
-                v_head_stride: head_dim,
-                scale: 1.0,
-                window,
-            },
-        )
+        let shape = OnlineAttnShape {
+            rows,
+            start_pos: start_pos - first,
+            num_q_heads,
+            group_size: num_q_heads / num_kv_heads,
+            qk_dim: head_dim,
+            v_dim: head_dim,
+            k_pos_stride: kv_stride,
+            k_head_stride: head_dim,
+            v_pos_stride: kv_stride,
+            v_head_stride: head_dim,
+            scale: 1.0,
+            window,
+        };
+        if let Some(out) = m
+            .kernels
+            .attention_prefill_tiled(&self.device, q, &k, &v, &shape)?
+        {
+            return Ok(out);
+        }
+        self.attention_online(q, &k, &v, shape)
     }
 
     /// One Gemma 4 layer over `rows` positions starting at `start_pos`
@@ -546,6 +551,7 @@ impl Model {
         rows: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
+        prof: &mut Option<PrefillProfile>,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &m.cfg;
         let (hidden_size, eps) = (cfg.hidden_size, cfg.rmsnorm_eps);
@@ -561,8 +567,20 @@ impl Model {
                 .f32()?
         };
 
+        let global = !shape.sliding;
         let x = self.rmsnorm(&hidden, layer.attn_norm.f32()?, rows, hidden_size, eps)?;
         let q = self.gemma4_mm(&x, &layer.attn_q, rows)?;
+        let k_raw = self.gemma4_mm(&x, &layer.attn_k, rows)?;
+        let v_raw;
+        let v_src = match &layer.attn_v {
+            Some(w) => {
+                v_raw = self.gemma4_mm(&x, w, rows)?;
+                &v_raw
+            }
+            None => &k_raw,
+        };
+        prof_mark(prof, PrefillPhase::QkvGemm, global)?;
+
         let mut q = self.rmsnorm(&q, layer.attn_q_norm.f32()?, rows * nq, hd, eps)?;
         m.kernels.rope_ff(
             &mut q,
@@ -574,16 +592,6 @@ impl Model {
             shape.n_rot,
             shape.rope_base,
         )?;
-
-        let k_raw = self.gemma4_mm(&x, &layer.attn_k, rows)?;
-        let v_raw;
-        let v_src = match &layer.attn_v {
-            Some(w) => {
-                v_raw = self.gemma4_mm(&x, w, rows)?;
-                &v_raw
-            }
-            None => &k_raw,
-        };
         let v = self.rmsnorm(v_src, &m.ones, rows * nkv, hd, eps)?;
         let mut k = self.rmsnorm(&k_raw, layer.attn_k_norm.f32()?, rows * nkv, hd, eps)?;
         m.kernels.rope_ff(
@@ -596,6 +604,7 @@ impl Model {
             shape.n_rot,
             shape.rope_base,
         )?;
+        prof_mark(prof, PrefillPhase::NormRope, global)?;
 
         let kv_stride = nkv * hd;
         let range = start_pos * kv_stride..(start_pos + rows) * kv_stride;
@@ -605,23 +614,29 @@ impl Model {
         self.device
             .dtod_copy(&v, &mut v_cache.slice_mut(range))
             .map_err(|e| crate::gpu_err!(e, "gemma4 kv-cache dtod v: {e}"))?;
+        prof_mark(prof, PrefillPhase::KvCopy, global)?;
         let window = if shape.sliding { cfg.sliding_window } else { 0 };
-        let attn =
-            self.gemma4_attention(&q, k_cache, v_cache, nq, nkv, hd, start_pos, rows, window)?;
+        let attn = self.gemma4_attention(
+            m, &q, k_cache, v_cache, nq, nkv, hd, start_pos, rows, window,
+        )?;
+        prof_mark(prof, PrefillPhase::Attention, global)?;
         let o = self.gemma4_mm(&attn, &layer.attn_output, rows)?;
         let o = self.rmsnorm(&o, layer.post_attention_norm.f32()?, rows, hidden_size, eps)?;
         self.add_inplace(&mut hidden, &o)?;
+        prof_mark(prof, PrefillPhase::OProj, global)?;
 
         let y = self.rmsnorm(&hidden, layer.ffn_norm.f32()?, rows, hidden_size, eps)?;
         let gate = self.gemma4_mm(&y, &layer.ffn_gate, rows)?;
         let up = self.gemma4_mm(&y, &layer.ffn_up, rows)?;
         let act = m.kernels.gelu_tanh_and_mul(&self.device, &gate, &up)?;
         let f = self.gemma4_mm(&act, &layer.ffn_down, rows)?;
+        prof_mark(prof, PrefillPhase::Ffn, global)?;
         let f = self.rmsnorm(&f, layer.post_ffw_norm.f32()?, rows, hidden_size, eps)?;
         self.add_inplace(&mut hidden, &f)?;
         if layer.output_scale != 1.0 {
             m.kernels.scale(&mut hidden, layer.output_scale)?;
         }
+        prof_mark(prof, PrefillPhase::FfnTail, global)?;
         Ok(hidden)
     }
 
@@ -673,9 +688,19 @@ impl Model {
             self.attn_impl.max_positions(),
         )?;
         let mut caches = self.alloc_gemma4_kv_caches(m, rows + extra_headroom)?;
+        let mut prof = if prefill_profile_enabled() {
+            Some(PrefillProfile::start(&self.device)?)
+        } else {
+            None
+        };
         let mut hidden = self.gemma4_embed(m, &ids)?;
+        prof_mark(&mut prof, PrefillPhase::Embed, false)?;
         for ((shape, layer), (k, v)) in m.cfg.layers.iter().zip(&m.layers).zip(&mut caches) {
-            hidden = self.forward_gemma4_layer(m, shape, layer, hidden, 0, rows, k, v)?;
+            hidden =
+                self.forward_gemma4_layer(m, shape, layer, hidden, 0, rows, k, v, &mut prof)?;
+        }
+        if let Some(p) = prof {
+            p.report(&self.device, rows)?;
         }
         Ok((ids, hidden, caches, rows))
     }
@@ -690,7 +715,8 @@ impl Model {
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut hidden = self.gemma4_embed(m, &[token_id])?;
         for ((shape, layer), (k, v)) in m.cfg.layers.iter().zip(&m.layers).zip(caches) {
-            hidden = self.forward_gemma4_layer(m, shape, layer, hidden, position, 1, k, v)?;
+            hidden =
+                self.forward_gemma4_layer(m, shape, layer, hidden, position, 1, k, v, &mut None)?;
         }
         Ok(hidden)
     }
@@ -842,12 +868,26 @@ fn grid_stride_cfg(n: u64) -> LaunchConfig {
     }
 }
 
-/// The `kernels_cuda/gemma4.cu` kernels, loaded from one module.
+/// The `kernels_cuda/gemma4.cu` kernels, loaded from one module, and the
+/// tiled prefill attention kernels from `kernels_cuda/attention_tiled.cu`.
 pub(super) struct Gemma4Kernels {
     rope_ff: AotKernel,
     gelu_tanh_and_mul: AotKernel,
     softcap: AotKernel,
     scale: AotKernel,
+    attn_tiled_d256: AotKernel,
+    attn_tiled_d512: AotKernel,
+}
+
+/// `attention_tiled.cu`'s block size, and its query vectors per block for a
+/// head dim it has a kernel for.
+const ATTN_TILED_THREADS: u32 = 256;
+fn attn_tiled_queries_per_block(head_dim: usize) -> Option<usize> {
+    match head_dim {
+        256 => Some(64),
+        512 => Some(32),
+        _ => None,
+    }
 }
 
 impl Gemma4Kernels {
@@ -868,12 +908,83 @@ impl Gemma4Kernels {
             fns.next()
                 .ok_or_else(|| crate::reflex_err!(Cuda, "missing kernel in module gemma4"))
         };
+        let mut tiled = aot::load_kernel_module(
+            device,
+            include_bytes!(env!("REFLEX_KERNEL_ATTENTION_TILED")),
+            "attention_tiled",
+            &["attention_tiled_d256_kernel", "attention_tiled_d512_kernel"],
+        )?
+        .into_iter();
+        let mut next_tiled = || {
+            tiled
+                .next()
+                .ok_or_else(|| crate::reflex_err!(Cuda, "missing kernel in module attention_tiled"))
+        };
         Ok(Self {
             rope_ff: next()?,
             gelu_tanh_and_mul: next()?,
             softcap: next()?,
             scale: next()?,
+            attn_tiled_d256: next_tiled()?,
+            attn_tiled_d512: next_tiled()?,
         })
+    }
+
+    /// Batched-prefill attention with `attention_tiled.cu`, which reuses each
+    /// K/V tile across a block of query rows and the query heads of a GQA
+    /// group. `None` when the shape isn't one it covers (a single row, head
+    /// dims other than 256/512, `qk_dim != v_dim`, or a group size that
+    /// neither divides nor is a multiple of the queries per block); the
+    /// caller then uses [`Model::attention_online`]. Same layout, masking and
+    /// output as that kernel; only the f32 summation order differs.
+    pub(super) fn attention_prefill_tiled(
+        &self,
+        device: &Arc<CudaDevice>,
+        q: &CudaSlice<f32>,
+        k: &CudaView<f32>,
+        v: &CudaView<f32>,
+        s: &OnlineAttnShape,
+    ) -> Result<Option<CudaSlice<f32>>, ReflexError> {
+        let Some(m) = attn_tiled_queries_per_block(s.qk_dim) else {
+            return Ok(None);
+        };
+        let g = s.group_size;
+        if s.rows < 2
+            || s.v_dim != s.qk_dim
+            || g == 0
+            || !s.num_q_heads.is_multiple_of(g)
+            || !(m.is_multiple_of(g) || g.is_multiple_of(m))
+        {
+            return Ok(None);
+        }
+        let kernel = if s.qk_dim == 256 {
+            &self.attn_tiled_d256
+        } else {
+            &self.attn_tiled_d512
+        };
+        let heads_per_block = g.min(m);
+        let rows_per_block = m / heads_per_block;
+        let num_kv_heads = s.num_q_heads / g;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                s.rows.div_ceil(rows_per_block) as u32,
+                (num_kv_heads * (g / heads_per_block)) as u32,
+                1,
+            ),
+            block_dim: (ATTN_TILED_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut out = device
+            .alloc_zeros::<f32>(s.rows * s.num_q_heads * s.v_dim)
+            .map_err(|e| crate::gpu_err!(e, "attn_tiled alloc out: {e}"))?;
+        unsafe {
+            kernel
+                .function
+                .clone()
+                .launch(cfg, (q, k, v, &mut out, s.unsplit_params(), s.rows as u32))
+                .map_err(|e| crate::gpu_err!(e, "attn_tiled launch: {e}"))?;
+        }
+        Ok(Some(out))
     }
 
     /// NEOX RoPE with per-pair frequency factors, in place over `t`
