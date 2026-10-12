@@ -1,12 +1,14 @@
 # Design: Gemma 4 support (`gemma4`)
 
-**Status (2026-10-09): Phases 1-4 done; the 12B is verified, the 31B hasn't been run.**
+**Status (2026-10-11): Phases 1-5 done; the 12B and the 31B are verified.**
 On an RTX A40, Gemma 4 12B-it `Q8_0` generates the same greedy tokens as llama.cpp running
 with f32 activations, on 4/4 prompts of 20 tokens, including one past the 1,024-token
 sliding window. `system1` scores match llama.cpp's within 0.06. The first token comes
 1.45x sooner than with `llama-simple`. As a classifier, Gemma 4 suits warm mode
 (~74 ms per decision), not one process per decision (~2.1 s). See
-[Phase 4 results](#phase-4-results-2026-10-09).
+[Phase 4 results](#phase-4-results-2026-10-09). On an A100 80 GB, the 31B-it `Q8_0`
+(f16 weights) matches llama.cpp running fully in f32 on 5/5 prompts, up to 1,262
+tokens, and `system1` within 0.03. See [31B results](#31b-results-2026-10-11).
 
 Goal: run Google's Gemma 4 text models on Reflex. They are released under Apache 2.0.
 The target is `gemma-4-31B-it`, and development uses `gemma-4-12B-it`, which has the
@@ -147,7 +149,7 @@ and head dims up to 1024. New kernels:
    `system1` scores against llama.cpp's soft-capped logits, and a regression rerun of
    the existing models. Then cold-start and classifier benchmarks: cold `system1`, and
    warm `/v1/classify` p50/p95 for 1-token and multi-token labels.
-5. **31B**: in f16 on an 80 GB GPU. To fit a 24–48 GB card, `REFLEX_QUANT_RESIDENT=1`
+5. **31B** (done, see [31B results](#31b-results-2026-10-11)): in f16 on an 80 GB GPU. To fit a 24–48 GB card, `REFLEX_QUANT_RESIDENT=1`
    would have to be extended to this path, with a Q4_K_M file. ggml-org ships only
    Q4_0/Q8_0, which quantized-resident mode does not keep resident.
 
@@ -298,13 +300,87 @@ quality on a bare prompt is its own question: the instruction-tuned 12B scores
 " positive" (16.77) above " negative" (12.43) for that review, and llama.cpp gives the
 same scores.
 
-**Not done:** the 31B (61 GB in f16, so it needs an 80 GB card or quantized-resident
-support on this path), and a true cold-disk measurement.
+**Not done:** a true cold-disk measurement. (The 31B was run later; see
+[31B results](#31b-results-2026-10-11).)
+
+## 31B results (2026-10-11)
+
+ThunderCompute A100-SXM4-80GB (sm_80). Reflex was built from `46fcb29` with
+`REFLEX_CUDA_ARCH=sm_80`, and llama.cpp at `79e2e74`. Model: `gemma-4-31B-it-Q8_0.gguf`
+with `--weights f16` (about 61 GB on the GPU). The harness, including the llama.cpp
+reference program and the `LLAMA_NO_Q8` switch, is archived as
+`test-data/large-model-verify-src.tar.gz`. No code changed for the 31B.
+
+**The reference has to be fully f32.** llama.cpp with f32 activations alone (the 12B's
+reference) left a 0.54 gap on the top logit of the 982-token repeated-sentence prompt
+(Reflex 17.174, llama.cpp 17.718), though the greedy token was the same. The cause is on
+llama.cpp's side:
+
+| 982-token prompt, first-token logits | 236770 | 236832 |
+|---|---|---|
+| Reflex, f16 weights | **17.174** (top 1) | |
+| llama.cpp, f32 activations, flash attention (f16) | 17.718 | 17.589 |
+| llama.cpp, f32 activations, no flash attention, f16 KV | 17.322 | **17.391** (top 1) |
+| llama.cpp, f32 activations, no flash attention, f32 KV | **17.162** | 16.865 |
+
+With flash attention on, llama.cpp ignores an f32 KV cache type, so the KV setting
+changes nothing until flash attention is off. Reflex keeps its KV cache in f32. Reflex's
+own f16 activation cast is not the cause: batched prefill (f16 activations into cuBLAS)
+and sequential prefill (f32 activations) agree on a 1,038-token prompt, top logit 16.344
+vs 16.333, rel L2 3.3e-3. So the reference for long Gemma 4 prompts is f32 activations
+**plus** an f32 KV cache with flash attention off.
+
+**Greedy tokens against that reference** (20 tokens each; both sides stop only at
+`<eos>`, see below):
+
+| Prompt | Fully-f32 llama.cpp | Stock llama.cpp |
+|---|---|---|
+| "The capital of France is" | 20/20 | 20/20 |
+| "Once upon a time" | 20/20 | 20/20 |
+| Chat-format question | 17/17 (through `<eos>`) | 17/17 |
+| 982 tokens | 20/20 | differs at token 1 |
+| 1,262 tokens (past the 1,024 window) | 20/20 | 20/20 |
+| 2,641-token natural prompt (the start of llama.cpp's README) | 10/10, top logit 20.054 vs 20.020 | differs at token 1 (a 0.05 near-tie) |
+
+On the repeated-sentence prompts the remaining top-logit gaps are up to 0.34 (1,262
+tokens); on the natural prompt it is 0.03. These degenerate prompts are unusually
+sensitive: llama.cpp moves by 0.5 between its own attention paths on them.
+
+**Stop tokens.** `reflex check`/`generate` stop only at `eos_token_id` (`<eos>` = 1).
+llama.cpp stops at any end-of-generation token, including `<turn|>` (106). Compare with
+EOS-only stopping on llama.cpp's side, or the chat prompt looks like a 6-token answer
+there and a 17-token one in Reflex.
+
+**`system1`**, against llama.cpp's logit sums on the same tokens (all candidate token ids
+identical):
+
+| Prompt | Candidate | Reflex | Fully-f32 llama.cpp |
+|---|---|---|---|
+| "The capital of France is" | " Paris" (1 token) | 27.254 | 27.257 |
+| | " London" (1) | 7.566 | 7.568 |
+| | " the city of Paris" (4) | 101.715 | 101.718 |
+| | " Rome, Italy" (3) | 43.314 | 43.343 |
+| "Review: The battery died after two days. Sentiment:" | " positive" (1) | 4.284 | 4.281 |
+| | " negative" (1) | 18.771 | 18.760 |
+| | " very positive" (2) | 25.288 | 25.277 |
+| | " mixed feelings" (2) | 16.615 | 16.618 |
+
+**GPU tests** with `REFLEX_GEMMA4_GGUF` pointing at the 31B:
+`gemma4_model_batched_prefill_matches_sequential`, `gemma4_model_system1_scores_match_full_logits`
+and `gemma4_model_generates_without_error` pass. Run them with `--test-threads=1`: in
+parallel, two 61 GB loads exhaust the 80 GB card and one test fails.
+
+**Timings** (same host, file in page cache, median of 3, wall time launch to exit):
+Reflex 15.0 s to the first token vs `llama-simple` 19.0 s. ThunderCompute attaches the
+GPU over the network, and loading 61 GB dominates both, so only the ratio means anything;
+these numbers don't compare with the A40's.
 
 ## Risks
 
 - **f16 activation range.** Resolved on the 12B: the largest prefill activation was
-  2,063, and none were clamped (Phase 4). Re-check on the 31B. The fallback is still
+  2,063, and none were clamped (Phase 4). On the 31B, batched prefill (f16 activations)
+  agrees with sequential prefill (f32) to rel L2 3.3e-3, and tokens match the fully-f32
+  llama.cpp, so the cast does no visible harm there either. The fallback is still
   `--weights f32`, but the 12B in f32 (about 48 GB) doesn't fit a 48 GB card.
 - **VRAM.** 12B in f16 is about 24 GB, so it needs a 48 GB card. 31B in f16 is about
   61 GB, so it needs 80 GB. On top of that comes the KV cache: f32, sized to
