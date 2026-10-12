@@ -382,6 +382,79 @@ Reflex 15.0 s to the first token vs `llama-simple` 19.0 s. ThunderCompute attach
 GPU over the network, and loading 61 GB dominates both, so only the ratio means anything;
 these numbers don't compare with the A40's.
 
+## Long-prompt prefill (2026-10-12)
+
+Runpod RTX A40 (sm_86), Reflex `8485f1c` built with `REFLEX_CUDA_ARCH=sm_86`, llama.cpp
+`79e2e74`. The 12B ran with f16 weights and the 31B with `REFLEX_QUANT_RESIDENT=1`. The
+prompts are llama.cpp's `README.md` followed by `docs/build.md`, cut by bytes. Rows are
+the actual token counts.
+
+**Measured with `REFLEX_PREFILL_PROFILE=1`.** This records a timing event at every phase
+boundary of `forward_gemma4_layer` and prints GPU ms per phase for sliding and global
+layers, plus the host enqueue time and the wall time. Off by default.
+
+**Prefill time** (GPU total, second run of two; the two runs agree within 1%):
+
+| Tokens | 12B Reflex | 12B llama.cpp (FA / no FA / f32 ref) | 31B Reflex | 31B llama.cpp (FA / no FA / f32 ref) |
+|---|---|---|---|---|
+| 246 | 0.49 s | 0.10 / 0.10 / 0.27 s | 1.41 s | 0.20 / 0.22 / 0.60 s |
+| 502 | 1.01 s | 0.17 / 0.18 / 0.40 s | 2.63 s | 0.39 / 0.42 / 0.89 s |
+| 1,184 | 2.85 s | 0.41 / 0.46 / 1.04 s | 7.45 s | 0.93 / 1.06 / 2.37 s |
+| 2,110 | 5.99 s | 0.73 / 0.83 / 1.83 s | 15.5 s | 1.68 / 1.95 / 4.21 s |
+| 2,763 | 8.75 s | 0.94 / 1.09 / 2.29 s | | 2.19 / 2.57 / 5.24 s |
+| 3,713 | 13.4 s | 1.27 / 1.50 / 3.12 s | 33.1 s | 2.98 / 3.52 / 7.15 s |
+
+llama.cpp is `llama-bench -n 0 -r 2`. FA and no FA are stock builds, with 8-bit
+activations. "f32 ref" is the reference Reflex is checked against: `LLAMA_NO_Q8=1`,
+`GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32`, no flash attention. Its KV cache is f16, because
+llama-bench has no f32 KV option.
+
+**Where the time goes** (12B; sliding + global layers):
+
+| Tokens | RMSNorm (hidden width) | Attention | Everything else | Host enqueue / wall |
+|---|---|---|---|---|
+| 246 | 330 ms (68%) | 45 ms (9%) | 112 ms | 300 / 492 ms |
+| 502 | 676 ms (67%) | 165 ms (16%) | 173 ms | 614 / 1,018 ms |
+| 1,184 | 1,572 ms (55%) | 863 ms (30%) | 418 ms | 1,799 / 2,866 ms |
+| 2,110 | 2,835 ms (47%) | 2,435 ms (41%) | 723 ms | 3,576 / 6,050 ms |
+| 2,763 | 3,803 ms (43%) | 4,079 ms (47%) | 865 ms | 5,477 / 8,779 ms |
+| 3,713 | 5,182 ms (39%) | 6,912 ms (52%) | 1,303 ms | 7,879 / 13,593 ms |
+
+The 31B splits the same way: RMSNorm 58-63% up to 502 tokens and 40% at 3,713;
+attention 8% rising to 52%.
+
+The RMSNorm figure is four times the `ffn_tail` phase. That phase is one full-width
+RMSNorm (`post_ffw_norm`) plus an add and a scale, which cost about 0.2 ms each. Each
+layer runs four full-width norms (`attn_norm`, `post_attention_norm`, `ffn_norm`,
+`post_ffw_norm`), and each of the other three sits in one of the other phases.
+
+Findings:
+
+1. **RMSNorm is the largest cost up to ~2,000 tokens, and it isn't Gemma-specific.**
+   `rmsnorm_kernel` (`src/kernels_cuda/rmsnorm.cu`) runs one thread per *output
+   element*, and each thread recomputes its row's whole sum of squares. A
+   `[rows, hidden]` norm therefore does `rows × hidden²` loads instead of `rows × hidden`.
+   At hidden 3,840 that is ~20 ms per norm at 2,763 rows (12B), and 3.8 s of the 8.75 s
+   prefill. Every architecture uses this kernel, so their prefills pay the same cost.
+   The per-head Q/K/V norms (width 256/512) cost much less: 185 ms at 2,763 rows,
+   including RoPE. This also explains why prefill was ~2 ms per token even at 449
+   tokens.
+2. **Attention takes the lead past ~2,000 tokens.** The online kernel gives every
+   (query row, head) pair its own block, with no reuse of K/V across rows or across the
+   q heads that share a KV head. Global layers suffer most: 16 q heads read the one KV
+   head separately, at head dim 512. At 3,713 tokens a global layer's attention costs
+   496 ms, against 74 ms for a sliding one.
+3. **The sliding window is applied (suspect b).** The kernel starts each row at
+   `seq_len − window`. Sliding-layer attention grows ~2x from 2,110 to 3,713 tokens; the
+   full quadratic would be 3.1x.
+4. **Host work, syncs and the KV cache are not the cause (suspects c and d).** GPU time
+   accounts for the whole wall time. The host enqueue time is large only because the
+   launch queue fills and the host waits on the GPU. The KV-cache copies take 9 ms at
+   3,713 tokens, and the embedding gather 30-40 ms.
+5. **The GEMMs are fine.** Everything other than norms and attention takes 0.87 s at
+   2,763 tokens on the 12B, about 45% of the A40's f16 tensor-core peak, close to
+   llama.cpp's whole prefill (0.94 s).
+
 ## Risks
 
 - **f16 activation range.** Resolved on the 12B: the largest prefill activation was
