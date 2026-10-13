@@ -5,6 +5,27 @@ What has been built, in order. Measurements live in
 
 ## 2026-10-12
 
+- **Tokenizer pre-types: `tokenizer.ggml.pre` is now read and checked.** Before this,
+  every `gpt2`-model GGUF got the Qwen2 split regex. A Llama-3 or DeepSeek file
+  therefore loaded and tokenized wrongly, with no error.
+  - New ports, each hand-ported from llama.cpp `79e2e74`: `llama-bpe` (Llama 3),
+    `deepseek-llm` (DeepSeek LLM, DeepSeek-V2/V2-Lite), `deepseek-v3`, `qwen35`
+    (Qwen3.5/3.8: letter runs also take combining marks) and `gpt-2`. They classify
+    characters with llama.cpp's own Unicode tables, transcribed into
+    `src/tokenizer_unicode.rs`. No new dependency.
+  - Unchanged: `qwen2` and `kolibri1`.
+  - Any other value fails to load, and the error names it. A missing key keeps the old
+    Qwen2 behavior.
+  - Each type matches `llama-tokenize` token for token on a 13-string tricky set. The
+    tests use tokenizer-only fixtures, made by the new `scripts/gguf_tokenizer_only.py`.
+  - `reflex check` on an RTX 3090 (every fixture plus Qwen3-0.6B) is unchanged on 29 of
+    30 rows, logit checksums included. The 30th is `tiny-qwen3moe` (`gpt-2`) on the
+    long prompt, whose prompt ids now match `llama-tokenize`.
+  - Known gap, unchanged on purpose: the `qwen2` split still disagrees with llama.cpp on
+    Arabic harakat.
+
+  Details: [docs/design/tokenizer-pre-types.md](docs/design/tokenizer-pre-types.md).
+
 - **Runpod Hub release `v0.2.6-runpod-hub`.** Rebuilds the Hub worker from current
   `master`, so the classifier gets the bit-identical `rmsnorm_kernel` fix below: faster
   prefill, same outputs. The image, the baked Qwen3-0.6B-Q8_0 model, `hub.json` and

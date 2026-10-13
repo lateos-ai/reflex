@@ -28,6 +28,7 @@ pub mod moe;
 pub mod python;
 pub mod sampling;
 pub mod tokenizer;
+mod tokenizer_unicode;
 
 /// Terminates the process immediately via the raw `_exit` syscall, skipping
 /// libc's `atexit` handlers -- notably the CUDA driver's own registered

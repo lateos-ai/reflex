@@ -3749,3 +3749,75 @@ What was learned, beyond the numbers:
 
 The pending MLA golden-token re-check (`add_bos_token`) was closed on the same host: 8/8
 against llama.cpp, first token still `94216`/`" NavLink"`.
+
+### Tokenizer pre-types: `tokenizer.ggml.pre` read and validated (2026-10-12)
+
+Architecture coverage round 2, phase 1 (branch `tokenizer-pre-types`). `Tokenizer::from_gguf`
+never read `tokenizer.ggml.pre`, so every `gpt2`-model vocab got the Qwen2 split regex. Now
+the value maps to a `PreType` enum:
+- **Unchanged**: `qwen2`, `kolibri1` and a missing key keep the old Qwen2 code.
+- **New ports**: `qwen35`, `llama-bpe`, `gpt-2`, `deepseek-llm` and `deepseek-v3`,
+  hand-ported from llama.cpp `79e2e74`.
+- **Rejected**: anything else, with an error that names the value.
+
+Design and how to add a type: `docs/design/tokenizer-pre-types.md`.
+
+**Step 0 survey** (header range requests plus test-data/). It found two latent bugs besides
+the one being fixed:
+- **`qwen35`** (Qwen3.5-0.8B, Qwen3.8-27B, `tiny-qwen35moe`) has its own llama.cpp
+  splitter. Letter runs are `[\p{L}\p{M}]+`, so it differs from Qwen2 on combining marks.
+- **`gpt-2`** (`tiny-qwen3moe`'s hand-built tokenizer) uses the original GPT-2 regex.
+- **Real DeepSeek-V2-Lite** reports `deepseek-llm`, not Qwen2-compatible (its A100
+  re-verify is queued in STATUS.md).
+- **The synthetic MLA fixture** reports `qwen2`.
+
+The user chose to port `qwen35` and `gpt-2` as well.
+
+**Implementation.**
+- llama.cpp runs `qwen35`/`llama3`/`gpt2` through hand-written splitters
+  (`unicode_regex_split_custom_*`). These are ported line for line as step functions.
+- It runs the DeepSeek regex lists through `std::regex`, each regex over every previous
+  piece, with "collapsed" category text or with non-ASCII whitespace replaced by `\x0B`.
+  `split_stl` emulates `regex_iterator`, and each regex is a hand-written matcher.
+- All new splits classify with llama.cpp's own tables (`unicode_ranges_flags`,
+  `unicode_set_whitespace`), generated into `src/tokenizer_unicode.rs` by
+  `scripts/gen_unicode_tables.py` (2,273 ranges). Rust's std has no `\p{P}`/`\p{S}`/`\p{M}`,
+  and its `is_alphabetic` isn't `\p{L}`.
+- `llama-bpe` also gets llama.cpp's `ignore_merges`.
+
+**Verification.**
+- **Fixtures**: tokenizer-only GGUFs (metadata plus an empty tensor table) from 40 MB
+  heads. `scripts/gguf_tokenizer_only.py` reproduces `kolibri1-tokenizer.gguf` byte for
+  byte.
+- **Golden ids**: a CPU `llama-tokenize` at `79e2e74`, built in local Docker (no pod
+  needed), run over 13 tricky strings.
+  - `llama-bpe`, `deepseek-llm`, `deepseek-v3`, `qwen35` and `gpt-2`: 13/13 each.
+  - `qwen2` (Qwen3-0.6B): 12/13, the known gap below.
+  - Recipe and raw output: `test-data/tokenizer-pre-types-src.tar.gz`.
+- **Host prediction**: the `reg.sh` regression prompts tokenize identically on master and
+  the branch for every fixture, except `tiny-qwen3moe` on the 1,352-byte prompt. There
+  the branch's ids equal `llama-tokenize`'s and master's don't.
+- **GPU** (Runpod community RTX 3090, $0.22/h, about 25 min, both binaries built on the
+  same pod): 29/30 `reflex check` rows are identical, including logit checksums. The 30th
+  is that same `tiny-qwen3moe` row. Full `cargo test` (host) passes, and clippy is clean.
+
+What was learned:
+1. **Unicode normalization silently corrupted a ported regex.**
+   - Copying DeepSeek-LLM's Latin class through tool output NFC-normalized U+212A KELVIN
+     SIGN to ASCII `K` (`K-ℭ` then covered `[`, `{`, `]`, `}`) and U+1F7D to U+03CE (an
+     inverted range).
+   - The only symptom was one merge on `" {[<>]}"`, 12/13 instead of 13/13. Diagnosed
+     by checking split vs merge separately (a BPE trace showed the correct merges gave
+     llama.cpp's answer, so the split had to be wrong), then printing the stage-by-stage
+     pieces.
+   - Fix: the six NFC-unstable codepoints are now `\u{..}` escapes, written by a script
+     straight from the upstream bytes, plus a test that guards the class.
+2. **The original Qwen2 port has a real, small gap.** Rust's `is_alphabetic` counts
+   Arabic harakat (Mn, Other_Alphabetic) as letters. It was left unchanged so reading
+   pre types didn't move any `qwen2` output. Switching it is queued as a decision.
+3. **Harness gotchas.**
+   - The Bash tool collapses backslashes even inside quoted heredocs, so put scripts
+     with escapes in files.
+   - A multi-file GGUF head's `split.*` keys make `llama-tokenize` look for the other
+     shards; drop them.
+   - Piping `tar` over the pod's SSH failed; scp worked.
