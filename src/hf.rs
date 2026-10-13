@@ -10,9 +10,8 @@ use hf_hub::api::sync::Api;
 use std::path::{Path, PathBuf};
 
 /// `general.architecture == "qwen3"` (dense), confirmed against
-/// `crate::model::parse_model_config`'s architecture check before picking this --
-/// a Qwen2.5 GGUF would be rejected by that check, so this must stay a `qwen3`
-/// checkpoint. Same model family as this project's own most-exercised local test
+/// `crate::model::parse_model_config`'s architecture check before picking this.
+/// Same model family as this project's own most-exercised local test
 /// fixture. `Qwen3-0.6B-Q8_0.gguf` is 639MB, so `--quickstart`'s "~60 seconds" is a
 /// best-effort, network-speed-dependent target, not a guarantee -- documented in
 /// the CLI usage text, not silently assumed.
@@ -111,8 +110,8 @@ mod tests {
         );
 
         // The actual model-compatibility check this constant choice depends on:
-        // `crate::model::parse_model_config` only accepts `general.architecture ==
-        // "qwen3"` (or an MoE architecture) -- confirm the real downloaded file
+        // `crate::model::parse_model_config` accepts `general.architecture ==
+        // "qwen3"` (among others) -- confirm the real downloaded file
         // reports exactly that, independent of any GPU/CUDA availability.
         let file = crate::gguf::GgufFile::open(&path).expect("downloaded GGUF should parse");
         let architecture = file

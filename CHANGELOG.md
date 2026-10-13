@@ -3,6 +3,40 @@
 What has been built, in order. Measurements live in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+## 2026-10-13
+
+- **Qwen2 / Qwen2.5 (`qwen2`), including Qwen2.5-Math and Qwen2.5-Coder.** These run on
+  the dense path. The new piece is Qwen2's Q/K/V projection biases, added right after
+  each projection and before RoPE, as llama.cpp's `build_qkv` does. Batched prefill
+  adds them with the existing `add_kernel`, which now broadcasts one row over many.
+  Residual adds don't change and give bit-identical results.
+  - `--weights f16|f32`, `REFLEX_QUANT_RESIDENT=1`, `--lora`, `--export-kv`/`--import-kv`
+    and `system1` all work, through the existing dense code.
+  - ChatML, the Math prompt and Coder's FIM and repo tokens (`<|fim_prefix|>`,
+    `<|file_sep|>`, ...) tokenize as single special tokens, matching `llama-tokenize`.
+  - Rejected at load, with the tensor or key named: YaRN `rope.scaling`,
+    `attn_output.bias`, `output.bias`, a fused `attn_qkv`, and a partial or misshapen
+    bias set. The output-bias and fused-QKV checks cover every dense architecture.
+    `qwen2moe` used to pass the generic MoE check and would have run without its shared
+    expert. Any MoE file with shared-expert tensors is now rejected.
+  - Tests: config parsing of five real Qwen2.5 headers (0.5B, 1.5B, Math, Coder ×2),
+    rejections, and a synthetic `tiny-qwen2` fixture plus LoRA, both converted with
+    llama.cpp's own converters, with greedy golden ids from llama.cpp.
+
+  Details: [docs/design/qwen2.md](docs/design/qwen2.md).
+
+- **`qwen2` tokenizer split now uses llama.cpp's Unicode tables.** It was the last pre
+  type still classifying characters with Rust's `is_alphabetic`/`is_numeric`, which
+  count Arabic harakat as letters. It now runs llama.cpp's
+  `unicode_regex_split_custom_qwen2` port, like every other pre type. Output changes only
+  on text whose characters the two disagree on, such as combining marks.
+  - Qwen2 golden test vs `llama-tokenize`: 12/13 -> 13/13.
+  - Kolibri-1 (`kolibri1`, same split): unchanged against HF `tokenizers`, including two
+    new Arabic and Devanagari strings.
+  - The `reflex check` prompts tokenize identically on every fixture.
+
+  Details: [docs/design/tokenizer-pre-types.md](docs/design/tokenizer-pre-types.md#resolved-the-original-qwen2-port).
+
 ## 2026-10-12
 
 - **Tokenizer pre-types: `tokenizer.ggml.pre` is now read and checked.** Before this,

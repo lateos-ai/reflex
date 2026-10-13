@@ -8,7 +8,7 @@ use super::*;
 use crate::gguf::GgufFile;
 use std::io::Write;
 
-enum Val {
+pub(super) enum Val {
     U32(u32),
     F32(f32),
     Bool(bool),
@@ -16,24 +16,24 @@ enum Val {
     Bools(Vec<bool>),
 }
 
-struct Header {
-    kv: Vec<(String, Val)>,
+pub(super) struct Header {
+    pub(super) kv: Vec<(String, Val)>,
     /// (name, shape); every tensor is declared F32 with no data -- the config
     /// parser only reads shapes.
-    tensors: Vec<(String, Vec<u64>)>,
+    pub(super) tensors: Vec<(String, Vec<u64>)>,
 }
 
 impl Header {
-    fn set(&mut self, key: &str, val: Val) {
+    pub(super) fn set(&mut self, key: &str, val: Val) {
         self.kv.retain(|(k, _)| k != key);
         self.kv.push((key.to_string(), val));
     }
 
-    fn remove(&mut self, key: &str) {
+    pub(super) fn remove(&mut self, key: &str) {
         self.kv.retain(|(k, _)| k != key);
     }
 
-    fn open(&self) -> GgufFile {
+    pub(super) fn open(&self) -> GgufFile {
         fn string(buf: &mut Vec<u8>, s: &str) {
             buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
@@ -86,7 +86,7 @@ impl Header {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "reflex_kolibri_cfg_test_{}_{}.gguf",
+            "reflex_cfg_test_{}_{}.gguf",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
