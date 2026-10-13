@@ -443,14 +443,14 @@ pub(super) fn parse_hybrid_moe_config(
 }
 
 /// Derives [`MlaConfig`] and the layer count from a GGUF file's `deepseek2.*`
-/// metadata. Scope narrowed to real DeepSeek-V2/V3 files' actual shape (confirmed
-/// against a real `DeepSeek-V2-Lite` GGUF's metadata while extending this from the
-/// MVP-step-4 synthetic-fixture-only version): dense-lead + MoE-with-shared-expert
-/// FFN, `is_lite`-style direct `wq` (no Q-LoRA), and YaRN RoPE scaling are all
-/// supported now. Still hard-errors (matching the hybrid path's MTP rejection
-/// precedent) on: Q-LoRA query decomposition (`attention.q_lora_rank` present and
-/// nonzero -- no real small file needing this has been seen yet), MTP/NextN
-/// blocks, and any RoPE scaling type other than `"none"`/`"yarn"`.
+/// metadata, following llama.cpp `79e2e74`'s `llama_model_deepseek2::load_arch_hparams`/
+/// `load_arch_tensors` and `build_moe_ffn`. Supported: dense-lead + MoE-with-shared-expert
+/// FFN, direct `wq` or Q-LoRA queries, softmax or sigmoid (DeepSeek-V3) gating with an
+/// optional `exp_probs_b` selection bias, `expert_weights_scale`/`expert_weights_norm`,
+/// and YaRN RoPE scaling. Hard-errors on: MTP/NextN blocks, all-MoE files,
+/// group-limited routing (`expert_group_count > 1`), other gating functions, attention
+/// temperature scaling, legacy unsplit `attn_kv_b` files, and any RoPE scaling type
+/// other than `"none"`/`"yarn"`. Survey and sources: `docs/design/mla-widening.md`.
 pub(super) fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usize), ReflexError> {
     let architecture = "deepseek2";
     let key = |suffix: &str| format!("{architecture}.{suffix}");
@@ -472,16 +472,24 @@ pub(super) fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usi
         .ok_or_else(|| crate::reflex_err!(Gguf, "missing {}", key("leading_dense_block_count")))?
         as usize;
 
-    if u64_meta(file, &key("attention.q_lora_rank"))
-        .filter(|&n| n > 0)
-        .is_some()
-    {
+    if f32_meta(file, &key("attention.temperature_scale")).is_some_and(|t| t != 0.0) {
         return Err(crate::reflex_err!(
-            Gguf,
-            "{} (Q-LoRA query decomposition) is not supported by this MVP",
-            key("attention.q_lora_rank")
+            UnsupportedArchitecture,
+            "{} (attention temperature tuning) is not supported",
+            key("attention.temperature_scale")
         ));
     }
+
+    // llama.cpp's vocab size for its per-model heuristics: `vocab_size`, else the
+    // token list's length.
+    let n_vocab = u64_meta(file, &key("vocab_size"))
+        .map(|n| n as usize)
+        .or_else(|| match file.metadata.get("tokenizer.ggml.tokens") {
+            Some(GgufValue::Array(items)) => Some(items.len()),
+            _ => None,
+        });
+
+    let q_lora_rank = parse_mla_q_lora_rank(file, block_count, n_vocab)?;
 
     let hidden_size = u64_meta(file, &key("embedding_length"))
         .ok_or_else(|| crate::reflex_err!(Gguf, "missing {}", key("embedding_length")))?
@@ -570,7 +578,11 @@ pub(super) fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usi
                 ))
             }
         };
-        let routed_scaling_factor = f32_meta(file, &key("expert_weights_scale")).unwrap_or(1.0);
+        // `build_moe_ffn` skips the scaling when the factor is 0 or 1, so both
+        // are stored as the no-op 1.0.
+        let routed_scaling_factor = f32_meta(file, &key("expert_weights_scale"))
+            .filter(|&s| s != 0.0)
+            .unwrap_or(1.0);
         // The converter only ever writes this key when the source model's
         // `norm_topk_prob` is truthy (see `MlaMoeConfig`'s doc comment) -- absence
         // means "don't renormalize", not "assume the usual true default".
@@ -578,11 +590,34 @@ pub(super) fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usi
             file.metadata.get(&key("expert_weights_norm")),
             Some(GgufValue::Bool(true))
         );
+        let gating = parse_mla_gating(file, block_count, n_vocab)?;
+
+        let groups = u64_meta(file, &key("expert_group_count")).unwrap_or(0);
+        if groups > 1 {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "{} = {groups} (group-limited expert routing) is not supported",
+                key("expert_group_count")
+            ));
+        }
+
+        let has_exp_probs_b = file
+            .tensor_info(&format!("blk.{leading_dense}.exp_probs_b.bias"))
+            .is_some();
+        if has_exp_probs_b && gating == MlaGating::Softmax {
+            // llama.cpp would add it to the softmax probabilities; no file does that.
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "deepseek2 file has exp_probs_b with softmax gating, which is not supported"
+            ));
+        }
         Some(MlaMoeConfig {
             expert_used_count,
             n_ff_exp,
             routed_scaling_factor,
             normalize_top_k,
+            gating,
+            has_exp_probs_b,
         })
     } else {
         None
@@ -674,12 +709,100 @@ pub(super) fn parse_mla_config(file: &GgufFile) -> Result<(MlaConfig, usize, usi
             ffn_hidden_size,
             rope_base,
             rmsnorm_eps,
+            q_lora_rank,
             moe,
             yarn,
         },
         block_count,
         leading_dense,
     ))
+}
+
+/// llama.cpp's `is_lite` test in `llama_model_deepseek2::load_arch_hparams`: for
+/// these layer counts (DeepSeek-V2-Lite, GigaChat3-10B, Kanana-2-30B) it never reads
+/// `attention.q_lora_rank`.
+fn mla_is_lite(n_layer: usize, n_vocab: Option<usize>) -> bool {
+    n_layer == 27 || n_layer == 26 || (n_layer == 48 && n_vocab == Some(128256))
+}
+
+/// Which query projection an MLA file uses: `Some(rank)` for Q-LoRA (`attn_q_a` ->
+/// `attn_q_a_norm` -> `attn_q_b`), `None` for a direct `attn_q`. Decided by which
+/// tensors layer 0 has, as llama.cpp's graph does (`is_lite = layers[il].wq`),
+/// and cross-checked against `attention.q_lora_rank` where llama.cpp reads it.
+fn parse_mla_q_lora_rank(
+    file: &GgufFile,
+    block_count: usize,
+    n_vocab: Option<usize>,
+) -> Result<Option<usize>, ReflexError> {
+    let rank_key = "deepseek2.attention.q_lora_rank";
+    let key_rank = u64_meta(file, rank_key).filter(|&n| n > 0);
+    let q_a = file.tensor_info("blk.0.attn_q_a.weight");
+    let q_direct = file.tensor_info("blk.0.attn_q.weight").is_some();
+    match (q_a, q_direct) {
+        (Some(_), true) => Err(crate::reflex_err!(
+            Gguf,
+            "deepseek2 file has both attn_q and attn_q_a/attn_q_b query projections"
+        )),
+        (None, false) => Err(crate::reflex_err!(
+            Gguf,
+            "deepseek2 file has neither attn_q nor attn_q_a/attn_q_b query projections"
+        )),
+        (None, true) => {
+            if let Some(rank) = key_rank {
+                if !mla_is_lite(block_count, n_vocab) {
+                    return Err(crate::reflex_err!(
+                        Gguf,
+                        "{rank_key} = {rank} but the file has a direct attn_q, not attn_q_a/attn_q_b"
+                    ));
+                }
+            }
+            Ok(None)
+        }
+        (Some(info), false) => {
+            let rank = match info.shape.as_slice() {
+                [_hidden, rank] => *rank as usize,
+                other => {
+                    return Err(crate::reflex_err!(
+                        Gguf,
+                        "blk.0.attn_q_a.weight has unexpected shape {other:?}"
+                    ))
+                }
+            };
+            if let Some(k) = key_rank {
+                if k as usize != rank {
+                    return Err(crate::reflex_err!(
+                        Gguf,
+                        "{rank_key} = {k} doesn't match blk.0.attn_q_a.weight's width {rank}"
+                    ));
+                }
+            }
+            Ok(Some(rank))
+        }
+    }
+}
+
+/// `deepseek2.expert_gating_func`, defaulted the way `load_arch_hparams` does when
+/// the key is absent: sigmoid for "GLM 4.7 Lite" (47 or 48 layers with a 154,880
+/// vocab -- ggml-org's and bartowski's GLM-4.7-Flash files carry no key), softmax
+/// for everything else (DeepSeek-V2/V2.5).
+fn parse_mla_gating(
+    file: &GgufFile,
+    block_count: usize,
+    n_vocab: Option<usize>,
+) -> Result<MlaGating, ReflexError> {
+    match expert_gating_func(file, "deepseek2") {
+        Some(GATING_SOFTMAX) => Ok(MlaGating::Softmax),
+        Some(GATING_SIGMOID) => Ok(MlaGating::Sigmoid),
+        Some(other) => Err(crate::reflex_err!(
+            UnsupportedArchitecture,
+            "deepseek2.expert_gating_func = {other} is not supported (only {GATING_SOFTMAX}, \
+             softmax, and {GATING_SIGMOID}, sigmoid, are implemented)"
+        )),
+        None if (block_count == 47 || block_count == 48) && n_vocab == Some(154880) => {
+            Ok(MlaGating::Sigmoid)
+        }
+        None => Ok(MlaGating::Softmax),
+    }
 }
 
 /// `qwen35moe`'s routing config, read from `qwen35moe.*` metadata by
@@ -700,9 +823,8 @@ pub(super) struct HybridMoeConfig {
 
 /// Shape/hyperparameter config for a DeepSeek-V2/V3 Multi-head Latent Attention
 /// (MLA) model (MVP step 4), read from the GGUF file's `deepseek2.*` metadata by
-/// `parse_mla_config`. Scope deliberately narrowed (see that function's doc
-/// comment): dense-only (no MoE FFN), no Q-LoRA query decomposition (`is_lite`-style
-/// direct `wq` only), no YaRN RoPE scaling, no MTP/NextN.
+/// `parse_mla_config` (see that function's doc comment for what is supported and
+/// what is rejected).
 pub(super) struct MlaConfig {
     pub(super) hidden_size: usize,
     pub(super) num_heads: usize,
@@ -726,6 +848,10 @@ pub(super) struct MlaConfig {
     pub(super) ffn_hidden_size: usize,
     pub(super) rope_base: f32,
     pub(super) rmsnorm_eps: f32,
+    /// `Some(q_lora_rank)` when queries go through Q-LoRA (`attn_q_a` ->
+    /// `attn_q_a_norm` -> `attn_q_b`, GLM-4.7-Flash and the full-size V2/V3),
+    /// `None` for a direct `attn_q` (the "lite" files).
+    pub(super) q_lora_rank: Option<usize>,
     /// `Some` iff this file has MoE layers past its dense-lead layers (a real
     /// DeepSeek-V2/V3 file always does; the synthetic MVP-step-4 test fixture is
     /// dense-only, so `None` there).
@@ -757,6 +883,22 @@ pub(super) struct MlaMoeConfig {
     /// struct's own doc comment for why the default differs from most other
     /// optional keys in this codebase).
     pub(super) normalize_top_k: bool,
+    /// Router gating function (see [`MlaGating`]).
+    pub(super) gating: MlaGating,
+    /// Whether the MoE layers carry an `exp_probs_b.bias` selection bias (sigmoid
+    /// gating only). Loaded host-side per layer (`MlaFfn::Moe::exp_probs_b`).
+    pub(super) has_exp_probs_b: bool,
+}
+
+/// An MLA file's router gating (`expert_gating_func`, defaulted as in
+/// `parse_mla_gating`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MlaGating {
+    /// DeepSeek-V2/V2.5: softmax over all experts, `crate::moe::route_top_k_with_norm`.
+    Softmax,
+    /// DeepSeek-V3, GigaChat3, GLM-4.7-Flash, Moonlight: sigmoid with an optional
+    /// selection bias, `crate::moe::route_sigmoid_bias`.
+    Sigmoid,
 }
 
 /// Precomputed YaRN RoPE-scaling parameters for MLA's `q_pe`/`k_pe` rotation
@@ -792,6 +934,20 @@ pub(super) struct MlaYarnConfig {
 /// `sigmoid(logits) + bias` and picks different experts whenever the bias is
 /// nonzero.
 pub(super) const KOLIBRI_GATING_SIGMOID_LOGIT_ADD: u64 = 5;
+
+/// llama.cpp's `LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX` (`src/llama-hparams.h`).
+pub(super) const GATING_SOFTMAX: u64 = 1;
+/// llama.cpp's `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID`: DeepSeek-V3's rule,
+/// `crate::moe::route_sigmoid_bias`.
+pub(super) const GATING_SIGMOID: u64 = 2;
+
+/// `{architecture}.expert_gating_func`, or `None` when the key is absent
+/// (llama.cpp's `LLAMA_EXPERT_GATING_FUNC_TYPE_NONE`, which each architecture
+/// then defaults its own way). Shared by `parse_kolibri_config` and
+/// `parse_mla_config`.
+pub(super) fn expert_gating_func(file: &GgufFile, architecture: &str) -> Option<u64> {
+    u64_meta(file, &format!("{architecture}.expert_gating_func")).filter(|&g| g != 0)
+}
 
 /// Shape/hyperparameter config for Aleph Alpha's Kolibri-1 (`kolibri1`), read
 /// from `kolibri1.*` metadata by [`parse_kolibri_config`]. Every layer is MoE
@@ -867,7 +1023,7 @@ pub(super) fn parse_kolibri_config(file: &GgufFile) -> Result<(KolibriConfig, us
         }
     }
 
-    let gating = u64_meta(file, &key("expert_gating_func")).ok_or_else(|| {
+    let gating = expert_gating_func(file, architecture).ok_or_else(|| {
         crate::reflex_err!(Gguf, "missing {} metadata key", key("expert_gating_func"))
     })?;
     if gating != KOLIBRI_GATING_SIGMOID_LOGIT_ADD {

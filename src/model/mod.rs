@@ -119,6 +119,8 @@ mod kolibri_forward_tests;
 #[cfg(test)]
 mod mla_batching_tests;
 #[cfg(test)]
+mod mla_config_tests;
+#[cfg(test)]
 mod moe_fixture_tests;
 #[cfg(test)]
 mod prefill_batching_tests;
