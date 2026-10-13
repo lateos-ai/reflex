@@ -367,7 +367,8 @@ impl Model {
     /// in place -- `crate::lora::load` does the host-side `B @ A` math and
     /// hands back a full-size delta per targeted tensor; this method only
     /// uploads each delta once and adds it in with the existing in-place-add
-    /// kernel (`add_k`, unchanged since Phase 2 round 2). No new kernel, and
+    /// kernel (`add_k`, launched directly with `m == n`; see
+    /// `Model::add_inplace`). No new kernel, and
     /// the forward pass itself is completely unmodified afterward -- exactly
     /// the "load-time adapter application, no runtime hot-swap multiplexer"
     /// scope README.md's Non-goals section commits this feature to.
@@ -483,7 +484,8 @@ impl Model {
             unsafe {
                 add_fn
                     .clone()
-                    .launch(launch_cfg, (&mut *w32, &delta_dev, n))
+                    // `add_kernel(a, b, n, m)`: m == n is the plain elementwise add.
+                    .launch(launch_cfg, (&mut *w32, &delta_dev, n, n))
                     .map_err(|e| {
                         crate::gpu_err!(e, "LoRA add launch for '{}': {e}", target.name)
                     })?;
