@@ -249,6 +249,16 @@ retitled, `.runpod/README.md`'s "Classifier caller contract" documents how to us
 packaging, doc and model-quant only. `v0.2.4-runpod-hub` is the adoption/Hub-refresh release
 (#16), not this one.
 
+**Update, 2026-10-12 (`v0.2.6-runpod-hub`):** an engine-only rebuild. `rmsnorm_kernel` now
+runs one block per row instead of recomputing each row's sum of squares in every thread,
+with the same summation order, so outputs are bit-identical. Classification scores and
+generated tokens can't change; only prefill gets faster. Measured on an RTX A40 with
+Qwen3-0.6B (f16 weights), warm prefill went 8.0 -> 7.2 ms at 29 tokens, 14.2 -> 10.6 ms at
+113 and 67.5 -> 53.9 ms at 449. The fix was GPU-verified on sm_86 only; the Hub's
+build-time `tests.json` run is the first check on the other fatbin architectures.
+`.runpod/Dockerfile`, `hub.json`, `handler.py`, `tests.json` and the baked model are
+unchanged.
+
 `iconUrl` in `hub.json` points at a real hosted asset (`.runpod/icon.jpg` on `master`), not
 the old `TODO:` placeholder. The GPU-selection fields in `hub.json`/`tests.json` are kept as
 advisory intent only (real evidence above shows the Hub test scheduler does not honor them).
