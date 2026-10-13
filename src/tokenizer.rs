@@ -22,13 +22,10 @@
 //! against its `llama-tokenize` on a tricky string set, one tokenizer-only
 //! fixture per pre type (`test_*_encode_matches_llama_tokenize_if_fixture_present`;
 //! Kolibri-1 is also checked against HF `tokenizers`). See
-//! docs/design/tokenizer-pre-types.md. One known gap: the original Qwen2
-//! port ([`qwen2_pretokenize_one`]) classifies characters with Rust's
-//! `is_alphabetic`/`is_numeric`/`is_whitespace`, which disagree with
-//! llama.cpp's Unicode tables on some combining marks (Arabic harakat), so
-//! `qwen2` vocabs can split such text differently from llama.cpp. It is kept
-//! as is so `qwen2` output didn't change when pre types started being read;
-//! every other pre type uses llama.cpp's tables (`crate::tokenizer_unicode`).
+//! docs/design/tokenizer-pre-types.md. Every split classifies codepoints
+//! with llama.cpp's own Unicode tables (`crate::tokenizer_unicode`), never
+//! Rust's `is_alphabetic`/`is_numeric`/`is_whitespace`: those disagree with
+//! the tables on combining marks such as Arabic harakat.
 
 use crate::error::ReflexError;
 use crate::gguf::{GgufFile, GgufValue};
@@ -112,7 +109,7 @@ fn parse_byte_fallback(tok: &str) -> Option<u8> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreType {
     /// `LLAMA_VOCAB_PRE_TYPE_QWEN2` (`qwen2`, `kolibri1`, or no `pre` key):
-    /// [`qwen2_pretokenize_one`]. Unchanged from before pre types were read.
+    /// one digit per piece (`\p{N}`), letter runs `\p{L}+`.
     Qwen2,
     /// `LLAMA_VOCAB_PRE_TYPE_QWEN35` (`qwen35`): Qwen2's split, but letter
     /// runs also take combining marks (`[\p{L}\p{M}]+`).
@@ -603,13 +600,13 @@ impl Tokenizer {
     /// Qwen3-0.6B GGUF's own metadata). Two real differences from
     /// [`Self::encode_sentencepiece`], not a small variation of it:
     ///
-    /// 1. **Regex-based pre-tokenization** ([`qwen2_pretokenize`]) splits
+    /// 1. **Regex-based pre-tokenization** ([`pretokenize`]) splits
     ///    `text` into maximal chunks *before* any BPE merging happens — a
-    ///    merge can never cross a pre-token boundary. Ported by hand (see
-    ///    that function's own doc for why: no `regex` crate dependency,
-    ///    matching this crate's established from-scratch-small-helper
-    ///    convention, e.g. [`Xorshift64`] over the `rand` crate) from the
-    ///    real llama.cpp `LLAMA_VOCAB_PRE_TYPE_QWEN2` pattern:
+    ///    merge can never cross a pre-token boundary. Ported by hand (no
+    ///    `regex` crate dependency, matching this crate's established
+    ///    from-scratch-small-helper convention, e.g. [`Xorshift64`] over the
+    ///    `rand` crate) from llama.cpp's splitters, e.g. the
+    ///    `LLAMA_VOCAB_PRE_TYPE_QWEN2` pattern:
     ///    `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`.
     /// 2. **Byte-to-unicode remapping** ([`gpt2_byte_to_unicode_table`]):
     ///    every raw UTF-8 byte of each pre-token is remapped through a fixed
@@ -624,26 +621,15 @@ impl Tokenizer {
     /// initial symbols are and how text gets split into independently-merged
     /// chunks first.
     ///
-    /// Step 1's split depends on `tokenizer.ggml.pre` ([`PreType`]): `qwen2`
-    /// (and `kolibri1`, and a missing key) keep [`qwen2_pretokenize_one`]
-    /// exactly as before pre types were read; every other accepted type goes
-    /// through [`pretokenize`]. Every split is checked against llama.cpp's
-    /// `llama-tokenize` (see the module doc for the one known `qwen2` gap).
+    /// Step 1's split depends on `tokenizer.ggml.pre` ([`PreType`], see
+    /// [`pretokenize`]). Every split is checked against llama.cpp's
+    /// `llama-tokenize`.
     fn encode_gpt2(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
         let chars: Vec<char> = text.chars().collect();
         let pre_type = self.pre_type.unwrap_or(PreType::Qwen2);
         let mut ids = Vec::new();
-        if pre_type == PreType::Qwen2 {
-            let mut i = 0;
-            while i < chars.len() {
-                let end = qwen2_pretokenize_one(&chars, i);
-                self.encode_gpt2_piece(&chars[i..end], false, &mut ids)?;
-                i = end;
-            }
-        } else {
-            for (start, end) in pretokenize(pre_type, &chars) {
-                self.encode_gpt2_piece(&chars[start..end], pre_type.ignore_merges(), &mut ids)?;
-            }
+        for (start, end) in pretokenize(pre_type, &chars) {
+            self.encode_gpt2_piece(&chars[start..end], pre_type.ignore_merges(), &mut ids)?;
         }
         Ok(ids)
     }
@@ -1007,193 +993,19 @@ fn gpt2_unicode_to_byte_table() -> &'static HashMap<char, u8> {
     })
 }
 
-/// `\p{L}` proxy: Rust's `char::is_alphabetic()` is Unicode-alphabetic-aware
-/// but not a byte-for-byte match to Unicode's `L*` general-category union —
-/// close enough for real text in the common case. Confirmed divergence from
-/// llama.cpp: Arabic harakat (Mn, Other_Alphabetic) count as letters here
-/// but not in llama.cpp's table (`test_qwen2_encode_matches_llama_tokenize_if_fixture_present`
-/// skips that string). Used only by the `qwen2` split, kept unchanged on
-/// purpose; the other pre types use [`CptFlags`].
-fn is_l(c: char) -> bool {
-    c.is_alphabetic()
-}
-
-/// `\p{N}` proxy — see [`is_l`]'s same caveat.
-fn is_n(c: char) -> bool {
-    c.is_numeric()
-}
-
-fn is_other(c: char) -> bool {
-    !c.is_whitespace() && !is_l(c) && !is_n(c)
-}
-
-/// Hand-ported equivalent of the real llama.cpp `LLAMA_VOCAB_PRE_TYPE_QWEN2`
-/// pre-tokenizer regex (see [`Tokenizer::encode_gpt2`]'s own doc for the
-/// exact pattern and citation) — no `regex` crate dependency (this crate's
-/// established convention, see [`Xorshift64`]). Returns the end index
-/// (exclusive) of the single maximal pre-token starting at `chars[start]`,
-/// by trying each of the pattern's 7 alternatives in the same left-to-right
-/// priority order a real regex engine's alternation would, taking whichever
-/// matches first. Always returns `> start` (falls back to consuming exactly
-/// one character if — this shouldn't be reachable for any real input, since
-/// alternative 4's `[^\s\p{L}\p{N}]+` alone already covers every character
-/// that isn't whitespace/letter/digit — none of the 7 alternatives match,
-/// which would otherwise loop forever).
-fn qwen2_pretokenize_one(chars: &[char], start: usize) -> usize {
-    match_contraction(chars, start)
-        .or_else(|| match_word(chars, start))
-        .or_else(|| match_digit(chars, start))
-        .or_else(|| match_other(chars, start))
-        .or_else(|| match_blank_lines(chars, start))
-        .or_else(|| match_whitespace_not_followed_by_nonspace(chars, start))
-        .or_else(|| match_whitespace_run(chars, start))
-        .unwrap_or(start + 1)
-}
-
-/// `(?i:'s|'t|'re|'ve|'m|'ll|'d)`
-fn match_contraction(chars: &[char], i: usize) -> Option<usize> {
-    if chars[i] != '\'' {
-        return None;
-    }
-    for suffix in ["s", "t", "re", "ve", "m", "ll", "d"] {
-        let end = i + 1 + suffix.len();
-        if end <= chars.len()
-            && chars[i + 1..end]
-                .iter()
-                .collect::<String>()
-                .eq_ignore_ascii_case(suffix)
-        {
-            return Some(end);
-        }
-    }
-    None
-}
-
-/// `[^\r\n\p{L}\p{N}]?\p{L}+`
-fn match_word(chars: &[char], i: usize) -> Option<usize> {
-    let mut j = i;
-    if is_l(chars[j]) {
-        // No optional leading char needed — the letter run starts here.
-    } else if chars[j] != '\r' && chars[j] != '\n' && !is_n(chars[j]) {
-        // Candidate optional leading char, only real if a letter follows.
-        if j + 1 < chars.len() && is_l(chars[j + 1]) {
-            j += 1;
-        } else {
-            return None;
-        }
-    } else {
-        return None;
-    }
-    if j >= chars.len() || !is_l(chars[j]) {
-        return None;
-    }
-    while j < chars.len() && is_l(chars[j]) {
-        j += 1;
-    }
-    Some(j)
-}
-
-/// `\p{N}` — exactly one digit character (Qwen2's own pattern, unlike
-/// original GPT-2's `\p{N}+`, deliberately does not group digit runs).
-fn match_digit(chars: &[char], i: usize) -> Option<usize> {
-    if is_n(chars[i]) {
-        Some(i + 1)
-    } else {
-        None
-    }
-}
-
-/// ` ?[^\s\p{L}\p{N}]+[\r\n]*`
-fn match_other(chars: &[char], i: usize) -> Option<usize> {
-    let mut j = i;
-    if chars[j] == ' ' && j + 1 < chars.len() && is_other(chars[j + 1]) {
-        j += 1;
-    }
-    let run_start = j;
-    while j < chars.len() && is_other(chars[j]) {
-        j += 1;
-    }
-    if j == run_start {
-        return None;
-    }
-    while j < chars.len() && (chars[j] == '\r' || chars[j] == '\n') {
-        j += 1;
-    }
-    Some(j)
-}
-
-/// `\s*[\r\n]+` — matches through the *last* newline in the contiguous
-/// whitespace run starting at `i` (see [`Tokenizer::encode_gpt2`]'s doc
-/// comment history / this function's own derivation: greedy `\s*` backtracks
-/// minimally, from the end, until `[\r\n]+` can match — the first such
-/// position is always the run's last newline character). `None` if that run
-/// contains no newline at all.
-fn match_blank_lines(chars: &[char], i: usize) -> Option<usize> {
-    if !chars[i].is_whitespace() {
-        return None;
-    }
-    let mut j = i;
-    while j < chars.len() && chars[j].is_whitespace() {
-        j += 1;
-    }
-    (i..j)
-        .rev()
-        .find(|&k| chars[k] == '\r' || chars[k] == '\n')
-        .map(|k| k + 1)
-}
-
-/// `\s+(?!\S)` — the whole contiguous whitespace run if it reaches
-/// end-of-input; otherwise the run minus its final character (that last
-/// whitespace char is left for the *next* scan position to combine with
-/// whatever non-whitespace follows, via [`match_word`]/[`match_other`]'s own
-/// "optional single leading char" branch — the real mechanism behind "one
-/// leading space glues to the following word, extra leading spaces don't").
-/// `None` for a length-1 run followed by non-whitespace (the `(?!\S)`
-/// lookahead can't be satisfied by a zero-length match), which correctly
-/// falls through to [`match_whitespace_run`] for that case.
-fn match_whitespace_not_followed_by_nonspace(chars: &[char], i: usize) -> Option<usize> {
-    if !chars[i].is_whitespace() {
-        return None;
-    }
-    let mut j = i;
-    while j < chars.len() && chars[j].is_whitespace() {
-        j += 1;
-    }
-    if j == chars.len() {
-        return Some(j);
-    }
-    if j - i >= 2 {
-        return Some(j - 1);
-    }
-    None
-}
-
-/// `\s+` — plain greedy whitespace run, the final fallback alternative.
-fn match_whitespace_run(chars: &[char], i: usize) -> Option<usize> {
-    if !chars[i].is_whitespace() {
-        return None;
-    }
-    let mut j = i;
-    while j < chars.len() && chars[j].is_whitespace() {
-        j += 1;
-    }
-    Some(j)
-}
-
 // ---------------------------------------------------------------------------
-// Pre-tokenizer splits for every [`PreType`] except `Qwen2`.
+// Pre-tokenizer splits, one per [`PreType`].
 //
-// Hand-ported (no `regex` crate, same convention as `qwen2_pretokenize_one`)
-// from llama.cpp `79e2e74`: the regex lists in `src/llama-vocab.cpp`'s
-// `llm_tokenizer_bpe` constructor, run the way `src/unicode.cpp`'s
-// `unicode_regex_split` runs them. Unlike the Qwen2 port above, these classify
+// Hand-ported (no `regex` crate) from llama.cpp `79e2e74`: the regex lists in
+// `src/llama-vocab.cpp`'s `llm_tokenizer_bpe` constructor, run the way
+// `src/unicode.cpp`'s `unicode_regex_split` runs them. They classify
 // codepoints with llama.cpp's own Unicode tables (`crate::tokenizer_unicode`,
 // generated from `src/unicode-data.cpp`) instead of Rust's `is_alphabetic`/
 // `is_numeric`/`is_whitespace`, which disagree with them on combining marks,
 // and std has no `\p{P}`/`\p{S}`/`\p{M}` at all. Two execution models, both
 // llama.cpp's:
-// - `qwen35`/`llama-bpe`/`gpt-2` have a hand-written splitter in llama.cpp
-//   (`unicode_regex_split_custom_{qwen35,llama3,gpt2}`), ported line for line
+// - `qwen2`/`qwen35`/`llama-bpe`/`gpt-2` have a hand-written splitter in
+//   llama.cpp (`unicode_regex_split_custom_{qwen2,qwen35,llama3,gpt2}`), ported line for line
 //   by [`split_custom`] + a step function. An unmatched codepoint becomes a
 //   one-codepoint piece.
 // - `deepseek-llm`/`deepseek-v3` are lists of regexes llama.cpp runs through
@@ -1264,15 +1076,16 @@ fn cpt_at(chars: &[char], end: usize, pos: usize) -> Option<char> {
     (pos < end).then(|| chars[pos])
 }
 
-/// Split `chars` into `(start, end)` pre-token ranges for `pre_type` (any
-/// type but `Qwen2`, which keeps its own loop in [`Tokenizer::encode_gpt2`]).
+/// Split `chars` into `(start, end)` pre-token ranges for `pre_type`.
 fn pretokenize(pre_type: PreType, chars: &[char]) -> Vec<(usize, usize)> {
     if chars.is_empty() {
         return Vec::new();
     }
     let whole = vec![(0, chars.len())];
     match pre_type {
-        PreType::Qwen2 => split_custom(chars, &whole, qwen2_step),
+        PreType::Qwen2 => split_custom(chars, &whole, |c, e, p| {
+            llama3_family_step(c, e, p, 1, false)
+        }),
         PreType::Qwen35 => split_custom(chars, &whole, |c, e, p| {
             llama3_family_step(c, e, p, 1, true)
         }),
@@ -1403,19 +1216,15 @@ fn ws_run_end(chars: &[char], end: usize, pos: usize) -> usize {
     run_end(chars, end, pos, |f| f.whitespace)
 }
 
-/// `unicode_regex_split_custom_qwen2`, as a [`split_custom`] step. Not used
-/// for encoding (the `Qwen2` path keeps [`qwen2_pretokenize_one`] and its
-/// Rust-std character classes, unchanged); kept so [`pretokenize`] is total.
-fn qwen2_step(chars: &[char], end: usize, pos: usize) -> usize {
-    qwen2_pretokenize_one(&chars[..end], pos)
-}
-
-/// `unicode_regex_split_custom_llama3` (`digits = 3`, `marks = false`) and
+/// `unicode_regex_split_custom_llama3` (`digits = 3`, `marks = false`),
+/// `unicode_regex_split_custom_qwen2` (`digits = 1`, `marks = false`) and
 /// `unicode_regex_split_custom_qwen35` (`digits = 1`, `marks = true`), one
-/// pre-token per call. Same structure as llama.cpp's, line for line:
+/// pre-token per call. Same structure as llama.cpp's, line for line (at
+/// `79e2e74` the three functions differ only in those two places):
 ///
 /// ```text
 /// llama3: (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// qwen2:  (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 /// qwen35: (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 /// ```
 ///
@@ -2147,26 +1956,39 @@ mod tests {
         assert!(Tokenizer::from_gguf(&file).is_err());
     }
 
-    /// Phase 21.14's own `qwen2_pretokenize_one` — pre-tokenizer boundary
-    /// checks against the real llama.cpp `LLAMA_VOCAB_PRE_TYPE_QWEN2` regex's
-    /// documented behavior (no GPU, no real fixture needed — pure host-side
-    /// function, same "test the algorithm in isolation" precedent as
-    /// `dequant.rs`'s own hand-computed-expected-value tests). Splits `text`
-    /// into pieces by repeatedly calling `qwen2_pretokenize_one`.
+    /// The `qwen2` split ([`pretokenize`] with [`PreType::Qwen2`]) — pre-tokenizer
+    /// boundary checks against the real llama.cpp `LLAMA_VOCAB_PRE_TYPE_QWEN2`
+    /// regex's documented behavior (no GPU, no real fixture needed — pure
+    /// host-side function, same "test the algorithm in isolation" precedent
+    /// as `dequant.rs`'s own hand-computed-expected-value tests). Also checks
+    /// the pieces tile `text` exactly.
     fn qwen2_pretokenize_all(text: &str) -> Vec<String> {
         let chars: Vec<char> = text.chars().collect();
-        let mut pieces = Vec::new();
-        let mut i = 0;
-        while i < chars.len() {
-            let end = qwen2_pretokenize_one(&chars, i);
-            assert!(
-                end > i,
-                "qwen2_pretokenize_one must always make forward progress"
-            );
-            pieces.push(chars[i..end].iter().collect::<String>());
-            i = end;
+        let ranges = pretokenize(PreType::Qwen2, &chars);
+        let mut pos = 0;
+        for &(start, end) in &ranges {
+            assert!(start == pos && end > start, "pieces must tile the text");
+            pos = end;
         }
-        pieces
+        assert_eq!(pos, chars.len(), "pieces must cover the whole text");
+        ranges
+            .into_iter()
+            .map(|(start, end)| chars[start..end].iter().collect())
+            .collect()
+    }
+
+    #[test]
+    fn test_qwen2_pretokenize_harakat_are_not_letters() {
+        // كَتَبَ: Arabic letters, each followed by a fatha (U+064E, Mn). In
+        // llama.cpp's table a fatha is an accent mark, not a letter, so it
+        // starts the next `[^\r\n\p{L}\p{N}]?\p{L}+` piece instead of
+        // extending the current letter run; the last one, with no letter
+        // after it, is a `[^\s\p{L}\p{N}]+` piece. Rust's `is_alphabetic`
+        // (the split this replaced) counted it as a letter, giving one piece.
+        assert_eq!(
+            qwen2_pretokenize_all("\u{643}\u{64e}\u{62a}\u{64e}\u{628}\u{64e}"),
+            vec!["\u{643}", "\u{64e}\u{62a}", "\u{64e}\u{628}", "\u{64e}"]
+        );
     }
 
     #[test]
@@ -2422,6 +2244,19 @@ mod tests {
             (
                 "Grüße 👋🏽 — naïve café, 日本語",
                 &[72678, 53615, 32, 36121, 139, 52651, 189, 14188, 68455, 39993, 44, 32, 80815, 71163],
+            ),
+            // Arabic with harakat and a superscript alef (U+0670), and
+            // Devanagari with vowel signs, virama and anusvara: combining
+            // marks, where llama.cpp's Unicode table and Rust's
+            // `is_alphabetic` disagree. Also matched by `llama-tokenize`
+            // with the Kolibri-1 patch (836d571).
+            (
+                "\u{628}\u{650}\u{633}\u{652}\u{645}\u{650} \u{627}\u{644}\u{644}\u{651}\u{64e}\u{647}\u{650} \u{627}\u{644}\u{631}\u{651}\u{64e}\u{62d}\u{652}\u{645}\u{64e}\u{670}\u{646}\u{650} \u{627}\u{644}\u{631}\u{651}\u{64e}\u{62d}\u{650}\u{64a}\u{645}\u{650}",
+                &[10622, 26824, 12833, 29960, 6725, 26824, 25691, 5010, 61766, 11659, 26824, 25691, 7565, 61766, 20431, 29960, 6725, 12759, 217, 176, 7274, 26824, 25691, 7565, 61766, 20431, 78144, 6725, 26824],
+            ),
+            (
+                "\u{928}\u{92e}\u{938}\u{94d}\u{924}\u{947} \u{926}\u{941}\u{928}\u{93f}\u{92f}\u{93e}, \u{92f}\u{939} \u{939}\u{93f}\u{902}\u{926}\u{940} \u{92e}\u{947}\u{902} \u{932}\u{93f}\u{916}\u{93e} \u{917}\u{92f}\u{93e} \u{939}\u{948}\u{964}",
+                &[30759, 41737, 42118, 65034, 18066, 74280, 39882, 30759, 78870, 11683, 44, 95958, 52334, 46870, 19463, 130, 58561, 23840, 45256, 56446, 84204, 19463, 150, 11683, 90279, 59460, 11683, 46870, 53804, 53789],
             ),
             (
                 "<|im_start|>user\nWie spät ist es in München?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nEs ist 14:30 Uhr.<|im_end|>",
@@ -2758,13 +2593,12 @@ mod tests {
     }
 
     /// Encode every [`PRE_TYPE_GOLDEN_STRINGS`] entry with the tokenizer in
-    /// `test-data/<file_name>` and compare with `golden` (skipping the
-    /// indices in `skip`). Skips the whole test if the fixture is absent.
+    /// `test-data/<file_name>` and compare with `golden`. Skips the whole
+    /// test if the fixture is absent.
     fn assert_pre_type_golden_if_fixture_present(
         file_name: &str,
         expected_pre: PreType,
         golden: &[&[u32]; PRE_TYPE_GOLDEN_STRINGS.len()],
-        skip: &[usize],
     ) {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("test-data")
@@ -2777,10 +2611,7 @@ mod tests {
         let tok = Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf");
         assert_eq!(tok.architecture, "gpt2");
         assert_eq!(tok.pre_type, Some(expected_pre));
-        for (i, (&text, &expected)) in PRE_TYPE_GOLDEN_STRINGS.iter().zip(golden).enumerate() {
-            if skip.contains(&i) {
-                continue;
-            }
+        for (&text, &expected) in PRE_TYPE_GOLDEN_STRINGS.iter().zip(golden) {
             let ids = tok
                 .encode(text)
                 .unwrap_or_else(|e| panic!("encode({text:?}) failed: {e}"));
@@ -2853,7 +2684,6 @@ mod tests {
                     101201, 35217, 449, 4960, 105029, 25, 24252, 106524, 125902, 108117, 101333,
                 ],
             ],
-            &[],
         );
     }
 
@@ -2918,7 +2748,6 @@ mod tests {
                     25, 55993, 88980, 21437, 147, 227, 78930, 88980, 41737, 147, 220, 12241,
                 ],
             ],
-            &[],
         );
     }
 
@@ -2978,7 +2807,6 @@ mod tests {
                     7088, 30805, 28, 1123, 52748, 9821, 2212, 61079, 14778,
                 ],
             ],
-            &[],
         );
     }
 
@@ -3038,7 +2866,6 @@ mod tests {
                     4700, 178848, 25, 22639, 164865, 28850, 150765, 150021,
                 ],
             ],
-            &[],
         );
     }
 
@@ -3100,17 +2927,13 @@ mod tests {
                     24333, 39848, 149, 233, 12919,
                 ],
             ],
-            &[],
         );
     }
 
-    /// `qwen2` (QWEN2), on `test-data/Qwen3-0.6B-Q4_K_M.gguf`: pins the Qwen2
-    /// split, which reading pre types must leave byte-identical. Index 12 is
-    /// skipped: the Qwen2 port classifies with Rust's `is_alphabetic`, which
-    /// counts Arabic harakat (Mn with Other_Alphabetic) as letters where
-    /// llama.cpp's table doesn't, so `llama-tokenize` splits that string
-    /// differently. A known, queued gap (see docs/design/tokenizer-pre-types.md),
-    /// not changed here so `qwen2` output stays what it was.
+    /// `qwen2` (QWEN2), on `test-data/Qwen3-0.6B-Q4_K_M.gguf`. Index 12
+    /// (Arabic with harakat, Devanagari) is what the table-based split fixed:
+    /// the Rust-`is_alphabetic` port it replaced counted harakat as letters
+    /// and missed it (see docs/design/tokenizer-pre-types.md, "Resolved").
     #[test]
     fn test_qwen2_encode_matches_llama_tokenize_if_fixture_present() {
         assert_pre_type_golden_if_fixture_present(
@@ -3163,7 +2986,6 @@ mod tests {
                     11071, 59397, 29825, 27910, 21360, 127837,
                 ],
             ],
-            &[12],
         );
     }
 }
