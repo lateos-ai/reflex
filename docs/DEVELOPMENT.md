@@ -266,6 +266,22 @@ in `test-data/` locally:
   (`curl -r 0-41943039`): it keeps the metadata bytes verbatim, writes an empty tensor
   table and drops a shard's `split.*` keys. Run on Kolibri-1's head, it reproduces
   `kolibri1-tokenizer.gguf` byte for byte.
+- `test-data/qwen2.5-*-header.gguf` (0.5B-Instruct, 1.5B-Instruct, Math-1.5B-Instruct,
+  Coder-1.5B-Instruct, and ggml-org's Coder `Q8_0`) are real Qwen2.5 GGUF headers made
+  with `scripts/gguf_tokenizer_only.py --keep-tensor-table`: metadata **and** tensor
+  table, no tensor data. `parse_model_config` and the tokenizer read them like the real
+  file (Reflex only bounds-checks tensor data when it reads it); llama.cpp won't load
+  them. They back the `qwen2` config tests and the Qwen2.5 special-token golden test.
+  Sources: [design/qwen2.md](design/qwen2.md).
+- `test-data/tiny-qwen2.gguf` is a synthetic `qwen2` model: 2 layers, hidden 64, 4 query
+  and 2 KV heads, tied embeddings, nonzero Q/K/V biases scaled so that dropping any one
+  of them changes every comparison prompt's greedy tokens, and the real
+  Qwen2.5-0.5B-Instruct tokenizer. `test-data/tiny-qwen2-lora.gguf` is a random LoRA on
+  its `q_proj`/`v_proj`/`down_proj`. Both were built by running hand-written, random
+  Hugging Face checkpoints through llama.cpp `79e2e74`'s unmodified
+  `convert_hf_to_gguf.py` and `convert_lora_to_gguf.py`; the golden greedy ids (with and
+  without the LoRA) come from llama.cpp `79e2e74`. Builders, prompts and reference tool:
+  `test-data/tiny-qwen2-src.tar.gz`.
 - `test-data/tiny-gemma4.gguf` is a synthetic `gemma4` model: 6 layers (2 global, without
   `attn_v`), random f32 weights, an 8-token sliding window and the real Gemma 4
   tokenizer, written directly with llama.cpp's `gguf-py` from the real 12B header's

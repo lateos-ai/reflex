@@ -1704,7 +1704,37 @@ impl Model {
         a: &mut CudaSlice<f32>,
         b: &CudaSlice<f32>,
     ) -> Result<(), ReflexError> {
+        self.launch_add(a, b, a.len())
+    }
+
+    /// Row-broadcast add: `a` is `[a.len() / b.len(), b.len()]` row-major and
+    /// every row gets `b` added (`add_kernel` with `m = b.len()`). Used for
+    /// Qwen2's Q/K/V biases in batched prefill.
+    pub(super) fn add_rows_inplace(
+        &self,
+        a: &mut CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+    ) -> Result<(), ReflexError> {
+        if b.is_empty() || !a.len().is_multiple_of(b.len()) {
+            return Err(crate::reflex_err!(
+                Other,
+                "add_rows_inplace: {} elements is not a whole number of {}-element rows",
+                a.len(),
+                b.len()
+            ));
+        }
+        self.launch_add(a, b, b.len())
+    }
+
+    /// `add_kernel`: `a[i] += b[i % m]` over all of `a`.
+    fn launch_add(
+        &self,
+        a: &mut CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        m: usize,
+    ) -> Result<(), ReflexError> {
         let n = a.len() as u32;
+        let m = m as u32;
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
         let launch_cfg = LaunchConfig {
@@ -1716,7 +1746,7 @@ impl Model {
             self.add_k
                 .function
                 .clone()
-                .launch(launch_cfg, (a, b, n))
+                .launch(launch_cfg, (a, b, n, m))
                 .map_err(|e| crate::gpu_err!(e, "add launch: {e}"))?;
         }
         Ok(())

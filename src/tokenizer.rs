@@ -2988,4 +2988,65 @@ mod tests {
             ],
         );
     }
+
+    /// Qwen2.5 special tokens, matched literally before BPE: ChatML, the
+    /// Qwen2.5-Math chain-of-thought prompt, Coder's FIM and repo-level FIM
+    /// tokens (`<|fim_prefix|>`/`<|fim_suffix|>`/`<|fim_middle|>`,
+    /// `<|repo_name|>`/`<|file_sep|>`, all CONTROL), the USER_DEFINED
+    /// `<tool_call>` markers, and near misses that must not match. Golden ids
+    /// from llama.cpp `79e2e74`'s `llama-tokenize --stdin --ids --no-bos`
+    /// (special tokens parsed, its default) on the tokenizer-only version of
+    /// the same file. `test-data/qwen2.5-0.5b-instruct-header.gguf`: header of
+    /// https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+    /// (HTTP range `bytes=0-41943039`, `scripts/gguf_tokenizer_only.py
+    /// --keep-tensor-table`); every Qwen2.5 GGUF surveyed has the same vocab
+    /// (docs/design/qwen2.md).
+    #[test]
+    fn test_qwen25_special_tokens_match_llama_tokenize_if_fixture_present() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test-data")
+            .join("qwen2.5-0.5b-instruct-header.gguf");
+        if !path.exists() {
+            eprintln!("Skipping Qwen2.5 special-token test: {path:?} not present");
+            return;
+        }
+        let file = GgufFile::open(&path).expect("open Qwen2.5 header");
+        let tok = Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf");
+        assert_eq!(tok.pre_type, Some(PreType::Qwen2));
+        assert_eq!(tok.prompt_bos(), None, "Qwen2.5 sets add_bos_token = false");
+        assert_eq!(tok.eos_token_id, Some(151_645));
+        let golden: &[(&str, &[u32])] = &[
+            (
+                "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello! How are you today?<|im_end|>\n<|im_start|>assistant\n",
+                &[151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465, 553, 54364, 14817, 13, 1446, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 9707, 0, 2585, 525, 498, 3351, 30, 151645, 198, 151644, 77091, 198],
+            ),
+            (
+                "<|im_start|>system\nPlease reason step by step, and put your final answer within \\boxed{}.<|im_end|>\n<|im_start|>user\nSolve $3x + 7 = 22$, then compute $\\frac{1}{2} + \\sqrt{16}$ and $2^{10} = 1024$.<|im_end|>\n<|im_start|>assistant\n",
+                &[151644, 8948, 198, 5501, 2874, 3019, 553, 3019, 11, 323, 2182, 697, 1590, 4226, 2878, 1124, 79075, 46391, 151645, 198, 151644, 872, 198, 50, 3948, 400, 18, 87, 488, 220, 22, 284, 220, 17, 17, 54876, 1221, 12564, 57960, 37018, 90, 16, 15170, 17, 92, 488, 1124, 26888, 90, 16, 21, 31716, 323, 400, 17, 47822, 16, 15, 92, 284, 220, 16, 15, 17, 19, 12947, 151645, 198, 151644, 77091, 198],
+            ),
+            (
+                "<|fim_prefix|>def fibonacci(n):\n    if n < 2:\n        return n\n<|fim_suffix|>\n\nprint(fibonacci(10))\n<|fim_middle|>",
+                &[151659, 750, 75698, 1445, 982, 262, 421, 308, 366, 220, 17, 510, 286, 470, 308, 198, 151661, 271, 1350, 955, 579, 39345, 7, 16, 15, 1171, 151660],
+            ),
+            (
+                "<|repo_name|>reflex\n<|file_sep|>src/main.rs\nfn main() {\n    println!(\"hi\");\n}\n<|file_sep|>src/lib.rs\n<|fim_prefix|>pub fn add(a: i32, b: i32) -> i32 {\n    <|fim_suffix|>\n}\n<|fim_middle|>",
+                &[151663, 1097, 2571, 198, 151664, 3548, 15351, 25638, 198, 8822, 1887, 368, 341, 262, 13751, 17223, 6023, 797, 532, 151664, 3548, 8194, 25638, 198, 151659, 9585, 5168, 912, 2877, 25, 600, 18, 17, 11, 293, 25, 600, 18, 17, 8, 1464, 600, 18, 17, 341, 257, 151661, 198, 532, 151660],
+            ),
+            (
+                "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call><|endoftext|>done",
+                &[151657, 198, 4913, 606, 788, 330, 455, 69364, 497, 330, 16370, 788, 5212, 8926, 788, 330, 59604, 95642, 151658, 151643, 10438],
+            ),
+            (
+                "<|im_start>user <im_end|> <|fim_prefix |> <tool_call >",
+                &[27, 91, 318, 4906, 29, 872, 366, 318, 6213, 91, 29, 82639, 69, 318, 13974, 58721, 366, 14172, 13429, 861],
+            ),
+        ];
+        for &(text, expected) in golden {
+            let ids = tok
+                .encode(text)
+                .unwrap_or_else(|e| panic!("encode({text:?}) failed: {e}"));
+            assert_eq!(ids, expected, "ids differ from llama-tokenize for {text:?}");
+            assert_eq!(tok.decode(&ids), text, "round trip failed for {text:?}");
+        }
+    }
 }

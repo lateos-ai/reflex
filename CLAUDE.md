@@ -172,6 +172,15 @@ unimplemented scope, not a Non-goals constraint (README.md's Non-goals list only
 `batch_size`/concurrency/networking, never sampling strategy). No KV-cache reuse across
 process runs, no batching — those stay permanent (see Non-goals).
 
+`qwen2` (Qwen2/2.5, incl. Math and Coder) uses this same dense path. Its only new math
+is the Q/K/V projection bias (`DenseLayerWeights::attn_bias`, a `QkvBias`; validated per
+layer by `config::qkv_bias_names`), added right after the projections and before
+QK-Norm/RoPE in both `forward_attn_block` variants (batched prefill via
+`add_rows_inplace`, `add_kernel` with a row-broadcast length). `parse_model_config`
+rejects tensors the dense path doesn't implement (`attn_output.bias`, `output.bias`,
+fused `attn_qkv`) for every dense architecture, and shared-expert tensors on any
+generic MoE file (`qwen2moe`). See `docs/design/qwen2.md`.
+
 `general.architecture == "deepseek2"` dispatches to `Model::load_mla`/
 `forward_prompt_mla` (MVP step 4, Multi-head Latent Attention) instead, a separate path
 from the `LayerWeights`/`forward_layer` machinery above (own `MlaLayerWeights`/
@@ -301,3 +310,13 @@ in local `test-data/` (too large) — see STATUS.md's "Real DeepSeek-V2-Lite GGU
 preserved locally" entry for how to regenerate it, including the gotcha that every
 pre-quantized community GGUF checked predates llama.cpp's MLA tensor-split conversion
 format and will be rejected by `parse_mla_config`.
+
+`test-data/tiny-qwen2.gguf` (+ `tiny-qwen2-lora.gguf`) is the `qwen2` fixture, built the
+same way (random HF checkpoint + PEFT adapter through llama.cpp `79e2e74`'s unmodified
+converters; source, prompts and the `ref.cpp` reference tool in
+`test-data/tiny-qwen2-src.tar.gz`). Its Q/K/V biases are scaled so dropping any one of
+them changes every comparison prompt's 20-token greedy output; with tied embeddings and
+small layer outputs a random model just repeats one token, so keep the scales if
+rebuilding. `test-data/qwen2.5-*-header.gguf` are real Qwen2.5 headers (metadata +
+tensor table, no data; `scripts/gguf_tokenizer_only.py --keep-tensor-table`) for host-only
+config and tokenizer tests.

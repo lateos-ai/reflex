@@ -71,7 +71,12 @@ fn prefill_dense_batched_matches_sequential_prefill() {
     let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
     let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
     let model = Model::load(device, &file).expect("failed to load model");
+    assert_prefill_dense_batched_matches_sequential(&model, prompt);
+}
 
+/// The body of [`prefill_dense_batched_matches_sequential_prefill`], shared
+/// with the `qwen2` tests (`qwen2_tests.rs`).
+pub(super) fn assert_prefill_dense_batched_matches_sequential(model: &Model, prompt: &str) {
     let (seq_ids, seq_hidden, _, _, seq_position) = model
         .prefill_dense(prompt, None, 0)
         .expect("prefill_dense failed");

@@ -176,10 +176,16 @@ fn quant_resident_generate_matches_f32() {
     let gguf_path = std::env::var("REFLEX_TEST_GGUF")
         .expect("set REFLEX_TEST_GGUF to a real local GGUF path to run this test");
     let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
-    let prompt = "The capital of France is";
+    assert_quant_resident_generate_matches_f32(&file, "The capital of France is");
+}
+
+/// The body of [`quant_resident_generate_matches_f32`], shared with the
+/// `qwen2` tests (`qwen2_tests.rs`). `file` must be a dense model with Q4_K
+/// layer matmuls.
+pub(super) fn assert_quant_resident_generate_matches_f32(file: &GgufFile, prompt: &str) {
     let run = |dtype: WeightsDtype, quant: bool| {
         let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
-        let model = load_model(device, &file, dtype, quant);
+        let model = load_model(device, file, dtype, quant);
         let quant_layers = model
             .layers
             .iter()

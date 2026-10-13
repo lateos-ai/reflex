@@ -13,7 +13,12 @@ The result loads in Reflex (`Tokenizer::from_gguf`) and in llama.cpp's
 `test-data/*-tokenizer.gguf` fixtures are made (see docs/DEVELOPMENT.md's
 test-fixture section).
 
-Usage: python3 scripts/gguf_tokenizer_only.py <head.gguf> <out.gguf>
+With `--keep-tensor-table` the tensor table is kept too (tensor data still
+dropped): a "header" GGUF whose config and tensor shapes Reflex can parse
+(`parse_model_config` etc.) without the weights. llama.cpp won't load that
+one, since its tensor offsets point past the end of the file.
+
+Usage: python3 scripts/gguf_tokenizer_only.py [--keep-tensor-table] <head.gguf> <out.gguf>
 Fetch a head with e.g.
   curl -L -r 0-41943039 -o head.gguf https://huggingface.co/<repo>/resolve/main/<file>.gguf
 """
@@ -26,7 +31,10 @@ STRING, ARRAY, UINT32 = 8, 9, 4
 
 
 def main() -> None:
-    src, dst = sys.argv[1], sys.argv[2]
+    args = sys.argv[1:]
+    keep_tensor_table = "--keep-tensor-table" in args
+    args = [a for a in args if a != "--keep-tensor-table"]
+    src, dst = args[0], args[1]
     data = open(src, "rb").read()
     if data[:4] != b"GGUF":
         sys.exit(f"{src}: not a GGUF file")
@@ -71,12 +79,30 @@ def main() -> None:
             kvs += data[kv_start:pos]
             kept += 1
 
+    infos = bytearray()
+    if keep_tensor_table:
+        # name, n_dims, dims, ggml type, data offset -- copied verbatim. The
+        # offsets point past the end of the output: fine for Reflex's
+        # `GgufFile::open` (it bounds-checks only when tensor bytes are read),
+        # not for llama.cpp, which checks them at load.
+        start = pos
+        for _ in range(n_tensors):
+            (nlen,) = struct.unpack_from("<Q", data, pos)
+            pos += 8 + nlen
+            (n_dims,) = struct.unpack_from("<I", data, pos)
+            pos += 4 + 8 * n_dims + 4 + 8
+            if pos > len(data):
+                sys.exit(f"{src}: tensor table runs past the {len(data)} bytes fetched; fetch more")
+        infos = data[start:pos]
+
     out = bytearray(data[:8])
-    out += struct.pack("<QQ", 0, kept)
+    out += struct.pack("<QQ", n_tensors if keep_tensor_table else 0, kept)
     out += kvs
+    out += infos
     out += b"\0" * ((-len(out)) % alignment)
     open(dst, "wb").write(out)
-    print(f"{dst}: {len(out)} bytes, {kept} keys (dropped {n_tensors} tensor infos, {n_kv - kept} split keys)")
+    what = f"kept {n_tensors} tensor infos" if keep_tensor_table else f"dropped {n_tensors} tensor infos"
+    print(f"{dst}: {len(out)} bytes, {kept} keys ({what}, {n_kv - kept} split keys)")
 
 
 if __name__ == "__main__":

@@ -1,14 +1,25 @@
-// In-place residual add: a[i] += b[i]. Used to keep residual-stream adds
-// device-resident (see model.rs's forward functions) instead of downloading
-// both operands to host just to add two vectors.
+// In-place add: a[i] += b[i % m], where b has m elements. m == n is the
+// residual add (keeps residual-stream adds device-resident, see model.rs's
+// forward functions, instead of downloading both operands to host); m < n
+// broadcasts one row of m (a Qwen2 Q/K/V bias) over every row of a batched
+// prefill's [n / m, m] activations. The m == n test is uniform across the
+// launch, so the residual add does no modulo and gives the same result as
+// before the broadcast was added.
 extern "C" __global__ void add_kernel(
     float* __restrict__ a,
     const float* __restrict__ b,
-    unsigned int n
+    unsigned int n,
+    unsigned int m
 ) {
     unsigned int global_tid = blockIdx.x * blockDim.x + threadIdx.x;
-    for (unsigned int i = global_tid; i < n; i += gridDim.x * blockDim.x) {
-        a[i] += b[i];
+    if (m == n) {
+        for (unsigned int i = global_tid; i < n; i += gridDim.x * blockDim.x) {
+            a[i] += b[i];
+        }
+    } else {
+        for (unsigned int i = global_tid; i < n; i += gridDim.x * blockDim.x) {
+            a[i] += b[i % m];
+        }
     }
 }
 
