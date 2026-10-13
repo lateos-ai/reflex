@@ -1,0 +1,181 @@
+# Tokenizer pre-types (`tokenizer.ggml.pre`)
+
+A `tokenizer.ggml.model == "gpt2"` GGUF vocab is byte-level BPE, and its merges are
+only correct if the text is first split the way the model's tokenizer splits it. The
+split regex is named by `tokenizer.ggml.pre`. Reflex used to ignore that key and give
+every gpt2 vocab the Qwen2 regex, so a Llama-3 or DeepSeek GGUF loaded and tokenized
+wrongly with no error. Now `Tokenizer::from_gguf` maps the value to `PreType`
+(`src/tokenizer.rs`) and rejects any value it has no port for, naming it.
+
+SentencePiece (`tokenizer.ggml.model == "llama"`) and `gemma4` vocabs don't split with a
+regex. They get no pre type and their `pre` key, if any, isn't read.
+
+## Supported pre types
+
+Reference: llama.cpp `79e2e74`, the commit every llama.cpp reference build in this repo
+uses. Regex lists are in `src/llama-vocab.cpp` (the `llm_tokenizer_bpe` constructor),
+the code that runs them in `src/unicode.cpp`.
+
+| `pre` value | `PreType` | llama.cpp type | How llama.cpp runs it | Golden fixture |
+|---|---|---|---|---|
+| `qwen2` | `Qwen2` | `QWEN2` | `unicode_regex_split_custom_qwen2` | `Qwen3-0.6B-Q4_K_M.gguf` |
+| `kolibri1` | `Qwen2` | none at `79e2e74`; the community Kolibri-1 patch maps it to `QWEN2` | as `qwen2` | `kolibri1-tokenizer.gguf` (vs HF `tokenizers`) |
+| *(key missing)* | `Qwen2` | `DEFAULT`, with a "generation quality will be degraded" warning | | |
+| `qwen35` | `Qwen35` | `QWEN35` | `unicode_regex_split_custom_qwen35` | `qwen35-tokenizer.gguf` |
+| `llama-bpe` | `Llama3` | `LLAMA3` | `unicode_regex_split_custom_llama3`, plus `ignore_merges` | `llama-bpe-tokenizer.gguf` |
+| `gpt-2` | `Gpt2` | `GPT2` | `unicode_regex_split_custom_gpt2` | `tiny-qwen3moe.gguf` |
+| `deepseek-llm` | `DeepseekLlm` | `DEEPSEEK_LLM` | 6 regexes through `std::regex` | `deepseek-llm-tokenizer.gguf` |
+| `deepseek-v3` | `Deepseek3` | `DEEPSEEK3_LLM` | 3 regexes through `std::regex` | `deepseek-v3-tokenizer.gguf` |
+
+A missing key keeps the Qwen2 split, which is what every gpt2 vocab got before. That way
+a file that loaded before still tokenizes the same. No GGUF checked so far lacks the key
+except TheBloke's older conversions (e.g. `deepseek-llm-7B-chat-GGUF`), where llama.cpp
+itself falls back to a regex Reflex doesn't port.
+
+Aliases llama.cpp accepts for the same split (`llama3` and `llama-v3` for `llama-bpe`,
+`deepseek-r1-qwen` for `qwen2`, ...) are not accepted yet. Each one is a one-line
+addition to `PreType::ACCEPTED`, once a real file needs it.
+
+What uses which pre type, from a header survey (HTTP range requests on the first 40 MB):
+
+| File | `general.architecture` | `pre` |
+|---|---|---|
+| Qwen3-0.6B, `deepseek-tiny-mla` (synthetic) | `qwen3`, `deepseek2` | `qwen2` |
+| Kolibri-1, `tiny-kolibri1` | `kolibri1` | `kolibri1` |
+| Qwen3.5-0.8B, Qwen3.8-27B, `tiny-qwen35moe` | `qwen35`, `qwen35moe` | `qwen35` |
+| `tiny-qwen3moe` (synthetic) | `qwen3moe` | `gpt-2` |
+| DeepSeek-V2-Lite, DeepSeek LLM 7B | `deepseek2`, `llama` | `deepseek-llm` |
+| DeepSeek-V3-0324 | `deepseek2` | `deepseek-v3` |
+| Llama-3.2-1B-Instruct | `llama` | `llama-bpe` |
+| TinyLlama, Mistral-7B | `llama` | none (`llama` SentencePiece) |
+| Gemma 4 | `gemma4` | none (`gemma4` model) |
+
+Before this change, `qwen35`, `gpt-2` and `deepseek-llm` files all got the Qwen2 split:
+- **`qwen35`** differs only on combining marks: its letter runs are `[\p{L}\p{M}]+`.
+- **`gpt-2`** groups digit runs and splits newlines differently.
+- **`deepseek-llm`** differs on most non-trivial text.
+
+The earlier byte-exact checks on those models used prompts that never hit the
+difference. Real DeepSeek-V2-Lite needs re-checking for that reason.
+
+## How llama.cpp runs a regex list, and how the port mirrors it
+
+`unicode_regex_split` applies each regex in turn, and each one runs over every piece the
+previous one produced. So a piece boundary, once made, never goes away. There are two
+ways a regex runs:
+
+1. **A hand-written splitter** (`unicode_regex_split_custom_*`), used when the regex
+   string is one llama.cpp recognizes (`qwen2`, `qwen35`, `llama3`, `gpt2`). It walks the
+   piece one codepoint at a time. A codepoint no alternative matches becomes a
+   one-codepoint piece. Reflex ports these line for line as step functions
+   (`llama3_family_step` covers both llama3 and qwen35, plus `gpt2_step`) driven by
+   `split_custom`.
+2. **`std::regex`**, for every other regex (both DeepSeek types). `regex_iterator` finds
+   leftmost matches. Text between matches becomes its own piece. The piece's end acts as
+   end of input for `$` and `(?!\S)`. Reflex emulates the iterator in `split_stl` and
+   ports each regex as a matcher that returns the ECMAScript match at one position:
+   alternatives tried in order, greedy with backtracking.
+   - A regex containing `\p{..}` runs on "collapsed" text: ASCII stays as is, and every
+     other codepoint becomes a byte standing for its category (non-ASCII whitespace
+     becomes `\x0B`).
+   - A regex without `\p{..}` runs through `std::wregex` on the codepoints, with every
+     non-ASCII whitespace codepoint replaced by `\x0B`. For example U+3000 sits inside
+     DeepSeek's `　-。` range but only ever matches `\s`.
+
+   Either way, `\s` means llama.cpp's whitespace set and `\p{X}` means its category
+   table. The matchers test exactly that.
+
+**Unicode tables.** llama.cpp classifies codepoints with its own tables
+(`src/unicode-data.cpp`), not the platform's. Rust's std has no `\p{P}`/`\p{S}`/`\p{M}`,
+and its `is_alphabetic`/`is_whitespace` are different sets. `scripts/gen_unicode_tables.py`
+transcribes `unicode_ranges_flags` (2,273 category ranges) and `unicode_set_whitespace`
+into `src/tokenizer_unicode.rs`. That's about 18 KB of data and no new dependency.
+Rerun the script against the new commit when the pinned llama.cpp moves.
+
+**`ignore_merges`.** llama.cpp sets this for `LLAMA3`: a pre-token that is already one
+vocab entry is emitted as that entry without running BPE. Reflex does the same
+(`PreType::ignore_merges`). None of the other supported types set it.
+
+**Not ported:** `clean_spaces`, which only affects llama.cpp's detokenizer (it's on for
+`llama-bpe`). Reflex's decode returns the exact bytes.
+
+## Gotchas found while porting
+
+- **Unicode normalization ate two codepoints of an upstream regex.** DeepSeek-LLM's
+  Latin class contains U+212A KELVIN SIGN (`K-ℭ`) and U+1F7D (`Ὗ-ώ`), among others. A
+  tool in the copy path NFC-normalized them to ASCII `K` and U+03CE. `K-ℭ` then
+  swallowed ASCII `[`, `{`, `]` and `}`, and `Ὗ-ώ` became an inverted range. The only
+  symptom was one wrong merge on `" {[<>]}"`. The six codepoints NFC would change are
+  now `\u{..}` escapes in `DEEPSEEK_LLM_LATIN`, and
+  `test_deepseek_char_classes_are_well_formed` guards them. Copy class strings from
+  upstream with a script that writes bytes, never through an editor.
+- **Multi-file GGUF heads.** The DeepSeek-V3 source is shard 1 of 5. Its `split.*` keys
+  make `llama-tokenize` look for the other shards. `scripts/gguf_tokenizer_only.py` drops
+  them.
+
+## Known gap: the original Qwen2 port
+
+`qwen2_pretokenize_one` predates the tables and classifies with Rust's `is_alphabetic`/
+`is_numeric`/`is_whitespace`. On the golden set it matches `llama-tokenize` on 12 of 13
+strings. The miss is Arabic with harakat, U+064E etc.: those are Mn with
+Other_Alphabetic, so Rust counts them as letters and llama.cpp (and HF `tokenizers`)
+don't. It is left unchanged on purpose, so that reading pre types didn't change any
+`qwen2` output. Switching `qwen2` to the table-based splitter, which llama.cpp has as
+`unicode_regex_split_custom_qwen2`, is a separate, deliberate change. The Qwen2 golden
+test skips that one string until then.
+
+## Verification
+
+Golden ids come from llama.cpp `79e2e74`'s `llama-tokenize`, CPU-only, built in a Docker
+container (`ubuntu:24.04`, `cmake -DGGML_CUDA=OFF`). It runs over 13 tricky strings:
+- digits
+- contractions in both cases
+- CJK, kana and Hangul
+- Cyrillic, Greek, Arabic and Thai
+- `\r\n`, blank lines, tabs and trailing whitespace
+- emoji with ZWJ and variation selectors
+- punctuation runs
+- leading spaces
+- decomposed accents
+- code
+- NBSP, ideographic and em spaces
+- fullwidth forms
+- Devanagari and Arabic combining marks
+
+Each string is a separate `--stdin --ids --no-bos` run. Results on that set:
+- Every supported pre type matches 13/13, except `qwen2` at 12/13 (see above).
+- Before the fixes above, `deepseek-llm` was 12/13 (the normalization bug).
+- `qwen2` and Kolibri-1 outputs are unchanged.
+
+Tests: `test_*_encode_matches_llama_tokenize_if_fixture_present` in `src/tokenizer.rs`,
+skip-if-absent, with golden ids inline. The fixtures are tokenizer-only GGUFs: the real
+file's metadata section, with an empty tensor table, from
+`scripts/gguf_tokenizer_only.py` (see [DEVELOPMENT.md](../DEVELOPMENT.md)'s test-fixture
+section). Sources and byte ranges are in each test's doc comment.
+
+On every model fixture in `test-data/`, the three `reflex check` regression prompts
+tokenize identically before and after this change, except one: `tiny-qwen3moe` on the
+1,352-byte prompt, which now follows the `gpt-2` split. Its prompt ids equal
+`llama-tokenize`'s; before, they didn't. The GPU check confirms it. On an RTX 3090,
+before and after built on the same machine, 29 of 30 `reflex check` rows (every fixture
+plus Qwen3-0.6B, three prompts each) are identical, token ids and logit checksums
+included. The 30th is that `tiny-qwen3moe` row.
+
+## Adding a pre type
+
+1. Find the value's `LLAMA_VOCAB_PRE_TYPE_*` in `src/llama-vocab.cpp` at the pinned
+   commit, and its regex list. If it maps to a type already ported, add the value to
+   `PreType::ACCEPTED` and skip to step 4.
+2. Check how `unicode_regex_split` runs each regex: through a `unicode_regex_split_custom_*`
+   function (port that function as a `split_custom` step) or through `std::regex` (write
+   a `split_stl` matcher, using the collapsed-text or wregex rules above). Use
+   `CptFlags`, never Rust's character predicates. Check whether the type sets
+   `ignore_merges`.
+3. Add the variant and its `pretokenize` arm. Cite the llama.cpp type and the regex
+   strings in a comment, the way the existing arms do. Copy any non-ASCII class string
+   with a script, and escape what NFC would change.
+4. Make a fixture: fetch the first ~40 MB of a real GGUF using that pre type with an
+   HTTP range request, then run `scripts/gguf_tokenizer_only.py`.
+5. Get golden ids for the 13-string set (`PRE_TYPE_GOLDEN_STRINGS`) from `llama-tokenize`
+   at the pinned commit, and add a `test_<type>_encode_matches_llama_tokenize_if_fixture_present`
+   test.
