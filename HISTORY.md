@@ -3907,3 +3907,72 @@ serverless catalog showed the A5000 HIGH both times, so neither number predicts 
 Public #27 (github `9025aa4`) pins an RTX 4090, as most of Runpod's own Hub workers do, lists
 `allowedCudaVersions` in the test config, and adds `ADA_24` to `gpuIds`. Released as
 `v0.2.9-runpod-hub` on 2026-10-14 16:14Z.
+
+### MLA widening to small real checkpoints (2026-10-13)
+
+Architecture coverage round 2, phase 3 (branch `mla-widening`), plus phase 1's queued
+DeepSeek-V2-Lite re-verify. Design, survey and results: `docs/design/mla-widening.md`.
+
+**Step 0 survey.** First 40 MB of 14 `deepseek2` GGUFs. Only five models were worth targeting, and every one had a
+dense lead layer, `expert_group_count` ≤ 1 and no NextN, so group-limited routing, all-MoE
+files and MTP never came up. What they did need: sigmoid gating with an `exp_probs_b`
+selection bias (all but Coder-V2-Lite), Q-LoRA (GLM-4.7-Flash only) and four new pre types
+(`gigachat`, `glm4`, `kimi-k2`, `kanana2`). Targets picked: Coder-V2-Lite (nothing new),
+GigaChat3.1 (smallest, sigmoid), GLM-4.7-Flash (Q-LoRA); Moonlight and Kanana-2 queued, as
+each only lacks its pre type. Two survey findings mattered beyond the table:
+- ggml-org's and bartowski's GLM-4.7-Flash files have no `expert_gating_func`. llama.cpp
+  hard-codes sigmoid for "47 or 48 layers and a 154,880 vocab"; Reflex copies that rule.
+- The old MLA path never read `expert_gating_func` at all. A sigmoid file would have loaded
+  and routed with softmax, silently. Only the phase 1 pre-type validation (which rejected
+  every such file's tokenizer) had kept that from happening.
+
+**Two "sigmoid" rules.** Kolibri-1's `route_sigmoid_logit_add` selects on `logits + bias`;
+DeepSeek-V3 (and GigaChat, GLM, Moonlight) select on `sigmoid(logits) + bias`. They pick
+different experts on the same input, so "reuse Kolibri's router" meant sharing its ranking
+and normalization core, not calling it. `route_sigmoid_bias` is checked against a host
+reference of `build_moe_ffn`'s steps, including the 2^-14 sum clamp.
+
+**Pre types were aliases.** `glm4` maps to llama.cpp's CHATGLM4, whose regex is LLAMA3's
+string verbatim (so the same custom splitter) with `ignore_merges`, but it also nulls the
+BOS id. `gigachat` is GPT2. Both 13/13 vs `llama-tokenize`, and on the real prompts (digits,
+punctuation, Chinese, Russian, code, mixed scripts) the full prompt ids including BOS
+matched 21/21 across the DeepSeek, GigaChat and GLM vocabs before any GPU time.
+
+**Converter gotcha.** `79e2e74`'s `convert_hf_to_gguf.py` identifies tokenizers by hashing
+the ids of a test string. With `transformers` 5.19 DeepSeek's tokenizer hashes to an unknown
+value and the converter writes no usable pre type; with 4.57.1 it's `deepseek-llm`.
+
+**Fixture.** `tiny-mla-v3`, a random `DeepseekV3ForCausalLM` through the real converter.
+Each new feature (bias, gating, scale, normalization, q_a_norm weight), dropped, changes
+llama.cpp's 20-token output on all 7 prompts.
+
+**GPU session** (Runpod A100 SXM 80 GB; community stock vanished between the check and three
+create attempts, so secure cloud at $1.79/h, ~1.5 h, ~$2.70).
+- `reflex check`, base vs branch: the 45 existing rows were identical, including real
+  V2-Lite and Coder-V2-Lite.
+- Greedy ids vs llama.cpp with f32 activations, 7 × 20 tokens: fixture 6/7, V2-Lite 6/7,
+  Coder 6/7, GigaChat 5/7, GLM 4/7 (f16). Every mismatch looked like the familiar
+  late-prompt divergence, so a `REF_MARGINS` option in `ref.cpp` printed llama.cpp's top-2
+  at every step. In all 8 cases Reflex's token is llama.cpp's runner-up, 0.005 to 0.19
+  logits behind, with identical ids before. On the fixture, HF `transformers` (a third
+  implementation) picks what Reflex picks.
+- GLM's logits sit around 120 with top-2 gaps often under 0.1, so with f16 weights (f32
+  doesn't fit) near-ties come early.
+- DeepSeek-V2-Lite re-verify: 20/20 on the digit-run, punctuation-run, Chinese, code and
+  mixed-script prompts that the `deepseek-llm` split actually changes.
+- The first test run caught two test-data problems, not code bugs:
+  - The fixture golden from llama.cpp's CPU backend differs from its CUDA backend on
+    `arabic` (Reflex = CUDA, as in phase 2's LoRA case).
+  - The f16 test's "clear pick" threshold left only 3 prompts.
+
+  Both were fixed and the tests re-run 5/5; nightly 57/0/2.
+- Cold start on GigaChat3.1 `q8_0`: 4.22 s vs `llama-simple` 4.40 s p50. The lead is small
+  because the MLA path dequantizes 11 GB to f16 at load (2.0 s), which `llama-simple`
+  doesn't.
+
+Queued:
+- Moonlight (`kimi-k2`) and Kanana-2 (`kanana2`) pre types.
+- llama.cpp's BPE `add_bos_token` default (no BOS when the key is missing, unless the pre
+  type says so; affects `tiny-qwen3moe`).
+- The public GPU nightly's Kolibri tests failing instead of skipping.
+- A `Q8_0`-resident MLA path for load-bound cold starts.

@@ -187,9 +187,13 @@ from the `LayerWeights`/`forward_layer` machinery above (own `MlaLayerWeights`/
 `MlaModel`, same dispatch pattern as `"qwen35"` → `load_hybrid`). See HISTORY.md's MLA
 sections for the math and this MVP step's scope (dense-lead layers, routed-MoE +
 always-on shared-expert FFN via `MlaFfn::Dense`/`Moe`, and YaRN RoPE scaling are all
-supported — real DeepSeek-V2-Lite's actual shape; only Q-LoRA query decomposition and
-MTP are still rejected — see `parse_mla_config`'s doc comment for the exact rejected
-cases). Reuses every device-resident op convention Phase 2 round 2 established
+supported — real DeepSeek-V2-Lite's actual shape; round 2 phase 3 added Q-LoRA queries
+(`MlaQuery`), sigmoid gating with the `exp_probs_b` selection bias
+(`moe::route_sigmoid_bias`, DeepSeek-V3's rule, **not** Kolibri's `route_sigmoid_logit_add`)
+and llama.cpp's GLM-4.7 missing-gating-key rule, for DeepSeek-Coder-V2-Lite, GigaChat3.1
+and GLM-4.7-Flash — see `docs/design/mla-widening.md`; MTP, group-limited routing and
+all-MoE files are still rejected — see `parse_mla_config`'s doc comment for the exact
+rejected cases). Reuses every device-resident op convention Phase 2 round 2 established
 (`rmsnorm`/`gemv`/`silu_and_mul`/`add_inplace` unchanged) plus several new ones
 specific to MLA: `gemv_view`/`gemv_per_head` (per-head GEMV via the same `gemv_kernel`,
 "expert" → "head" vs. `gemv_expert`'s MoE slicing), `mla_attention` (`kernels_cuda/
@@ -252,8 +256,9 @@ this crate.
    different mechanism from GQA, not an incremental extension). Read llama.cpp PR
    #11446 before attempting it. **Done**: dense-lead layers, routed-MoE +
    always-on shared-expert FFN, and YaRN RoPE scaling are all supported (real
-   DeepSeek-V2-Lite's actual shape); only Q-LoRA query decomposition and MTP/NextN
-   are still rejected with a clear error. Verified against both a synthetic fixture
+   DeepSeek-V2-Lite's actual shape); Q-LoRA and sigmoid routing were added in round 2
+   phase 3 (DeepSeek-Coder-V2-Lite, GigaChat3.1, GLM-4.7-Flash); MTP/NextN and
+   group-limited routing are still rejected with a clear error. Verified against both a synthetic fixture
    (no small real `deepseek2` GGUF exists publicly) and the real
    `deepseek-ai/DeepSeek-V2-Lite` checkpoint on a rented 80GB A100 (~63GB of `f32`
    device-resident weights under this project's GPU-residency model — doesn't fit
@@ -320,3 +325,14 @@ small layer outputs a random model just repeats one token, so keep the scales if
 rebuilding. `test-data/qwen2.5-*-header.gguf` are real Qwen2.5 headers (metadata +
 tensor table, no data; `scripts/gguf_tokenizer_only.py --keep-tensor-table`) for host-only
 config and tokenizer tests.
+
+`test-data/tiny-mla-v3.gguf` is the second MLA fixture (random `DeepseekV3ForCausalLM`
+through the same unmodified converter; source, llama.cpp references and the sensitivity
+check in `test-data/tiny-mla-v3-src.tar.gz`): Q-LoRA queries, sigmoid routing with a
+nonzero `exp_probs_b`, `expert_weights_norm`/`expert_weights_scale`, a shared expert and
+`v_head_dim != qk_nope_head_dim`; dropping any one changes every comparison prompt's
+greedy output in llama.cpp. Real `deepseek2` headers (DeepSeek-Coder-V2-Lite current and
+legacy, GigaChat3.1, GLM-4.7-Flash with and without `expert_gating_func`, Moonlight,
+Kanana-2) back the MLA config tests (`docs/design/mla-widening.md`). Converting a DeepSeek
+checkpoint with `79e2e74`'s converter needs `transformers==4.57.1`: 5.x doesn't recognize
+the tokenizer hash and writes no usable pre type.

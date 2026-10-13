@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
 short, current-state summary; HISTORY.md is the log.
 
-_Last updated: 2026-10-13 (architecture coverage round 2, phase 2 done: `qwen2` (Qwen2.5, Math, Coder) verified byte-exact against llama.cpp with f32 activations on an RTX 3090, plus the `qwen2` tokenizer split moved to llama.cpp's Unicode tables; `reflex check` unchanged 30/30. Previous update: 2026-10-12 (architecture coverage round 2, phase 1 done: `tokenizer.ggml.pre` is read and validated, with new `llama-bpe`/`deepseek-llm`/`deepseek-v3`/`qwen35`/`gpt-2` splits matching `llama-tokenize`; `reflex check` unchanged on 29/30 rows, the 30th the `gpt-2` fix; DeepSeek-V2-Lite re-verify queued. Previous update: 2026-10-12 (queued "Planned next work: architecture coverage round 2": tokenizer `pre` validation, `qwen2`, MLA widening, Mamba-2 hybrid. Previous update: 2026-10-12 (Gemma 4 long-prompt prefill 4-7x faster: bit-identical `rmsnorm_kernel` fix for every architecture plus a Gemma-only tiled prefill attention kernel, public PR #22; extending the tiled kernel to the other architectures is queued in "Planned next work: tiled prefill attention for the other architectures" below. Previous update: 2026-10-12 (Gemma 4 quantized-resident `Q8_0` behind `REFLEX_QUANT_RESIDENT=1`: the 31B-it now runs on a 48 GB A40, verified against fully-f32 llama.cpp; the pending MLA golden-token re-check is done. See `docs/design/quantized-resident-weights.md`'s "Q8_0 on Gemma 4: results". Previous update: 2026-10-11 (Gemma 4 31B-it and Qwen3.8-27B, both `Q8_0` with f16 weights, verified against llama.cpp on a ThunderCompute A100 80 GB; no code change. See "Planned next work: extending architecture coverage" item 3 below and `docs/design/gemma4.md`'s "31B results". Previous update: 2026-09-30 (`qwen35moe` — Qwen3.5 hybrid trunk + routed-MoE/sigmoid-gated shared-expert FFN — implemented and verified byte-exact against llama.cpp on a T4 using a converted public tiny-random checkpoint; see "Planned next work: extending architecture coverage" below and HISTORY.md's "`qwen35moe` support" entry. Previous update: 2026-09-29 (cold-start comparison table refreshed against the current code on a dedicated AWS EC2 `g4dn.xlarge`/Tesla T4 — A6000 was unavailable on ThunderCompute, so the sanctioned T4 fallback was used; docs/harness only, no engine change. Fresh p50/p95, the harness-validation surprise, and raw-log locations are in the "Cold-start comparison refresh" note under "Benchmarking expansion" below. Previous update: item 6 of the ranked warm-latency-vs-TypeSafe-Jev plan — lazy/partial `token_embd` dequant, the bottleneck item 5's profiling found — is now implemented and real-hardware-verified on an AWS EC2 `g4dn.xlarge`/Tesla T4: `token_embd` construction dropped from item 5's measured 547.6ms to ~102ms, `model_load_ms` p50 **868.1ms → 410.3ms (-53%)** and total cold start **1084.2ms → 627.3ms (-42%)** for `reflex system1`, with zero numeric drift (golden tokens byte-identical across dense/hybrid/MoE/synthetic-MLA). Honestly-reported caveat found by a follow-up A/B: `reflex generate` on a *tied*-embedding model doesn't get this win (the deferred dequant cost just moves from `model_load_ms` to `prompt_eval_ms`, plus a small fixed added-copy tax) — measured a ~110ms (~9%) *regression* for that specific caller, an accepted trade-off matching `LmHead::TiedLazy`'s already-documented system1-only scope. See HISTORY.md's "Lazy token_embd dequant (item 6)" entry for the full numbers. Previous update: item 5 of the same plan — pipelined model load — dropped the weight-loading loop it targets **153.8ms → 122.7ms (-20.3%)** with zero numeric drift, but that loop is only ~17% of `model_load_ms`, so end-to-end cold start improved just ~3%; that session's sub-phase profiling found the `token_embd` bottleneck item 6 above then closed — see HISTORY.md's "Pipelined model load (item 5)". Before that: items 2/3/4 of the same plan were real-hardware-verified on a fresh AWS EC2 `g4dn.xlarge` — see "Planned next work: warm-latency perf vs. TypeSafe Jev" below and HISTORY.md's "Real-hardware verification of the warm-latency perf plan" entry for the full numbers: item 2's warp-per-row `gemv_kernel`/`gemv_gather_kernel` rewrite measured a **~4.9x decode-throughput improvement** (15.4 → 74.8 tok/s), item 3's lazy `LmHead` dropped GPU-resident bytes by exactly the predicted ~608 MiB and improved cold-start too, item 4's phase breakdown now reports real, tight p50/p95 numbers. Golden tokens reproduced exactly for dense and hybrid; all 8 relevant internal-consistency oracle tests pass across dense/MoE/hybrid/synthetic-MLA. Item 1 (f16 weight residency) reframed (memory-bandwidth-bound, not tensor-core-FLOP-bound; `CUBLAS_COMPUTE_32F_FAST_16F` for f32 accumulation; land opt-in; do item 5 first) but still unstarted, deliberately, pending a numerics-methodology decision. Previous update: TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry)_
+_Last updated: 2026-10-13 (architecture coverage round 2, phase 3 done: MLA widened to DeepSeek-Coder-V2-Lite, GigaChat3.1-10B-A1.8B and GLM-4.7-Flash (sigmoid routing with `exp_probs_b`, Q-LoRA, `gigachat`/`glm4` pre types) and real DeepSeek-V2-Lite re-verified with its `deepseek-llm` tokenizer, on an A100 80 GB; existing `reflex check` rows unchanged 45/45, every greedy divergence a near-tie at llama.cpp's own runner-up. Previous update: 2026-10-13 (architecture coverage round 2, phase 2 done: `qwen2` (Qwen2.5, Math, Coder) verified byte-exact against llama.cpp with f32 activations on an RTX 3090, plus the `qwen2` tokenizer split moved to llama.cpp's Unicode tables; `reflex check` unchanged 30/30. Previous update: 2026-10-12 (architecture coverage round 2, phase 1 done: `tokenizer.ggml.pre` is read and validated, with new `llama-bpe`/`deepseek-llm`/`deepseek-v3`/`qwen35`/`gpt-2` splits matching `llama-tokenize`; `reflex check` unchanged on 29/30 rows, the 30th the `gpt-2` fix; DeepSeek-V2-Lite re-verify queued. Previous update: 2026-10-12 (queued "Planned next work: architecture coverage round 2": tokenizer `pre` validation, `qwen2`, MLA widening, Mamba-2 hybrid. Previous update: 2026-10-12 (Gemma 4 long-prompt prefill 4-7x faster: bit-identical `rmsnorm_kernel` fix for every architecture plus a Gemma-only tiled prefill attention kernel, public PR #22; extending the tiled kernel to the other architectures is queued in "Planned next work: tiled prefill attention for the other architectures" below. Previous update: 2026-10-12 (Gemma 4 quantized-resident `Q8_0` behind `REFLEX_QUANT_RESIDENT=1`: the 31B-it now runs on a 48 GB A40, verified against fully-f32 llama.cpp; the pending MLA golden-token re-check is done. See `docs/design/quantized-resident-weights.md`'s "Q8_0 on Gemma 4: results". Previous update: 2026-10-11 (Gemma 4 31B-it and Qwen3.8-27B, both `Q8_0` with f16 weights, verified against llama.cpp on a ThunderCompute A100 80 GB; no code change. See "Planned next work: extending architecture coverage" item 3 below and `docs/design/gemma4.md`'s "31B results". Previous update: 2026-09-30 (`qwen35moe` — Qwen3.5 hybrid trunk + routed-MoE/sigmoid-gated shared-expert FFN — implemented and verified byte-exact against llama.cpp on a T4 using a converted public tiny-random checkpoint; see "Planned next work: extending architecture coverage" below and HISTORY.md's "`qwen35moe` support" entry. Previous update: 2026-09-29 (cold-start comparison table refreshed against the current code on a dedicated AWS EC2 `g4dn.xlarge`/Tesla T4 — A6000 was unavailable on ThunderCompute, so the sanctioned T4 fallback was used; docs/harness only, no engine change. Fresh p50/p95, the harness-validation surprise, and raw-log locations are in the "Cold-start comparison refresh" note under "Benchmarking expansion" below. Previous update: item 6 of the ranked warm-latency-vs-TypeSafe-Jev plan — lazy/partial `token_embd` dequant, the bottleneck item 5's profiling found — is now implemented and real-hardware-verified on an AWS EC2 `g4dn.xlarge`/Tesla T4: `token_embd` construction dropped from item 5's measured 547.6ms to ~102ms, `model_load_ms` p50 **868.1ms → 410.3ms (-53%)** and total cold start **1084.2ms → 627.3ms (-42%)** for `reflex system1`, with zero numeric drift (golden tokens byte-identical across dense/hybrid/MoE/synthetic-MLA). Honestly-reported caveat found by a follow-up A/B: `reflex generate` on a *tied*-embedding model doesn't get this win (the deferred dequant cost just moves from `model_load_ms` to `prompt_eval_ms`, plus a small fixed added-copy tax) — measured a ~110ms (~9%) *regression* for that specific caller, an accepted trade-off matching `LmHead::TiedLazy`'s already-documented system1-only scope. See HISTORY.md's "Lazy token_embd dequant (item 6)" entry for the full numbers. Previous update: item 5 of the same plan — pipelined model load — dropped the weight-loading loop it targets **153.8ms → 122.7ms (-20.3%)** with zero numeric drift, but that loop is only ~17% of `model_load_ms`, so end-to-end cold start improved just ~3%; that session's sub-phase profiling found the `token_embd` bottleneck item 6 above then closed — see HISTORY.md's "Pipelined model load (item 5)". Before that: items 2/3/4 of the same plan were real-hardware-verified on a fresh AWS EC2 `g4dn.xlarge` — see "Planned next work: warm-latency perf vs. TypeSafe Jev" below and HISTORY.md's "Real-hardware verification of the warm-latency perf plan" entry for the full numbers: item 2's warp-per-row `gemv_kernel`/`gemv_gather_kernel` rewrite measured a **~4.9x decode-throughput improvement** (15.4 → 74.8 tok/s), item 3's lazy `LmHead` dropped GPU-resident bytes by exactly the predicted ~608 MiB and improved cold-start too, item 4's phase breakdown now reports real, tight p50/p95 numbers. Golden tokens reproduced exactly for dense and hybrid; all 8 relevant internal-consistency oracle tests pass across dense/MoE/hybrid/synthetic-MLA. Item 1 (f16 weight residency) reframed (memory-bandwidth-bound, not tensor-core-FLOP-bound; `CUBLAS_COMPUTE_32F_FAST_16F` for f32 accumulation; land opt-in; do item 5 first) but still unstarted, deliberately, pending a numerics-methodology decision. Previous update: TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry)_
 
 ## MVP progress
 
@@ -1080,7 +1080,10 @@ Order (cheapest correctness first); each phase is its own branch and session:
    | Gemma 4 (all) | gemma4 | none | gemma4 | unchanged |
 
    Queued from this phase:
-   - **Re-verify real DeepSeek-V2-Lite on an A100** (`deepseek-llm`, not
+   - ~~**Re-verify real DeepSeek-V2-Lite on an A100**~~ **Done 2026-10-13** in phase 3's A100
+     session (see phase 3 below): 20/20 greedy tokens vs llama.cpp f32 activations on the
+     digit-run, punctuation-run, Chinese, code and mixed-script prompts, Russian 18/20 then a
+     0.0085 near-tie; `reflex check` rows unchanged. Original item: (`deepseek-llm`, not
      Qwen2-compatible). Its earlier byte-exact match only means those prompts never hit
      the difference. Regenerate the GGUF per the "Real DeepSeek-V2-Lite GGUF not
      preserved locally" entry. Use prompts with digit runs, punctuation runs and
@@ -1168,6 +1171,60 @@ Order (cheapest correctness first); each phase is its own branch and session:
    - A second synthetic MLA fixture (Q-LoRA + sigmoid routing) via the real converter.
      Then the real target on an A40/A100 vs llama.cpp with f32 activations.
    - Still out: MTP/NextN, and multi-GPU (V3/R1).
+
+   **Done 2026-10-13** (branch `mla-widening`, origin only; design note
+   `docs/design/mla-widening.md`, HISTORY.md "MLA widening to small real checkpoints").
+   - Survey (first 40 MB of 14 `deepseek2` GGUFs; header fixtures in `test-data/`):
+
+     | Model | pre | q_lora | gating | `exp_probs_b` | scale / norm | groups | NextN | format |
+     |---|---|---|---|---|---|---|---|---|
+     | DeepSeek-Coder-V2-Lite | `deepseek-llm` | – | softmax | no | 1.0 / – | 1 | 0 | split (mradermacher, mad-lab-ai); legacy (bartowski, Guervency, V2-Lite-Chat) |
+     | GigaChat3.1-10B-A1.8B | `gigachat` | – (26 layers) | sigmoid | yes | 1.0 / true | 1 | 0 | split |
+     | Moonlight-16B-A3B | `kimi-k2` | – | sigmoid | yes | 2.446 / true | –, 1 | 0 | split (gabriellarson, shoonthitsa); legacy (mmnga) |
+     | GLM-4.7-Flash | `glm4` | 768 | sigmoid (key missing in ggml-org's/bartowski's) | yes | 1.8 / true | 1 | 0 | split |
+     | Kanana-2-30B-A3B | `kanana2` | – (48 layers, 128K vocab) | sigmoid | yes | 2.448 / true | 1 | 0 | split |
+
+     No surveyed small file needs group-limited routing, all-MoE layers or NextN.
+   - Code: `moe::route_sigmoid_bias` (DeepSeek-V3's rule; shares its core with Kolibri's
+     `route_sigmoid_logit_add`, which selects on `logits + bias` instead); `parse_mla_config`
+     reads `expert_gating_func` (shared parser with Kolibri), copies llama.cpp's GLM-4.7
+     missing-key rule, treats scale 0 as a no-op, rejects groups > 1 / other gating /
+     softmax + bias / temperature scaling; Q-LoRA queries (`MlaQuery`) by tensor presence;
+     pre types `gigachat` (GPT2) and `glm4` (LLAMA3 + `ignore_merges`, BOS off). Before this,
+     the MLA path ignored `expert_gating_func` entirely (masked only by the tokenizer
+     rejecting those files' pre types). No CUDA kernel changed.
+   - Fixture `test-data/tiny-mla-v3.gguf` (random `DeepseekV3ForCausalLM` through the
+     unmodified converter, source `test-data/tiny-mla-v3-src.tar.gz`): each new feature,
+     dropped, changes llama.cpp's greedy output on 7/7 prompts.
+   - GPU (Runpod A100 SXM 80 GB, secure cloud $1.79/h after community stock vanished,
+     ~1.5 h, ~$2.70): `reflex check` base vs branch 45/45 existing rows identical (V2-Lite
+     and Coder-V2-Lite included), 12 new rows run. Greedy ids vs llama.cpp `79e2e74` with
+     f32 activations, 7 prompts × 20 tokens: fixture 6/7, V2-Lite 6/7, Coder-V2-Lite 6/7,
+     GigaChat3.1 5/7, GLM-4.7-Flash 4/7 (f16 only); f32 and f16 weights identical per
+     model. All 8 divergences are near-ties: Reflex picks llama.cpp's own runner-up,
+     margins 0.005-0.19 (`REF_MARGINS` probe); on the fixture HF transformers agrees with
+     Reflex. Nightly 57/0/2, `cargo test` 186. Cold start GigaChat3.1 q8_0 4.22 s p50 vs
+     `llama-simple` 4.40 s (n=30).
+   - The first GPU test run had two test-data failures, fixed and re-run 5/5: the
+     fixture's `arabic` golden came from llama.cpp's CPU backend (CUDA differs at step 2;
+     Reflex = CUDA), and the f16 test's "clear pick" threshold left too few prompts.
+
+   Queued from this phase:
+   - **Moonlight-16B-A3B** (`kimi-k2` pre type: port `unicode_regex_split_custom_kimi_k2`)
+     and **Kanana-2-30B-A3B** (`kanana2` = llama.cpp's `gpt-4o` split, 2 regexes through
+     `std::regex`). Both already parse (sigmoid + bias); each needs only its pre type.
+   - **BPE `add_bos_token` default.** With the key missing, llama.cpp adds no BOS for BPE
+     vocabs unless the pre type sets it (LLAMA3 group, ...); Reflex adds the declared BOS.
+     Affects `tiny-qwen3moe` (`gpt-2`, BOS 50256) and Moonlight; fixing it changes
+     `tiny-qwen3moe`'s `reflex check` rows. `glm4` is handled (BOS nulled).
+   - **Public GPU nightly fails daily** (since at least 2026-10-08): the Kolibri tests
+     fail instead of skipping when `test-data/tiny-kolibri1*.gguf` is missing on the
+     runner. Add `gpu_nightly_tests.sh` rules for them.
+   - **MLA quantized-resident.** GigaChat3.1's cold start is load-bound (2.0 s of 3.2 s,
+     dequantizing 11 GB of `Q8_0` to f16); Reflex leads `llama-simple` by only 1.04x there.
+     A `Q8_0`-resident MLA path (Gemma 4's `gemv_q8_0`) would cut that and fit GLM-4.7-Flash
+     in 48 GB.
+   - Still out: MTP/NextN, group-limited routing (671B V3/R1), all-MoE files.
 4. **Mamba-2 hybrid** (largest; new kernels).
    - **Step 0:** a header survey of Granite 4.0-H (`granitehybrid`), Falcon-H1,
      Nemotron-H, pure Mamba-2 and a small Jamba. Pick by smallest real file, permissive
@@ -1304,6 +1361,10 @@ Order (cheapest correctness first); each phase is its own branch and session:
   bartowski) predates the MLA tensor-split conversion format and will be silently
   rejected by `parse_mla_config` (no `key_length_mla`/`value_length_mla` metadata) —
   don't assume a downloaded GGUF is usable without checking for those keys first.
+  2026-10-13: regenerated (and Coder-V2-Lite-Instruct) on the phase 3 A100 pod; with the
+  pinned converter use `transformers==4.57.1` (5.x doesn't recognize the tokenizer hash and
+  writes no usable pre type). sha256 of both conversions in `test-data/tiny-mla-v3-src.tar.gz`
+  (`gpu-a100/results/res/models.sha256`); `setup.sh` there is the recipe.
 - **Dockerfile `docker build` now real-verified (both modes); `docker run --gpus all`
   still not, for a hardware reason this time, not an environment-access one**: a
   genuine (non-nested-container) Docker host was finally available (a
