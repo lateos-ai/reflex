@@ -16,15 +16,19 @@
 //! greedy lowest-merge-rank adjacent-pair merging — confirmed against a real
 //! TinyLlama reference (`PHASE21_real_gguf_verification`).
 //!
-//! **GPT-2/Qwen2 path — not yet verified against a real reference
-//! tokenizer** (e.g. Python `transformers`/`tokenizers` on the same
-//! string): the pre-tokenization regex was hand-ported from real llama.cpp
-//! source (`LLAMA_VOCAB_PRE_TYPE_QWEN2`'s exact pattern), and the algorithm
-//! runs and produces well-formed, in-vocab output on a real Qwen3-0.6B GGUF
-//! (21.14.1's fixture), but byte-for-byte agreement with a real reference on
-//! arbitrary text is `PHASE21_14_PLAN.md`'s 21.14.2b's own remaining gate,
-//! same "flag the real gap honestly" posture this module's SentencePiece
-//! path already held before its own real-file verification.
+//! **GPT-2 path**: the pre-tokenization split depends on
+//! `tokenizer.ggml.pre` ([`PreType`]; unknown values are rejected). Each
+//! split is hand-ported from llama.cpp `79e2e74` and checked token for token
+//! against its `llama-tokenize` on a tricky string set, one tokenizer-only
+//! fixture per pre type (`test_*_encode_matches_llama_tokenize_if_fixture_present`;
+//! Kolibri-1 is also checked against HF `tokenizers`). See
+//! docs/design/tokenizer-pre-types.md. One known gap: the original Qwen2
+//! port ([`qwen2_pretokenize_one`]) classifies characters with Rust's
+//! `is_alphabetic`/`is_numeric`/`is_whitespace`, which disagree with
+//! llama.cpp's Unicode tables on some combining marks (Arabic harakat), so
+//! `qwen2` vocabs can split such text differently from llama.cpp. It is kept
+//! as is so `qwen2` output didn't change when pre types started being read;
+//! every other pre type uses llama.cpp's tables (`crate::tokenizer_unicode`).
 
 use crate::error::ReflexError;
 use crate::gguf::{GgufFile, GgufValue};
@@ -97,9 +101,98 @@ fn parse_byte_fallback(tok: &str) -> Option<u8> {
     u8::from_str_radix(inner, 16).ok()
 }
 
+/// The split regex a `tokenizer.ggml.model == "gpt2"` vocab pre-tokenizes
+/// with, read from `tokenizer.ggml.pre` and named after llama.cpp's
+/// `LLAMA_VOCAB_PRE_TYPE_*` (`src/llama-vocab.cpp` at `79e2e74`). Each variant
+/// is a hand-port of that pre type's regex list; see
+/// docs/design/tokenizer-pre-types.md for where each came from and how to add
+/// one. Any other `pre` value is rejected by [`PreType::from_gguf_value`]:
+/// before this enum existed every gpt2 vocab silently got the Qwen2 split, so
+/// a Llama-3 or DeepSeek GGUF loaded and tokenized wrongly with no error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreType {
+    /// `LLAMA_VOCAB_PRE_TYPE_QWEN2` (`qwen2`, `kolibri1`, or no `pre` key):
+    /// [`qwen2_pretokenize_one`]. Unchanged from before pre types were read.
+    Qwen2,
+    /// `LLAMA_VOCAB_PRE_TYPE_QWEN35` (`qwen35`): Qwen2's split, but letter
+    /// runs also take combining marks (`[\p{L}\p{M}]+`).
+    Qwen35,
+    /// `LLAMA_VOCAB_PRE_TYPE_LLAMA3` (`llama-bpe`): Qwen2's split with digit
+    /// runs grouped up to three (`\p{N}{1,3}`), plus llama.cpp's
+    /// `ignore_merges` (a pre-token that is already one vocab entry skips BPE).
+    Llama3,
+    /// `LLAMA_VOCAB_PRE_TYPE_GPT2` (`gpt-2`): the original GPT-2 regex.
+    Gpt2,
+    /// `LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM` (`deepseek-llm`): six regexes
+    /// applied in sequence (DeepSeek LLM 7B, DeepSeek-V2/V2-Lite).
+    DeepseekLlm,
+    /// `LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM` (`deepseek-v3`): three regexes
+    /// applied in sequence (DeepSeek-V3/R1).
+    Deepseek3,
+}
+
+impl PreType {
+    /// Every accepted `tokenizer.ggml.pre` value and the variant it maps to.
+    /// Only values whose split was checked against llama.cpp's
+    /// `llama-tokenize` are listed (aliases llama.cpp also accepts, like
+    /// `llama3` for `llama-bpe`, are left out until a real file needs them).
+    pub const ACCEPTED: &'static [(&'static str, PreType)] = &[
+        ("qwen2", PreType::Qwen2),
+        // Not a llama.cpp value at 79e2e74: the community Kolibri-1 patch
+        // maps it to LLAMA_VOCAB_PRE_TYPE_QWEN2, and Reflex matches HF
+        // `tokenizers` with the Qwen2 split
+        // (`test_kolibri1_encode_matches_hf_tokenizers_if_fixture_present`).
+        ("kolibri1", PreType::Qwen2),
+        ("qwen35", PreType::Qwen35),
+        ("llama-bpe", PreType::Llama3),
+        ("gpt-2", PreType::Gpt2),
+        ("deepseek-llm", PreType::DeepseekLlm),
+        ("deepseek-v3", PreType::Deepseek3),
+    ];
+
+    /// Map a gpt2-model vocab's `tokenizer.ggml.pre` to its split. A missing
+    /// key keeps the Qwen2 split every gpt2 vocab got before this was read,
+    /// so files that loaded before still tokenize identically (llama.cpp
+    /// itself warns and falls back to its `default` regex there; no file in
+    /// test-data/ lacks the key). Unknown values are an error naming the
+    /// value: tokenizing with the wrong split gives wrong ids, not a crash.
+    pub fn from_gguf_value(pre: Option<&str>) -> Result<Self, ReflexError> {
+        let Some(pre) = pre else {
+            return Ok(PreType::Qwen2);
+        };
+        Self::ACCEPTED
+            .iter()
+            .find(|(name, _)| *name == pre)
+            .map(|&(_, ty)| ty)
+            .ok_or_else(|| {
+                let names: Vec<&str> = Self::ACCEPTED.iter().map(|(n, _)| *n).collect();
+                crate::reflex_err!(
+                    Tokenizer,
+                    "unsupported tokenizer.ggml.pre '{pre}' for a gpt2 tokenizer \
+                     (supported: {}); tokenizing with another pre type's split \
+                     would give wrong token ids. See docs/design/tokenizer-pre-types.md \
+                     for how to add one",
+                    names.join(", ")
+                )
+            })
+    }
+
+    /// llama.cpp's `ignore_merges` for this pre type (set in
+    /// `llama_vocab::impl::load` at `79e2e74`): when a whole pre-token is a
+    /// vocab entry, emit it directly instead of BPE-merging it. Of the
+    /// accepted types only LLAMA3 sets it.
+    fn ignore_merges(self) -> bool {
+        self == PreType::Llama3
+    }
+}
+
 /// A tokenizer extracted from a GGUF file's `tokenizer.ggml.*` metadata keys.
 pub struct Tokenizer {
     pub architecture: String,
+    /// The gpt2-model split ([`PreType`]); `None` for every other
+    /// `tokenizer.ggml.model` (`llama` SentencePiece and `gemma4` don't
+    /// pre-tokenize with a regex, and ignore `tokenizer.ggml.pre`).
+    pub pre_type: Option<PreType>,
     pub tokens: Vec<String>,
     pub scores: Vec<f32>,
     pub token_type: Vec<i32>,
@@ -146,6 +239,20 @@ impl Tokenizer {
     /// defaults to empty/`None` when absent.
     pub fn from_gguf(file: &GgufFile) -> Result<Self, ReflexError> {
         let architecture = string_meta(&file.metadata, "tokenizer.ggml.model")?.to_string();
+        let pre_type = if architecture == "gpt2" {
+            let pre = match file.metadata.get("tokenizer.ggml.pre") {
+                Some(v) => Some(v.as_str().ok_or_else(|| {
+                    crate::reflex_err!(
+                        Tokenizer,
+                        "metadata key 'tokenizer.ggml.pre' is not a string"
+                    )
+                })?),
+                None => None,
+            };
+            Some(PreType::from_gguf_value(pre)?)
+        } else {
+            None
+        };
         let tokens = string_array(&file.metadata, "tokenizer.ggml.tokens")?;
 
         let scores = match file.metadata.get("tokenizer.ggml.scores") {
@@ -215,6 +322,7 @@ impl Tokenizer {
 
         Ok(Tokenizer {
             architecture,
+            pre_type,
             tokens,
             scores,
             token_type,
@@ -516,37 +624,65 @@ impl Tokenizer {
     /// initial symbols are and how text gets split into independently-merged
     /// chunks first.
     ///
-    /// **Not yet verified against a real reference tokenizer** (e.g. Python
-    /// `transformers`/`tokenizers` output on the same string) — same honest
-    /// caveat this module's own SentencePiece path already carried before
-    /// its own real-file verification; `PHASE21_14_PLAN.md`'s 21.14.2b is
-    /// where that verification happens.
+    /// Step 1's split depends on `tokenizer.ggml.pre` ([`PreType`]): `qwen2`
+    /// (and `kolibri1`, and a missing key) keep [`qwen2_pretokenize_one`]
+    /// exactly as before pre types were read; every other accepted type goes
+    /// through [`pretokenize`]. Every split is checked against llama.cpp's
+    /// `llama-tokenize` (see the module doc for the one known `qwen2` gap).
     fn encode_gpt2(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
         let chars: Vec<char> = text.chars().collect();
-        let byte_to_unicode = gpt2_byte_to_unicode_table();
+        let pre_type = self.pre_type.unwrap_or(PreType::Qwen2);
         let mut ids = Vec::new();
-        let mut i = 0;
-        while i < chars.len() {
-            let end = qwen2_pretokenize_one(&chars, i);
-            let piece: String = chars[i..end].iter().collect();
-            i = end;
-
-            let mut symbols: Vec<String> = Vec::with_capacity(piece.len());
-            for &b in piece.as_bytes() {
-                symbols.push(byte_to_unicode[b as usize].to_string());
+        if pre_type == PreType::Qwen2 {
+            let mut i = 0;
+            while i < chars.len() {
+                let end = qwen2_pretokenize_one(&chars, i);
+                self.encode_gpt2_piece(&chars[i..end], false, &mut ids)?;
+                i = end;
             }
-            self.bpe_merge(&mut symbols);
-            for s in symbols {
-                let id = self.token_to_id.get(&s).copied().ok_or_else(|| {
-                    crate::reflex_err!(
-                        Tokenizer,
-                        "gpt2 BPE symbol {s:?} not found in vocab (piece {piece:?})"
-                    )
-                })?;
-                ids.push(id);
+        } else {
+            for (start, end) in pretokenize(pre_type, &chars) {
+                self.encode_gpt2_piece(&chars[start..end], pre_type.ignore_merges(), &mut ids)?;
             }
         }
         Ok(ids)
+    }
+
+    /// Byte-remap one pre-token and BPE-merge it into `ids`. With
+    /// `ignore_merges` (llama.cpp's flag of that name, see
+    /// [`PreType::ignore_merges`]) a pre-token that is already a vocab entry
+    /// is emitted as that one id without merging.
+    fn encode_gpt2_piece(
+        &self,
+        piece: &[char],
+        ignore_merges: bool,
+        ids: &mut Vec<u32>,
+    ) -> Result<(), ReflexError> {
+        let byte_to_unicode = gpt2_byte_to_unicode_table();
+        let piece: String = piece.iter().collect();
+        if ignore_merges {
+            let word: String = piece.bytes().map(|b| byte_to_unicode[b as usize]).collect();
+            if let Some(&id) = self.token_to_id.get(&word) {
+                ids.push(id);
+                return Ok(());
+            }
+        }
+
+        let mut symbols: Vec<String> = Vec::with_capacity(piece.len());
+        for &b in piece.as_bytes() {
+            symbols.push(byte_to_unicode[b as usize].to_string());
+        }
+        self.bpe_merge(&mut symbols);
+        for s in symbols {
+            let id = self.token_to_id.get(&s).copied().ok_or_else(|| {
+                crate::reflex_err!(
+                    Tokenizer,
+                    "gpt2 BPE symbol {s:?} not found in vocab (piece {piece:?})"
+                )
+            })?;
+            ids.push(id);
+        }
+        Ok(())
     }
 
     /// Greedy lowest-rank adjacent-pair BPE merging, shared by
@@ -873,10 +1009,11 @@ fn gpt2_unicode_to_byte_table() -> &'static HashMap<char, u8> {
 
 /// `\p{L}` proxy: Rust's `char::is_alphabetic()` is Unicode-alphabetic-aware
 /// but not a byte-for-byte match to Unicode's `L*` general-category union —
-/// close enough for real text in the common case, not yet verified for
-/// every Unicode edge case a real reference tokenizer might diverge on
-/// (`PHASE21_14_PLAN.md`'s 21.14.2b correctness gate is where that gets
-/// checked against a real reference, not assumed exact here).
+/// close enough for real text in the common case. Confirmed divergence from
+/// llama.cpp: Arabic harakat (Mn, Other_Alphabetic) count as letters here
+/// but not in llama.cpp's table (`test_qwen2_encode_matches_llama_tokenize_if_fixture_present`
+/// skips that string). Used only by the `qwen2` split, kept unchanged on
+/// purpose; the other pre types use [`CptFlags`].
 fn is_l(c: char) -> bool {
     c.is_alphabetic()
 }
@@ -1043,6 +1180,529 @@ fn match_whitespace_run(chars: &[char], i: usize) -> Option<usize> {
     Some(j)
 }
 
+// ---------------------------------------------------------------------------
+// Pre-tokenizer splits for every [`PreType`] except `Qwen2`.
+//
+// Hand-ported (no `regex` crate, same convention as `qwen2_pretokenize_one`)
+// from llama.cpp `79e2e74`: the regex lists in `src/llama-vocab.cpp`'s
+// `llm_tokenizer_bpe` constructor, run the way `src/unicode.cpp`'s
+// `unicode_regex_split` runs them. Unlike the Qwen2 port above, these classify
+// codepoints with llama.cpp's own Unicode tables (`crate::tokenizer_unicode`,
+// generated from `src/unicode-data.cpp`) instead of Rust's `is_alphabetic`/
+// `is_numeric`/`is_whitespace`, which disagree with them on combining marks,
+// and std has no `\p{P}`/`\p{S}`/`\p{M}` at all. Two execution models, both
+// llama.cpp's:
+// - `qwen35`/`llama-bpe`/`gpt-2` have a hand-written splitter in llama.cpp
+//   (`unicode_regex_split_custom_{qwen35,llama3,gpt2}`), ported line for line
+//   by [`split_custom`] + a step function. An unmatched codepoint becomes a
+//   one-codepoint piece.
+// - `deepseek-llm`/`deepseek-v3` are lists of regexes llama.cpp runs through
+//   `std::regex`, each one over every piece the previous one produced
+//   ([`split_stl`], `unicode_regex_split_stl`). Text between matches stays as
+//   its own piece. Regexes using `\p{..}` run on llama.cpp's "collapsed" text
+//   (each non-ASCII codepoint replaced by a byte standing for its category),
+//   the others on the codepoints with every non-ASCII whitespace codepoint
+//   replaced by `\x0B`. Either way `\s` means llama.cpp's whitespace set and
+//   `\p{X}` means its category table, which is what the matchers below test.
+// ---------------------------------------------------------------------------
+
+/// llama.cpp's `unicode_cpt_flags` for one codepoint: its category bit
+/// (`tokenizer_unicode::LETTER` etc.) plus `is_whitespace`. The default
+/// (all zero) is what llama.cpp's splitters read past the end of a piece.
+#[derive(Clone, Copy, Default)]
+struct CptFlags {
+    category: u8,
+    whitespace: bool,
+}
+
+impl CptFlags {
+    fn of(c: char) -> Self {
+        use crate::tokenizer_unicode::{CATEGORY_RANGES, WHITESPACE};
+        let cp = c as u32;
+        let idx = CATEGORY_RANGES.partition_point(|&(start, _)| start <= cp) - 1;
+        CptFlags {
+            category: CATEGORY_RANGES[idx].1,
+            whitespace: WHITESPACE.binary_search(&cp).is_ok(),
+        }
+    }
+    fn is_letter(self) -> bool {
+        self.category == crate::tokenizer_unicode::LETTER
+    }
+    fn is_number(self) -> bool {
+        self.category == crate::tokenizer_unicode::NUMBER
+    }
+    fn is_accent_mark(self) -> bool {
+        self.category == crate::tokenizer_unicode::ACCENT_MARK
+    }
+    fn is_punctuation(self) -> bool {
+        self.category == crate::tokenizer_unicode::PUNCTUATION
+    }
+    fn is_symbol(self) -> bool {
+        self.category == crate::tokenizer_unicode::SYMBOL
+    }
+    /// llama.cpp's `flags.as_uint() != 0`: true for every codepoint inside
+    /// the piece (each has a category bit, `UNDEFINED` included), false past
+    /// its end.
+    fn in_piece(self) -> bool {
+        self.category != 0 || self.whitespace
+    }
+}
+
+/// Flags of `chars[pos]`, or all-zero at/after `end` (llama.cpp's
+/// `_get_flags`, which reads nothing outside the current piece).
+fn flags_at(chars: &[char], end: usize, pos: usize) -> CptFlags {
+    if pos < end {
+        CptFlags::of(chars[pos])
+    } else {
+        CptFlags::default()
+    }
+}
+
+/// `chars[pos]`, or `None` at/after `end` (llama.cpp's `_get_cpt`, whose
+/// `OUT_OF_RANGE` never equals a real codepoint).
+fn cpt_at(chars: &[char], end: usize, pos: usize) -> Option<char> {
+    (pos < end).then(|| chars[pos])
+}
+
+/// Split `chars` into `(start, end)` pre-token ranges for `pre_type` (any
+/// type but `Qwen2`, which keeps its own loop in [`Tokenizer::encode_gpt2`]).
+fn pretokenize(pre_type: PreType, chars: &[char]) -> Vec<(usize, usize)> {
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let whole = vec![(0, chars.len())];
+    match pre_type {
+        PreType::Qwen2 => split_custom(chars, &whole, qwen2_step),
+        PreType::Qwen35 => split_custom(chars, &whole, |c, e, p| {
+            llama3_family_step(c, e, p, 1, true)
+        }),
+        PreType::Llama3 => split_custom(chars, &whole, |c, e, p| {
+            llama3_family_step(c, e, p, 3, false)
+        }),
+        PreType::Gpt2 => split_custom(chars, &whole, gpt2_step),
+        PreType::DeepseekLlm => {
+            // LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM, in order:
+            //   "[\r\n]"
+            //   "\\s?[A-Za-zµÀ-ÖØ-öø-ƺ...𞤀-𞥃]+"    (DEEPSEEK_LLM_LATIN)
+            //   "\\s?[!-/:-~！-／：-～‘-‟　-。]+"   (DEEPSEEK_LLM_PUNCT)
+            //   "\\s+$"
+            //   "[一-龥ࠀ-一가-퟿]+"                  (DEEPSEEK_LLM_CJK)
+            //   "\\p{N}+"
+            let classes = deepseek_classes();
+            let mut pieces = split_stl(chars, &whole, |c, _, p| {
+                matches!(c[p], '\r' | '\n').then_some(p + 1)
+            });
+            pieces = split_stl(chars, &pieces, |c, e, p| {
+                match_ws_opt_class_run(c, e, p, &classes.llm_latin)
+            });
+            pieces = split_stl(chars, &pieces, |c, e, p| {
+                match_ws_opt_class_run(c, e, p, &classes.llm_punct)
+            });
+            pieces = split_stl(chars, &pieces, |c, e, p| {
+                let run = ws_run_end(c, e, p);
+                (run > p && run == e).then_some(e)
+            });
+            pieces = split_stl(chars, &pieces, |c, e, p| {
+                match_class_run(c, e, p, &classes.llm_cjk)
+            });
+            split_stl(chars, &pieces, |c, e, p| {
+                let run = run_end(c, e, p, |f| f.is_number());
+                (run > p).then_some(run)
+            })
+        }
+        PreType::Deepseek3 => {
+            // LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM, in order:
+            //   "\\p{N}{1,3}"
+            //   "[一-龥぀-ゟ゠-ヿ]+"                  (DEEPSEEK_V3_CJK)
+            //   "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"
+            let classes = deepseek_classes();
+            let mut pieces = split_stl(chars, &whole, |c, e, p| {
+                let run = run_end(c, e, p, |f| f.is_number());
+                (run > p).then_some(run.min(p + 3))
+            });
+            pieces = split_stl(chars, &pieces, |c, e, p| {
+                match_class_run(c, e, p, &classes.v3_cjk)
+            });
+            split_stl(chars, &pieces, deepseek3_main_match)
+        }
+    }
+}
+
+/// Run `step` over each piece in `pieces` the way llama.cpp's
+/// `unicode_regex_split_custom_*` functions do: `step(chars, piece_end, pos)`
+/// returns the end of the pre-token starting at `pos` (always `> pos`).
+fn split_custom(
+    chars: &[char],
+    pieces: &[(usize, usize)],
+    step: impl Fn(&[char], usize, usize) -> usize,
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for &(start, end) in pieces {
+        let mut pos = start;
+        while pos < end {
+            let next = step(chars, end, pos);
+            debug_assert!(next > pos && next <= end);
+            out.push((pos, next));
+            pos = next;
+        }
+    }
+    out
+}
+
+/// Run one regex over each piece in `pieces` the way llama.cpp's
+/// `unicode_regex_split_stl` does with `std::regex_iterator`: scan for the
+/// leftmost match, emit any unmatched text before it as its own piece, then
+/// the match, and continue after it. `matcher(chars, piece_end, pos)` returns
+/// the end of the regex's match starting exactly at `pos` (leftmost
+/// alternative, greedy with backtracking, ECMAScript semantics), or `None`.
+/// The piece end acts as end of input for `$` and lookaheads, as the
+/// iterator's sub-range does. None of the ported regexes can match empty.
+fn split_stl(
+    chars: &[char],
+    pieces: &[(usize, usize)],
+    matcher: impl Fn(&[char], usize, usize) -> Option<usize>,
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for &(start, end) in pieces {
+        let mut gap = start;
+        let mut pos = start;
+        while pos < end {
+            match matcher(chars, end, pos) {
+                Some(m) => {
+                    debug_assert!(m > pos && m <= end);
+                    if gap < pos {
+                        out.push((gap, pos));
+                    }
+                    out.push((pos, m));
+                    pos = m;
+                    gap = m;
+                }
+                None => pos += 1,
+            }
+        }
+        if gap < end {
+            out.push((gap, end));
+        }
+    }
+    out
+}
+
+/// End of the run of codepoints from `pos` (before `end`) whose flags pass `f`.
+fn run_end(chars: &[char], end: usize, pos: usize, f: impl Fn(CptFlags) -> bool) -> usize {
+    let mut j = pos;
+    while j < end && f(CptFlags::of(chars[j])) {
+        j += 1;
+    }
+    j
+}
+
+/// End of the `\s` run from `pos`. llama.cpp maps every non-ASCII whitespace
+/// codepoint to `\x0B` before `std::regex` sees it, so `\s` is exactly its
+/// whitespace set.
+fn ws_run_end(chars: &[char], end: usize, pos: usize) -> usize {
+    run_end(chars, end, pos, |f| f.whitespace)
+}
+
+/// `unicode_regex_split_custom_qwen2`, as a [`split_custom`] step. Not used
+/// for encoding (the `Qwen2` path keeps [`qwen2_pretokenize_one`] and its
+/// Rust-std character classes, unchanged); kept so [`pretokenize`] is total.
+fn qwen2_step(chars: &[char], end: usize, pos: usize) -> usize {
+    qwen2_pretokenize_one(&chars[..end], pos)
+}
+
+/// `unicode_regex_split_custom_llama3` (`digits = 3`, `marks = false`) and
+/// `unicode_regex_split_custom_qwen35` (`digits = 1`, `marks = true`), one
+/// pre-token per call. Same structure as llama.cpp's, line for line:
+///
+/// ```text
+/// llama3: (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// qwen35: (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// ```
+///
+/// llama.cpp groups a digit run into threes inside one call; returning one
+/// group per call is equivalent, since the next call starts on a digit and
+/// reaches the same branch. The contraction check lowercases with ASCII
+/// rules: in llama.cpp's `unicode_map_lowercase` no non-ASCII codepoint
+/// lowercases to any of `s t m d r e v l`.
+fn llama3_family_step(chars: &[char], end: usize, pos: usize, digits: usize, marks: bool) -> usize {
+    let cpt = chars[pos];
+    let flags = CptFlags::of(cpt);
+    let is_word = |f: CptFlags| f.is_letter() || (marks && f.is_accent_mark());
+
+    // (?i:'s|'t|'re|'ve|'m|'ll|'d)
+    if cpt == '\'' && pos + 1 < end {
+        let next = chars[pos + 1].to_ascii_lowercase();
+        if matches!(next, 's' | 't' | 'm' | 'd') {
+            return pos + 2;
+        }
+        if pos + 2 < end {
+            let next2 = chars[pos + 2].to_ascii_lowercase();
+            if matches!((next, next2), ('r', 'e') | ('v', 'e') | ('l', 'l')) {
+                return pos + 3;
+            }
+        }
+    }
+
+    // [^\r\n\p{L}\p{N}]?\p{L}+   (qwen35: [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+)
+    if !(cpt == '\r' || cpt == '\n' || flags.is_number())
+        && (is_word(flags) || is_word(flags_at(chars, end, pos + 1)))
+    {
+        let mut j = pos + 1;
+        while is_word(flags_at(chars, end, j)) {
+            j += 1;
+        }
+        return j;
+    }
+
+    // \p{N}{1,3}   (qwen35: \p{N})
+    if flags.is_number() {
+        return run_end(chars, end, pos, |f| f.is_number()).min(pos + digits);
+    }
+
+    // <space>?[^\s\p{L}\p{N}]+[\r\n]*   (qwen35 also excludes \p{M})
+    let not_ws_word_num = |f: CptFlags| {
+        !(f.whitespace || f.is_letter() || f.is_number() || (marks && f.is_accent_mark()))
+    };
+    let flags2 = if cpt == ' ' {
+        flags_at(chars, end, pos + 1)
+    } else {
+        flags
+    };
+    if not_ws_word_num(flags2) && flags.in_piece() {
+        let mut j = pos + usize::from(cpt == ' ');
+        while {
+            let f = flags_at(chars, end, j);
+            not_ws_word_num(f) && f.in_piece()
+        } {
+            j += 1;
+        }
+        while matches!(cpt_at(chars, end, j), Some('\r' | '\n')) {
+            j += 1;
+        }
+        return j;
+    }
+
+    whitespace_tail_step(chars, end, pos, true)
+}
+
+/// The shared whitespace tail of llama.cpp's custom splitters:
+/// `\s*[\r\n]+` (only when `blank_lines`; GPT-2's regex has no such
+/// alternative), then `\s+(?!\S)`, then `\s+`, else a one-codepoint
+/// "no match" piece.
+fn whitespace_tail_step(chars: &[char], end: usize, pos: usize, blank_lines: bool) -> usize {
+    let mut num_whitespaces = 0;
+    let mut last_end_r_or_n = 0;
+    while flags_at(chars, end, pos + num_whitespaces).whitespace {
+        if matches!(chars[pos + num_whitespaces], '\r' | '\n') {
+            last_end_r_or_n = pos + num_whitespaces + 1;
+        }
+        num_whitespaces += 1;
+    }
+    // \s*[\r\n]+
+    if blank_lines && last_end_r_or_n > 0 {
+        return last_end_r_or_n;
+    }
+    // \s+(?!\S)
+    if num_whitespaces > 1 && pos + num_whitespaces < end {
+        return pos + num_whitespaces - 1;
+    }
+    // \s+
+    if num_whitespaces > 0 {
+        return pos + num_whitespaces;
+    }
+    // no match
+    pos + 1
+}
+
+/// `unicode_regex_split_custom_gpt2`, one pre-token per call:
+/// `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)`
+/// (contractions are case-sensitive here, unlike the llama3 family's).
+fn gpt2_step(chars: &[char], end: usize, pos: usize) -> usize {
+    let cpt = chars[pos];
+    let flags = CptFlags::of(cpt);
+
+    // 's|'t|'re|'ve|'m|'ll|'d
+    if cpt == '\'' && pos + 1 < end {
+        let next = chars[pos + 1];
+        if matches!(next, 's' | 't' | 'm' | 'd') {
+            return pos + 2;
+        }
+        if pos + 2 < end && matches!((next, chars[pos + 2]), ('r', 'e') | ('v', 'e') | ('l', 'l')) {
+            return pos + 3;
+        }
+    }
+
+    let flags2 = if cpt == ' ' {
+        flags_at(chars, end, pos + 1)
+    } else {
+        flags
+    };
+    let start = pos + usize::from(cpt == ' ');
+    // <space>?\p{L}+
+    if flags2.is_letter() {
+        return run_end(chars, end, start, |f| f.is_letter());
+    }
+    // <space>?\p{N}+
+    if flags2.is_number() {
+        return run_end(chars, end, start, |f| f.is_number());
+    }
+    // <space>?[^\s\p{L}\p{N}]+
+    let is_other = |f: CptFlags| !(f.whitespace || f.is_letter() || f.is_number()) && f.in_piece();
+    if is_other(flags2) {
+        return run_end(chars, end, start, is_other);
+    }
+
+    whitespace_tail_step(chars, end, pos, false)
+}
+
+/// The DeepSeek character classes, verbatim from llama.cpp `79e2e74`
+/// `src/llama-vocab.cpp` (the text between `[` and `]` of each regex), so a
+/// diff against upstream is a plain string comparison. Parsed into
+/// codepoint ranges once ([`deepseek_classes`]).
+const DEEPSEEK_LLM_LATIN: &str = "A-Za-zµÀ-ÖØ-öø-ƺƼ-ƿǄ-ʓʕ-ʯͰ-ͳͶͷͻ-ͽͿΆΈ-ΊΌΎ-ΡΣ-ϵϷ-ҁҊ-ԯԱ-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙὛὝὟ-\u{1F7D}ᾀ-ᾴᾶ-ᾼ\u{1FBE}ῂ-ῄῆ-ῌῐ-\u{1FD3}ῖ-\u{1FDB}ῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤ\u{2126}ℨ\u{212A}-ℭℯ-ℴℹℼ-ℿⅅ-ⅉⅎↃↄⰀ-ⱻⱾ-ⳤⳫ-ⳮⳲⳳꙀ-ꙭꚀ-ꚛꜢ-ꝯꝱ-ꞇꞋ-ꞎꭰ-ꮿﬀ-ﬆﬓ-ﬗＡ-Ｚａ-ｚ𐐀-𐑏𐒰-𐓓𐓘-𐓻𐲀-𐲲𐳀-𐳲𑢠-𑣟𞤀-𞥃";
+const DEEPSEEK_LLM_PUNCT: &str = "!-/:-~！-／：-～‘-‟　-。";
+const DEEPSEEK_LLM_CJK: &str = "一-龥ࠀ-一가-퟿";
+const DEEPSEEK_V3_CJK: &str = "一-龥぀-ゟ゠-ヿ";
+
+struct DeepseekClasses {
+    llm_latin: Vec<(u32, u32)>,
+    llm_punct: Vec<(u32, u32)>,
+    llm_cjk: Vec<(u32, u32)>,
+    v3_cjk: Vec<(u32, u32)>,
+}
+
+fn deepseek_classes() -> &'static DeepseekClasses {
+    static CLASSES: std::sync::OnceLock<DeepseekClasses> = std::sync::OnceLock::new();
+    CLASSES.get_or_init(|| DeepseekClasses {
+        llm_latin: parse_char_class(DEEPSEEK_LLM_LATIN),
+        llm_punct: parse_char_class(DEEPSEEK_LLM_PUNCT),
+        llm_cjk: parse_char_class(DEEPSEEK_LLM_CJK),
+        v3_cjk: parse_char_class(DEEPSEEK_V3_CJK),
+    })
+}
+
+/// Parse a bracket-expression body of single codepoints and `a-b` ranges (no
+/// escapes; none of the DeepSeek classes has any) into inclusive ranges.
+fn parse_char_class(body: &str) -> Vec<(u32, u32)> {
+    let cps: Vec<u32> = body.chars().map(|c| c as u32).collect();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < cps.len() {
+        if i + 2 < cps.len() && cps[i + 1] == '-' as u32 {
+            ranges.push((cps[i], cps[i + 2]));
+            i += 3;
+        } else {
+            ranges.push((cps[i], cps[i]));
+            i += 1;
+        }
+    }
+    ranges
+}
+
+/// Whether `c` is in `class`, as `std::wregex` sees it: llama.cpp replaces
+/// every non-ASCII whitespace codepoint with `\x0B` first, so e.g. U+3000
+/// (inside `　-。`) never matches a class, only `\s`.
+fn in_class(c: char, class: &[(u32, u32)]) -> bool {
+    let cp = c as u32;
+    let cp = if cp > 0x7F && CptFlags::of(c).whitespace {
+        0x0B
+    } else {
+        cp
+    };
+    class.iter().any(|&(lo, hi)| lo <= cp && cp <= hi)
+}
+
+/// `[class]+`
+fn match_class_run(chars: &[char], end: usize, pos: usize, class: &[(u32, u32)]) -> Option<usize> {
+    let mut j = pos;
+    while j < end && in_class(chars[j], class) {
+        j += 1;
+    }
+    (j > pos).then_some(j)
+}
+
+/// `\s?[class]+`: the optional `\s` is taken only if the class run follows
+/// (backtracking to no `\s` leaves a whitespace codepoint the class doesn't
+/// contain, so that fails too).
+fn match_ws_opt_class_run(
+    chars: &[char],
+    end: usize,
+    pos: usize,
+    class: &[(u32, u32)],
+) -> Option<usize> {
+    if CptFlags::of(chars[pos]).whitespace {
+        match_class_run(chars, end, pos + 1, class)
+    } else {
+        match_class_run(chars, end, pos, class)
+    }
+}
+
+/// DeepSeek-V3's third regex, on llama.cpp's collapsed text, alternatives
+/// tried in order:
+///
+/// 1. `[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+` (ASCII only: the
+///    collapsed text keeps ASCII as is, and a non-ASCII letter's category
+///    byte isn't in `A-Za-z`)
+/// 2. `[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+`
+/// 3. ` ?[\p{P}\p{S}]+[\r\n]*`
+/// 4. `\s*[\r\n]+` (greedy `\s*` backs off to the run's last `\r`/`\n`)
+/// 5. `\s+(?!\S)`
+/// 6. `\s+`
+fn deepseek3_main_match(chars: &[char], end: usize, pos: usize) -> Option<usize> {
+    let c = chars[pos];
+    let f = CptFlags::of(c);
+    let is_word = |f: CptFlags| f.is_letter() || f.is_accent_mark();
+    let is_ps = |f: CptFlags| f.is_punctuation() || f.is_symbol();
+
+    // 1.
+    if c.is_ascii_punctuation() && pos + 1 < end && chars[pos + 1].is_ascii_alphabetic() {
+        let mut j = pos + 1;
+        while j < end && chars[j].is_ascii_alphabetic() {
+            j += 1;
+        }
+        return Some(j);
+    }
+    // 2. Optional leading codepoint first (greedy), then without it.
+    let lead_ok = !matches!(c, '\r' | '\n') && !f.is_letter() && !is_ps(f);
+    if lead_ok && is_word(flags_at(chars, end, pos + 1)) {
+        return Some(run_end(chars, end, pos + 1, is_word));
+    }
+    if is_word(f) {
+        return Some(run_end(chars, end, pos, is_word));
+    }
+    // 3.
+    let start = if c == ' ' && is_ps(flags_at(chars, end, pos + 1)) {
+        pos + 1
+    } else {
+        pos
+    };
+    if is_ps(flags_at(chars, end, start)) {
+        let mut j = run_end(chars, end, start, is_ps);
+        while matches!(cpt_at(chars, end, j), Some('\r' | '\n')) {
+            j += 1;
+        }
+        return Some(j);
+    }
+    // 4.-6.
+    let ws_end = ws_run_end(chars, end, pos);
+    if ws_end == pos {
+        return None;
+    }
+    if let Some(k) = (pos..ws_end)
+        .rev()
+        .find(|&k| matches!(chars[k], '\r' | '\n'))
+    {
+        return Some(k + 1);
+    }
+    if ws_end == end {
+        return Some(end);
+    }
+    if ws_end - pos >= 2 {
+        return Some(ws_end - 1);
+    }
+    Some(ws_end)
+}
+
 fn u64_meta(metadata: &HashMap<String, GgufValue>, key: &str) -> Option<u64> {
     metadata.get(key).and_then(GgufValue::as_u64)
 }
@@ -1170,6 +1830,7 @@ mod tests {
 
         Tokenizer {
             architecture: "llama".to_string(),
+            pre_type: None,
             tokens,
             scores: Vec::new(),
             token_type: Vec::new(),
@@ -1962,5 +2623,547 @@ mod tests {
                 assert_eq!(tok.decode(&ids), text, "round trip failed for {text:?}");
             }
         }
+    }
+
+    /// The tricky string set for the `tokenizer.ggml.pre` golden tests
+    /// (docs/design/tokenizer-pre-types.md): digits, contractions, CJK/kana/
+    /// Hangul, mixed scripts, newlines and whitespace runs, emoji with ZWJ and
+    /// variation selectors, punctuation runs, leading/trailing spaces,
+    /// decomposed accents, code, NBSP/ideographic/em spaces, fullwidth forms,
+    /// and Devanagari/Arabic combining marks.
+    const PRE_TYPE_GOLDEN_STRINGS: [&str; 13] = [
+        "12345 3.14159 1234567890",
+        "don't I'LL we've they'RE it's YOU'D",
+        "Hello world! 你好，世界。日本語のテキスト、カタカナ。한국어 문장입니다.",
+        "Mixed: English, Русский текст, Ελληνικά, العربية, ไทย",
+        "line one\nline two\r\n\n\n  indented\t\ttabs   \n",
+        "emoji 👋🏽 🎉🎉 ❤\u{fe0f} 👨\u{200d}👩\u{200d}👧",
+        "Punctuation!!! ??? ... --- ((()))  {[<>]} @#$%^&*",
+        "   leading spaces and trailing   ",
+        "café naïve e\u{301} a\u{300} n\u{303}o",
+        "x = foo(bar, 42);\nif (x >= 10) { return \"ok\"; }\n",
+        "\u{a0}nbsp\u{3000}ideographic space\u{2003}em",
+        "ＦｕｌｌＷｉｄｔｈ １２３ ！？",
+        "Hindi: नमस\u{94d}त\u{947} द\u{941}न\u{93f}य\u{93e}, Arabic with harakat: م\u{64e}ر\u{652}ح\u{64e}ب\u{64b}ا",
+    ];
+
+    fn gpt2_tokenizer_gguf(pre: Option<&str>) -> GgufFile {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x4655_4747u32.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        let kv_count: u64 = if pre.is_some() { 3 } else { 2 };
+        buf.extend_from_slice(&kv_count.to_le_bytes());
+        write_kv_string(&mut buf, "tokenizer.ggml.model", "gpt2");
+        write_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["a", "b", "ab"]);
+        if let Some(pre) = pre {
+            write_kv_string(&mut buf, "tokenizer.ggml.pre", pre);
+        }
+        while buf.len() % 32 != 0 {
+            buf.push(0);
+        }
+        let path = write_temp_file(&buf);
+        let file = GgufFile::open(&path).expect("parse synthetic GGUF");
+        std::fs::remove_file(&path).ok();
+        file
+    }
+
+    /// An unknown `tokenizer.ggml.pre` on a gpt2 vocab is an error naming the
+    /// value, not a silent fall back to the Qwen2 split (which is what every
+    /// gpt2 vocab got before pre types were read).
+    #[test]
+    fn test_unknown_pre_type_is_rejected_and_named() {
+        let file = gpt2_tokenizer_gguf(Some("tekken"));
+        let err = Tokenizer::from_gguf(&file)
+            .err()
+            .expect("an unknown pre type must not load");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'tekken'"),
+            "error should name the value: {msg}"
+        );
+        assert!(
+            msg.contains("llama-bpe"),
+            "error should list what is supported: {msg}"
+        );
+    }
+
+    /// A gpt2 vocab with no `tokenizer.ggml.pre` keeps the Qwen2 split it
+    /// always had; every accepted value maps to its variant.
+    #[test]
+    fn test_pre_type_mapping() {
+        let tok = Tokenizer::from_gguf(&gpt2_tokenizer_gguf(None)).expect("no pre key");
+        assert_eq!(tok.pre_type, Some(PreType::Qwen2));
+        for &(name, ty) in PreType::ACCEPTED {
+            let tok = Tokenizer::from_gguf(&gpt2_tokenizer_gguf(Some(name))).expect(name);
+            assert_eq!(tok.pre_type, Some(ty), "{name}");
+        }
+        assert_eq!(
+            PreType::from_gguf_value(Some("kolibri1")).unwrap(),
+            PreType::Qwen2
+        );
+        assert_eq!(
+            PreType::from_gguf_value(Some("deepseek-v3")).unwrap(),
+            PreType::Deepseek3
+        );
+    }
+
+    /// SentencePiece (`llama`) and `gemma4` vocabs don't pre-tokenize with a
+    /// regex: they get no pre type and a `pre` value isn't checked.
+    #[test]
+    fn test_pre_type_ignored_for_non_gpt2_models() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x4655_4747u32.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&3u64.to_le_bytes());
+        write_kv_string(&mut buf, "tokenizer.ggml.model", "llama");
+        write_kv_string_array(&mut buf, "tokenizer.ggml.tokens", &["<unk>", "a"]);
+        write_kv_string(&mut buf, "tokenizer.ggml.pre", "not-a-pre-type");
+        while buf.len() % 32 != 0 {
+            buf.push(0);
+        }
+        let path = write_temp_file(&buf);
+        let file = GgufFile::open(&path).expect("parse synthetic GGUF");
+        std::fs::remove_file(&path).ok();
+        let tok = Tokenizer::from_gguf(&file).expect("llama vocab ignores pre");
+        assert_eq!(tok.pre_type, None);
+    }
+
+    /// The DeepSeek character classes must parse to ordered ranges that leave
+    /// ASCII punctuation alone. Guards the `\u{..}` escapes in
+    /// `DEEPSEEK_LLM_LATIN`: an editor or tool that NFC-normalizes the source
+    /// turns U+212A KELVIN SIGN into ASCII `K` (so `K-...` swallows `[`, `{`
+    /// and friends) and U+1F7D into U+03CE (an inverted range), which is
+    /// exactly how this split once went wrong.
+    #[test]
+    fn test_deepseek_char_classes_are_well_formed() {
+        let c = deepseek_classes();
+        for class in [&c.llm_latin, &c.llm_punct, &c.llm_cjk, &c.v3_cjk] {
+            for &(lo, hi) in class.iter() {
+                assert!(lo <= hi, "inverted range {lo:#x}-{hi:#x}");
+            }
+        }
+        for ch in "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~0123456789 ".chars() {
+            assert!(
+                !in_class(ch, &c.llm_latin),
+                "{ch:?} must not be in the Latin class"
+            );
+        }
+        assert!(in_class('\u{212a}', &c.llm_latin));
+        assert!(in_class('\u{1f7d}', &c.llm_latin));
+        // U+3000 is inside the punctuation class's range but llama.cpp maps
+        // it to \x0B (whitespace) before std::wregex sees it.
+        assert!(!in_class('\u{3000}', &c.llm_punct));
+    }
+
+    /// Encode every [`PRE_TYPE_GOLDEN_STRINGS`] entry with the tokenizer in
+    /// `test-data/<file_name>` and compare with `golden` (skipping the
+    /// indices in `skip`). Skips the whole test if the fixture is absent.
+    fn assert_pre_type_golden_if_fixture_present(
+        file_name: &str,
+        expected_pre: PreType,
+        golden: &[&[u32]; PRE_TYPE_GOLDEN_STRINGS.len()],
+        skip: &[usize],
+    ) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test-data")
+            .join(file_name);
+        if !path.exists() {
+            eprintln!("Skipping {expected_pre:?} golden test: test-data/{file_name} not present");
+            return;
+        }
+        let file = GgufFile::open(&path).expect("open tokenizer GGUF");
+        let tok = Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf");
+        assert_eq!(tok.architecture, "gpt2");
+        assert_eq!(tok.pre_type, Some(expected_pre));
+        for (i, (&text, &expected)) in PRE_TYPE_GOLDEN_STRINGS.iter().zip(golden).enumerate() {
+            if skip.contains(&i) {
+                continue;
+            }
+            let ids = tok
+                .encode(text)
+                .unwrap_or_else(|e| panic!("encode({text:?}) failed: {e}"));
+            assert_eq!(
+                ids, expected,
+                "{file_name}: ids differ from llama-tokenize for {text:?}"
+            );
+            assert_eq!(
+                tok.decode(&ids),
+                text,
+                "{file_name}: round trip failed for {text:?}"
+            );
+        }
+    }
+
+    // Golden ids for the tests below: llama.cpp `79e2e74`'s `llama-tokenize`
+    // (CPU build) on the same fixture, `--stdin --ids --no-bos`, one string
+    // per run. Recipe: docs/design/tokenizer-pre-types.md.
+
+    /// `llama-bpe` (LLAMA3). `test-data/llama-bpe-tokenizer.gguf`: metadata of
+    /// https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+    /// (HTTP range `bytes=0-41943039`, rewritten by `scripts/gguf_tokenizer_only.py`).
+    #[test]
+    fn test_llama_bpe_encode_matches_llama_tokenize_if_fixture_present() {
+        assert_pre_type_golden_if_fixture_present(
+            "llama-bpe-tokenizer.gguf",
+            PreType::Llama3,
+            &[
+                &[
+                    4513, 1774, 220, 18, 13, 9335, 2946, 220, 4513, 10961, 16474, 15,
+                ],
+                &[
+                    15357, 956, 358, 6, 4178, 584, 3077, 814, 95253, 433, 596, 15334, 28805,
+                ],
+                &[
+                    9906, 1917, 0, 118195, 53901, 3922, 102616, 1811, 102433, 102158, 16144, 57933,
+                    62903, 71634, 5486, 71493, 47307, 71493, 96452, 1811, 112699, 32179, 54535,
+                    41953, 80052, 13,
+                ],
+                &[
+                    87533, 25, 6498, 11, 121258, 101591, 71995, 11, 121029, 102434, 11, 110356, 11,
+                    124554,
+                ],
+                &[
+                    1074, 832, 198, 1074, 1403, 201, 1432, 220, 1280, 16243, 197, 3324, 3518, 5996,
+                ],
+                &[
+                    38623, 62904, 233, 9468, 237, 121, 11410, 236, 231, 9468, 236, 231, 71570,
+                    31643, 62904, 101, 102470, 9468, 239, 102, 102470, 9468, 239, 100,
+                ],
+                &[
+                    47, 73399, 12340, 52417, 2564, 12730, 1819, 10340, 220, 46691, 21806, 14316,
+                    571, 49177, 46999, 5, 9,
+                ],
+                &[256, 6522, 12908, 323, 28848, 262],
+                &[
+                    936, 59958, 95980, 588, 384, 54939, 264, 97649, 308, 119074, 78,
+                ],
+                &[
+                    87, 284, 15586, 55730, 11, 220, 2983, 317, 333, 320, 87, 2669, 220, 605, 8,
+                    314, 471, 330, 564, 5233, 457,
+                ],
+                &[4194, 5792, 23249, 95107, 3634, 116503, 336],
+                &[
+                    1569, 99, 15755, 243, 103375, 103375, 1569, 115, 104009, 15755, 226, 15755,
+                    242, 15755, 230, 220, 20713, 25963, 34617, 220, 6447, 11571,
+                ],
+                &[
+                    39, 29785, 25, 100282, 88344, 79468, 100365, 35470, 100291, 101391, 100322,
+                    101201, 35217, 449, 4960, 105029, 25, 24252, 106524, 125902, 108117, 101333,
+                ],
+            ],
+            &[],
+        );
+    }
+
+    /// `deepseek-llm` (DEEPSEEK_LLM, the pre type of DeepSeek LLM 7B and
+    /// DeepSeek-V2/V2-Lite). `test-data/deepseek-llm-tokenizer.gguf`: metadata of
+    /// https://huggingface.co/mradermacher/deepseek-llm-7b-chat-GGUF/resolve/main/deepseek-llm-7b-chat.Q4_K_M.gguf
+    /// (HTTP range `bytes=0-41943039`, rewritten by `scripts/gguf_tokenizer_only.py`).
+    /// TheBloke's conversion of the same model has no `pre` key at all.
+    #[test]
+    fn test_deepseek_llm_encode_matches_llama_tokenize_if_fixture_present() {
+        assert_pre_type_golden_if_fixture_present(
+            "deepseek-llm-tokenizer.gguf",
+            PreType::DeepseekLlm,
+            &[
+                &[
+                    16, 17, 18, 19, 20, 207, 18, 13, 16, 19, 16, 20, 24, 207, 16, 17, 18, 19, 20,
+                    21, 22, 23, 24, 15,
+                ],
+                &[
+                    10314, 6, 83, 304, 6, 2369, 395, 6, 313, 657, 6, 1374, 359, 6, 82, 19326, 6, 35,
+                ],
+                &[
+                    17464, 1843, 0, 207, 84313, 19304, 4997, 398, 10162, 13072, 239, 28213, 8550,
+                    215, 9156, 242, 50145, 52462, 537, 9156, 104, 93491, 9156, 104, 8550, 219, 398,
+                    76152, 91765, 242, 94627, 112, 207, 165, 105, 116, 48848, 98, 48848, 214,
+                    39537, 92968, 13,
+                ],
+                &[
+                    69036, 25, 3517, 11, 11050, 368, 1960, 954, 76887, 11, 7558, 230, 19236, 19236,
+                    93467, 53382, 30791, 11, 52160, 64040, 21437, 41737, 35047, 88708, 11, 207,
+                    45735, 213, 16510, 232, 16510, 95,
+                ],
+                &[
+                    1031, 634, 185, 1031, 984, 188, 185, 185, 185, 207, 96272, 184, 184, 20526,
+                    300, 185,
+                ],
+                &[
+                    39349, 12833, 59948, 220, 10044, 224, 121, 12356, 223, 218, 10044, 223, 218,
+                    207, 75655, 46713, 59948, 101, 350, 222, 10044, 226, 102, 350, 222, 10044, 226,
+                    100,
+                ],
+                &[
+                    60516, 21716, 10259, 59946, 3564, 16966, 8306, 23434, 207, 509, 44277, 29,
+                    17001, 1173, 2, 3, 4, 61, 5, 9,
+                ],
+                &[243, 5881, 9577, 285, 38506, 300],
+                &[
+                    91774, 587, 10010, 2865, 313, 301, 47904, 245, 34015, 291, 134, 212, 78,
+                ],
+                &[
+                    87, 403, 24433, 7, 1684, 11, 207, 19, 17, 476, 185, 351, 334, 87, 10441, 207,
+                    16, 15, 8, 509, 972, 440, 544, 3170, 615, 185,
+                ],
+                &[1202, 3765, 88946, 546, 12263, 2516, 51570, 370],
+                &[
+                    948, 99, 68940, 230, 68940, 221, 68940, 221, 948, 115, 68940, 218, 68940, 213,
+                    68940, 229, 68940, 217, 207, 948, 226, 948, 227, 948, 228, 61198, 2224,
+                ],
+                &[
+                    39, 71643, 25, 207, 77982, 96984, 80260, 52539, 97, 63087, 207, 10072, 99,
+                    23424, 210, 77982, 70168, 10072, 107, 43909, 11, 39195, 366, 6457, 559, 253,
+                    25, 55993, 88980, 21437, 147, 227, 78930, 88980, 41737, 147, 220, 12241,
+                ],
+            ],
+            &[],
+        );
+    }
+
+    /// `deepseek-v3` (DEEPSEEK3_LLM). `test-data/deepseek-v3-tokenizer.gguf`:
+    /// metadata of the first shard
+    /// https://huggingface.co/unsloth/DeepSeek-V3-0324-GGUF/resolve/main/Q2_K/DeepSeek-V3-0324-Q2_K-00001-of-00005.gguf
+    /// (HTTP range `bytes=0-41943039`, rewritten by `scripts/gguf_tokenizer_only.py`,
+    /// which drops the `split.*` keys).
+    #[test]
+    fn test_deepseek_v3_encode_matches_llama_tokenize_if_fixture_present() {
+        assert_pre_type_golden_if_fixture_present(
+            "deepseek-v3-tokenizer.gguf",
+            PreType::Deepseek3,
+            &[
+                &[
+                    6895, 1883, 223, 21, 16, 9926, 3318, 223, 6895, 18009, 25744, 18,
+                ],
+                &[
+                    20385, 1664, 342, 9, 3699, 579, 5270, 851, 9, 3827, 436, 734, 28253, 9, 38,
+                ],
+                &[
+                    19923, 2058, 3, 223, 30594, 303, 3427, 320, 88768, 1576, 17383, 20367, 24552,
+                    410, 15961, 11767, 15961, 27071, 320, 5634, 17564, 9227, 22426, 14301, 34941,
+                    16,
+                ],
+                &[
+                    113685, 28, 3947, 14, 87103, 16980, 121212, 14, 19217, 43595, 20975, 14, 55595,
+                    14, 223, 39311,
+                ],
+                &[
+                    1836, 834, 201, 1836, 1234, 204, 6328, 223, 1126, 19686, 200, 17299, 10284,
+                    14320,
+                ],
+                &[
+                    18872, 7063, 52780, 236, 40965, 124, 7351, 239, 234, 53153, 234, 53341, 100,
+                    10759, 52780, 104, 46088, 25730, 105, 46088, 25730, 103,
+                ],
+                &[
+                    50, 371, 119569, 34513, 93041, 4588, 11569, 12031, 72456, 223, 680, 61, 47357,
+                    48663, 2390, 125463, 7, 64, 8, 12,
+                ],
+                &[262, 6646, 13564, 305, 52964, 361],
+                &[
+                    69, 2797, 619, 112752, 312, 17793, 260, 45345, 313, 59436, 81,
+                ],
+                &[
+                    90, 438, 52735, 10, 6515, 14, 223, 3180, 833, 394, 343, 90, 11620, 223, 553,
+                    11, 680, 1354, 582, 633, 21390, 1554,
+                ],
+                &[2162, 28706, 18524, 681, 8566, 3987, 77469, 381],
+                &[
+                    286, 102, 5879, 246, 5879, 237, 5879, 237, 286, 118, 125567, 5879, 229, 127088,
+                    5879, 233, 223, 127167, 25081, 223, 1175, 1148,
+                ],
+                &[
+                    77865, 28, 23597, 12524, 70223, 6011, 26227, 101422, 85639, 14, 32121, 418,
+                    7088, 30805, 28, 1123, 52748, 9821, 2212, 61079, 14778,
+                ],
+            ],
+            &[],
+        );
+    }
+
+    /// `qwen35` (QWEN35; Qwen3.5 and Qwen3.8). `test-data/qwen35-tokenizer.gguf`:
+    /// metadata of
+    /// https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf
+    /// (HTTP range `bytes=0-41943039`, rewritten by `scripts/gguf_tokenizer_only.py`).
+    /// Before pre types were read these files got the Qwen2 split, which
+    /// differs on combining marks (the Devanagari/Arabic string).
+    #[test]
+    fn test_qwen35_encode_matches_llama_tokenize_if_fixture_present() {
+        assert_pre_type_golden_if_fixture_present(
+            "qwen35-tokenizer.gguf",
+            PreType::Qwen35,
+            &[
+                &[
+                    16, 17, 18, 19, 20, 220, 18, 13, 16, 19, 16, 20, 24, 220, 16, 17, 18, 19, 20,
+                    21, 22, 23, 24, 15,
+                ],
+                &[
+                    14572, 914, 353, 6, 3950, 567, 2908, 781, 90902, 424, 579, 14551, 26807,
+                ],
+                &[
+                    9419, 1814, 0, 220, 109266, 3709, 96748, 1710, 247359, 15303, 210342, 5205,
+                    167281, 221215, 1710, 174675, 30061, 51643, 39504, 151396, 13,
+                ],
+                &[
+                    83445, 25, 6163, 11, 209428, 185386, 11, 150098, 164594, 159778, 11, 171405,
+                    11, 181204,
+                ],
+                &[
+                    1021, 799, 198, 1021, 1330, 201, 1358, 220, 1214, 15397, 197, 3139, 3325, 5690,
+                ],
+                &[
+                    36280, 59720, 233, 9008, 237, 121, 10838, 236, 231, 9008, 236, 231, 68089,
+                    29545, 59720, 101, 373, 235, 9008, 239, 102, 373, 235, 9008, 239, 100,
+                ],
+                &[
+                    47, 69843, 11726, 49591, 2423, 12091, 1718, 9831, 220, 44074, 20475, 13587,
+                    554, 46474, 44370, 5, 9,
+                ],
+                &[256, 6187, 12258, 321, 26849, 262],
+                &[
+                    895, 56868, 91603, 571, 378, 52033, 264, 93213, 307, 136, 225, 78,
+                ],
+                &[
+                    87, 283, 14785, 52794, 11, 220, 19, 17, 1174, 198, 331, 318, 87, 2518, 220, 16,
+                    15, 8, 313, 460, 328, 547, 4961, 333, 198,
+                ],
+                &[3966, 5496, 21742, 90762, 3433, 373, 225, 334],
+                &[
+                    169327, 14945, 243, 14945, 234, 14945, 234, 169617, 169730, 14945, 226, 14945,
+                    242, 14945, 230, 220, 19496, 24128, 32405, 220, 190500,
+                ],
+                &[
+                    39, 27746, 25, 149518, 84237, 150104, 153348, 184642, 235886, 11, 32988, 440,
+                    4700, 178848, 25, 22639, 164865, 28850, 150765, 150021,
+                ],
+            ],
+            &[],
+        );
+    }
+
+    /// `gpt-2` (GPT2), on the synthetic `test-data/tiny-qwen3moe.gguf` (its
+    /// hand-built tokenizer reports `gpt-2`; source in
+    /// `test-data/tiny-qwen3moe-src.tar.gz`).
+    #[test]
+    fn test_gpt2_pre_encode_matches_llama_tokenize_if_fixture_present() {
+        assert_pre_type_golden_if_fixture_present(
+            "tiny-qwen3moe.gguf",
+            PreType::Gpt2,
+            &[
+                &[10163, 2231, 513, 13, 1415, 19707, 17031, 2231, 30924, 3829],
+                &[
+                    9099, 470, 314, 6, 3069, 356, 1053, 484, 6, 2200, 340, 338, 7013, 6, 35,
+                ],
+                &[
+                    15496, 995, 0, 220, 19526, 254, 25001, 121, 171, 120, 234, 10310, 244, 45911,
+                    234, 16764, 33768, 98, 17312, 105, 45739, 252, 5641, 24336, 25084, 43302,
+                    23513, 21763, 23376, 21763, 26229, 16764, 47991, 250, 166, 113, 255, 168, 244,
+                    112, 31619, 105, 116, 168, 252, 98, 168, 252, 227, 46695, 230, 46695, 97, 13,
+                ],
+                &[
+                    44, 2966, 25, 3594, 11, 12466, 254, 35072, 21727, 21727, 31583, 18849, 140,
+                    117, 220, 20375, 16843, 31583, 21727, 20375, 11, 7377, 243, 39377, 39377, 138,
+                    115, 26180, 29945, 43000, 138, 105, 11, 28981, 44690, 26897, 39848, 22654,
+                    45632, 11, 220, 31479, 226, 19567, 245, 19567, 95,
+                ],
+                &[
+                    1370, 530, 198, 1370, 734, 201, 628, 198, 220, 773, 4714, 197, 197, 8658, 82,
+                    220, 220, 220, 198,
+                ],
+                &[
+                    368, 31370, 50169, 233, 8582, 237, 121, 12520, 236, 231, 8582, 236, 231, 43074,
+                    97, 37929, 50169, 101, 447, 235, 41840, 102, 447, 235, 41840, 100,
+                ],
+                &[
+                    47, 16260, 2288, 10185, 34913, 2644, 11420, 14808, 3419, 4008, 220, 1391, 58,
+                    27, 37981, 92, 2488, 29953, 4, 61, 5, 9,
+                ],
+                &[220, 220, 3756, 9029, 290, 25462, 220, 220, 220],
+                &[
+                    66, 1878, 2634, 41492, 304, 136, 223, 257, 136, 222, 299, 136, 225, 78,
+                ],
+                &[
+                    87, 796, 22944, 7, 5657, 11, 5433, 1776, 198, 361, 357, 87, 18189, 838, 8,
+                    1391, 1441, 366, 482, 8172, 1782, 198,
+                ],
+                &[1849, 77, 24145, 5099, 222, 485, 6826, 2272, 447, 225, 368],
+                &[
+                    171, 120, 99, 171, 121, 243, 171, 121, 234, 171, 121, 234, 171, 120, 115, 171,
+                    121, 231, 171, 121, 226, 171, 121, 242, 171, 121, 230, 27332, 120, 239, 171,
+                    120, 240, 171, 120, 241, 27332, 120, 223, 171, 120, 253,
+                ],
+                &[
+                    39, 521, 72, 25, 28225, 101, 11976, 106, 11976, 116, 24231, 235, 11976, 97,
+                    24231, 229, 28225, 99, 24231, 223, 11976, 101, 11976, 123, 11976, 107, 48077,
+                    11, 17526, 351, 3971, 461, 265, 25, 47048, 24333, 26897, 48763, 148, 255,
+                    24333, 39848, 149, 233, 12919,
+                ],
+            ],
+            &[],
+        );
+    }
+
+    /// `qwen2` (QWEN2), on `test-data/Qwen3-0.6B-Q4_K_M.gguf`: pins the Qwen2
+    /// split, which reading pre types must leave byte-identical. Index 12 is
+    /// skipped: the Qwen2 port classifies with Rust's `is_alphabetic`, which
+    /// counts Arabic harakat (Mn with Other_Alphabetic) as letters where
+    /// llama.cpp's table doesn't, so `llama-tokenize` splits that string
+    /// differently. A known, queued gap (see docs/design/tokenizer-pre-types.md),
+    /// not changed here so `qwen2` output stays what it was.
+    #[test]
+    fn test_qwen2_encode_matches_llama_tokenize_if_fixture_present() {
+        assert_pre_type_golden_if_fixture_present(
+            "Qwen3-0.6B-Q4_K_M.gguf",
+            PreType::Qwen2,
+            &[
+                &[
+                    16, 17, 18, 19, 20, 220, 18, 13, 16, 19, 16, 20, 24, 220, 16, 17, 18, 19, 20,
+                    21, 22, 23, 24, 15,
+                ],
+                &[
+                    15007, 944, 358, 6, 4086, 582, 3003, 807, 94153, 432, 594, 14985, 27705,
+                ],
+                &[
+                    9707, 1879, 0, 220, 108386, 3837, 99489, 1773, 101059, 102819, 15767, 56833,
+                    61803, 70534, 5373, 70393, 46207, 70393, 95352, 1773, 23573, 124785, 31079,
+                    53435, 40853, 78952, 13,
+                ],
+                &[
+                    86433, 25, 6364, 11, 140869, 126302, 70895, 11, 7851, 243, 33486, 33486, 41424,
+                    33269, 29762, 67337, 74134, 11, 129071, 11, 220, 125451,
+                ],
+                &[
+                    1056, 825, 198, 1056, 1378, 201, 1406, 220, 1257, 15864, 197, 3244, 3435, 5872,
+                ],
+                &[
+                    37523, 61804, 233, 145375, 11162, 236, 231, 144841, 70470, 30543, 61804, 101,
+                    378, 235, 145233, 378, 235, 145665,
+                ],
+                &[
+                    47, 72299, 12069, 51317, 2503, 12448, 1781, 10131, 220, 45591, 21122, 13989,
+                    569, 48077, 45899, 5, 9,
+                ],
+                &[256, 6388, 12621, 323, 27748, 262],
+                &[
+                    924, 58858, 94880, 586, 384, 53839, 264, 96549, 308, 136, 225, 78,
+                ],
+                &[
+                    87, 284, 15229, 54630, 11, 220, 19, 17, 317, 333, 320, 87, 2604, 220, 16, 15,
+                    8, 314, 470, 330, 562, 5123, 456,
+                ],
+                &[4102, 5674, 22441, 94007, 3550, 378, 225, 336],
+                &[
+                    141161, 144552, 144433, 144433, 144084, 144155, 144514, 144297, 144455, 220,
+                    20109, 24918, 33517, 220, 6313, 11319,
+                ],
+                &[
+                    39, 28685, 25, 14925, 101, 87244, 78368, 30484, 97, 34370, 14925, 99, 72653,
+                    60096, 42311, 107, 23868, 11, 34117, 448, 4855, 585, 266, 25, 23364, 27910,
+                    11071, 59397, 29825, 27910, 21360, 127837,
+                ],
+            ],
+            &[12],
+        );
     }
 }

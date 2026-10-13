@@ -256,6 +256,16 @@ in `test-data/` locally:
   of `ggml-org/gemma-4-12B-it-GGUF`'s `gemma-4-12B-it-Q8_0.gguf` (~16 MB) with an empty
   tensor table, for the `gemma4` tokenizer golden test (see
   [design/gemma4.md](design/gemma4.md)).
+- `test-data/llama-bpe-tokenizer.gguf`, `deepseek-llm-tokenizer.gguf`,
+  `deepseek-v3-tokenizer.gguf` and `qwen35-tokenizer.gguf` are the same thing for the
+  `tokenizer.ggml.pre` golden tests (Llama-3.2-1B-Instruct, DeepSeek LLM 7B chat,
+  DeepSeek-V3-0324 shard 1, Qwen3.5-0.8B). Golden ids come from llama.cpp's
+  `llama-tokenize`. Sources and byte ranges are in each test's doc comment; see
+  [design/tokenizer-pre-types.md](design/tokenizer-pre-types.md).
+  `scripts/gguf_tokenizer_only.py` makes any of these from the first ~40 MB of a GGUF
+  (`curl -r 0-41943039`): it keeps the metadata bytes verbatim, writes an empty tensor
+  table and drops a shard's `split.*` keys. Run on Kolibri-1's head, it reproduces
+  `kolibri1-tokenizer.gguf` byte for byte.
 - `test-data/tiny-gemma4.gguf` is a synthetic `gemma4` model: 6 layers (2 global, without
   `attn_v`), random f32 weights, an 8-token sliding window and the real Gemma 4
   tokenizer, written directly with llama.cpp's `gguf-py` from the real 12B header's
