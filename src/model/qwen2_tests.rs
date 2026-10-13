@@ -337,7 +337,7 @@ fn prompts() -> Vec<(&'static str, String)> {
 
 /// llama.cpp `79e2e74` greedy ids for [`prompts`] on the fixture, 20 tokens,
 /// f32 weights and KV cache (`ref.cpp` in the archive, EOS-only stopping like
-/// Reflex). Recorded with llama.cpp's CPU backend (`REF_CPU=1`); the GPU session re-checks them against its CUDA build.
+/// Reflex). Recorded with llama.cpp's CUDA build on an RTX 3090; its CPU backend gives the same ids.
 const FIXTURE_GOLDEN: [&[u32]; 7] = [
     &[
         31006, 102672, 42659, 41759, 126425, 140910, 145599, 83756, 92974, 725, 62523, 149752,
@@ -370,15 +370,18 @@ const FIXTURE_GOLDEN: [&[u32]; 7] = [
 ];
 
 /// The same with the LoRA fixture applied (llama.cpp's own LoRA path,
-/// `REF_LORA`).
+/// `REF_LORA`), from its CUDA build. Its CPU backend picks a different token
+/// at step 8 of `story` (a near-tie); HF `transformers` with the LoRA merged
+/// by hand (`hf_ref.py` in the archive) agrees with the CUDA ids there and on
+/// every prompt but `arabic`, where it already differs without the LoRA.
 const FIXTURE_LORA_GOLDEN: [&[u32]; 7] = [
     &[
         23200, 80708, 20487, 113586, 35241, 113910, 6746, 81233, 8018, 70434, 68513, 66003, 81776,
         47879, 102731, 28733, 141598, 55080, 28248, 31246,
     ],
     &[
-        79584, 33347, 125342, 148479, 108994, 149914, 30831, 111181, 132309, 108994, 67714, 62638,
-        4389, 90101, 74983, 111637, 108994, 51345, 105828, 78868,
+        79584, 33347, 125342, 148479, 108994, 149914, 30831, 63111, 21042, 108994, 108471, 39423,
+        91450, 91450, 91450, 102723, 112305, 131433, 80738, 39622,
     ],
     &[
         128497, 31310, 104564, 52999, 111755, 44311, 144854, 58648, 38624, 24220, 58048, 68700,
