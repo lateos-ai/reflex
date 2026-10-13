@@ -5,6 +5,12 @@ What has been built, in order. Measurements live in
 
 ## 2026-10-12
 
+- **Runpod Hub release `v0.2.6-runpod-hub`.** Rebuilds the Hub worker from current
+  `master`, so the classifier gets the bit-identical `rmsnorm_kernel` fix below: faster
+  prefill, same outputs. The image, the baked Qwen3-0.6B-Q8_0 model, `hub.json` and
+  `handler.py` are unchanged. Gemma 4 support is in the engine but not reachable from
+  the Hub worker, which serves only its baked model.
+
 - **Long-prompt prefill 4-7x faster on Gemma 4, and faster prefill everywhere.** Two
   causes, measured with a new per-phase profiler (`REFLEX_PREFILL_PROFILE=1`):
   - `rmsnorm_kernel` recomputed each row's sum of squares in every thread (rows x
