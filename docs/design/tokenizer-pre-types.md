@@ -146,7 +146,9 @@ merges don't cross the moved boundaries, so the ids are the same. The two new st
 were added to its HF golden test anyway (both engines agree on them). The Qwen2 golden
 test no longer skips anything. The `reflex check` regression prompts are ASCII, where
 Rust's classes and the tables agree, so every fixture tokenizes them identically before
-and after (host diff, all 24 rows).
+and after (host diff, all 24 rows). The GPU check confirms it: on an RTX 3090, master vs this
+change built on the same pod, all 30 existing `reflex check` rows (every fixture plus
+Qwen3-0.6B, three prompts each) are identical, token ids and logit checksums included.
 
 ## Verification
 

@@ -1,6 +1,11 @@
 # Design: Qwen2 / Qwen2.5 support (`qwen2`)
 
-**Status (2026-10-13): host work done; GPU verification pending.**
+**Status (2026-10-13): done and verified on an RTX 3090.** Greedy tokens match llama.cpp
+`79e2e74` on the synthetic fixture (7/7 prompts × 20 tokens, with and without a LoRA)
+and on real Qwen2.5-0.5B-Instruct, 1.5B-Instruct, Coder-1.5B-Instruct and
+Math-1.5B-Instruct (7/7 each against llama.cpp with f32 activations; `f16` and
+quantized-resident weights too). Cold start on Qwen2.5-0.5B is 0.650 s p50 vs
+`llama-simple`'s 0.700 s. See [Results](#results-2026-10-13).
 
 Goal: run the dense `qwen2` architecture: Qwen2.5-Instruct (0.5B to 72B), Qwen2.5-Math
 and Qwen2.5-Coder. Correctness means byte-exact greedy agreement with llama.cpp, as for
@@ -138,7 +143,7 @@ Unchanged and reused as-is: tokenizer (`qwen2` pre type, now table-based; see
 special-token matching, `LmHead` (tied or not), LoRA targets (`attn_q` etc. map to the
 same `DenseLayerWeights` fields), the version-1 dense KV-cache format, `system1`.
 
-## Known differences from llama.cpp, not fixed here
+## Known differences, not fixed here
 
 - **End-of-generation set.** Reflex stops only at `eos_token_id` (`<|im_end|>`).
   llama.cpp also stops at `<|endoftext|>`, `<|fim_pad|>`, `<|repo_name|>` and
@@ -148,6 +153,12 @@ same `DenseLayerWeights` fields), the version-1 dense KV-cache format, `system1`
   architecture (Qwen3 has the same tokens), so it's queued as its own item rather than
   changed for one architecture here. Comparisons use EOS-only stopping on both sides,
   as for Gemma 4.
+- **NFC normalization.** Qwen2.5's HF `tokenizer.json` has an NFC normalizer, which
+  reorders combining marks into canonical order (Arabic shadda + fatha becomes
+  fatha + shadda). A GGUF doesn't carry the normalizer: llama.cpp tokenizes the raw text,
+  and so does Reflex. On text that isn't already NFC, HF `transformers` therefore gives
+  different ids from both (seen on the fixture's Arabic prompt: two tokens swap). Kolibri-1's
+  tokenizer has no normalizer, which is why its HF golden test agrees on the same text.
 - **Special-token partition order.** Reflex scans left to right and takes the longest
   special token at each position. llama.cpp partitions by each special token in turn,
   longest first. These only differ when special tokens overlap in the text, which the
@@ -179,6 +190,68 @@ GPU (`#[ignore]`, nightly rules in `scripts/gpu_nightly_tests.sh`):
 - `--export-kv`/`--import-kv` resume == uninterrupted run
 - LoRA on the fixture
 
-## Results
+## Results (2026-10-13)
 
-Pending the GPU session.
+Runpod RTX 3090 (community, driver 580.65.06), one pod for everything: llama.cpp `79e2e74`
+built with CUDA plus the `LLAMA_NO_Q8` patch and `ref.cpp`, and Reflex master and this
+branch built side by side. Prompts: plain, story, ChatML, Qwen2.5-Math chain-of-thought,
+Coder FIM, Arabic with harakat, and a 980-token prompt (`prompts.py` in
+`test-data/tiny-qwen2-src.tar.gz`). "f32 reference" means llama.cpp with
+`LLAMA_NO_Q8=1 GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32 GGML_CUDA_DISABLE_GRAPHS=1
+GGML_CUDA_DISABLE_FUSION=1` and flash attention off. Greedy ids, 20 tokens, EOS-only
+stopping on both sides:
+
+| Model | Reflex weights | vs | Prompts identical |
+|---|---|---|---|
+| `tiny-qwen2` fixture | f32 | llama.cpp default and without flash attention | 7/7, 7/7 |
+| `tiny-qwen2` + LoRA (`reflex generate --lora`) | f32 | llama.cpp with the same adapter (`REF_LORA`) | 7/7 |
+| Qwen2.5-0.5B-Instruct Q4_K_M | f32 | f32 reference | 7/7 |
+| Qwen2.5-0.5B-Instruct Q4_K_M | f16 | f32 reference | 7/7 |
+| Qwen2.5-0.5B-Instruct Q4_K_M | f32 | stock llama.cpp (8-bit activations) | 4/7; the others diverge after 4, 7 and 19 tokens |
+| Qwen2.5-1.5B-Instruct Q4_K_M | f32 | f32 reference | 7/7 |
+| Qwen2.5-1.5B-Instruct Q4_K_M | f16, `REFLEX_QUANT_RESIDENT=1` | f32 reference | 7/7 |
+| Qwen2.5-Coder-1.5B-Instruct Q4_K_M | f32 | f32 reference | 7/7 |
+| Qwen2.5-Math-1.5B-Instruct Q4_K_M (bartowski) | f32 | f32 reference | 7/7 |
+
+As with Gemma 4, stock llama.cpp's 8-bit activation quantization moves the 0.5B's logits
+enough to flip some greedy picks; with f32 activations every row matches.
+
+Tests on the same pod: the 7 `qwen2` GPU tests pass (fixture vs llama.cpp with and
+without the LoRA, batched prefill == sequential in f32 and f16, f16 within 3.0e-3
+relative L2 of f32 on first-step logits, KV export/import resume exact, and
+quantized-resident + batched prefill on the real 1.5B). The nightly suite:
+52 passed, 0 failed, 2 skipped (no `IQ_GGUF`/`MLA_REAL_GGUF`). Full `cargo test`: 167
+passed.
+
+**A regression the GPU run caught.** Giving `add_kernel` a fourth argument (the
+broadcast length) missed one caller: `Model::apply_lora` launches it directly. With three
+arguments the kernel read garbage for `m`, and every `--lora` run segfaulted, `qwen3moe`
+included. The host build and every host test passed. Fixed (`m = n`); after the fix
+`qwen3moe` + LoRA output is identical to master's and `qwen2` + LoRA matches llama.cpp.
+
+**LoRA golden ids: llama.cpp CPU vs CUDA.** The fixture's goldens were first recorded with
+llama.cpp's CPU backend. Without the LoRA, CPU and CUDA give identical ids. With it, the CPU
+backend picks a different token at step 8 of the `story` prompt (the fixture's narrowest
+margins). A third reference settled it: HF `transformers` in f32 with the LoRA merged by
+hand (`hf_ref.py` in the archive) agrees with CUDA there and on every prompt except
+`arabic`, where HF already differs without the LoRA (the NFC difference above). The tests
+use the CUDA ids.
+
+**`reflex check` before/after** (every fixture plus Qwen3-0.6B, 3 prompts, 8 tokens, master
+vs branch on the same pod): the 30 existing rows are identical, token ids and logit
+checksums included, as the host-side tokenization diff predicted. The 12 new rows
+(`tiny-qwen2` f32/f16, Qwen2.5-0.5B, Qwen2.5-1.5B quantized-resident) are rejected by
+master and run on the branch.
+
+**Cold start** (process launch to first token, external wall clock, `bench_cold_common.sh`,
+n=30, prompt "Once upon a time", same method as the 2026-09-29 T4 refresh):
+
+| Model | Reflex p50 / p95 | `llama-simple` p50 / p95 | Peak RSS (Reflex / llama.cpp) |
+|---|---|---|---|
+| Qwen2.5-0.5B-Instruct Q4_K_M | **0.650 / 0.680 s** | 0.700 / 0.750 s | 993 / 731 MB |
+| Qwen3-0.6B Q4_K_M (same pod) | 0.685 / 0.770 s | 0.695 / 0.750 s | 896 / 640 MB |
+
+Reflex is 1.08x faster on Qwen2.5-0.5B and at parity on Qwen3-0.6B on this pod (the T4
+refresh measured 1.13x for Qwen3-0.6B). Qwen2.5-0.5B's separate `output.weight` skips the
+tied-embedding dequant that `generate` pays on Qwen3-0.6B (prompt eval 10.7 vs 177 ms).
+As in the earlier refresh, `llama-simple` takes `--no-warmup` as part of its prompt.

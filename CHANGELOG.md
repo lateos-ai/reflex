@@ -22,6 +22,14 @@ What has been built, in order. Measurements live in
   - Tests: config parsing of five real Qwen2.5 headers (0.5B, 1.5B, Math, Coder ×2),
     rejections, and a synthetic `tiny-qwen2` fixture plus LoRA, both converted with
     llama.cpp's own converters, with greedy golden ids from llama.cpp.
+  - Verified on an RTX 3090 against llama.cpp `79e2e74` with f32 activations: identical
+    greedy tokens (7 prompts × 20 tokens) on the fixture with and without a LoRA, on
+    Qwen2.5-0.5B-Instruct (`f32` and `f16`), Qwen2.5-1.5B-Instruct (also
+    `REFLEX_QUANT_RESIDENT=1`), Coder-1.5B and Math-1.5B. Stock llama.cpp's 8-bit
+    activations flip 3 of 7 on the 0.5B, as on Gemma 4.
+  - Cold start on Qwen2.5-0.5B-Instruct: 0.650 s p50 vs `llama-simple`'s 0.700 s (n=30,
+    same pod).
+  - `reflex check` on every fixture plus Qwen3-0.6B is unchanged, 30/30 rows.
 
   Details: [docs/design/qwen2.md](docs/design/qwen2.md).
 
@@ -33,7 +41,8 @@ What has been built, in order. Measurements live in
   - Qwen2 golden test vs `llama-tokenize`: 12/13 -> 13/13.
   - Kolibri-1 (`kolibri1`, same split): unchanged against HF `tokenizers`, including two
     new Arabic and Devanagari strings.
-  - The `reflex check` prompts tokenize identically on every fixture.
+  - The `reflex check` prompts tokenize identically on every fixture, and the GPU check
+    shows all 30 rows unchanged.
 
   Details: [docs/design/tokenizer-pre-types.md](docs/design/tokenizer-pre-types.md#resolved-the-original-qwen2-port).
 
