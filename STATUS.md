@@ -1048,7 +1048,7 @@ Order (cheapest correctness first); each phase is its own branch and session:
    - Host tests per pre type against `llama-tokenize` on a tricky string set (digits,
      contractions, CJK, newlines, emoji), using tokenizer-only GGUFs.
 
-   **Done 2026-10-12** (branch `tokenizer-pre-types`; design note
+   **Done 2026-10-12** (public PR #24, merged as github `21af679`, private master synced `936c0fa`; design note
    `docs/design/tokenizer-pre-types.md`, HISTORY.md "Tokenizer pre-types").
    - `PreType` enum. Mappings:
      - `qwen2`, `kolibri1` and a missing key go to the Qwen2 split (old code,
