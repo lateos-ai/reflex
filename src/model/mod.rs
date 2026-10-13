@@ -119,7 +119,7 @@ mod kolibri_forward_tests;
 #[cfg(test)]
 mod mla_batching_tests;
 #[cfg(test)]
-mod mla_config_tests;
+mod mla_widening_tests;
 #[cfg(test)]
 mod moe_fixture_tests;
 #[cfg(test)]

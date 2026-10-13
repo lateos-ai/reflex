@@ -322,7 +322,7 @@ fn qwen2_real_headers_config() {
 /// The comparison prompts (`prompts.py` in the fixture archive): plain text,
 /// ChatML, a Qwen2.5-Math chain-of-thought prompt, Coder FIM, Arabic with
 /// harakat, and a 980-token prompt.
-fn prompts() -> Vec<(&'static str, String)> {
+pub(super) fn prompts() -> Vec<(&'static str, String)> {
     let long = "The quick brown fox jumps over the lazy dog while the cat watches. ".repeat(70);
     vec![
         ("plain", "The capital of France is".to_string()),
