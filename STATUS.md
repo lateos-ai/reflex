@@ -4,7 +4,7 @@ Current state of the project. For narrative write-ups (how each milestone was ve
 full benchmark tables, bugs found along the way), see `HISTORY.md` — this file is the
 short, current-state summary; HISTORY.md is the log.
 
-_Last updated: 2026-10-12 (Gemma 4 quantized-resident `Q8_0` behind `REFLEX_QUANT_RESIDENT=1`: the 31B-it now runs on a 48 GB A40, verified against fully-f32 llama.cpp; the pending MLA golden-token re-check is done. See `docs/design/quantized-resident-weights.md`'s "Q8_0 on Gemma 4: results". Previous update: 2026-10-11 (Gemma 4 31B-it and Qwen3.8-27B, both `Q8_0` with f16 weights, verified against llama.cpp on a ThunderCompute A100 80 GB; no code change. See "Planned next work: extending architecture coverage" item 3 below and `docs/design/gemma4.md`'s "31B results". Previous update: 2026-09-30 (`qwen35moe` — Qwen3.5 hybrid trunk + routed-MoE/sigmoid-gated shared-expert FFN — implemented and verified byte-exact against llama.cpp on a T4 using a converted public tiny-random checkpoint; see "Planned next work: extending architecture coverage" below and HISTORY.md's "`qwen35moe` support" entry. Previous update: 2026-09-29 (cold-start comparison table refreshed against the current code on a dedicated AWS EC2 `g4dn.xlarge`/Tesla T4 — A6000 was unavailable on ThunderCompute, so the sanctioned T4 fallback was used; docs/harness only, no engine change. Fresh p50/p95, the harness-validation surprise, and raw-log locations are in the "Cold-start comparison refresh" note under "Benchmarking expansion" below. Previous update: item 6 of the ranked warm-latency-vs-TypeSafe-Jev plan — lazy/partial `token_embd` dequant, the bottleneck item 5's profiling found — is now implemented and real-hardware-verified on an AWS EC2 `g4dn.xlarge`/Tesla T4: `token_embd` construction dropped from item 5's measured 547.6ms to ~102ms, `model_load_ms` p50 **868.1ms → 410.3ms (-53%)** and total cold start **1084.2ms → 627.3ms (-42%)** for `reflex system1`, with zero numeric drift (golden tokens byte-identical across dense/hybrid/MoE/synthetic-MLA). Honestly-reported caveat found by a follow-up A/B: `reflex generate` on a *tied*-embedding model doesn't get this win (the deferred dequant cost just moves from `model_load_ms` to `prompt_eval_ms`, plus a small fixed added-copy tax) — measured a ~110ms (~9%) *regression* for that specific caller, an accepted trade-off matching `LmHead::TiedLazy`'s already-documented system1-only scope. See HISTORY.md's "Lazy token_embd dequant (item 6)" entry for the full numbers. Previous update: item 5 of the same plan — pipelined model load — dropped the weight-loading loop it targets **153.8ms → 122.7ms (-20.3%)** with zero numeric drift, but that loop is only ~17% of `model_load_ms`, so end-to-end cold start improved just ~3%; that session's sub-phase profiling found the `token_embd` bottleneck item 6 above then closed — see HISTORY.md's "Pipelined model load (item 5)". Before that: items 2/3/4 of the same plan were real-hardware-verified on a fresh AWS EC2 `g4dn.xlarge` — see "Planned next work: warm-latency perf vs. TypeSafe Jev" below and HISTORY.md's "Real-hardware verification of the warm-latency perf plan" entry for the full numbers: item 2's warp-per-row `gemv_kernel`/`gemv_gather_kernel` rewrite measured a **~4.9x decode-throughput improvement** (15.4 → 74.8 tok/s), item 3's lazy `LmHead` dropped GPU-resident bytes by exactly the predicted ~608 MiB and improved cold-start too, item 4's phase breakdown now reports real, tight p50/p95 numbers. Golden tokens reproduced exactly for dense and hybrid; all 8 relevant internal-consistency oracle tests pass across dense/MoE/hybrid/synthetic-MLA. Item 1 (f16 weight residency) reframed (memory-bandwidth-bound, not tensor-core-FLOP-bound; `CUBLAS_COMPUTE_32F_FAST_16F` for f32 accumulation; land opt-in; do item 5 first) but still unstarted, deliberately, pending a numerics-methodology decision. Previous update: TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry)_
+_Last updated: 2026-10-12 (Gemma 4 long-prompt prefill 4-7x faster: bit-identical `rmsnorm_kernel` fix for every architecture plus a Gemma-only tiled prefill attention kernel, public PR #22; extending the tiled kernel to the other architectures is queued in "Planned next work: tiled prefill attention for the other architectures" below. Previous update: 2026-10-12 (Gemma 4 quantized-resident `Q8_0` behind `REFLEX_QUANT_RESIDENT=1`: the 31B-it now runs on a 48 GB A40, verified against fully-f32 llama.cpp; the pending MLA golden-token re-check is done. See `docs/design/quantized-resident-weights.md`'s "Q8_0 on Gemma 4: results". Previous update: 2026-10-11 (Gemma 4 31B-it and Qwen3.8-27B, both `Q8_0` with f16 weights, verified against llama.cpp on a ThunderCompute A100 80 GB; no code change. See "Planned next work: extending architecture coverage" item 3 below and `docs/design/gemma4.md`'s "31B results". Previous update: 2026-09-30 (`qwen35moe` — Qwen3.5 hybrid trunk + routed-MoE/sigmoid-gated shared-expert FFN — implemented and verified byte-exact against llama.cpp on a T4 using a converted public tiny-random checkpoint; see "Planned next work: extending architecture coverage" below and HISTORY.md's "`qwen35moe` support" entry. Previous update: 2026-09-29 (cold-start comparison table refreshed against the current code on a dedicated AWS EC2 `g4dn.xlarge`/Tesla T4 — A6000 was unavailable on ThunderCompute, so the sanctioned T4 fallback was used; docs/harness only, no engine change. Fresh p50/p95, the harness-validation surprise, and raw-log locations are in the "Cold-start comparison refresh" note under "Benchmarking expansion" below. Previous update: item 6 of the ranked warm-latency-vs-TypeSafe-Jev plan — lazy/partial `token_embd` dequant, the bottleneck item 5's profiling found — is now implemented and real-hardware-verified on an AWS EC2 `g4dn.xlarge`/Tesla T4: `token_embd` construction dropped from item 5's measured 547.6ms to ~102ms, `model_load_ms` p50 **868.1ms → 410.3ms (-53%)** and total cold start **1084.2ms → 627.3ms (-42%)** for `reflex system1`, with zero numeric drift (golden tokens byte-identical across dense/hybrid/MoE/synthetic-MLA). Honestly-reported caveat found by a follow-up A/B: `reflex generate` on a *tied*-embedding model doesn't get this win (the deferred dequant cost just moves from `model_load_ms` to `prompt_eval_ms`, plus a small fixed added-copy tax) — measured a ~110ms (~9%) *regression* for that specific caller, an accepted trade-off matching `LmHead::TiedLazy`'s already-documented system1-only scope. See HISTORY.md's "Lazy token_embd dequant (item 6)" entry for the full numbers. Previous update: item 5 of the same plan — pipelined model load — dropped the weight-loading loop it targets **153.8ms → 122.7ms (-20.3%)** with zero numeric drift, but that loop is only ~17% of `model_load_ms`, so end-to-end cold start improved just ~3%; that session's sub-phase profiling found the `token_embd` bottleneck item 6 above then closed — see HISTORY.md's "Pipelined model load (item 5)". Before that: items 2/3/4 of the same plan were real-hardware-verified on a fresh AWS EC2 `g4dn.xlarge` — see "Planned next work: warm-latency perf vs. TypeSafe Jev" below and HISTORY.md's "Real-hardware verification of the warm-latency perf plan" entry for the full numbers: item 2's warp-per-row `gemv_kernel`/`gemv_gather_kernel` rewrite measured a **~4.9x decode-throughput improvement** (15.4 → 74.8 tok/s), item 3's lazy `LmHead` dropped GPU-resident bytes by exactly the predicted ~608 MiB and improved cold-start too, item 4's phase breakdown now reports real, tight p50/p95 numbers. Golden tokens reproduced exactly for dense and hybrid; all 8 relevant internal-consistency oracle tests pass across dense/MoE/hybrid/synthetic-MLA. Item 1 (f16 weight residency) reframed (memory-bandwidth-bound, not tensor-core-FLOP-bound; `CUBLAS_COMPUTE_32F_FAST_16F` for f32 accumulation; land opt-in; do item 5 first) but still unstarted, deliberately, pending a numerics-methodology decision. Previous update: TypeSafe Jev citation — both cold-start and warm-latency axes — re-verified on a real AWS EC2 `g4dn.xlarge` (Tesla T4), cross-validating the original ThunderCompute A6000 numbers on independent rented-GPU hardware; see HISTORY.md's "TypeSafe Jev re-verification on real AWS EC2 T4" entry)_
 
 ## MVP progress
 
@@ -933,6 +933,73 @@ DECISIONS.md's "Extending architecture coverage..."). Next in order:
    `test-data/large-model-verify-src.tar.gz`.
 
 All three additions cleared the project's independent-implementation verification bar.
+
+## Planned next work: tiled prefill attention for the other architectures (queued 2026-10-12)
+
+`attention_tiled.cu` (Gemma 4 prefill only, since 2026-10-12) took 12B prefill attention
+at 3,713 tokens from 6.9 s to 0.70 s on an A40. Every other architecture still runs
+batched prefill through `attention_online_kernel`, which streams each query row's whole
+K/V range per (row, head), with no reuse across rows or across a GQA group's query heads.
+The cost grows with prompt length × group size × head dim, so the gain is likely large on
+long prompts and small on the short prompts that dominate cold-start benchmarks. Design,
+numbers and the Gemma verification method: `docs/design/gemma4.md`, "Long-prompt
+prefill". Ordered steps; each one gates the next:
+
+1. **Measure first.** Extend `REFLEX_PREFILL_PROFILE` (`src/model/prefill_profile.rs`)
+   from `forward_gemma4_layer` to the dense/MoE (`forward_layer`), hybrid and MLA
+   batched paths. Profile prefill at 512 / 2K / 8K tokens on Qwen3-0.6B, a 7-8B dense
+   model (Mistral-7B or Qwen3-8B, f16), Qwen3.5-0.8B, Kolibri-1 and DeepSeek-V2-Lite
+   (the last two need an 80 GB A100). Proceed per architecture only where attention is at
+   least ~20% of prefill at 2K tokens. Record the table in a design note.
+2. **Generalize the kernel** (`src/kernels_cuda/attention_tiled.cu`):
+   - Template on `(QK_D, V_D)` instead of one `D`, and pick the queries per block `M` per
+     instantiation from the register budget. Today `M = 16384 / D` keeps 64 output floats
+     per thread; at D = 64/128 that gives M = 256/128, so cap M (likely 64) and re-check
+     `--resource-usage` (no spills; the d256 variant already spills 12 bytes, fix that
+     too).
+   - Dense, MoE, Kolibri and Llama/Mistral need D = 64 and 128. Qwen3.5's gated
+     attention is D = 256, which already exists; it only needs dispatch.
+   - MLA (qk 576 = latent 512 + rope 64, v 512, head strides 0, group = all heads): K and
+     V are the same compressed row, so stage one tile and read V as its first 512 floats.
+     This needs its own variant with M sized for v = 512.
+   - Group sizes that neither divide nor are a multiple of M fall back to the online
+     kernel, as today.
+3. **Cold start: don't tax short prompts or other models.** In a PTX build with no warm
+   driver JIT cache, the Gemma module costs ~340 ms of JIT (a background-thread load
+   doesn't help; the driver serializes the JIT against all calls in the context).
+   - One module per head-dim family, so a model compiles only what it uses.
+   - Load it lazily on the first prefill above a row threshold, measured per
+     architecture (where tiled starts beating online). `system1` and short prompts should
+     never load it.
+   - Gate: no change to `modules_ms`/`model_load_ms` on the short-prompt cold-start
+     benchmarks (`scripts/bench_cold_*`). Measure PTX with `CUDA_CACHE_DISABLE=1` and
+     the Docker fatbin.
+4. **Dispatch.** Move the launcher from `Gemma4Kernels::attention_prefill_tiled` to
+   `src/model/kernels.rs`, next to `attention_online`. Call it from `attention_prefill`
+   and `mla_attention_prefill` when the shape is supported and `rows >= threshold`;
+   otherwise use the online kernel. Decode keeps the split-K online kernel. Add an
+   escape hatch to force the online kernel for A/B runs, such as
+   `REFLEX_ATTN_KERNEL=online` alongside `legacy`. Keep `legacy` behavior unchanged.
+5. **Verify per architecture.** Summation order changes, so `reflex check` logit
+   checksums will move for each architecture switched over. That is no longer
+   byte-identical, so document each one the way Gemma 4's is.
+   - Kernel test: tiled vs online for every new shape (extend `attention_tiled_tests`,
+     ≤ ~1e-5), including the sliding window (Kolibri), resumed prefill, and MLA's
+     shared latent.
+   - Greedy tokens vs llama.cpp on the standard prompts for Qwen3-0.6B, TinyLlama,
+     Mistral-7B, the qwen3moe / qwen35moe / Kolibri / MLA fixtures, and Qwen3.5-0.8B.
+     Also real Kolibri-1 Q4_K_M and DeepSeek-V2-Lite on an A100, against llama.cpp with
+     f32 activations.
+   - The golden fixture tests, batched-vs-sequential tests and the full
+     `scripts/gpu_nightly_tests.sh`.
+6. **Report.** Prefill per length before/after for each architecture switched over, and
+   the short-prompt cold-start benchmarks unchanged. Update CHANGELOG,
+   `docs/benchmarks.md`, and `docs/DEVELOPMENT.md` if the attention-kernel description
+   changes.
+7. **Later, separate decisions.** Optional, opt-in TF32/f16 tensor-core variants:
+   faster, but they move numerics away from the f32 llama.cpp reference. Short prompts
+   with few rows × few KV heads may leave the GPU underfilled with the tiled grid; a
+   split over K/V tiles, like the decode path's, may help there.
 
 ## Known debt / limitations
 
