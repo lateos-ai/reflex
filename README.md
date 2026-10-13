@@ -67,6 +67,7 @@ serverless endpoint in one click, no build required ([worker docs](.runpod/READM
 | Architecture (GGUF `general.architecture`) | Tested with |
 |---|---|
 | Dense Qwen3 (`qwen3`) | Qwen3-0.6B |
+| Dense Qwen2 / Qwen2.5, incl. Math and Coder (`qwen2`) | Qwen2.5-0.5B-Instruct; a synthetic fixture. YaRN long-context scaling and `qwen2moe` are not supported |
 | Qwen3-MoE (`qwen3moe`) | synthetic fixtures (real `qwen3moe` tensor layout, top-k routing) |
 | Llama / Mistral (`llama`) | TinyLlama-1.1B |
 | Qwen3.5 hybrid Gated DeltaNet (`qwen35`, `qwen35moe`) | Qwen3.5-0.8B; Qwen3.8-27B `Q8_0` (f16 weights, 80 GB GPU); a random-weight `qwen35moe` checkpoint |

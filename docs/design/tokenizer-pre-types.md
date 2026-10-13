@@ -28,7 +28,8 @@ the code that runs them in `src/unicode.cpp`.
 | `deepseek-v3` | `Deepseek3` | `DEEPSEEK3_LLM` | 3 regexes through `std::regex` | `deepseek-v3-tokenizer.gguf` |
 
 A missing key keeps the Qwen2 split, which is what every gpt2 vocab got before. That way
-a file that loaded before still tokenizes the same. No GGUF checked so far lacks the key
+a file that loaded before still tokenizes the same (apart from the 2026-10-13 `qwen2`
+fix for combining marks, see [Resolved](#resolved-the-original-qwen2-port)). No GGUF checked so far lacks the key
 except TheBloke's older conversions (e.g. `deepseek-llm-7B-chat-GGUF`), where llama.cpp
 itself falls back to a regex Reflex doesn't port.
 
@@ -68,7 +69,7 @@ ways a regex runs:
    string is one llama.cpp recognizes (`qwen2`, `qwen35`, `llama3`, `gpt2`). It walks the
    piece one codepoint at a time. A codepoint no alternative matches becomes a
    one-codepoint piece. Reflex ports these line for line as step functions
-   (`llama3_family_step` covers both llama3 and qwen35, plus `gpt2_step`) driven by
+   (`llama3_family_step` covers llama3, qwen2 and qwen35, plus `gpt2_step`) driven by
    `split_custom`.
 2. **`std::regex`**, for every other regex (both DeepSeek types). `regex_iterator` finds
    leftmost matches. Text between matches becomes its own piece. The piece's end acts as
@@ -113,16 +114,41 @@ vocab entry is emitted as that entry without running BPE. Reflex does the same
   make `llama-tokenize` look for the other shards. `scripts/gguf_tokenizer_only.py` drops
   them.
 
-## Known gap: the original Qwen2 port
+## Resolved: the original Qwen2 port
 
-`qwen2_pretokenize_one` predates the tables and classifies with Rust's `is_alphabetic`/
-`is_numeric`/`is_whitespace`. On the golden set it matches `llama-tokenize` on 12 of 13
-strings. The miss is Arabic with harakat, U+064E etc.: those are Mn with
-Other_Alphabetic, so Rust counts them as letters and llama.cpp (and HF `tokenizers`)
-don't. It is left unchanged on purpose, so that reading pre types didn't change any
-`qwen2` output. Switching `qwen2` to the table-based splitter, which llama.cpp has as
-`unicode_regex_split_custom_qwen2`, is a separate, deliberate change. The Qwen2 golden
-test skips that one string until then.
+**Before (until 2026-10-13).** `qwen2_pretokenize_one` predated the tables and
+classified with Rust's `is_alphabetic`/`is_numeric`/`is_whitespace`. On the golden set
+it matched `llama-tokenize` on 12 of 13 strings. The miss was Arabic with harakat
+(U+064E etc.): those are Mn with Other_Alphabetic, so Rust counted them as letters, and
+llama.cpp (and HF `tokenizers`) don't. It was left unchanged in the first round, so
+that reading pre types didn't change any `qwen2` output.
+
+**After.** `qwen2` now runs llama.cpp's `unicode_regex_split_custom_qwen2` through
+`split_custom`, like the other custom splitters. At `79e2e74` that function is
+`unicode_regex_split_custom_llama3` with `\p{N}` (one digit) instead of `\p{N}{1,3}`
+(checked by diffing the two functions), so it is `llama3_family_step` with `digits = 1,
+marks = false`; no new step function. The old port, its `match_*` helpers and
+`is_l`/`is_n`/`is_other` are gone. Its unit tests now run through `pretokenize`, with
+the same expectations, plus one for harakat.
+
+Results, master vs this change, each against llama.cpp `79e2e74`'s `llama-tokenize`
+(and, for Kolibri-1, HF `tokenizers` 0.23.2 and `llama-tokenize` built with the
+Kolibri-1 patch at `836d571`, since stock llama.cpp has no `kolibri1` architecture):
+
+| Vocab | Strings | Before | After |
+|---|---|---|---|
+| Qwen3-0.6B (`qwen2`) | 13 golden + 2 new (Arabic harakat, Devanagari) | 13/15: misses golden #12 and the new Arabic string | 15/15 |
+| Kolibri-1 (`kolibri1`) | same 15 | 15/15 | 15/15, ids unchanged |
+| Qwen2.5-0.5B-Instruct (`qwen2`) | chat, math, FIM, repo FIM, tool call, near misses | | 6/6 |
+
+On the Kolibri-1 vocab the split now differs from before on these strings, but the
+merges don't cross the moved boundaries, so the ids are the same. The two new strings
+were added to its HF golden test anyway (both engines agree on them). The Qwen2 golden
+test no longer skips anything. The `reflex check` regression prompts are ASCII, where
+Rust's classes and the tables agree, so every fixture tokenizes them identically before
+and after (host diff, all 24 rows). The GPU check confirms it: on an RTX 3090, master vs this
+change built on the same pod, all 30 existing `reflex check` rows (every fixture plus
+Qwen3-0.6B, three prompts each) are identical, token ids and logit checksums included.
 
 ## Verification
 
@@ -143,9 +169,10 @@ container (`ubuntu:24.04`, `cmake -DGGML_CUDA=OFF`). It runs over 13 tricky stri
 - Devanagari and Arabic combining marks
 
 Each string is a separate `--stdin --ids --no-bos` run. Results on that set:
-- Every supported pre type matches 13/13, except `qwen2` at 12/13 (see above).
+- Every supported pre type matches 13/13. `qwen2` was 12/13 until its 2026-10-13 switch to
+  the table-based split (see above).
 - Before the fixes above, `deepseek-llm` was 12/13 (the normalization bug).
-- `qwen2` and Kolibri-1 outputs are unchanged.
+- `qwen2` and Kolibri-1 outputs were unchanged by the first round.
 
 Tests: `test_*_encode_matches_llama_tokenize_if_fixture_present` in `src/tokenizer.rs`,
 skip-if-absent, with golden ids inline. The fixtures are tokenizer-only GGUFs: the real

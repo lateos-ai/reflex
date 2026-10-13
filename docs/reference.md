@@ -36,7 +36,7 @@ feature matrix*, not a release build — see the table for what it drags in.
 
 | feature | adds | extra host build dependency |
 |---|---|---|
-| *(none — core)* | `generate`/`system1`/`smoke`/`bench`/`check`, all four model architectures | CUDA toolkit only (`nvcc`) |
+| *(none — core)* | `generate`/`system1`/`smoke`/`bench`/`check`, every supported model architecture | CUDA toolkit only (`nvcc`) |
 | `ipc` | `reflex stdio` / `reflex uds` (also enables `json-output` via `serde`) | none |
 | `json-output` | `--json` on `generate`/`system1`/`bench`/`smoke`/`check`/`doctor` | none |
 | `download` | `--model <org/repo:file.gguf>` / `--quickstart` (HF downloader via `hf-hub`) | `libssl-dev` + `pkg-config` on Linux (**not** Windows/macOS, where `hf-hub` uses a different TLS backend) |

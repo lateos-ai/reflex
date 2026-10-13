@@ -38,10 +38,22 @@ pub(super) struct DenseLayerWeights {
     /// config flag, gates whether the forward pass applies it.
     pub(super) attn_q_norm: Option<Weight>,
     pub(super) attn_k_norm: Option<Weight>,
+    /// Qwen2's Q/K/V biases; `None` for architectures without them.
+    pub(super) attn_bias: Option<QkvBias>,
     pub(super) ffn_norm: Weight,
     pub(super) ffn_gate: Weight,
     pub(super) ffn_up: Weight,
     pub(super) ffn_down: Weight,
+}
+
+/// One layer's Q/K/V projection biases (`attn_{q,k,v}.bias`, f32), added right
+/// after each projection and before QK-Norm/RoPE, where llama.cpp's
+/// `build_qkv` adds them. All three or none (`qkv_bias_names`). Used by
+/// `qwen2` (docs/design/qwen2.md).
+pub(super) struct QkvBias {
+    pub(super) q: Weight,
+    pub(super) k: Weight,
+    pub(super) v: Weight,
 }
 
 /// One MoE transformer layer's weights: an attention block identical in
@@ -58,6 +70,7 @@ pub(super) struct MoeLayerWeights {
     pub(super) attn_output: Weight,
     pub(super) attn_q_norm: Option<Weight>,
     pub(super) attn_k_norm: Option<Weight>,
+    pub(super) attn_bias: Option<QkvBias>,
     pub(super) ffn_norm: Weight,
     pub(super) ffn_gate_inp: Weight,
     pub(super) ffn_gate_exps: Weight,
@@ -191,6 +204,10 @@ impl Model {
                 (cfg, block_count, moe.map(|m| m.expert_used_count))
             }
         };
+        // Qwen2's Q/K/V biases, checked for every layer before any upload.
+        let qkv_bias_by_layer = (0..block_count)
+            .map(|i| qkv_bias_names(file, i, &cfg))
+            .collect::<Result<Vec<_>, _>>()?;
         let profile_on = load_profile_enabled();
         let t_modules = std::time::Instant::now();
 
@@ -432,7 +449,7 @@ impl Model {
         };
 
         let mut layers = Vec::with_capacity(block_count);
-        for i in 0..block_count {
+        for (i, bias_names) in qkv_bias_by_layer.iter().enumerate() {
             eprint!("\rLoading weights: layer {}/{block_count}", i + 1);
             let attn_norm = load_weight_kind(&format!("blk.{i}.attn_norm.weight"), false)?;
             let attn_q = load_weight_kind(&format!("blk.{i}.attn_q.weight"), true)?;
@@ -441,9 +458,23 @@ impl Model {
             let attn_output = load_weight_kind(&format!("blk.{i}.attn_output.weight"), true)?;
             let attn_q_norm = load_weight_kind(&format!("blk.{i}.attn_q_norm.weight"), false).ok();
             let attn_k_norm = load_weight_kind(&format!("blk.{i}.attn_k_norm.weight"), false).ok();
+            let attn_bias = match bias_names {
+                Some([q, k, v]) => Some(QkvBias {
+                    q: load_weight_kind(q, false)?,
+                    k: load_weight_kind(k, false)?,
+                    v: load_weight_kind(v, false)?,
+                }),
+                None => None,
+            };
             let ffn_norm = load_weight_kind(&format!("blk.{i}.ffn_norm.weight"), false)?;
 
             let layer = if let Some(kc) = &kolibri {
+                if attn_bias.is_some() {
+                    return Err(crate::reflex_err!(
+                        UnsupportedArchitecture,
+                        "kolibri1 layer {i} has Q/K/V biases, which its path doesn't apply"
+                    ));
+                }
                 let bias_name = format!("blk.{i}.exp_probs_b.bias");
                 let bias_info = file
                     .tensor_info(&bias_name)
@@ -522,6 +553,7 @@ impl Model {
                     attn_output,
                     attn_q_norm,
                     attn_k_norm,
+                    attn_bias,
                     ffn_norm,
                     ffn_gate_inp: load_weight_kind(&format!("blk.{i}.ffn_gate_inp.weight"), false)?,
                     ffn_gate_exps: load_weight_kind(
@@ -543,6 +575,7 @@ impl Model {
                     attn_output,
                     attn_q_norm,
                     attn_k_norm,
+                    attn_bias,
                     ffn_norm,
                     ffn_gate: load_weight_kind(&format!("blk.{i}.ffn_gate.weight"), true)?,
                     ffn_up: load_weight_kind(&format!("blk.{i}.ffn_up.weight"), true)?,
@@ -674,7 +707,7 @@ impl Model {
         })
     }
 
-    /// RMSNorm -> QKV -> QK-Norm (if present) -> RoPE -> causal attention ->
+    /// RMSNorm -> QKV (+ bias, if present) -> QK-Norm (if present) -> RoPE -> causal attention ->
     /// O-proj (residual), for one layer at `position`, writing this
     /// position's K/V directly into `k_cache`/`v_cache` (preallocated
     /// device buffers, see `Model::forward_prompt`). Shared byte-for-byte by
@@ -695,6 +728,7 @@ impl Model {
         attn_output: &Weight,
         attn_q_norm: &Option<Weight>,
         attn_k_norm: &Option<Weight>,
+        attn_bias: Option<&QkvBias>,
         mode: AttnMode,
         post_norm: Option<&Weight>,
         mut hidden: CudaSlice<f32>,
@@ -713,7 +747,12 @@ impl Model {
 
         let mut q = self.gemv(&normed, attn_q)?;
         let mut k = self.gemv(&normed, attn_k)?;
-        let v = self.gemv(&normed, attn_v)?;
+        let mut v = self.gemv(&normed, attn_v)?;
+        if let Some(b) = attn_bias {
+            self.add_inplace(&mut q, b.q.f32()?)?;
+            self.add_inplace(&mut k, b.k.f32()?)?;
+            self.add_inplace(&mut v, b.v.f32()?)?;
+        }
 
         if let Some(qn) = attn_q_norm {
             q = self.rmsnorm(
@@ -807,6 +846,7 @@ impl Model {
             &layer.attn_output,
             &layer.attn_q_norm,
             &layer.attn_k_norm,
+            layer.attn_bias.as_ref(),
             AttnMode::STANDARD,
             None,
             hidden,
@@ -860,6 +900,7 @@ impl Model {
             &layer.attn_output,
             &layer.attn_q_norm,
             &layer.attn_k_norm,
+            layer.attn_bias.as_ref(),
             AttnMode::STANDARD,
             None,
             hidden,
@@ -1086,6 +1127,7 @@ impl Model {
             &layer.attn_output,
             &layer.attn_q_norm,
             &layer.attn_k_norm,
+            None,
             layer.attn_mode,
             Some(&layer.post_attention_norm),
             hidden,
@@ -1181,6 +1223,7 @@ impl Model {
         attn_output: &Weight,
         attn_q_norm: &Option<Weight>,
         attn_k_norm: &Option<Weight>,
+        attn_bias: Option<&QkvBias>,
         mode: AttnMode,
         post_norm: Option<&Weight>,
         mut hidden: CudaSlice<f32>,
@@ -1200,7 +1243,12 @@ impl Model {
 
         let mut q = self.gemm(&normed, attn_q, rows)?;
         let mut k = self.gemm(&normed, attn_k, rows)?;
-        let v = self.gemm(&normed, attn_v, rows)?;
+        let mut v = self.gemm(&normed, attn_v, rows)?;
+        if let Some(b) = attn_bias {
+            self.add_rows_inplace(&mut q, b.q.f32()?)?;
+            self.add_rows_inplace(&mut k, b.k.f32()?)?;
+            self.add_rows_inplace(&mut v, b.v.f32()?)?;
+        }
 
         if let Some(qn) = attn_q_norm {
             q = self.rmsnorm(
@@ -1304,6 +1352,7 @@ impl Model {
             &layer.attn_output,
             &layer.attn_q_norm,
             &layer.attn_k_norm,
+            layer.attn_bias.as_ref(),
             AttnMode::STANDARD,
             None,
             hidden,
@@ -1427,6 +1476,7 @@ impl Model {
             &layer.attn_output,
             &layer.attn_q_norm,
             &layer.attn_k_norm,
+            layer.attn_bias.as_ref(),
             AttnMode::STANDARD,
             None,
             hidden,
@@ -1500,6 +1550,7 @@ impl Model {
             &layer.attn_output,
             &layer.attn_q_norm,
             &layer.attn_k_norm,
+            None,
             layer.attn_mode,
             Some(&layer.post_attention_norm),
             hidden,

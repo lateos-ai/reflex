@@ -46,13 +46,82 @@ pub enum RopeType {
 /// anyway: the community patch the published GGUFs are made with adds it to
 /// llama.cpp's NEOX list, and vLLM's `get_rope` (Aleph Alpha's official
 /// plugin) defaults to NEOX. Its full-attention layers use no RoPE at all (see
-/// [`KolibriConfig::sliding_layers`]).
+/// [`KolibriConfig::sliding_layers`]). `qwen2` is listed for the same reason:
+/// `llama_model_rope_type` at `79e2e74` has `LLM_ARCH_QWEN2` in its NEOX
+/// group (docs/design/qwen2.md).
 pub(super) fn rope_type_for(architecture: &str) -> RopeType {
     match architecture {
         "llama" | "mistral" | "mixtral" => RopeType::Norm,
-        "kolibri1" => RopeType::Neox,
+        "kolibri1" | "qwen2" => RopeType::Neox,
         _ => RopeType::Neox,
     }
+}
+
+/// Tensors llama.cpp applies when present but the dense/MoE path doesn't
+/// implement, checked on layer 0 and the LM head by [`parse_model_config`].
+/// Without the check a file carrying one would load and run without it:
+/// wrong output, no error. `attn_qkv` is the fused projection
+/// `create_tensor_qkv` prefers over separate `attn_q`/`attn_k`/`attn_v`.
+/// No surveyed Qwen2.5, Qwen3 or Llama GGUF has any of them
+/// (docs/design/qwen2.md).
+const UNSUPPORTED_DENSE_TENSORS: [&str; 4] = [
+    "blk.0.attn_output.bias",
+    "blk.0.attn_qkv.weight",
+    "blk.0.attn_qkv.bias",
+    "output.bias",
+];
+
+/// Shared-expert tensors (`qwen2moe`, `qwen35moe`, DeepSeek). The generic MoE
+/// path has no shared expert, so a file with one is rejected rather than run
+/// with it silently dropped.
+const SHARED_EXPERT_TENSORS: [&str; 4] = [
+    "blk.0.ffn_gate_inp_shexp.weight",
+    "blk.0.ffn_gate_shexp.weight",
+    "blk.0.ffn_up_shexp.weight",
+    "blk.0.ffn_down_shexp.weight",
+];
+
+/// The `blk.{layer}.attn_{q,k,v}.bias` names to load for one dense/MoE layer
+/// (Qwen2's Q/K/V biases, `create_tensor_qkv` in llama.cpp), or `None` when
+/// the layer has none. All three or none: a partial set is rejected, naming
+/// the missing tensor, and each length must equal its projection's output
+/// width. Host-only (metadata and tensor table), so loading never starts on a
+/// file that would fail here.
+pub(super) fn qkv_bias_names(
+    file: &GgufFile,
+    layer: usize,
+    cfg: &LayerConfig,
+) -> Result<Option<[String; 3]>, ReflexError> {
+    let names = ["attn_q", "attn_k", "attn_v"].map(|t| format!("blk.{layer}.{t}.bias"));
+    let widths = [
+        cfg.num_q_heads * cfg.head_dim,
+        cfg.num_kv_heads * cfg.head_dim,
+        cfg.num_kv_heads * cfg.head_dim,
+    ];
+    let present = names
+        .iter()
+        .filter(|n| file.tensor_info(n).is_some())
+        .count();
+    if present == 0 {
+        return Ok(None);
+    }
+    for (name, width) in names.iter().zip(widths) {
+        let info = file.tensor_info(name).ok_or_else(|| {
+            crate::reflex_err!(
+                Gguf,
+                "layer {layer} has {present} of the 3 Q/K/V biases but no '{name}'; \
+                 a partial bias set is not supported"
+            )
+        })?;
+        if info.shape.as_slice() != [width as u64] {
+            return Err(crate::reflex_err!(
+                Gguf,
+                "'{name}' has shape {:?}, expected [{width}]",
+                info.shape
+            ));
+        }
+    }
+    Ok(Some(names))
 }
 
 /// Static shape/hyperparameter config for one dense Qwen3 transformer layer,
@@ -65,7 +134,8 @@ pub struct LayerConfig {
     /// Read explicitly from `qwen3.attention.key_length` -- Qwen3 decouples
     /// this from `hidden_size / num_q_heads` (real finding from
     /// RustFeference's own Phase 21.14: a real Qwen3-0.6B has head_dim=128,
-    /// not the 64 that division would give).
+    /// not the 64 that division would give). Files without the key (`qwen2`,
+    /// Llama) use `hidden_size / num_q_heads`, as llama.cpp does.
     pub head_dim: usize,
     /// Number of leading dims of each head RoPE actually rotates (GPT-NeoX
     /// half-rotation convention). Equal to `head_dim` (full rotary) for
@@ -93,10 +163,12 @@ pub struct MoeMetaConfig {
 /// [`MoeMetaConfig`] from a GGUF file's `<arch>.*` metadata (plus
 /// `blk.0.ffn_gate[_exps].weight`'s real shape, since GGUF has no dedicated
 /// "FFN hidden size" metadata key). Pure/host-only, no GPU required.
-/// Supports dense `qwen3` and any architecture reporting a nonzero
-/// `<arch>.expert_count` (real `qwen3moe`, or a Mixtral-style test fixture
-/// under `llama.*`) -- other architectures are out of scope (see README.md's
-/// MVP order).
+/// Supports dense `qwen3`/`qwen2`/`llama` and any architecture reporting a
+/// nonzero `<arch>.expert_count` (real `qwen3moe`, or a Mixtral-style test
+/// fixture under `llama.*`) -- other architectures are out of scope (see
+/// README.md's MVP order). Also rejects files carrying tensors this path
+/// doesn't implement (`UNSUPPORTED_DENSE_TENSORS`, and shared experts on an
+/// MoE file); Qwen2's Q/K/V biases are checked per layer by [`qkv_bias_names`].
 pub fn parse_model_config(
     file: &GgufFile,
 ) -> Result<(LayerConfig, usize, Option<MoeMetaConfig>), ReflexError> {
@@ -133,13 +205,37 @@ pub fn parse_model_config(
         None => None,
     };
 
-    if architecture != "qwen3"
-        && !matches!(architecture, "llama" | "mistral" | "mixtral")
-        && moe.is_none()
+    if !matches!(
+        architecture,
+        "qwen3" | "qwen2" | "llama" | "mistral" | "mixtral"
+    ) && moe.is_none()
     {
         return Err(crate::reflex_err!(UnsupportedArchitecture,
-            "unsupported architecture '{architecture}': only dense 'qwen3'/'llama'/'mistral' and MoE architectures reporting a nonzero '{architecture}.expert_count' are in scope for this MVP"
+            "unsupported architecture '{architecture}': only dense 'qwen3'/'qwen2'/'llama'/'mistral' and MoE architectures reporting a nonzero '{architecture}.expert_count' are in scope for this MVP"
         ));
+    }
+
+    if let Some(name) = UNSUPPORTED_DENSE_TENSORS
+        .iter()
+        .find(|n| file.tensor_info(n).is_some())
+    {
+        return Err(crate::reflex_err!(
+            UnsupportedArchitecture,
+            "'{architecture}' file has tensor '{name}', which this engine doesn't implement \
+             (running without it would give wrong output); see docs/design/qwen2.md"
+        ));
+    }
+    if moe.is_some() {
+        if let Some(name) = SHARED_EXPERT_TENSORS
+            .iter()
+            .find(|n| file.tensor_info(n).is_some())
+        {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "'{architecture}' MoE file has a shared expert ('{name}'), which the generic \
+                 MoE path doesn't implement (e.g. qwen2moe); only routed experts are supported"
+            ));
+        }
     }
 
     // RoPE scaling types other than "none" (e.g. Llama-3.1's "linear"/"yarn"
