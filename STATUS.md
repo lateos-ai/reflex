@@ -1085,7 +1085,8 @@ Order (cheapest correctness first); each phase is its own branch and session:
      the difference. Regenerate the GGUF per the "Real DeepSeek-V2-Lite GGUF not
      preserved locally" entry. Use prompts with digit runs, punctuation runs and
      non-ASCII text, and compare against llama.cpp `79e2e74`.
-   - **Decide whether `qwen2` switches to the table-based split** (llama.cpp's
+   - **Decided 2026-10-13: yes, done as part of phase 2.** `qwen2` switches to the
+     table-based split (llama.cpp's
      `unicode_regex_split_custom_qwen2`). The old port's Rust `is_alphabetic` counts
      Arabic harakat as letters, so it differs from llama.cpp and HF on such text.
      Switching changes `qwen2` and Kolibri-1 output on that text only. Re-check with
