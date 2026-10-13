@@ -3821,3 +3821,62 @@ What was learned:
    - A multi-file GGUF head's `split.*` keys make `llama-tokenize` look for the other
      shards; drop them.
    - Piping `tar` over the pod's SSH failed; scp worked.
+
+### `qwen2` architecture and table-based `qwen2` split (2026-10-13)
+
+Architecture coverage round 2, phase 2 (branch `qwen2-arch`). Two changes: the dense
+`qwen2` architecture (Qwen2/2.5 Instruct, Math, Coder) and the `qwen2` pre-tokenizer moved
+onto llama.cpp's Unicode tables, the queued item from phase 1. Design, survey and results:
+`docs/design/qwen2.md`; the split change: `docs/design/tokenizer-pre-types.md`, "Resolved".
+
+**Step 0 survey.** Headers of Qwen's own Qwen2.5-0.5B/1.5B/Coder-1.5B GGUFs, bartowski's
+Math-1.5B (Qwen publishes none) and ggml-org's Coder Q8_0, by HTTP range request. All
+`pre = qwen2`. Q/K/V biases, no O bias, no QK-Norm, head dim = hidden / heads (no
+`key_length`), NEOX RoPE (`llama_model_rope_type`). Two surprises: Math uses a RoPE base of
+1e4 (the others 1e6) and is tied; Qwen's "Q4_K_M" 0.5B has no Q4_K tensors at all (896
+isn't a multiple of 256), so quantized-resident only applies from 1.5B up. The heads are
+kept as `test-data/qwen2.5-*-header.gguf` (`scripts/gguf_tokenizer_only.py`'s new
+`--keep-tensor-table`), which Reflex's config parser reads without tensor data.
+
+**Tokenizer.** Diffing llama.cpp's `unicode_regex_split_custom_qwen2` against the llama3 one
+showed they differ only in `\p{N}` vs `\p{N}{1,3}`, so `qwen2` is
+`llama3_family_step(digits = 1, marks = false)` and the old Rust-class port was deleted.
+Qwen2 golden 12/13 -> 13/13. On Kolibri-1's vocab the split moves on combining marks but
+no merge crosses the moved boundaries, so its ids didn't change; two Arabic/Devanagari
+strings were added to its HF test and matched by the Kolibri-patched `llama-tokenize`.
+(A stock-llama.cpp check of the Kolibri vocab doesn't work: it rejects the `kolibri1`
+architecture; an early reading of that run was wrong because the error went to stderr.)
+
+**Architecture.** `QkvBias` on dense/MoE layers, added before QK-Norm/RoPE where
+`build_qkv` adds it. Batched prefill uses `add_kernel` with a new row-broadcast length.
+Files with tensors llama.cpp would apply but Reflex doesn't (`attn_output.bias`,
+`output.bias`, fused `attn_qkv`) are now rejected on every dense architecture, and
+`qwen2moe`, which passed the generic `expert_count` check and would have run without its
+shared expert, is rejected too.
+
+**Fixture lessons.** The first random fixture (small layer outputs, tied embeddings) made
+every prompt repeat one token: the token's own embedding dominated the residual, so a
+missing bias could have passed. Scaling up the output projections fixed that; with std-1
+biases attention flattened and outputs collapsed onto attractor tokens, so the biases went
+to std 0.5. Checked with llama.cpp: zeroing Q's, K's or V's bias (or all) changes all 7
+prompts' 20-token outputs. Separately, `$(cat file)` stripped the chat/math prompts'
+trailing newline on the first reference run (a known gotcha); `ref_all.sh` now keeps it.
+
+**GPU session** (Runpod RTX 3090 community, $0.22/h, ~45 min; the first pod had no public
+SSH port and was replaced). Identical greedy tokens vs llama.cpp `79e2e74` with f32
+activations on the fixture and four real Qwen2.5 models in f32, f16 and quantized-resident
+modes; stock llama.cpp's Q8 activations flip 3/7 on the 0.5B. `reflex check` 30/30 rows
+unchanged. Nightly 52/0/2. Cold start Qwen2.5-0.5B 0.650 s vs `llama-simple` 0.700 s p50.
+
+**What the GPU run caught.**
+- `apply_lora` launches `add_kernel` itself, with the old three arguments, so every
+  `--lora` run segfaulted (all architectures). No host test could see it: kernel argument
+  lists aren't type-checked against the PTX. A search for `add_k` callers missed it
+  because it clones the function into `add_fn`. Fixed; LoRA now matches llama.cpp.
+- llama.cpp's CPU and CUDA backends disagree with the LoRA on one near-tie (step 8 of
+  `story`). HF `transformers` with the LoRA merged by hand sided with CUDA; the tests use
+  the CUDA ids. HF in turn differs on the Arabic prompt because Qwen2.5's `tokenizer.json`
+  NFC-normalizes (shadda + fatha are reordered) and GGUF tokenizers don't.
+
+Queued: an end-of-generation token set (llama.cpp also stops at `<|endoftext|>` and the FIM
+tokens), YaRN for `qwen2`, and `qwen2moe`.

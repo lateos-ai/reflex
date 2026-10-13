@@ -110,6 +110,17 @@ peak RSS 982 MB.
 log axis, so vLLM stays visible. Right: where Reflex's 0.83s goes. Editable vector source:
 [`docs/cold-start-t4.svg`](cold-start-t4.svg).*
 
+**Qwen2.5-0.5B-Instruct (`qwen2`), 2026-10-13.** Same harness and commands, on a Runpod
+RTX 3090 (community), `n=30`, with Qwen3-0.6B re-measured on the same pod for reference:
+
+| Model | Reflex p50 / p95 | `llama-simple` p50 / p95 | Ratio (p50) |
+|---|---|---|---|
+| Qwen2.5-0.5B-Instruct Q4_K_M | 0.650 / 0.680 s | 0.700 / 0.750 s | Reflex 1.08x faster |
+| Qwen3-0.6B Q4_K_M | 0.685 / 0.770 s | 0.695 / 0.750 s | parity |
+
+Not comparable to the T4 table above (different card and host). See
+[design/qwen2.md](design/qwen2.md#results-2026-10-13).
+
 ## TypeSafe Jev
 
 These compare Reflex's warm-compute side against Jev, an always-warm managed decision API
