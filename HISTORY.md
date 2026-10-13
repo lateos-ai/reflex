@@ -3880,3 +3880,15 @@ unchanged. Nightly 52/0/2. Cold start Qwen2.5-0.5B 0.650 s vs `llama-simple` 0.7
 
 Queued: an end-of-generation token set (llama.cpp also stops at `<|endoftext|>` and the FIM
 tokens), YaRN for `qwen2`, and `qwen2moe`.
+
+### Runpod Hub: v0.2.6 never built; v0.2.7-runpod-hub (2026-10-13)
+
+The Hub kept listing `v0.2.4-runpod-hub` after v0.2.5 and v0.2.6 were released. The Hub
+console showed v0.2.6's build failing at its first step: "Could not find remote branch
+5a6a9c44… to clone". The Hub clones a release's `target_commitish` as a **branch**, and
+v0.2.6 had been created with the commit SHA as its target (every earlier release says
+`master`). The image itself was fine: `.runpod/Dockerfile` at the v0.2.6 tag builds cleanly
+(2.84 GB). Fix: `v0.2.7-runpod-hub`, created with `--target master` on github `3846b25`
+(v0.2.6's changes plus #24 and #25; Hub worker files unchanged). Why v0.2.5 (target
+`master`) never listed is still unknown. Rule: always `gh release create ... --target master`,
+never a SHA.

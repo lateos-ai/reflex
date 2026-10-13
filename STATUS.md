@@ -1107,7 +1107,7 @@ Order (cheapest correctness first); each phase is its own branch and session:
    - Byte-exact vs llama.cpp on Qwen2.5-0.5B for chat, math and FIM prompts, plus a
      cold-start benchmark like Qwen3-0.6B's.
 
-   **Done 2026-10-13** (branch `qwen2-arch`; design note `docs/design/qwen2.md`, HISTORY.md
+   **Done 2026-10-13** (public PR #25, merged as github `3846b25`, private master synced; design note `docs/design/qwen2.md`, HISTORY.md
    "`qwen2` architecture and table-based `qwen2` split").
    - Survey (first 40 MB of each GGUF; every file `tokenizer.ggml.pre = qwen2`, Q/K/V
      biases, no `attn_output.bias`, no QK-Norm, no `rope.scaling`, no `key_length`):
