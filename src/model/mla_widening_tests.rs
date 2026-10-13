@@ -352,8 +352,13 @@ fn tiny_mla_v3_fixture_has_the_features_it_was_built_for() {
 }
 
 /// llama.cpp `79e2e74` greedy ids for [`prompts`] on the fixture, 20 tokens,
-/// f32 weights and KV cache (`ref.cpp` in the archive, CPU backend, EOS-only
-/// stopping like Reflex).
+/// f32 weights and KV cache (`ref.cpp` in the archive, EOS-only stopping like
+/// Reflex), recorded with its CUDA build on an A100. Its CPU backend gives the
+/// same ids except on `arabic`, where it picks another token at step 2 (a
+/// near-tie; Reflex agrees with CUDA, as in the qwen2 fixture). `story` stops at 17:
+/// step 18 is a near-tie (top-2 logits 0.0025 apart in HF `transformers` f32)
+/// where Reflex and HF pick 55584 and llama.cpp picks 144374 (`hf_ref.py` and
+/// the A100 results in the archive).
 const FIXTURE_GOLDEN: [&[u32]; 7] = [
     &[
         150509, 34215, 101849, 141107, 145837, 143148, 60012, 32803, 38898, 136060, 66313, 148273,
@@ -361,7 +366,7 @@ const FIXTURE_GOLDEN: [&[u32]; 7] = [
     ],
     &[
         58726, 138723, 117248, 133788, 3535, 90706, 115159, 150060, 83094, 142644, 113533, 89839,
-        141960, 89147, 49629, 94481, 67841, 144374, 77253, 113831,
+        141960, 89147, 49629, 94481, 67841,
     ],
     &[
         35376, 35535, 120234, 8051, 62153, 46602, 27677, 17676, 21723, 27646, 82326, 63505, 144177,
@@ -376,8 +381,8 @@ const FIXTURE_GOLDEN: [&[u32]; 7] = [
         6738, 80212, 140132, 19814, 8096, 99367, 25639, 44752,
     ],
     &[
-        61932, 61312, 70580, 24325, 67420, 137331, 21483, 136060, 80021, 131678, 23473, 77540,
-        126286, 112709, 17354, 73610, 56358, 8900, 45690, 60669,
+        61932, 41114, 102228, 39708, 66926, 67453, 95479, 139102, 76838, 80271, 19749, 24995,
+        66531, 119566, 117494, 90313, 87801, 67768, 95231, 105083,
     ],
     &[
         114608, 33974, 39399, 21996, 6335, 34616, 66545, 70721, 89308, 50160, 78506, 42135, 97414,
@@ -471,12 +476,14 @@ fn tiny_mla_v3_batched_prefill_matches_sequential() {
 
 /// f16 weight storage stays close to f32: first-step logits within a relative
 /// L2 error, and the same greedy first token wherever f32's top two are clearly
-/// apart.
+/// apart. The fixture's first-step margins run from 0.018 (`arabic`) to 0.95;
+/// at 0.2 five prompts count as clear (f16's relative L2 error is ~5e-3, about
+/// 0.05 in logits).
 #[test]
 #[ignore]
 fn tiny_mla_v3_f16_weights_track_f32() {
     const REL_L2_TOL: f64 = 1e-2;
-    const CLEAR_MARGIN: f32 = 0.5;
+    const CLEAR_MARGIN: f32 = 0.2;
     let (Some(f32_model), Some(f16_model)) = (load(WeightsDtype::F32), load(WeightsDtype::F16))
     else {
         return;
