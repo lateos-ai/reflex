@@ -1172,7 +1172,7 @@ Order (cheapest correctness first); each phase is its own branch and session:
      Then the real target on an A40/A100 vs llama.cpp with f32 activations.
    - Still out: MTP/NextN, and multi-GPU (V3/R1).
 
-   **Done 2026-10-13** (branch `mla-widening`, origin only; design note
+   **Done 2026-10-13** (public PR #28, merged 2026-10-14 as github `a60d02b`, private master synced; design note
    `docs/design/mla-widening.md`, HISTORY.md "MLA widening to small real checkpoints").
    - Survey (first 40 MB of 14 `deepseek2` GGUFs; header fixtures in `test-data/`):
 
