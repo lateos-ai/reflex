@@ -145,7 +145,22 @@ impl PreType {
         ("gpt-2", PreType::Gpt2),
         ("deepseek-llm", PreType::DeepseekLlm),
         ("deepseek-v3", PreType::Deepseek3),
+        // GigaChat3: llama.cpp maps it to LLAMA_VOCAB_PRE_TYPE_GPT2 with no
+        // other flags.
+        ("gigachat", PreType::Gpt2),
+        // GLM-4.7-Flash: llama.cpp maps it to LLAMA_VOCAB_PRE_TYPE_CHATGLM4,
+        // whose regex is LLAMA3's string (so `unicode_regex_split_custom_llama3`)
+        // with `ignore_merges`, plus no BOS ([`PreType::value_disables_bos`]).
+        ("glm4", PreType::Llama3),
     ];
+
+    /// Whether llama.cpp sets `special_bos_id = LLAMA_TOKEN_NULL` for this
+    /// `tokenizer.ggml.pre` value (`llama_vocab::impl::load` at `79e2e74`), so
+    /// no BOS is ever prepended whatever `add_bos_token` says: `glm4` (whose
+    /// GGUFs declare a BOS id but no `add_bos_token` key).
+    fn value_disables_bos(pre: Option<&str>) -> bool {
+        pre == Some("glm4")
+    }
 
     /// Map a gpt2-model vocab's `tokenizer.ggml.pre` to its split. A missing
     /// key keeps the Qwen2 split every gpt2 vocab got before this was read,
@@ -236,8 +251,8 @@ impl Tokenizer {
     /// defaults to empty/`None` when absent.
     pub fn from_gguf(file: &GgufFile) -> Result<Self, ReflexError> {
         let architecture = string_meta(&file.metadata, "tokenizer.ggml.model")?.to_string();
-        let pre_type = if architecture == "gpt2" {
-            let pre = match file.metadata.get("tokenizer.ggml.pre") {
+        let pre = if architecture == "gpt2" {
+            match file.metadata.get("tokenizer.ggml.pre") {
                 Some(v) => Some(v.as_str().ok_or_else(|| {
                     crate::reflex_err!(
                         Tokenizer,
@@ -245,7 +260,11 @@ impl Tokenizer {
                     )
                 })?),
                 None => None,
-            };
+            }
+        } else {
+            None
+        };
+        let pre_type = if architecture == "gpt2" {
             Some(PreType::from_gguf_value(pre)?)
         } else {
             None
@@ -295,7 +314,7 @@ impl Tokenizer {
         let add_bos = match file.metadata.get("tokenizer.ggml.add_bos_token") {
             Some(GgufValue::Bool(b)) => *b,
             _ => bos_token_id.is_some(),
-        };
+        } && !PreType::value_disables_bos(pre);
         let eos_token_id =
             u64_meta(&file.metadata, "tokenizer.ggml.eos_token_id").map(|v| v as u32);
         let unk_token_id =
@@ -2808,6 +2827,142 @@ mod tests {
                 ],
             ],
         );
+    }
+
+    /// `gigachat` (GPT2, the pre type of GigaChat3). `test-data/gigachat-tokenizer.gguf`: metadata of
+    /// https://huggingface.co/ai-sage/GigaChat3.1-10B-A1.8B-GGUF/resolve/main/GigaChat3.1-10B-A1.8B-q8_0.gguf
+    /// (HTTP range `bytes=0-41943039`, rewritten by `scripts/gguf_tokenizer_only.py`).
+    #[test]
+    fn test_gigachat_encode_matches_llama_tokenize_if_fixture_present() {
+        assert_pre_type_golden_if_fixture_present(
+            "gigachat-tokenizer.gguf",
+            PreType::Gpt2,
+            &[
+                &[
+                    19, 20, 21, 22, 23, 223, 21, 16, 19, 22, 19, 23, 27, 223, 19, 20, 21, 22, 23,
+                    24, 25, 26, 27, 18,
+                ],
+                &[
+                    10960, 1791, 406, 9, 4033, 859, 11705, 1478, 9, 984, 587, 1111, 58053, 9, 38,
+                ],
+                &[
+                    16656, 3621, 3, 223, 15632, 21406, 3227, 86791, 3392, 11918, 13442, 107011,
+                    6756, 33745, 49543, 41007, 8265, 46685, 17188, 46685, 90934, 3392, 22212,
+                    39438, 258, 34854, 57102, 46762, 113561, 16,
+                ],
+                &[
+                    106322, 28, 10713, 14, 88601, 13906, 14, 7763, 246, 30934, 30934, 35707, 19219,
+                    99542, 44850, 14, 15851, 14, 223, 89610, 49690, 50247,
+                ],
+                &[
+                    1568, 1356, 201, 1568, 2189, 204, 127826, 223, 3150, 25357, 200, 200, 93770,
+                    750,
+                ],
+                &[
+                    96843, 26293, 242, 236, 82927, 124, 26293, 239, 234, 12618, 239, 234, 3609,
+                    254, 100, 42697, 26293, 242, 104, 96644, 97886, 105, 96644, 97886, 103,
+                ],
+                &[
+                    50, 100091, 30982, 10604, 33, 3805, 13269, 3874, 21434, 223, 71202, 23919,
+                    25478, 678, 50159, 7, 64, 8, 12,
+                ],
+                &[127762, 12081, 17375, 391, 40262, 127763],
+                &[
+                    69, 1536, 1277, 5050, 55702, 1206, 390, 7809, 296, 139, 225, 343, 139, 228, 81,
+                ],
+                &[
+                    90, 298, 24506, 10, 3151, 14, 223, 22, 20, 1396, 201, 389, 347, 90, 3931, 223,
+                    19, 18, 11, 358, 636, 372, 735, 13539, 752, 201,
+                ],
+                &[7546, 28149, 28393, 917, 18269, 5086, 77732, 464],
+                &[
+                    1984, 102, 17657, 246, 17657, 237, 17657, 237, 1984, 118, 17657, 234, 17657,
+                    229, 17657, 245, 17657, 233, 223, 107567, 1984, 243, 1984, 244, 223, 25028,
+                    53004,
+                ],
+                &[
+                    42, 16297, 28, 17835, 104, 98821, 99789, 35506, 59807, 45849, 17835, 102,
+                    98125, 92636, 54367, 4998, 110, 21536, 14, 49209, 613, 15701, 28, 555, 1482,
+                    404, 3711, 760, 1482, 490, 1630, 289,
+                ],
+            ],
+        );
+    }
+
+    /// `glm4` (CHATGLM4, the pre type of GLM-4.7-Flash: the LLAMA3 split with `ignore_merges`). `test-data/glm4-tokenizer.gguf`: metadata of
+    /// https://huggingface.co/unsloth/GLM-4.7-Flash-GGUF/resolve/main/GLM-4.7-Flash-Q4_K_M.gguf
+    /// (HTTP range `bytes=0-41943039`, rewritten by `scripts/gguf_tokenizer_only.py`).
+    #[test]
+    fn test_glm4_encode_matches_llama_tokenize_if_fixture_present() {
+        assert_pre_type_golden_if_fixture_present(
+            "glm4-tokenizer.gguf",
+            PreType::Llama3,
+            &[
+                &[
+                    108714, 100461, 220, 18, 13, 122804, 102573, 220, 108714, 100461, 21, 100928,
+                    24, 15,
+                ],
+                &[
+                    14995, 944, 358, 6, 4086, 582, 3003, 807, 93362, 432, 594, 14973, 27612,
+                ],
+                &[
+                    9703, 1879, 0, 101726, 98384, 3837, 99011, 1773, 99799, 131513, 15755, 56451,
+                    61369, 70008, 5373, 69868, 45928, 69868, 94551, 1773, 23508, 130419, 30953,
+                    53079, 40626, 78318, 13,
+                ],
+                &[
+                    85715, 25, 6364, 11, 133177, 127616, 70363, 11, 128228, 137790, 130624, 11,
+                    137930, 11, 220, 49438, 35705, 34339,
+                ],
+                &[
+                    1056, 825, 198, 1056, 1378, 201, 1406, 220, 1257, 15852, 197, 3244, 3435, 5872,
+                ],
+                &[
+                    37328, 61370, 233, 151821, 11157, 236, 231, 151705, 69945, 30423, 61370, 101,
+                    124564, 151929, 124564, 151927,
+                ],
+                &[
+                    47, 71744, 12063, 50979, 2503, 12442, 1781, 10126, 220, 45322, 21075, 13980,
+                    569, 47775, 45627, 5, 9,
+                ],
+                &[256, 6388, 12615, 323, 27654, 262],
+                &[
+                    924, 58451, 94083, 586, 384, 53481, 264, 95739, 308, 151459, 78,
+                ],
+                &[
+                    87, 284, 15217, 54265, 11, 220, 101961, 317, 333, 320, 87, 2604, 220, 98668, 8,
+                    314, 470, 330, 562, 5123, 456,
+                ],
+                &[4102, 5674, 22382, 93217, 3550, 103245, 336],
+                &[
+                    1540, 99, 15381, 243, 15381, 234, 15381, 234, 1540, 115, 15381, 231, 15381,
+                    226, 15381, 242, 15381, 230, 220, 20069, 24842, 33355, 115352, 11314,
+                ],
+                &[
+                    39, 28583, 25, 14913, 101, 86522, 77740, 30366, 97, 34200, 14913, 99, 72094,
+                    59678, 42069, 107, 23801, 11, 33952, 448, 4855, 585, 266, 25, 23300, 27815,
+                    11066, 58985, 29710, 27815, 21310, 127789, 5703,
+                ],
+            ],
+        );
+    }
+
+    /// llama.cpp sets `special_bos_id = LLAMA_TOKEN_NULL` for `glm4`, so a GLM
+    /// prompt never starts with BOS even though the file declares one (154822)
+    /// and has no `add_bos_token` key.
+    #[test]
+    fn test_glm4_adds_no_bos_if_fixture_present() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-data/glm4-tokenizer.gguf");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let file = GgufFile::open(&path).expect("open glm4-tokenizer.gguf");
+        let tok = Tokenizer::from_gguf(&file).expect("load glm4 tokenizer");
+        assert_eq!(tok.bos_token_id, Some(154822));
+        assert!(!tok.add_bos);
+        assert_eq!(tok.prompt_bos(), None);
     }
 
     /// `qwen35` (QWEN35; Qwen3.5 and Qwen3.8). `test-data/qwen35-tokenizer.gguf`:

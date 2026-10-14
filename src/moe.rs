@@ -114,10 +114,58 @@ pub fn route_sigmoid_logit_add(
     k: usize,
     normalize: bool,
 ) -> Result<Vec<(usize, f32)>, ReflexError> {
+    route_sigmoid_by(
+        "route_sigmoid_logit_add",
+        logits,
+        bias,
+        k,
+        normalize,
+        |l, b| l + b,
+    )
+}
+
+/// DeepSeek-V3's router (llama.cpp's `SIGMOID` gating with an `exp_probs_b`
+/// tensor, `build_moe_ffn`): select the top-`k` experts on
+/// `sigmoid(logits[i]) + bias[i]`, then weight each selected expert by the
+/// *unbiased* `sigmoid(logits[i])`, optionally renormalized to sum to 1
+/// (`expert_weights_norm`). With no `exp_probs_b` tensor llama.cpp skips the
+/// add, so pass an all-zero `bias`. Returns `k` `(expert_index, weight)`
+/// pairs in selection order (biased score descending, ties by ascending
+/// index). Used by GigaChat3, GLM-4.7-Flash, Moonlight and DeepSeek-V3 itself
+/// (`docs/design/mla-widening.md`).
+///
+/// Differs from [`route_sigmoid_logit_add`] only in where the bias goes; see
+/// that function's doc comment.
+pub fn route_sigmoid_bias(
+    logits: &[f32],
+    bias: &[f32],
+    k: usize,
+    normalize: bool,
+) -> Result<Vec<(usize, f32)>, ReflexError> {
+    route_sigmoid_by("route_sigmoid_bias", logits, bias, k, normalize, |l, b| {
+        sigmoid(l) + b
+    })
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// The shared core of the two sigmoid routers: rank experts on
+/// `score(logits[i], bias[i])`, keep the top `k`, weight them by
+/// `sigmoid(logits[i])` and optionally normalize.
+fn route_sigmoid_by(
+    name: &str,
+    logits: &[f32],
+    bias: &[f32],
+    k: usize,
+    normalize: bool,
+    score: impl Fn(f32, f32) -> f32,
+) -> Result<Vec<(usize, f32)>, ReflexError> {
     if logits.is_empty() || logits.len() != bias.len() {
         return Err(crate::reflex_err!(
             Other,
-            "route_sigmoid_logit_add: {} logits vs {} bias entries (must be equal and nonzero)",
+            "{name}: {} logits vs {} bias entries (must be equal and nonzero)",
             logits.len(),
             bias.len()
         ));
@@ -125,32 +173,32 @@ pub fn route_sigmoid_logit_add(
     if k == 0 || k > logits.len() {
         return Err(crate::reflex_err!(
             Other,
-            "route_sigmoid_logit_add: k ({k}) must be in 1..={} (logits.len())",
+            "{name}: k ({k}) must be in 1..={} (logits.len())",
             logits.len()
         ));
     }
-    if let Some(bad) = logits
+    let scores: Vec<f32> = logits
         .iter()
         .zip(bias)
-        .position(|(l, b)| !(l + b).is_finite())
-    {
+        .map(|(&l, &b)| score(l, b))
+        .collect();
+    if let Some(bad) = scores.iter().position(|s| !s.is_finite()) {
         return Err(crate::reflex_err!(
             Other,
-            "route_sigmoid_logit_add: biased logit of expert {bad} is not finite"
+            "{name}: biased score of expert {bad} is not finite"
         ));
     }
 
-    let biased: Vec<f32> = logits.iter().zip(bias).map(|(l, b)| l + b).collect();
-    let mut order: Vec<usize> = (0..biased.len()).collect();
+    let mut order: Vec<usize> = (0..scores.len()).collect();
     order.sort_unstable_by(|&a, &b| {
-        biased[b]
-            .partial_cmp(&biased[a])
+        scores[b]
+            .partial_cmp(&scores[a])
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.cmp(&b))
     });
     let mut routed: Vec<(usize, f32)> = order[..k]
         .iter()
-        .map(|&i| (i, 1.0 / (1.0 + (-logits[i]).exp())))
+        .map(|&i| (i, sigmoid(logits[i])))
         .collect();
 
     if normalize {
@@ -282,6 +330,100 @@ mod tests {
         let sum: f32 = normed.iter().map(|&(_, w)| w).sum();
         assert!((sum - 1.0).abs() < 1e-6);
         assert_eq!(normed[0].0, raw[0].0);
+    }
+
+    /// llama.cpp's `build_moe_ffn` with `SIGMOID` gating and `exp_probs_b`,
+    /// written out step by step (docs/design/mla-widening.md): sigmoid, add the
+    /// selection bias, top-k on the biased scores, gather the unbiased probs,
+    /// normalize with the 2^-14 clamp.
+    fn deepseek_v3_reference(
+        logits: &[f32],
+        bias: &[f32],
+        k: usize,
+        normalize: bool,
+    ) -> Vec<(usize, f32)> {
+        let probs: Vec<f32> = logits.iter().map(|&l| sigmoid(l)).collect();
+        let selection: Vec<f32> = probs.iter().zip(bias).map(|(p, b)| p + b).collect();
+        let mut picked: Vec<usize> = Vec::new();
+        for _ in 0..k {
+            let best = (0..selection.len())
+                .filter(|i| !picked.contains(i))
+                .fold(None, |best: Option<usize>, i| match best {
+                    Some(j) if selection[j] >= selection[i] => Some(j),
+                    _ => Some(i),
+                })
+                .unwrap();
+            picked.push(best);
+        }
+        let mut weights: Vec<f32> = picked.iter().map(|&i| probs[i]).collect();
+        if normalize {
+            // llama.cpp's clamp, written there as 6.103515625e-5 (exactly 2^-14).
+            let sum = weights.iter().sum::<f32>().max(2f32.powi(-14));
+            weights.iter_mut().for_each(|w| *w /= sum);
+        }
+        picked.into_iter().zip(weights).collect()
+    }
+
+    #[test]
+    fn sigmoid_bias_matches_host_reference() {
+        // 16 experts, deterministic pseudo-random logits and biases.
+        let mut state = 0x2545_f491_u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32) * 6.0 - 3.0
+        };
+        for _ in 0..50 {
+            let logits: Vec<f32> = (0..16).map(|_| next()).collect();
+            let bias: Vec<f32> = (0..16).map(|_| next() * 0.1).collect();
+            for (k, normalize) in [(1, false), (4, true), (6, false), (16, true)] {
+                let got = route_sigmoid_bias(&logits, &bias, k, normalize).unwrap();
+                let want = deepseek_v3_reference(&logits, &bias, k, normalize);
+                assert_eq!(got, want, "k={k} normalize={normalize}");
+            }
+        }
+    }
+
+    /// The same inputs as `sigmoid_logit_add_differs_from_deepseek_v3_selection`:
+    /// the two sigmoid rules pick different experts.
+    #[test]
+    fn sigmoid_bias_selects_after_the_sigmoid() {
+        let logits = [4.0f32, 0.0];
+        let bias = [0.0f32, 0.6];
+        let v3 = route_sigmoid_bias(&logits, &bias, 1, false).unwrap();
+        assert_eq!(
+            v3,
+            vec![(1, sigmoid(0.0))],
+            "weight must be the unbiased sigmoid"
+        );
+        let kolibri = route_sigmoid_logit_add(&logits, &bias, 1, false).unwrap();
+        assert_eq!(kolibri[0].0, 0);
+    }
+
+    /// llama.cpp clamps the weight sum at 2^-14 before dividing, so tiny
+    /// sigmoid weights are not blown up to sum to 1.
+    #[test]
+    fn sigmoid_bias_normalization_clamps_the_sum() {
+        let logits = [-20.0f32, -21.0, -22.0];
+        let bias = [0.0f32; 3];
+        let routed = route_sigmoid_bias(&logits, &bias, 2, true).unwrap();
+        assert_eq!(routed[0], (0, sigmoid(-20.0) / 2f32.powi(-14)));
+        assert_eq!(routed[1], (1, sigmoid(-21.0) / 2f32.powi(-14)));
+        let sum: f32 = routed.iter().map(|&(_, w)| w).sum();
+        assert!(
+            sum < 0.1,
+            "clamped sum must not renormalize to 1, got {sum}"
+        );
+    }
+
+    #[test]
+    fn sigmoid_bias_rejects_bad_inputs() {
+        assert!(route_sigmoid_bias(&[], &[], 1, false).is_err());
+        assert!(route_sigmoid_bias(&[1.0, 2.0], &[0.0], 1, false).is_err());
+        assert!(route_sigmoid_bias(&[1.0, 2.0], &[0.0, 0.0], 0, false).is_err());
+        assert!(route_sigmoid_bias(&[1.0, 2.0], &[0.0, 0.0], 3, false).is_err());
+        assert!(route_sigmoid_bias(&[1.0, 2.0], &[f32::NAN, 0.0], 1, false).is_err());
     }
 
     #[test]

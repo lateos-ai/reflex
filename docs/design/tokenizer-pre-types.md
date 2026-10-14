@@ -26,6 +26,8 @@ the code that runs them in `src/unicode.cpp`.
 | `gpt-2` | `Gpt2` | `GPT2` | `unicode_regex_split_custom_gpt2` | `tiny-qwen3moe.gguf` |
 | `deepseek-llm` | `DeepseekLlm` | `DEEPSEEK_LLM` | 6 regexes through `std::regex` | `deepseek-llm-tokenizer.gguf` |
 | `deepseek-v3` | `Deepseek3` | `DEEPSEEK3_LLM` | 3 regexes through `std::regex` | `deepseek-v3-tokenizer.gguf` |
+| `gigachat` | `Gpt2` | `GPT2` | as `gpt-2` | `gigachat-tokenizer.gguf` |
+| `glm4` | `Llama3` | `CHATGLM4`: the `LLAMA3` regex, `ignore_merges`, and no BOS (`special_bos_id` nulled) | as `llama-bpe`, BOS off | `glm4-tokenizer.gguf` |
 
 A missing key keeps the Qwen2 split, which is what every gpt2 vocab got before. That way
 a file that loaded before still tokenizes the same (apart from the 2026-10-13 `qwen2`
@@ -48,6 +50,10 @@ What uses which pre type, from a header survey (HTTP range requests on the first
 | DeepSeek-V2-Lite, DeepSeek LLM 7B | `deepseek2`, `llama` | `deepseek-llm` |
 | DeepSeek-V3-0324 | `deepseek2` | `deepseek-v3` |
 | Llama-3.2-1B-Instruct | `llama` | `llama-bpe` |
+| GigaChat3.1-10B-A1.8B | `deepseek2` | `gigachat` |
+| GLM-4.7-Flash | `deepseek2` | `glm4` |
+| Moonlight-16B-A3B | `deepseek2` | `kimi-k2` (not ported) |
+| Kanana-2-30B-A3B | `deepseek2` | `kanana2` (not ported; llama.cpp's `gpt-4o` split) |
 | TinyLlama, Mistral-7B | `llama` | none (`llama` SentencePiece) |
 | Gemma 4 | `gemma4` | none (`gemma4` model) |
 
@@ -93,9 +99,16 @@ transcribes `unicode_ranges_flags` (2,273 category ranges) and `unicode_set_whit
 into `src/tokenizer_unicode.rs`. That's about 18 KB of data and no new dependency.
 Rerun the script against the new commit when the pinned llama.cpp moves.
 
-**`ignore_merges`.** llama.cpp sets this for `LLAMA3`: a pre-token that is already one
+**`ignore_merges`.** llama.cpp sets this for `LLAMA3` (and `CHATGLM4`, which `glm4` maps to): a pre-token that is already one
 vocab entry is emitted as that entry without running BPE. Reflex does the same
 (`PreType::ignore_merges`). None of the other supported types set it.
+
+**BOS.** For `glm4` llama.cpp nulls `special_bos_id`, so a GLM prompt never starts with
+BOS even though the file declares one and has no `add_bos_token` key
+(`PreType::value_disables_bos`). The 2026-10-13 MLA-widening check (design/mla-widening.md)
+compared full prompt ids, BOS included, against `llama-tokenize` on 7 prompts (digits,
+punctuation, CJK, Cyrillic, code, mixed scripts) for the DeepSeek, GigaChat and GLM
+vocabs: 21/21 identical.
 
 **Not ported:** `clean_spaces`, which only affects llama.cpp's detokenizer (it's on for
 `llama-bpe`). Reflex's decode returns the exact bytes.

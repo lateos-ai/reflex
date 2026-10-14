@@ -121,6 +121,17 @@ RTX 3090 (community), `n=30`, with Qwen3-0.6B re-measured on the same pod for re
 Not comparable to the T4 table above (different card and host). See
 [design/qwen2.md](design/qwen2.md#results-2026-10-13).
 
+**GigaChat3.1-10B-A1.8B (`deepseek2`, MLA + sigmoid-routed MoE), 2026-10-13.** Same
+harness and commands, on a Runpod A100-SXM4-80GB (secure cloud), `n=30`, page cache warm:
+
+| Model | Reflex p50 / p95 | `llama-simple` p50 / p95 | Ratio (p50) |
+|---|---|---|---|
+| GigaChat3.1-10B-A1.8B q8_0 (11.4 GB) | 4.22 / 4.51 s | 4.40 / 4.76 s | Reflex 1.04x faster |
+
+Reflex's load (~2.0 s) dominates: the MLA path dequantizes every `Q8_0` matrix to f16 on
+the device and has no quantized-resident mode. See
+[design/mla-widening.md](design/mla-widening.md#results-2026-10-13).
+
 ## TypeSafe Jev
 
 These compare Reflex's warm-compute side against Jev, an always-warm managed decision API

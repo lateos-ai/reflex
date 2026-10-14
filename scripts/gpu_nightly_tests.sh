@@ -45,6 +45,7 @@ requirement() {
     *::qwen2_real_model_*) echo "$QWEN2_GGUF|$QWEN2_GGUF|set QWEN2_GGUF" ;;
     *::qwen2_fixture_lora_*) echo "|test-data/tiny-qwen2-lora.gguf|fixture missing" ;;
     model::qwen2_tests::*) echo "|test-data/tiny-qwen2.gguf|fixture missing" ;;
+    model::mla_widening_tests::*) echo "|test-data/tiny-mla-v3.gguf|fixture missing" ;;
     lora::moe_expert_lora_fixture_tests::*) echo "|test-data/tiny-qwen3moe-lora.gguf|fixture missing" ;;
     *::qwen3moe_fixture_*) echo "|test-data/tiny-qwen3moe.gguf|fixture missing" ;;
     *::qwen35moe_fixture_*) echo "|test-data/tiny-qwen35moe.gguf|fixture missing" ;;
