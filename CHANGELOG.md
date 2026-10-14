@@ -12,6 +12,11 @@ What has been built, in order. Measurements live in
   (all three in EU-RO-1 only). `tests.json` now pins an RTX A5000, and `hub.json` adds
   `AMPERE_24` after `AMPERE_16` and allows CUDA 13.2 hosts. Image, handler, tests and
   baked model are unchanged. Details: `.runpod/README.md`, "Update, 2026-10-14".
+- **Runpod Hub test job pinned to an RTX 4090** (`v0.2.9-runpod-hub`). v0.2.8's test job
+  found no RTX A5000 either, and showed that the test's fallbacks are the pinned GPU's own
+  pool (RTX 3090, L4), not `hub.json`'s `gpuIds`. The RTX 4090 is what most of Runpod's own
+  Hub workers pin; the test config now also lists `allowedCudaVersions`, and `hub.json`
+  adds `ADA_24` as a last-resort pool.
 
 ## 2026-10-13
 

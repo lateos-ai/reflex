@@ -123,11 +123,11 @@ every card in the pool, Ada included, plus PTX that newer GPUs JIT. So it runs w
 Hub picks, with no JIT on the listed ones. Confirmed on real Runpod workers on 2026-10-02 (see
 "Fatbin on Ada" below), so `hub.json` now allows the whole `AMPERE_16` pool, Ada cards included.
 
-Since `v0.2.8-runpod-hub`, `hub.json` also allows `AMPERE_24` (RTX A5000, RTX 3090, L4) after
-`AMPERE_16`, and `tests.json` pins the test job to an RTX A5000 instead of an RTX A4500 (see
-"Update, 2026-10-14" below). The pool order is a preference: deployed endpoints use the cheaper
-`AMPERE_16` ($0.58/hr serverless) when it has capacity and `AMPERE_24` ($0.69/hr) otherwise.
-Every card in both pools is `sm_86` or `sm_89`, which the fatbin carries natively.
+Since `v0.2.9-runpod-hub`, `hub.json` allows `AMPERE_16`, then `AMPERE_24` (RTX A5000, RTX 3090,
+L4), then `ADA_24` (RTX 4090), and `tests.json` pins the test job to an RTX 4090 (see "Update,
+2026-10-14" below). The pool order is a preference: deployed endpoints use the cheaper
+`AMPERE_16` ($0.58/hr serverless) when it has capacity and the next pool otherwise. Every card
+in these pools is `sm_86` or `sm_89`, which the fatbin carries natively.
 
 ## Non-goals for this addition
 
@@ -287,3 +287,19 @@ across four data centers on 2026-10-14), adds `AMPERE_24` as a fallback pool, an
 13.2 hosts, which most A4500/A5000 serverless hosts report (the image's CUDA 12.4 runtime runs on
 any newer driver). The image, `handler.py`, the tests themselves and the baked model are
 unchanged.
+
+**Follow-up, same day (`v0.2.9-runpod-hub`).** v0.2.8's test job failed the same way: "no
+instances available for your specified GPU NVIDIA RTX A5000 nor on any of the fallback GPUs
+NVIDIA GeForce RTX 3090, NVIDIA L4". Two things it showed:
+
+- The test job's fallbacks are the other cards in the **pinned GPU's own pool** (`AMPERE_24`
+  here), not `hub.json`'s `gpuIds`. Widening `gpuIds` doesn't help the test; only the pin does.
+- Stock moves within the hour: the A5000 went from HIGH to out on every CUDA version, with the
+  A4500, A4000 and RTX 3090.
+
+So `tests.json` now pins an **RTX 4090**, as most of Runpod's own Hub workers do
+(`worker-sglang`, `worker-comfyui`, `worker-faster_whisper`). It is the largest serverless fleet,
+and the only 24 GB card with stock at that check. The test config also lists
+`allowedCudaVersions` explicitly, like theirs. `hub.json` adds `ADA_24` as a last-resort pool for
+deployed endpoints. No pin guarantees capacity: if a test job still finds none, retrying it from
+the Hub console when stock returns needs no new release.
