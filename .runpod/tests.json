@@ -35,7 +35,8 @@
     }
   ],
   "config": {
-    "gpuTypeId": "NVIDIA RTX A5000",
-    "gpuCount": 1
+    "gpuTypeId": "NVIDIA GeForce RTX 4090",
+    "gpuCount": 1,
+    "allowedCudaVersions": ["12.4", "12.8", "13.0", "13.2"]
   }
 }
