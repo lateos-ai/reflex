@@ -123,6 +123,12 @@ every card in the pool, Ada included, plus PTX that newer GPUs JIT. So it runs w
 Hub picks, with no JIT on the listed ones. Confirmed on real Runpod workers on 2026-10-02 (see
 "Fatbin on Ada" below), so `hub.json` now allows the whole `AMPERE_16` pool, Ada cards included.
 
+Since `v0.2.8-runpod-hub`, `hub.json` also allows `AMPERE_24` (RTX A5000, RTX 3090, L4) after
+`AMPERE_16`, and `tests.json` pins the test job to an RTX A5000 instead of an RTX A4500 (see
+"Update, 2026-10-14" below). The pool order is a preference: deployed endpoints use the cheaper
+`AMPERE_16` ($0.58/hr serverless) when it has capacity and `AMPERE_24` ($0.69/hr) otherwise.
+Every card in both pools is `sm_86` or `sm_89`, which the fatbin carries natively.
+
 ## Non-goals for this addition
 
 - No changes to `serverless/runpod/`, `sidecar/openai-adapter/`, or any core engine file. Both
@@ -263,3 +269,21 @@ unchanged.
 the old `TODO:` placeholder. The GPU-selection fields in `hub.json`/`tests.json` are kept as
 advisory intent only (real evidence above shows the Hub test scheduler does not honor them).
 
+**Update, 2026-10-14 (`v0.2.8-runpod-hub`): why v0.2.5 to v0.2.7 never listed.** The listing
+stayed on `v0.2.4-runpod-hub` through three releases. The Hub console showed two causes:
+
+- `v0.2.6-runpod-hub` failed at its first build step ("Could not find remote branch 5a6a9c44…
+  to clone"). The Hub clones a release's target as a **branch**, and v0.2.6 had been created
+  with a commit SHA as its target. Always create Hub releases with `--target master`.
+- `v0.2.7-runpod-hub` (target `master`, same image) built, but its test job failed: "There were
+  no instances available for your specified GPU NVIDIA RTX A4500 nor on any of the fallback GPUs
+  NVIDIA RTX 2000 Ada Generation, NVIDIA RTX 4000 Ada Generation." The test fallbacks come from
+  `hub.json`'s `gpuIds`, and in serverless stock all three cards sit in one data center
+  (EU-RO-1), so they run out together. `v0.2.5-runpod-hub` has the same pin and pool, which
+  fits it failing the same way.
+
+So this release pins the test job to an RTX A5000 (`sm_86` like the A4500, serverless stock HIGH
+across four data centers on 2026-10-14), adds `AMPERE_24` as a fallback pool, and allows CUDA
+13.2 hosts, which most A4500/A5000 serverless hosts report (the image's CUDA 12.4 runtime runs on
+any newer driver). The image, `handler.py`, the tests themselves and the baked model are
+unchanged.

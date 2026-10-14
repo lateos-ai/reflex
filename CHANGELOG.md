@@ -3,6 +3,16 @@
 What has been built, in order. Measurements live in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+## 2026-10-14
+
+- **Runpod Hub test job no longer depends on one data center's RTX A4500s**
+  (`v0.2.8-runpod-hub`). The listing had stayed on `v0.2.4-runpod-hub`: v0.2.6's build
+  failed because its release targeted a commit SHA, which the Hub tries to clone as a
+  branch, and v0.2.7's test job found no RTX A4500, RTX 2000 Ada or RTX 4000 Ada capacity
+  (all three in EU-RO-1 only). `tests.json` now pins an RTX A5000, and `hub.json` adds
+  `AMPERE_24` after `AMPERE_16` and allows CUDA 13.2 hosts. Image, handler, tests and
+  baked model are unchanged. Details: `.runpod/README.md`, "Update, 2026-10-14".
+
 ## 2026-10-13
 
 - **Qwen2 / Qwen2.5 (`qwen2`), including Qwen2.5-Math and Qwen2.5-Coder.** These run on

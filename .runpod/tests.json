@@ -35,7 +35,7 @@
     }
   ],
   "config": {
-    "gpuTypeId": "NVIDIA RTX A4500",
+    "gpuTypeId": "NVIDIA RTX A5000",
     "gpuCount": 1
   }
 }
