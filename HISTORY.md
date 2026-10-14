@@ -3892,3 +3892,10 @@ v0.2.6 had been created with the commit SHA as its target (every earlier release
 (v0.2.6's changes plus #24 and #25; Hub worker files unchanged). Why v0.2.5 (target
 `master`) never listed is still unknown. Rule: always `gh release create ... --target master`,
 never a SHA.
+
+Then v0.2.7 built but its test job failed: no capacity on the pinned RTX A4500 or on the
+fallbacks from `gpuIds: AMPERE_16` (RTX 2000/4000 Ada), all three in EU-RO-1 only. v0.2.5,
+with the same pin and pool, most likely failed the same way. Fix (public #26, github
+`14a04e4`): `tests.json` pins an RTX A5000, `hub.json` `gpuIds` is `AMPERE_16,AMPERE_24`
+and allows CUDA 13.2 hosts. Released as `v0.2.8-runpod-hub` (target `master`) on
+2026-10-14 01:27Z.
