@@ -37,6 +37,27 @@ pub(super) enum MlaFfn {
         ffn_gate_shexp: Weight,
         ffn_up_shexp: Box<Weight>,
         ffn_down_shexp: Box<Weight>,
+        /// `exp_probs_b.bias`, the sigmoid router's selection bias, kept host-side
+        /// like Kolibri-1's (it is only added to the host-side router scores). All
+        /// zeros when the file has none (llama.cpp skips the add) or the gating is
+        /// softmax (where it is never read).
+        exp_probs_b: Vec<f32>,
+    },
+}
+
+/// An MLA layer's query projection (`docs/design/mla-widening.md`).
+pub(super) enum MlaQuery {
+    /// `attn_q`: `[hidden, n_head*(qk_nope_head_dim+qk_rope_head_dim)]`, the "lite"
+    /// files (DeepSeek-V2-Lite, Coder-V2-Lite, GigaChat3).
+    Direct(Weight),
+    /// Q-LoRA (GLM-4.7-Flash, full-size V2/V3): `q = wq_b · rmsnorm(wq_a · x)`.
+    Lora {
+        /// `attn_q_a`: `[hidden, q_lora_rank]`.
+        wq_a: Weight,
+        /// `attn_q_a_norm`: `[q_lora_rank]`.
+        q_a_norm: Weight,
+        /// `attn_q_b`: `[q_lora_rank, n_head*(qk_nope_head_dim+qk_rope_head_dim)]`.
+        wq_b: Box<Weight>,
     },
 }
 
@@ -51,9 +72,8 @@ pub(super) enum MlaFfn {
 /// shared-expert for the rest -- see [`MlaFfn`].
 pub(super) struct MlaLayerWeights {
     pub(super) attn_norm: Weight,
-    /// `[hidden, n_head*(qk_nope_head_dim+qk_rope_head_dim)]` -- direct projection,
-    /// no Q-LoRA decomposition (out of scope this round).
-    pub(super) wq: Weight,
+    /// Direct `attn_q` or the Q-LoRA pair, see [`MlaQuery`].
+    pub(super) wq: MlaQuery,
     /// `[hidden, kv_lora_rank+qk_rope_head_dim]`, fused compressed-KV + shared
     /// rope-K projection (MQA: a single shared "head").
     pub(super) wkv_a_mqa: Weight,
@@ -304,8 +324,36 @@ impl Model {
                     ffn_down: load_weight(&format!("blk.{i}.ffn_down.weight"))?,
                 }
             } else {
+                let moe_cfg = mla_cfg.moe.as_ref().ok_or_else(|| {
+                    ReflexError::Other(
+                        "internal error: MoE layer but MlaConfig::moe is None".into(),
+                    )
+                })?;
+                let ffn_gate_inp = load_weight(&format!("blk.{i}.ffn_gate_inp.weight"))?;
+                let expert_count = ffn_gate_inp.shape[1] as usize;
+                let exp_probs_b = if moe_cfg.has_exp_probs_b {
+                    let bias_name = format!("blk.{i}.exp_probs_b.bias");
+                    let info = file
+                        .tensor_info(&bias_name)
+                        .ok_or_else(|| crate::reflex_err!(Gguf, "missing tensor '{bias_name}'"))?;
+                    let bias = crate::dequant::dequantize(
+                        info.ggml_type,
+                        file.tensor_bytes(info)?,
+                        info.element_count(),
+                    )?;
+                    if bias.len() != expert_count {
+                        return Err(crate::reflex_err!(
+                            Gguf,
+                            "{bias_name} has {} entries, expected expert_count = {expert_count}",
+                            bias.len()
+                        ));
+                    }
+                    bias
+                } else {
+                    vec![0.0; expert_count]
+                };
                 MlaFfn::Moe {
-                    ffn_gate_inp: load_weight(&format!("blk.{i}.ffn_gate_inp.weight"))?,
+                    ffn_gate_inp,
                     ffn_gate_exps: load_weight(&format!("blk.{i}.ffn_gate_exps.weight"))?,
                     ffn_up_exps: load_weight(&format!("blk.{i}.ffn_up_exps.weight"))?,
                     ffn_down_exps: load_weight(&format!("blk.{i}.ffn_down_exps.weight"))?,
@@ -314,11 +362,21 @@ impl Model {
                     ffn_down_shexp: Box::new(load_weight(&format!(
                         "blk.{i}.ffn_down_shexp.weight"
                     ))?),
+                    exp_probs_b,
                 }
+            };
+            let wq = if mla_cfg.q_lora_rank.is_some() {
+                MlaQuery::Lora {
+                    wq_a: load_weight(&format!("blk.{i}.attn_q_a.weight"))?,
+                    q_a_norm: load_weight(&format!("blk.{i}.attn_q_a_norm.weight"))?,
+                    wq_b: Box::new(load_weight(&format!("blk.{i}.attn_q_b.weight"))?),
+                }
+            } else {
+                MlaQuery::Direct(load_weight(&format!("blk.{i}.attn_q.weight"))?)
             };
             layers.push(MlaLayerWeights {
                 attn_norm: load_weight(&format!("blk.{i}.attn_norm.weight"))?,
-                wq: load_weight(&format!("blk.{i}.attn_q.weight"))?,
+                wq,
                 wkv_a_mqa: load_weight(&format!("blk.{i}.attn_kv_a_mqa.weight"))?,
                 attn_kv_a_norm: load_weight(&format!("blk.{i}.attn_kv_a_norm.weight"))?,
                 wk_b: load_weight(&format!("blk.{i}.attn_k_b.weight"))?,
@@ -513,10 +571,43 @@ impl Model {
         Self::finish_system1_response(candidates, resolved, scores, temperature)
     }
 
+    /// An MLA layer's query projection of the attention-normed input: `wq · x`
+    /// for a direct `attn_q`, or `wq_b · rmsnorm(wq_a · x)` for Q-LoRA (llama.cpp
+    /// `deepseek2.cpp`'s `!is_lite` branch, `attn_q_a_norm` with the model's RMS
+    /// epsilon). `rows = None` is the single-position path (GEMV), `Some(rows)`
+    /// the batched-prefill path (GEMM, even for one row), so each path keeps the
+    /// matmul it always used.
+    fn mla_query(
+        &self,
+        wq: &MlaQuery,
+        normed: &CudaSlice<f32>,
+        rows: Option<usize>,
+        eps: f32,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let matmul = |x: &CudaSlice<f32>, w: &Weight| match rows {
+            None => self.gemv(x, w),
+            Some(rows) => self.gemm(x, w, rows),
+        };
+        match wq {
+            MlaQuery::Direct(w) => matmul(normed, w),
+            MlaQuery::Lora {
+                wq_a,
+                q_a_norm,
+                wq_b,
+            } => {
+                let q_a = matmul(normed, wq_a)?;
+                let rank = wq_a.shape[1] as usize;
+                let q_a_normed =
+                    self.rmsnorm(&q_a, q_a_norm.f32()?, rows.unwrap_or(1), rank, eps)?;
+                matmul(&q_a_normed, wq_b)
+            }
+        }
+    }
+
     /// One DeepSeek-V2/V3 MLA attention block (see `MlaConfig`'s doc comment for
     /// this MVP step's scope). Ported from llama.cpp's `src/models/deepseek2.cpp`
-    /// `graph::graph()`, the `is_mla && is_lite` branch (read in full while
-    /// planning this): RMSNorm -> `wq` (direct, no Q-LoRA) -> split into
+    /// `graph::graph()`, the `is_mla` branch (read in full while
+    /// planning this): RMSNorm -> query projection ([`Self::mla_query`]) -> split into
     /// `q_nope`/`q_pe` per head -> `wkv_a_mqa` -> split into `kv_cmpr`/`k_pe` ->
     /// RoPE on `k_pe`/`q_pe` (full rotation over their own small buffers, not a
     /// slice of a wider head -- `Self::rope` applies unchanged) -> RMSNorm
@@ -554,8 +645,8 @@ impl Model {
             cfg.rmsnorm_eps,
         )?;
 
-        // q: [n_head, n_embd_head_k_mla] flat (plain gemv -- is_lite path, no Q-LoRA).
-        let q = self.gemv(&normed, &w.wq)?;
+        // q: [n_head, n_embd_head_k_mla] flat.
+        let q = self.mla_query(&w.wq, &normed, None, cfg.rmsnorm_eps)?;
 
         // kv_cmpr_pe: [kv_lora_rank + qk_rope_head_dim] flat (single shared "head").
         let kv_cmpr_pe = self.gemv(&normed, &w.wkv_a_mqa)?;
@@ -743,9 +834,8 @@ impl Model {
             cfg.rmsnorm_eps,
         )?;
 
-        // q_batched: [rows, n_head, n_embd_head_k_mla] flat (plain gemm -- is_lite
-        // path, no Q-LoRA).
-        let q_batched = self.gemm(&normed, &w.wq, rows)?;
+        // q_batched: [rows, n_head, n_embd_head_k_mla] flat.
+        let q_batched = self.mla_query(&w.wq, &normed, Some(rows), cfg.rmsnorm_eps)?;
 
         // kv_cmpr_pe_batched: [rows, kv_lora_rank + qk_rope_head_dim] flat (single
         // shared "head" per row).
@@ -1003,6 +1093,7 @@ impl Model {
             ffn_gate_shexp,
             ffn_up_shexp,
             ffn_down_shexp,
+            exp_probs_b,
         } = &layer.ffn
         else {
             return Err(ReflexError::Other(
@@ -1017,11 +1108,7 @@ impl Model {
             .device
             .dtoh_sync_copy(&router_logits_dev)
             .map_err(|e| crate::gpu_err!(e, "mla moe router dtoh: {e}"))?;
-        let routed = route_top_k_with_norm(
-            &router_logits,
-            moe_cfg.expert_used_count,
-            moe_cfg.normalize_top_k,
-        )?;
+        let routed = mla_route(moe_cfg, exp_probs_b, &router_logits)?;
 
         let mut ffn_out_dev = self
             .device
@@ -1091,6 +1178,7 @@ impl Model {
             ffn_gate_shexp,
             ffn_up_shexp,
             ffn_down_shexp,
+            exp_probs_b,
         } = &layer.ffn
         else {
             return Err(ReflexError::Other(
@@ -1122,9 +1210,7 @@ impl Model {
             hidden_size,
             &router_logits,
             num_experts,
-            &|logits| {
-                route_top_k_with_norm(logits, moe_cfg.expert_used_count, moe_cfg.normalize_top_k)
-            },
+            &|logits| mla_route(moe_cfg, exp_probs_b, logits),
             moe_cfg.routed_scaling_factor,
             ffn_gate_exps,
             ffn_up_exps,
@@ -1476,5 +1562,24 @@ impl Model {
             kv_caches,
         };
         Ok(((generated[0], text), cache))
+    }
+}
+
+/// Routes one row's MoE router logits by the file's gating
+/// (`docs/design/mla-widening.md`): softmax (DeepSeek-V2/V2.5,
+/// `route_top_k_with_norm`) or sigmoid with the `exp_probs_b` selection bias
+/// (DeepSeek-V3 style, `crate::moe::route_sigmoid_bias`). Both honor
+/// `expert_weights_norm`; `expert_weights_scale` is applied by the caller.
+fn mla_route(
+    moe_cfg: &MlaMoeConfig,
+    exp_probs_b: &[f32],
+    logits: &[f32],
+) -> Result<Vec<(usize, f32)>, ReflexError> {
+    let k = moe_cfg.expert_used_count;
+    match moe_cfg.gating {
+        MlaGating::Softmax => route_top_k_with_norm(logits, k, moe_cfg.normalize_top_k),
+        MlaGating::Sigmoid => {
+            crate::moe::route_sigmoid_bias(logits, exp_probs_b, k, moe_cfg.normalize_top_k)
+        }
     }
 }
