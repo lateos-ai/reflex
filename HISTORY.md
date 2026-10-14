@@ -3899,3 +3899,11 @@ with the same pin and pool, most likely failed the same way. Fix (public #26, gi
 `14a04e4`): `tests.json` pins an RTX A5000, `hub.json` `gpuIds` is `AMPERE_16,AMPERE_24`
 and allows CUDA 13.2 hosts. Released as `v0.2.8-runpod-hub` (target `master`) on
 2026-10-14 01:27Z.
+
+v0.2.8's test job then failed the same way twice, once on release and once on a console
+retry. The fallbacks turned out to be the other cards in the pinned GPU's own pool (RTX 3090,
+L4), not `hub.json`'s `gpuIds`. The retry failed with pod stock LOW on all three cards, and the
+serverless catalog showed the A5000 HIGH both times, so neither number predicts the test.
+Public #27 (github `9025aa4`) pins an RTX 4090, as most of Runpod's own Hub workers do, lists
+`allowedCudaVersions` in the test config, and adds `ADA_24` to `gpuIds`. Released as
+`v0.2.9-runpod-hub` on 2026-10-14 16:14Z.
