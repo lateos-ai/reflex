@@ -17,6 +17,11 @@ What has been built, in order. Measurements live in
   pool (RTX 3090, L4), not `hub.json`'s `gpuIds`. The RTX 4090 is what most of Runpod's own
   Hub workers pin; the test config now also lists `allowedCudaVersions`, and `hub.json`
   adds `ADA_24` as a last-resort pool.
+- **GPU nightly: Kolibri-1 fixture tests skip when their fixtures are absent.**
+  `scripts/gpu_nightly_tests.sh` had no rule for the nine Kolibri-1 tests, so they ran
+  against the dense model and failed opening `test-data/tiny-kolibri1.gguf` /
+  `tiny-kolibri1-f32.gguf`, failing every nightly since 2026-10-08. They now report SKIP
+  with the missing path, like the other fixture tests.
 
 ## 2026-10-13
 
