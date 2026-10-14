@@ -247,7 +247,21 @@ in `test-data/` locally:
   `deepseek-ai/DeepSeek-V2-Lite` checkpoint (about 17 GB at `q8_0`), which is not kept
   in the repo. Community `deepseek2` GGUFs that predate llama.cpp's MLA tensor-split
   conversion are rejected by this engine, so convert it fresh with a current
-  `convert_hf_to_gguf.py`.
+  `convert_hf_to_gguf.py`. With `79e2e74`'s converter, use `transformers==4.57.1`:
+  with 5.x the DeepSeek tokenizer hash isn't recognized and no usable pre type is
+  written.
+- `test-data/tiny-mla-v3.gguf` is a second synthetic `deepseek2` model, built from a
+  random `DeepseekV3ForCausalLM` checkpoint the same way. It covers what the first one
+  doesn't: Q-LoRA queries, sigmoid routing with a nonzero `exp_probs_b` selection bias,
+  `expert_weights_norm` and `expert_weights_scale`, a shared expert and
+  `v_head_dim != qk_nope_head_dim`. Dropping any one of these changes every comparison
+  prompt's greedy tokens in llama.cpp. Builder, references and that check:
+  `test-data/tiny-mla-v3-src.tar.gz`.
+- `test-data/*-header.gguf` for DeepSeek-Coder-V2-Lite (current and legacy format),
+  GigaChat3.1-10B-A1.8B, GLM-4.7-Flash (unsloth's, and ggml-org's without
+  `expert_gating_func`), Moonlight-16B-A3B and Kanana-2-30B-A3B are real `deepseek2`
+  headers (metadata and tensor table, see the Qwen2.5 headers below) for the MLA config
+  tests. Sources: [design/mla-widening.md](design/mla-widening.md).
 - `test-data/kolibri1-tokenizer.gguf` is the metadata section of
   `Hob-forge/Kolibri-1-GGUF`'s `Kolibri-1-Q4_K_M.gguf` (the first ~4.8 MB, read with an
   HTTP range request) rewritten with an empty tensor table. It carries the real
@@ -257,9 +271,10 @@ in `test-data/` locally:
   tensor table, for the `gemma4` tokenizer golden test (see
   [design/gemma4.md](design/gemma4.md)).
 - `test-data/llama-bpe-tokenizer.gguf`, `deepseek-llm-tokenizer.gguf`,
-  `deepseek-v3-tokenizer.gguf` and `qwen35-tokenizer.gguf` are the same thing for the
-  `tokenizer.ggml.pre` golden tests (Llama-3.2-1B-Instruct, DeepSeek LLM 7B chat,
-  DeepSeek-V3-0324 shard 1, Qwen3.5-0.8B). Golden ids come from llama.cpp's
+  `deepseek-v3-tokenizer.gguf`, `qwen35-tokenizer.gguf`, `gigachat-tokenizer.gguf` and
+  `glm4-tokenizer.gguf` are the same thing for the `tokenizer.ggml.pre` golden tests
+  (Llama-3.2-1B-Instruct, DeepSeek LLM 7B chat, DeepSeek-V3-0324 shard 1, Qwen3.5-0.8B,
+  GigaChat3.1-10B-A1.8B, GLM-4.7-Flash). Golden ids come from llama.cpp's
   `llama-tokenize`. Sources and byte ranges are in each test's doc comment; see
   [design/tokenizer-pre-types.md](design/tokenizer-pre-types.md).
   `scripts/gguf_tokenizer_only.py` makes any of these from the first ~40 MB of a GGUF

@@ -1,6 +1,12 @@
 # Design: MLA widening to small real checkpoints (`deepseek2`)
 
-**Status (2026-10-13): design and host work in progress; GPU verification not run yet.**
+**Status (2026-10-13): done and verified on an A100 80 GB.** DeepSeek-Coder-V2-Lite,
+GigaChat3.1-10B-A1.8B and GLM-4.7-Flash run, and real DeepSeek-V2-Lite was re-verified
+with its `deepseek-llm` tokenizer. Every existing `reflex check` row is unchanged (45/45,
+V2-Lite and Coder-V2-Lite included). Greedy tokens agree with llama.cpp up to a near-tie
+on every prompt, and at every one of the 8 divergences Reflex picks llama.cpp's own
+runner-up, 0.005 to 0.19 logits behind. Cold start on GigaChat3.1 is 4.22 s p50 vs
+`llama-simple`'s 4.40 s. See [Results](#results-2026-10-13).
 
 Goal: run the small real `deepseek2`-architecture checkpoints people actually use, not
 just DeepSeek-V2-Lite. Correctness means byte-exact greedy agreement with llama.cpp, as
@@ -175,7 +181,7 @@ and `glm4-tokenizer.gguf` (unsloth GLM-4.7-Flash Q4_K_M), first 40 MB each.
 
 ## Fixture
 
-`test-data/tiny-mla-v3.gguf` (to build): a random `DeepseekV3ForCausalLM` checkpoint
+`test-data/tiny-mla-v3.gguf`: a random `DeepseekV3ForCausalLM` checkpoint
 through llama.cpp `79e2e74`'s unmodified `convert_hf_to_gguf.py`, in the local
 `reflex-llama-qwen2:79e2e74` image, source in `test-data/tiny-mla-v3-src.tar.gz`.
 It covers:
@@ -186,13 +192,18 @@ It covers:
 - `n_group = topk_group = 1`, one dense lead layer and a shared expert.
 - `v_head_dim` ≠ `qk_nope_head_dim`.
 
-Tokenizer: the Qwen2 vocab files, as in `deepseek-tiny-mla`. Before trusting it, check
-against llama.cpp that each new feature changes the greedy output when dropped:
+Tokenizer: the Qwen2 vocab files, as in `deepseek-tiny-mla`. Checked against llama.cpp
+before any Reflex code ran: each of these, dropped or changed, alters the 20-token greedy
+output of all 7 prompts (most from the first token):
 - zero the bias;
 - switch the gating to softmax;
 - set the scale to 1;
 - turn normalization off;
-- bypass `attn_q_a_norm`.
+- triple `attn_q_a_norm`'s weight.
+
+llama.cpp always normalizes, so dropping the normalization itself can't be tested there.
+Instead, `wq_a`'s outputs have an rms of about 3, so a missing normalization would
+rescale Q; the Reflex GPU tests against llama.cpp's ids are that check.
 
 ## Tests
 
@@ -217,6 +228,78 @@ GPU (nightly rules in `scripts/gpu_nightly_tests.sh`):
 - KV export/import resumes exactly.
 - `system1` scores match full logits.
 
-## Results
+## Results (2026-10-13)
 
-Not run yet.
+Runpod A100-SXM4-80GB (secure cloud), one pod for everything:
+- llama.cpp `79e2e74` built with CUDA plus the `LLAMA_NO_Q8` patch and `ref.cpp`;
+- Reflex built twice: the base (`qwen2-arch`, the tree master gets once phase 2 merges) and this branch;
+- DeepSeek-V2-Lite and DeepSeek-Coder-V2-Lite-Instruct converted fresh (`--outtype q8_0`, `transformers` 4.57.1, both `deepseek-llm`, MLA split format);
+- GigaChat3.1 `q8_0` from ai-sage;
+- GLM-4.7-Flash `Q8_0` from ggml-org, which has no `expert_gating_func` key, so the GLM-4.7 fallback is what selects sigmoid.
+
+Scripts and every log: `gpu-a100/` in `test-data/tiny-mla-v3-src.tar.gz`.
+
+**Tokenization, checked before renting.** Full prompt ids (BOS included) for 7 prompts
+(digit runs, punctuation runs, Chinese, Russian, code, mixed scripts) on the
+DeepSeek, GigaChat and GLM vocabs: Reflex = `llama-tokenize`, 21/21.
+
+**`reflex check`, base vs branch on the same pod** (every fixture, Qwen3-0.6B, real
+V2-Lite and Coder-V2-Lite, 3 prompts each, 8 tokens):
+- The 45 existing rows are identical, token ids and logit checksums included.
+- The 12 new rows (`tiny-mla-v3` f32/f16, GigaChat3.1, GLM-4.7-Flash) are rejected by the base and run on the branch.
+
+**Greedy ids vs llama.cpp** (20 tokens, EOS-only stopping):
+- The fixture uses its 7 prompts, compared against llama.cpp's default CUDA settings.
+- The real models use the 7 prompts above, compared against llama.cpp with f32 activations (`LLAMA_NO_Q8=1`, cuBLAS f32 compute, flash attention off).
+
+| Model | Reflex weights | Prompts identical | Where the others diverge (step: llama.cpp's top-2 margin) |
+|---|---|---|---|
+| `tiny-mla-v3` | f32, f16 | 6/7 | story 18: 0.0053 |
+| DeepSeek-V2-Lite | f32, f16 | 6/7 | russian 19: 0.0085 |
+| DeepSeek-Coder-V2-Lite-Instruct | f32, f16 | 6/7 | plain 4: 0.089 |
+| GigaChat3.1-10B-A1.8B | f32, f16 | 5/7 | digits 7: 0.19; mixed 2: 0.074 |
+| GLM-4.7-Flash | f16 | 4/7 | punct 11: 0.052; russian 2: 0.0048; mixed 17: 0.029 |
+
+Notes on the table:
+- **f32 and f16 agree.** f32 and f16 weights give the same ids as each other on every model. GLM-4.7-Flash needs about 120 GB in f32, so it ran f16 only.
+- **Every divergence is a near-tie.** `probe.sh` printed llama.cpp's top-2 logits at every step, and in all 8 divergences Reflex's token is llama.cpp's runner-up at that step. Up to that step, the ids are identical.
+- **A third reference agrees with Reflex.** On the fixture, HF `transformers` in f32 picks the same token as Reflex at story step 18.
+- **The divergences cover every new feature.** They fall on prompts that also go through sigmoid routing, Q-LoRA and the new tokenizers, and many prompts match all 20 tokens on each model.
+- **llama.cpp's own backends disagree on Arabic.** Its CPU and CUDA backends differ on the fixture's `arabic` prompt from step 2. Reflex matches CUDA, so the test goldens use the CUDA ids.
+- **Stock llama.cpp agrees less.** Against stock llama.cpp (8-bit activations), the match counts drop to V2-Lite 5/7, GigaChat 5/7 and GLM 3/7.
+
+**DeepSeek-V2-Lite re-verify** (phase 1's queued item). The `deepseek-llm` split was never
+exercised by the first verification's prompts. Now:
+- V2-Lite matches 20/20 on the digit-run, punctuation-run, Chinese, code and mixed-script prompts.
+- The Russian prompt matches 18 tokens and then hits a 0.0085 near-tie.
+- Its `reflex check` rows are unchanged.
+
+**Tests on the pod.**
+- `cargo test`: 186 passed.
+- The 5 `tiny-mla-v3` GPU tests:
+  - first run: 3 passed, 2 failed;
+  - after the fixes below: 5/5;
+  - nightly run: also pass.
+- `prefill_mla_batched_matches_sequential_real_moe_checkpoint` passes on GigaChat3.1 (sigmoid), GLM-4.7-Flash (Q-LoRA + sigmoid) and Coder-V2-Lite.
+- Nightly suite: 57 passed, 0 failed, 2 skipped (no `IQ_GGUF`/`QWEN2_GGUF`).
+
+The first run's two failures were test data, not code:
+- **Arabic golden.** The fixture golden for `arabic` came from llama.cpp's CPU backend, and Reflex matches CUDA.
+- **f16 clear-pick floor.** The f16 test's "clear pick" threshold (0.5) left only 3 of the fixture's 7 first-step margins above it. It is 0.2 now.
+- The `story` golden also compares 17 tokens now.
+
+**Cold start** on the smallest real target (process launch to first token, external wall
+clock, `bench_cold_common.sh`, n=30, page cache warm, prompt "Once upon a time"):
+
+| Model | Reflex p50 / p95 | `llama-simple` p50 / p95 | Peak RSS (Reflex / llama.cpp) |
+|---|---|---|---|
+| GigaChat3.1-10B-A1.8B `q8_0` (11.4 GB) | **4.22 / 4.51 s** | 4.40 / 4.76 s | 11.2 / 11.1 GB |
+
+Reflex's own phase split for that run:
+- `model_load_ms` ≈ 2.0 s: 11 GB of `Q8_0` dequantized to f16 on the device. MLA has no quantized-resident mode.
+- `cuda_init_ms` ≈ 0.93 s.
+- `prompt_eval_ms` ≈ 0.14 s.
+
+That's 1.04x faster than `llama-simple`, a smaller lead than on small dense models. The f16 dequant writes twice the bytes `llama-simple` keeps resident, and the load dominates.
+
+**Cost:** about 1.5 h on a secure-cloud A100 at $1.79/h, about $2.70.

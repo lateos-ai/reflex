@@ -20,6 +20,40 @@ What has been built, in order. Measurements live in
 
 ## 2026-10-13
 
+- **MLA (`deepseek2`) widened to small real checkpoints: DeepSeek-Coder-V2-Lite,
+  GigaChat3.1-10B-A1.8B and GLM-4.7-Flash.**
+  - Sigmoid expert gating with the `exp_probs_b` selection bias (DeepSeek-V3's rule:
+    select on `sigmoid(logits) + bias`, weight by the unbiased sigmoid). The MLA path
+    used to ignore `expert_gating_func`, so a sigmoid file would have routed with softmax
+    silently; its tokenizer was rejected first, so no file actually did.
+  - llama.cpp's rule for GLM-4.7 files with no gating key (47/48 layers, 154,880 vocab:
+    sigmoid).
+  - `expert_weights_scale` of 0 is a no-op, as in llama.cpp.
+  - Q-LoRA queries (`wq_b · rmsnorm(wq_a · x)`), picked by which tensors the file has.
+  - Pre types `gigachat` (GPT-2 split) and `glm4` (Llama-3 split, `ignore_merges`, no BOS).
+  - Rejected at load, with the key named: group-limited routing (`expert_group_count > 1`),
+    other gating functions, softmax with `exp_probs_b`, attention temperature scaling;
+    MTP/NextN and all-MoE files as before. `--lora` stays rejected on MLA.
+  - Tests: config parsing of seven real `deepseek2` headers (Coder-V2-Lite current and
+    legacy, GigaChat3.1, GLM-4.7-Flash with and without the gating key, Moonlight,
+    Kanana-2), rejections, routing vs a host reference, tokenizer goldens, and a new
+    synthetic `tiny-mla-v3` fixture (Q-LoRA, sigmoid routing, bias, scale, norm) whose
+    every new feature changes llama.cpp's greedy output when dropped. GPU tests: llama.cpp
+    golden ids, batched == sequential prefill, f16 vs f32, KV export/import, `system1`.
+  - Verified on an A100 80 GB against llama.cpp `79e2e74` with f32 activations:
+    - `reflex check` is unchanged on all 45 existing rows, real DeepSeek-V2-Lite and
+      Coder-V2-Lite included.
+    - Greedy tokens agree up to a near-tie on every prompt. Prompts matching all 20
+      tokens: fixture 6/7, V2-Lite 6/7, Coder-V2-Lite 6/7, GigaChat3.1 5/7,
+      GLM-4.7-Flash 4/7.
+    - At each of the 8 divergences, Reflex picks llama.cpp's own runner-up, 0.005 to
+      0.19 logits behind.
+  - Real DeepSeek-V2-Lite re-verified with its `deepseek-llm` tokenizer on digit runs,
+    punctuation runs, Chinese and mixed scripts.
+  - Cold start on GigaChat3.1 `q8_0`: 4.22 s p50 vs `llama-simple`'s 4.40 s (n=30).
+
+  Details: [docs/design/mla-widening.md](docs/design/mla-widening.md).
+
 - **Qwen2 / Qwen2.5 (`qwen2`), including Qwen2.5-Math and Qwen2.5-Coder.** These run on
   the dense path. The new piece is Qwen2's Q/K/V projection biases, added right after
   each projection and before RoPE, as llama.cpp's `build_qkv` does. Batched prefill
