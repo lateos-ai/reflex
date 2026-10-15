@@ -412,6 +412,7 @@ impl Model {
             attn_online_k,
             attn_online_combine_k,
             attn_impl,
+            attn_tiled: TiledAttnKernels::from_env()?,
             add_k,
             split_qg_k,
             sigmoid_gate_k,
@@ -552,7 +553,6 @@ impl Model {
         rows: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-        prof: &mut Option<PrefillProfile>,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &m.cfg;
         let (hidden_size, eps) = (cfg.hidden_size, cfg.rmsnorm_eps);
@@ -568,7 +568,11 @@ impl Model {
                 .f32()?
         };
 
-        let global = !shape.sliding;
+        let kind = if shape.sliding {
+            LayerKind::Sliding
+        } else {
+            LayerKind::Global
+        };
         let x = self.rmsnorm(&hidden, layer.attn_norm.f32()?, rows, hidden_size, eps)?;
         let q = self.gemma4_mm(&x, &layer.attn_q, rows)?;
         let k_raw = self.gemma4_mm(&x, &layer.attn_k, rows)?;
@@ -580,7 +584,7 @@ impl Model {
             }
             None => &k_raw,
         };
-        prof_mark(prof, PrefillPhase::QkvGemm, global)?;
+        prof_mark(PrefillPhase::QkvGemm, kind)?;
 
         let mut q = self.rmsnorm(&q, layer.attn_q_norm.f32()?, rows * nq, hd, eps)?;
         m.kernels.rope_ff(
@@ -605,7 +609,7 @@ impl Model {
             shape.n_rot,
             shape.rope_base,
         )?;
-        prof_mark(prof, PrefillPhase::NormRope, global)?;
+        prof_mark(PrefillPhase::NormRope, kind)?;
 
         let kv_stride = nkv * hd;
         let range = start_pos * kv_stride..(start_pos + rows) * kv_stride;
@@ -615,29 +619,29 @@ impl Model {
         self.device
             .dtod_copy(&v, &mut v_cache.slice_mut(range))
             .map_err(|e| crate::gpu_err!(e, "gemma4 kv-cache dtod v: {e}"))?;
-        prof_mark(prof, PrefillPhase::KvCopy, global)?;
+        prof_mark(PrefillPhase::KvCopy, kind)?;
         let window = if shape.sliding { cfg.sliding_window } else { 0 };
         let attn = self.gemma4_attention(
             m, &q, k_cache, v_cache, nq, nkv, hd, start_pos, rows, window,
         )?;
-        prof_mark(prof, PrefillPhase::Attention, global)?;
+        prof_mark(PrefillPhase::Attention, kind)?;
         let o = self.gemma4_mm(&attn, &layer.attn_output, rows)?;
         let o = self.rmsnorm(&o, layer.post_attention_norm.f32()?, rows, hidden_size, eps)?;
         self.add_inplace(&mut hidden, &o)?;
-        prof_mark(prof, PrefillPhase::OProj, global)?;
+        prof_mark(PrefillPhase::OProj, kind)?;
 
         let y = self.rmsnorm(&hidden, layer.ffn_norm.f32()?, rows, hidden_size, eps)?;
         let gate = self.gemma4_mm(&y, &layer.ffn_gate, rows)?;
         let up = self.gemma4_mm(&y, &layer.ffn_up, rows)?;
         let act = m.kernels.gelu_tanh_and_mul(&self.device, &gate, &up)?;
         let f = self.gemma4_mm(&act, &layer.ffn_down, rows)?;
-        prof_mark(prof, PrefillPhase::Ffn, global)?;
+        prof_mark(PrefillPhase::Ffn, kind)?;
         let f = self.rmsnorm(&f, layer.post_ffw_norm.f32()?, rows, hidden_size, eps)?;
         self.add_inplace(&mut hidden, &f)?;
         if layer.output_scale != 1.0 {
             m.kernels.scale(&mut hidden, layer.output_scale)?;
         }
-        prof_mark(prof, PrefillPhase::FfnTail, global)?;
+        prof_mark(PrefillPhase::FfnTail, kind)?;
         Ok(hidden)
     }
 
@@ -689,19 +693,14 @@ impl Model {
             self.attn_impl.max_positions(),
         )?;
         let mut caches = self.alloc_gemma4_kv_caches(m, rows + extra_headroom)?;
-        let mut prof = if prefill_profile_enabled() {
-            Some(PrefillProfile::start(&self.device)?)
-        } else {
-            None
-        };
+        let prof = prefill_profile_begin(&self.device)?;
         let mut hidden = self.gemma4_embed(m, &ids)?;
-        prof_mark(&mut prof, PrefillPhase::Embed, false)?;
+        prof_mark(PrefillPhase::Embed, LayerKind::Layer)?;
         for ((shape, layer), (k, v)) in m.cfg.layers.iter().zip(&m.layers).zip(&mut caches) {
-            hidden =
-                self.forward_gemma4_layer(m, shape, layer, hidden, 0, rows, k, v, &mut prof)?;
+            hidden = self.forward_gemma4_layer(m, shape, layer, hidden, 0, rows, k, v)?;
         }
         if let Some(p) = prof {
-            p.report(&self.device, rows)?;
+            p.finish(rows)?;
         }
         Ok((ids, hidden, caches, rows))
     }
@@ -716,8 +715,7 @@ impl Model {
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut hidden = self.gemma4_embed(m, &[token_id])?;
         for ((shape, layer), (k, v)) in m.cfg.layers.iter().zip(&m.layers).zip(caches) {
-            hidden =
-                self.forward_gemma4_layer(m, shape, layer, hidden, position, 1, k, v, &mut None)?;
+            hidden = self.forward_gemma4_layer(m, shape, layer, hidden, position, 1, k, v)?;
         }
         Ok(hidden)
     }
@@ -880,17 +878,6 @@ pub(super) struct Gemma4Kernels {
     attn_tiled_d512: AotKernel,
 }
 
-/// `attention_tiled.cu`'s block size, and its query vectors per block for a
-/// head dim it has a kernel for.
-const ATTN_TILED_THREADS: u32 = 256;
-fn attn_tiled_queries_per_block(head_dim: usize) -> Option<usize> {
-    match head_dim {
-        256 => Some(64),
-        512 => Some(32),
-        _ => None,
-    }
-}
-
 impl Gemma4Kernels {
     pub(super) fn load(device: &Arc<CudaDevice>) -> Result<Self, ReflexError> {
         let mut fns = aot::load_kernel_module(
@@ -933,11 +920,10 @@ impl Gemma4Kernels {
 
     /// Batched-prefill attention with `attention_tiled.cu`, which reuses each
     /// K/V tile across a block of query rows and the query heads of a GQA
-    /// group. `None` when the shape isn't one it covers (a single row, head
-    /// dims other than 256/512, `qk_dim != v_dim`, or a group size that
-    /// neither divides nor is a multiple of the queries per block); the
-    /// caller then uses [`Model::attention_online`]. Same layout, masking and
-    /// output as that kernel; only the f32 summation order differs.
+    /// group. `None` when the shape isn't one it covers (see
+    /// [`attn_tiled_fits`]; head dims other than 256/512 too); the caller then
+    /// uses [`Model::attention_online`]. Same layout, masking and output as
+    /// that kernel; only the f32 summation order differs.
     pub(super) fn attention_prefill_tiled(
         &self,
         device: &Arc<CudaDevice>,
@@ -946,46 +932,15 @@ impl Gemma4Kernels {
         v: &CudaView<f32>,
         s: &OnlineAttnShape,
     ) -> Result<Option<CudaSlice<f32>>, ReflexError> {
-        let Some(m) = attn_tiled_queries_per_block(s.qk_dim) else {
-            return Ok(None);
+        let kernel = match s.qk_dim {
+            256 => &self.attn_tiled_d256,
+            512 => &self.attn_tiled_d512,
+            _ => return Ok(None),
         };
-        let g = s.group_size;
-        if s.rows < 2
-            || s.v_dim != s.qk_dim
-            || g == 0
-            || !s.num_q_heads.is_multiple_of(g)
-            || !(m.is_multiple_of(g) || g.is_multiple_of(m))
-        {
+        if !attn_tiled_fits(s) {
             return Ok(None);
         }
-        let kernel = if s.qk_dim == 256 {
-            &self.attn_tiled_d256
-        } else {
-            &self.attn_tiled_d512
-        };
-        let heads_per_block = g.min(m);
-        let rows_per_block = m / heads_per_block;
-        let num_kv_heads = s.num_q_heads / g;
-        let cfg = LaunchConfig {
-            grid_dim: (
-                s.rows.div_ceil(rows_per_block) as u32,
-                (num_kv_heads * (g / heads_per_block)) as u32,
-                1,
-            ),
-            block_dim: (ATTN_TILED_THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut out = device
-            .alloc_zeros::<f32>(s.rows * s.num_q_heads * s.v_dim)
-            .map_err(|e| crate::gpu_err!(e, "attn_tiled alloc out: {e}"))?;
-        unsafe {
-            kernel
-                .function
-                .clone()
-                .launch(cfg, (q, k, v, &mut out, s.unsplit_params(), s.rows as u32))
-                .map_err(|e| crate::gpu_err!(e, "attn_tiled launch: {e}"))?;
-        }
-        Ok(Some(out))
+        launch_attention_tiled(device, kernel, q, k, v, s).map(Some)
     }
 
     /// NEOX RoPE with per-pair frequency factors, in place over `t`

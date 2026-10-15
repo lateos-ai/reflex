@@ -5,6 +5,14 @@ What has been built, in order. Measurements live in
 
 ## 2026-10-15
 
+- **Tiled prefill attention for dense, MoE, Kolibri-1 and Qwen3.5.** Batched prefills
+  of 64 rows or more run the tiled kernel Gemma 4 introduced, now a template with
+  modules for head dims 64 and 128 as well. GQA groups that don't divide its block
+  (Qwen2.5's 6 and 7) are padded. Each module loads on the first long prefill, so short
+  prompts and cold start don't pay for it. On a T4, Qwen3-0.6B prefills 2K tokens 5.4x
+  faster and 8K tokens 10.5x faster; TinyLlama 5.3x at 2K; Mistral 7B 2.8x at 2K.
+  `REFLEX_ATTN_TILED=0` turns it off. See
+  [docs/design/tiled-prefill-attention.md](docs/design/tiled-prefill-attention.md).
 - **Granite 4.0-H (`granitehybrid`), the first Mamba-2 hybrid.** Mamba-2 SSM layers
   plus a few attention layers (no RoPE), each followed by a SwiGLU FFN, with Granite's
   muP scales (embedding, residual, attention, logits).

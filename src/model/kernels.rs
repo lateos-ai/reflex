@@ -101,6 +101,173 @@ impl OnlineAttnShape {
     }
 }
 
+/// `attention_tiled*.cu`'s block size.
+const ATTN_TILED_THREADS: u32 = 256;
+
+/// Batched prefill runs [`Model::attention_prefill`] through the tiled kernels from
+/// this many rows up, and through [`Model::attention_online`] below it. Short prompts
+/// (and `system1`) then never load a tiled module, which a PTX build without a warm
+/// driver cache JIT-compiles in ~200 ms. See docs/design/tiled-prefill-attention.md.
+pub(super) const ATTN_TILED_MIN_ROWS: usize = 64;
+
+/// Query vectors per block of the tiled kernel for `head_dim`, if there is one
+/// (`kernels_cuda/attention_tiled.cuh`).
+fn attn_tiled_queries_per_block(head_dim: usize) -> Option<usize> {
+    match head_dim {
+        64 | 128 | 256 => Some(64),
+        512 => Some(32),
+        _ => None,
+    }
+}
+
+/// Whether the tiled kernels cover `s`: at least two rows, a head dim with a
+/// kernel, `qk_dim == v_dim`, and a GQA group that is at most the queries per
+/// block or a multiple of it.
+pub(super) fn attn_tiled_fits(s: &OnlineAttnShape) -> bool {
+    let Some(m) = attn_tiled_queries_per_block(s.qk_dim) else {
+        return false;
+    };
+    let g = s.group_size;
+    s.rows >= 2
+        && s.v_dim == s.qk_dim
+        && g != 0
+        && s.num_q_heads.is_multiple_of(g)
+        && (g <= m || g.is_multiple_of(m))
+}
+
+/// Launches `kernel`, a tiled prefill attention kernel for `s.qk_dim`, on a shape
+/// [`attn_tiled_fits`] accepts. Same layout, masking and output as
+/// [`Model::attention_online`]; only the f32 summation order differs.
+pub(super) fn launch_attention_tiled(
+    device: &Arc<CudaDevice>,
+    kernel: &AotKernel,
+    q: &CudaSlice<f32>,
+    k: &CudaView<f32>,
+    v: &CudaView<f32>,
+    s: &OnlineAttnShape,
+) -> Result<CudaSlice<f32>, ReflexError> {
+    let m = attn_tiled_queries_per_block(s.qk_dim)
+        .ok_or_else(|| crate::reflex_err!(Other, "no tiled attention kernel for d {}", s.qk_dim))?;
+    let g = s.group_size;
+    let heads_per_block = g.min(m);
+    let rows_per_block = m / heads_per_block;
+    let num_kv_heads = s.num_q_heads / g;
+    let cfg = LaunchConfig {
+        grid_dim: (
+            s.rows.div_ceil(rows_per_block) as u32,
+            (num_kv_heads * (g / heads_per_block)) as u32,
+            1,
+        ),
+        block_dim: (ATTN_TILED_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut out = device
+        .alloc_zeros::<f32>(s.rows * s.num_q_heads * s.v_dim)
+        .map_err(|e| crate::gpu_err!(e, "attn_tiled alloc out: {e}"))?;
+    unsafe {
+        kernel
+            .function
+            .clone()
+            .launch(cfg, (q, k, v, &mut out, s.unsplit_params(), s.rows as u32))
+            .map_err(|e| crate::gpu_err!(e, "attn_tiled launch: {e}"))?;
+    }
+    Ok(out)
+}
+
+/// The tiled prefill attention kernels for [`Model::attention_prefill`], each
+/// module loaded on the first prefill that needs it. `REFLEX_ATTN_TILED=0` turns
+/// them off (every prefill uses [`Model::attention_online`], as before they existed)
+/// for A/B comparison. Gemma 4 has its own copy of the d256/d512 kernels
+/// (`Gemma4Kernels`) and ignores this switch.
+pub(super) struct TiledAttnKernels {
+    enabled: std::cell::Cell<bool>,
+    d64: std::sync::OnceLock<AotKernel>,
+    d128: std::sync::OnceLock<AotKernel>,
+    d256: std::sync::OnceLock<AotKernel>,
+}
+
+impl TiledAttnKernels {
+    pub(super) fn from_env() -> Result<Self, ReflexError> {
+        let enabled = match std::env::var("REFLEX_ATTN_TILED").as_deref() {
+            Err(_) | Ok("") | Ok("1") | Ok("on") => true,
+            Ok("0") | Ok("off") => false,
+            Ok(other) => {
+                return Err(crate::reflex_err!(
+                    InvalidInput,
+                    "REFLEX_ATTN_TILED must be `1`/`on` (the default) or `0`/`off`, got {other:?}"
+                ))
+            }
+        };
+        Ok(Self {
+            enabled: std::cell::Cell::new(enabled),
+            d64: std::sync::OnceLock::new(),
+            d128: std::sync::OnceLock::new(),
+            d256: std::sync::OnceLock::new(),
+        })
+    }
+
+    pub(super) fn enabled(&self) -> bool {
+        self.enabled.get()
+    }
+
+    /// For tests that compare the two paths on one loaded model.
+    #[cfg(test)]
+    pub(super) fn set_enabled(&self, on: bool) {
+        self.enabled.set(on);
+    }
+
+    /// Whether the module for `head_dim` has been loaded (tests).
+    #[cfg(test)]
+    pub(super) fn loaded(&self, head_dim: usize) -> bool {
+        match head_dim {
+            64 => self.d64.get().is_some(),
+            128 => self.d128.get().is_some(),
+            256 => self.d256.get().is_some(),
+            _ => false,
+        }
+    }
+
+    /// The kernel for `head_dim`, loading its module on first use; `None` when
+    /// there is no tiled kernel for that head dim.
+    pub(super) fn kernel(
+        &self,
+        device: &Arc<CudaDevice>,
+        head_dim: usize,
+    ) -> Result<Option<&AotKernel>, ReflexError> {
+        let (cell, bytes, module, name): (_, &'static [u8], _, _) = match head_dim {
+            64 => (
+                &self.d64,
+                include_bytes!(env!("REFLEX_KERNEL_ATTENTION_TILED_D64")),
+                "attention_tiled_d64",
+                "attention_tiled_d64_kernel",
+            ),
+            128 => (
+                &self.d128,
+                include_bytes!(env!("REFLEX_KERNEL_ATTENTION_TILED_D128")),
+                "attention_tiled_d128",
+                "attention_tiled_d128_kernel",
+            ),
+            256 => (
+                &self.d256,
+                include_bytes!(env!("REFLEX_KERNEL_ATTENTION_TILED")),
+                "attention_tiled",
+                "attention_tiled_d256_kernel",
+            ),
+            _ => return Ok(None),
+        };
+        if let Some(k) = cell.get() {
+            return Ok(Some(k));
+        }
+        let kernel = match device.get_func(module, name) {
+            Some(function) => AotKernel { function },
+            None => aot::load_kernel_module(device, bytes, module, &[name])?
+                .pop()
+                .ok_or_else(|| crate::reflex_err!(Cuda, "missing kernel in module {module}"))?,
+        };
+        Ok(Some(cell.get_or_init(|| kernel)))
+    }
+}
+
 /// `attention_online.cu`'s block size, in warps, and widest supported head.
 const ATTN_ONLINE_WARPS: usize = 8;
 const ATTN_ONLINE_MAX_DIM: usize = 1024;
@@ -1638,25 +1805,33 @@ impl Model {
         window: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         if self.attn_impl == AttnImpl::Online {
-            return self.attention_online(
-                q,
-                k_cache,
-                v_cache,
-                OnlineAttnShape {
-                    rows,
-                    start_pos,
-                    num_q_heads,
-                    group_size: num_q_heads / num_kv_heads,
-                    qk_dim: head_dim,
-                    v_dim: head_dim,
-                    k_pos_stride: num_kv_heads * head_dim,
-                    k_head_stride: head_dim,
-                    v_pos_stride: num_kv_heads * head_dim,
-                    v_head_stride: head_dim,
-                    scale: 1.0f32 / (head_dim as f32).sqrt(),
-                    window,
-                },
-            );
+            let shape = OnlineAttnShape {
+                rows,
+                start_pos,
+                num_q_heads,
+                group_size: num_q_heads / num_kv_heads,
+                qk_dim: head_dim,
+                v_dim: head_dim,
+                k_pos_stride: num_kv_heads * head_dim,
+                k_head_stride: head_dim,
+                v_pos_stride: num_kv_heads * head_dim,
+                v_head_stride: head_dim,
+                scale: 1.0f32 / (head_dim as f32).sqrt(),
+                window,
+            };
+            if rows >= ATTN_TILED_MIN_ROWS && self.attn_tiled.enabled() && attn_tiled_fits(&shape) {
+                if let Some(kernel) = self.attn_tiled.kernel(&self.device, head_dim)? {
+                    return launch_attention_tiled(
+                        &self.device,
+                        kernel,
+                        q,
+                        k_cache,
+                        v_cache,
+                        &shape,
+                    );
+                }
+            }
+            return self.attention_online(q, k_cache, v_cache, shape);
         }
         let mut dev_out = self
             .device
