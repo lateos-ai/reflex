@@ -268,6 +268,121 @@ impl TiledAttnKernels {
     }
 }
 
+/// `attention_decode.cu`'s block size, in threads.
+const ATTN_DECODE_THREADS: u32 = 128;
+/// The GQA decode kernels, in `attention_decode.cu`, as (head dim, query heads
+/// per block). [`DecodeAttnKernels`] keeps them in this order.
+const ATTN_DECODE_SHAPES: [(usize, usize); 11] = [
+    (64, 1),
+    (64, 2),
+    (64, 4),
+    (64, 8),
+    (128, 1),
+    (128, 2),
+    (128, 4),
+    (128, 8),
+    (256, 1),
+    (256, 2),
+    (256, 4),
+];
+const ATTN_DECODE_NAMES: [&str; 11] = [
+    "attention_decode_d64_h1_kernel",
+    "attention_decode_d64_h2_kernel",
+    "attention_decode_d64_h4_kernel",
+    "attention_decode_d64_h8_kernel",
+    "attention_decode_d128_h1_kernel",
+    "attention_decode_d128_h2_kernel",
+    "attention_decode_d128_h4_kernel",
+    "attention_decode_d128_h8_kernel",
+    "attention_decode_d256_h1_kernel",
+    "attention_decode_d256_h2_kernel",
+    "attention_decode_d256_h4_kernel",
+];
+/// Fewest cached positions per decode split, so the combine step stays small
+/// next to the work it merges.
+const ATTN_DECODE_MIN_SPLIT: usize = 32;
+
+/// Which `attention_decode.cu` kernel serves a decode step with this head dim and
+/// GQA group: the most query heads per block (8, 4, 2 or 1) that divides the group
+/// and has a kernel. `None` for head dims without one.
+pub(super) fn attn_decode_kernel_index(head_dim: usize, group_size: usize) -> Option<usize> {
+    ATTN_DECODE_SHAPES
+        .iter()
+        .enumerate()
+        .filter(|&(_, &(d, hb))| d == head_dim && group_size.is_multiple_of(hb))
+        .max_by_key(|&(_, &(_, hb))| hb)
+        .map(|(i, _)| i)
+}
+
+/// The GQA decode kernels behind [`Model::attention`] (`attention_decode.cu`):
+/// one module, loaded on the first decode step so cold start (which ends at the
+/// first token) never pays for it. `REFLEX_ATTN_DECODE=online` sends decode back
+/// to `attention_online_kernel` for A/B runs.
+pub(super) struct DecodeAttnKernels {
+    enabled: std::cell::Cell<bool>,
+    kernels: std::sync::OnceLock<Vec<AotKernel>>,
+    /// Streaming multiprocessors, read once, for sizing the splits.
+    sm_count: std::sync::OnceLock<usize>,
+}
+
+impl DecodeAttnKernels {
+    pub(super) fn from_env() -> Result<Self, ReflexError> {
+        let enabled = match std::env::var("REFLEX_ATTN_DECODE").as_deref() {
+            Err(_) | Ok("") | Ok("gqa") => true,
+            Ok("online") => false,
+            Ok(other) => {
+                return Err(crate::reflex_err!(
+                    InvalidInput,
+                    "REFLEX_ATTN_DECODE must be `gqa` (the default) or `online`, got {other:?}"
+                ))
+            }
+        };
+        Ok(Self {
+            enabled: std::cell::Cell::new(enabled),
+            kernels: std::sync::OnceLock::new(),
+            sm_count: std::sync::OnceLock::new(),
+        })
+    }
+
+    pub(super) fn enabled(&self) -> bool {
+        self.enabled.get()
+    }
+
+    /// For tests that compare the two paths on one loaded model.
+    #[cfg(test)]
+    pub(super) fn set_enabled(&self, on: bool) {
+        self.enabled.set(on);
+    }
+
+    /// Whether the module has been loaded (tests).
+    #[cfg(test)]
+    pub(super) fn loaded(&self) -> bool {
+        self.kernels.get().is_some()
+    }
+
+    fn kernels(&self, device: &Arc<CudaDevice>) -> Result<&[AotKernel], ReflexError> {
+        if let Some(k) = self.kernels.get() {
+            return Ok(k);
+        }
+        let loaded = aot::load_kernel_module(
+            device,
+            include_bytes!(env!("REFLEX_KERNEL_ATTENTION_DECODE")),
+            "attention_decode",
+            &ATTN_DECODE_NAMES,
+        )?;
+        Ok(self.kernels.get_or_init(|| loaded))
+    }
+
+    fn sm_count(&self, device: &Arc<CudaDevice>) -> usize {
+        *self.sm_count.get_or_init(|| {
+            device
+                .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+                .map(|n| n.max(1) as usize)
+                .unwrap_or(40)
+        })
+    }
+}
+
 /// `attention_online.cu`'s block size, in warps, and widest supported head.
 const ATTN_ONLINE_WARPS: usize = 8;
 const ATTN_ONLINE_MAX_DIM: usize = 1024;
@@ -297,6 +412,92 @@ pub(super) fn load_kernel_pair(
 }
 
 impl Model {
+    /// An f32 output buffer for a kernel that writes every element, so it skips
+    /// `alloc_zeros`'s memset. A decode step allocates a few hundred of these;
+    /// the memsets were ~5% of its GPU time and a third of its host-side driver
+    /// calls on a T4 (docs/design/decode-speed.md). Only for kernels whose launch
+    /// covers the whole buffer: anything they skip would hold stale data.
+    pub(super) fn alloc_out(&self, len: usize, what: &str) -> Result<CudaSlice<f32>, ReflexError> {
+        // SAFETY: f32 has no invalid bit patterns, and every caller's kernel
+        // writes all `len` elements before anything reads them.
+        unsafe { self.device.alloc::<f32>(len) }
+            .map_err(|e| crate::gpu_err!(e, "{what} alloc out: {e}"))
+    }
+
+    /// One decode step's attention through `attention_decode.cu`: a block per
+    /// (KV head, group chunk, split) reads each K/V row once for all its query
+    /// heads. `s` must be a single row with `qk_dim == v_dim` and a kernel from
+    /// [`attn_decode_kernel_index`]; the caller checks. Same output as
+    /// [`Self::attention_online`]; only the f32 summation order differs.
+    pub(super) fn attention_decode_gqa(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaView<f32>,
+        v: &CudaView<f32>,
+        s: &OnlineAttnShape,
+        kernel_index: usize,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let kernel = &self.attn_decode.kernels(&self.device)?[kernel_index];
+        let heads_per_block = ATTN_DECODE_SHAPES[kernel_index].1;
+        let seq_len = s.start_pos + 1;
+        let head_blocks = s.num_q_heads / heads_per_block;
+        // About four blocks per SM, but no split shorter than ATTN_DECODE_MIN_SPLIT.
+        let wanted = (4 * self.attn_decode.sm_count(&self.device)).div_ceil(head_blocks);
+        let max_splits = seq_len.div_ceil(ATTN_DECODE_MIN_SPLIT);
+        let splits = wanted.clamp(1, max_splits.clamp(1, ATTN_ONLINE_MAX_SPLITS));
+        let split_len = seq_len.div_ceil(splits);
+        let num_splits = seq_len.div_ceil(split_len);
+        let mut params = s.unsplit_params();
+        params.num_splits = num_splits as u32;
+        params.split_len = split_len as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (head_blocks as u32, num_splits as u32, 1),
+            block_dim: (ATTN_DECODE_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut out = self.alloc_out(s.num_q_heads * s.v_dim, "attn_decode")?;
+        if num_splits == 1 {
+            unsafe {
+                kernel
+                    .function
+                    .clone()
+                    .launch(cfg, (q, k, v, &mut out, params))
+                    .map_err(|e| crate::gpu_err!(e, "attn_decode launch: {e}"))?;
+            }
+            return Ok(out);
+        }
+        let mut partial = self.alloc_out(
+            s.num_q_heads * num_splits * (s.v_dim + 2),
+            "attn_decode partial",
+        )?;
+        unsafe {
+            kernel
+                .function
+                .clone()
+                .launch(cfg, (q, k, v, &mut partial, params))
+                .map_err(|e| crate::gpu_err!(e, "attn_decode launch: {e}"))?;
+            self.attn_online_combine_k
+                .function
+                .clone()
+                .launch(
+                    LaunchConfig {
+                        grid_dim: (1, s.num_q_heads as u32, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        &partial,
+                        &mut out,
+                        s.num_q_heads as u32,
+                        s.v_dim as u32,
+                        num_splits as u32,
+                    ),
+                )
+                .map_err(|e| crate::gpu_err!(e, "attn_decode combine launch: {e}"))?;
+        }
+        Ok(out)
+    }
+
     /// Runs `attention_online_kernel` (and, for a split decode, its combine kernel):
     /// the default implementation behind [`Self::attention`],
     /// [`Self::attention_prefill`], [`Self::mla_attention`] and
@@ -345,10 +546,7 @@ impl Model {
             shared_mem_bytes: ((s.qk_dim + ATTN_ONLINE_WARPS * (s.v_dim + 2))
                 * std::mem::size_of::<f32>()) as u32,
         };
-        let mut out = self
-            .device
-            .alloc_zeros::<f32>(s.rows * s.num_q_heads * s.v_dim)
-            .map_err(|e| crate::gpu_err!(e, "attn_online alloc out: {e}"))?;
+        let mut out = self.alloc_out(s.rows * s.num_q_heads * s.v_dim, "attn_online")?;
         if num_splits == 1 {
             unsafe {
                 self.attn_online_k
@@ -359,10 +557,10 @@ impl Model {
             }
             return Ok(out);
         }
-        let mut partial = self
-            .device
-            .alloc_zeros::<f32>(s.rows * s.num_q_heads * num_splits * (s.v_dim + 2))
-            .map_err(|e| crate::gpu_err!(e, "attn_online alloc partial: {e}"))?;
+        let mut partial = self.alloc_out(
+            s.rows * s.num_q_heads * num_splits * (s.v_dim + 2),
+            "attn_online partial",
+        )?;
         unsafe {
             self.attn_online_k
                 .function
@@ -402,10 +600,7 @@ impl Model {
         hidden_size: usize,
         eps: f32,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let mut dev_out = self
-            .device
-            .alloc_zeros::<f32>(x.len())
-            .map_err(|e| crate::gpu_err!(e, "rmsnorm alloc out: {e}"))?;
+        let mut dev_out = self.alloc_out(x.len(), "rmsnorm")?;
 
         // One block per row (see rmsnorm.cu), staging the row in shared memory
         // when it fits the default 48 KB (less the kernel's static shared float).
@@ -457,10 +652,7 @@ impl Model {
             ));
         }
 
-        let mut dev_y = self
-            .device
-            .alloc_zeros::<f32>(out_features)
-            .map_err(|e| crate::gpu_err!(e, "gemv alloc y: {e}"))?;
+        let mut dev_y = self.alloc_out(out_features, "gemv")?;
 
         // One warp per output row (gemv_kernel's doc comment has the
         // coalescing rationale) -- 256 threads/block = 8 warps/block, same
@@ -1668,10 +1860,7 @@ impl Model {
         up: &CudaSlice<f32>,
         hidden_size: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let mut dev_out = self
-            .device
-            .alloc_zeros::<f32>(hidden_size)
-            .map_err(|e| crate::gpu_err!(e, "silu alloc out: {e}"))?;
+        let mut dev_out = self.alloc_out(hidden_size, "silu")?;
 
         let threads = 256u32;
         let blocks = (hidden_size as u32).div_ceil(threads).max(1);
@@ -1726,25 +1915,26 @@ impl Model {
         let v_cache = &v_cache.slice(first * kv_stride..);
         let seq_len = seq_len - first;
         if self.attn_impl == AttnImpl::Online {
-            return self.attention_online(
-                q,
-                k_cache,
-                v_cache,
-                OnlineAttnShape {
-                    rows: 1,
-                    start_pos: seq_len - 1,
-                    num_q_heads,
-                    group_size: num_q_heads / num_kv_heads,
-                    qk_dim: head_dim,
-                    v_dim: head_dim,
-                    k_pos_stride: num_kv_heads * head_dim,
-                    k_head_stride: head_dim,
-                    v_pos_stride: num_kv_heads * head_dim,
-                    v_head_stride: head_dim,
-                    scale: 1.0f32 / (head_dim as f32).sqrt(),
-                    window: 0,
-                },
-            );
+            let shape = OnlineAttnShape {
+                rows: 1,
+                start_pos: seq_len - 1,
+                num_q_heads,
+                group_size: num_q_heads / num_kv_heads,
+                qk_dim: head_dim,
+                v_dim: head_dim,
+                k_pos_stride: num_kv_heads * head_dim,
+                k_head_stride: head_dim,
+                v_pos_stride: num_kv_heads * head_dim,
+                v_head_stride: head_dim,
+                scale: 1.0f32 / (head_dim as f32).sqrt(),
+                window: 0,
+            };
+            if self.attn_decode.enabled() {
+                if let Some(i) = attn_decode_kernel_index(head_dim, shape.group_size) {
+                    return self.attention_decode_gqa(q, k_cache, v_cache, &shape, i);
+                }
+            }
+            return self.attention_online(q, k_cache, v_cache, shape);
         }
         let mut dev_out = self
             .device
@@ -1942,10 +2132,7 @@ impl Model {
         in_features: usize,
         out_features: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let mut dev_y = self
-            .device
-            .alloc_zeros::<f32>(out_features)
-            .map_err(|e| crate::gpu_err!(e, "gemv_view alloc y: {e}"))?;
+        let mut dev_y = self.alloc_out(out_features, "gemv_view")?;
         // One warp per output row -- see gemv_raw's identical comment. Same
         // gemv_kernel, so this must stay in lockstep with gemv_raw's launch
         // geometry.
