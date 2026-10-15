@@ -216,8 +216,8 @@ another separate path: Gemma 4 changes head dim (256 sliding / 512 global), KV h
 base and the V source (global layers have no `attn_v`; V = `Wk·x`) from layer to layer,
 which the dense path's single `LayerConfig` can't express. One layer function
 (`forward_gemma4_layer`) serves batched prefill and decode. Prefill attention runs the
-tiled `kernels_cuda/attention_tiled.cu` (head dims 256/512, Gemma-only; decode and every
-other architecture keep `attention_online.cu`), and `REFLEX_PREFILL_PROFILE=1` prints a
+tiled `kernels_cuda/attention_tiled.cu` (head dims 256/512, loaded eagerly by
+`Gemma4Kernels`), and `REFLEX_PREFILL_PROFILE=1` prints a
 per-phase GPU split of a prefill (see `docs/design/gemma4.md`, "Long-prompt prefill";
 `rmsnorm_kernel` was 40-68% of it until made one block per row, bit-identically).
 Gemma-specific math, all
@@ -251,6 +251,21 @@ Dense-FFN Granite only (350M/1B/Micro); MoE Tiny/Small, LoRA, KV export/import r
 Compare against llama.cpp with f32 activations (`LLAMA_NO_Q8=1`). llama.cpp's CUDA scan
 only runs `d_state` in {96,128,256} with head_dim%16 and conv_dim%128, else silently on CPU.
 Design and results: `docs/design/mamba2-hybrid.md`.
+
+### Tiled prefill attention (`kernels_cuda/attention_tiled.cuh`)
+Batched prefill attention for dense, MoE, Kolibri-1 and Qwen3.5 goes through
+`Model::attention_prefill`, which runs the tiled kernel (`attention_tiled<D, M>`, one
+module per head-dim family: `attention_tiled.cu` d256/d512, `_d128.cu`, `_d64.cu`) from
+`ATTN_TILED_MIN_ROWS` (64) rows up and `attention_online` below it. `TiledAttnKernels`
+loads each module lazily on the first long prefill, so short prompts, decode, `system1`
+and cold start never load one; **keep it lazy** (a PTX build without a warm driver cache
+JIT-compiles each module in ~200 ms). GQA groups that don't divide the 64-query block
+(3/6/7) are padded with masked slots. `REFLEX_ATTN_TILED=0` forces the online kernel for
+A/B runs. Granite 4.0-H (calls `attention_online` directly) and MLA (needs a
+shared-latent variant) don't use it yet. Tiled vs online changes only the f32 summation
+order: compare whole prefills with **f32 weights** (with f16 ones, activation rounding
+turns ~1e-6 into ~5e-4 relative L2 on the logits). Design and T4 numbers:
+`docs/design/tiled-prefill-attention.md`.
 
 ### MoE routing (`src/moe.rs`)
 `route_top_k`: softmax over all experts, select top-k, renormalize. No new
