@@ -889,7 +889,9 @@ pub(super) fn load_dequant_kernels(
 /// variants) read: the tensors `--weights f16` stores as f16 (and
 /// `REFLEX_F16_ROUNDTRIP` rounds in f32 mode). Everything else stays `f32`:
 /// 1-D norms, biases and decay vectors, the Gated DeltaNet `ssm_conv1d`
-/// kernel (2-D, but read by the conv kernel), and
+/// kernel (2-D, but read by the conv kernel), Mamba-2's `ssm_a`/`ssm_d`
+/// (`[1, n_head]`) and grouped `ssm_norm` (`[d_inner / n_group, n_group]`),
+/// 2-D in the GGUF but vectors read by `kernels_cuda/mamba2.cu`, and
 /// the MoE routers (`ffn_gate_inp`, `ffn_gate_inp_shexp`), which are tiny and
 /// feed a discrete top-k choice where a rounding-induced near-tie flip would
 /// change which experts run.
@@ -901,7 +903,13 @@ pub(super) fn is_matrix_weight(name: &str, shape: &[u64]) -> bool {
     let suffix = base.rsplit('.').next().unwrap_or(base);
     !matches!(
         suffix,
-        "ssm_conv1d" | "ffn_gate_inp" | "ffn_gate_inp_shexp" | "token_embd"
+        "ssm_conv1d"
+            | "ssm_a"
+            | "ssm_d"
+            | "ssm_norm"
+            | "ffn_gate_inp"
+            | "ffn_gate_inp_shexp"
+            | "token_embd"
     )
 }
 

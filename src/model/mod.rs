@@ -78,6 +78,7 @@ use std::thread::ScopedJoinHandle;
 mod config;
 mod dense;
 mod gemma4;
+mod granite_hybrid;
 mod hybrid;
 mod kernels;
 mod loading;
@@ -88,6 +89,7 @@ use self::config::*;
 pub use self::config::{parse_model_config, LayerConfig, MoeMetaConfig, RopeType};
 use self::dense::*;
 use self::gemma4::*;
+use self::granite_hybrid::*;
 use self::hybrid::*;
 use self::kernels::*;
 use self::loading::*;
@@ -109,6 +111,10 @@ mod gemma4_kernel_tests;
 #[cfg(test)]
 mod gemma4_model_tests;
 #[cfg(test)]
+mod granite_hybrid_kernel_tests;
+#[cfg(test)]
+mod granite_hybrid_tests;
+#[cfg(test)]
 mod hybrid_batching_tests;
 #[cfg(test)]
 mod iq_dequant_host_vs_device_tests;
@@ -116,6 +122,9 @@ mod iq_dequant_host_vs_device_tests;
 mod kolibri_config_tests;
 #[cfg(test)]
 mod kolibri_forward_tests;
+#[cfg(test)]
+#[path = "../../reference/mamba2_reference.rs"]
+mod mamba2_reference;
 #[cfg(test)]
 mod mla_batching_tests;
 #[cfg(test)]
@@ -280,6 +289,10 @@ pub struct Model {
     /// `Some` iff this is a Gemma 4 model (see `Self::load_gemma4`); like
     /// `hybrid`, `cfg`/`layers`/`expert_used_count` are unused in that case.
     gemma4: Option<Gemma4Model>,
+    /// `Some` iff this is a Granite 4.0-H model (see
+    /// `Self::load_granite_hybrid`); like `hybrid`, `cfg`/`layers`/
+    /// `expert_used_count` are unused in that case.
+    granite: Option<GraniteHybridModel>,
 }
 
 /// Which forward path a loaded [`Model`] dispatches to -- used by callers
@@ -292,6 +305,7 @@ pub enum ArchitectureKind {
     Hybrid,
     Mla,
     Gemma4,
+    GraniteHybrid,
 }
 
 /// One candidate continuation to score against a shared prompt, for
@@ -341,6 +355,8 @@ impl Model {
             ArchitectureKind::Mla
         } else if self.gemma4.is_some() {
             ArchitectureKind::Gemma4
+        } else if self.granite.is_some() {
+            ArchitectureKind::GraniteHybrid
         } else {
             ArchitectureKind::Dense
         }
@@ -393,6 +409,11 @@ impl Model {
         if self.gemma4.is_some() {
             return Err(ReflexError::Lora(
                 "--lora is not supported for Gemma 4 models yet".to_string(),
+            ));
+        }
+        if self.granite.is_some() {
+            return Err(ReflexError::Lora(
+                "--lora is not supported for granitehybrid (Granite 4.0-H) models yet".to_string(),
             ));
         }
         if self.mla.is_some() {
@@ -630,6 +651,9 @@ impl Model {
         if architecture == "gemma4" {
             return Self::load_gemma4(device, file, &policy);
         }
+        if architecture == "granitehybrid" {
+            return Self::load_granite_hybrid(device, file, &policy);
+        }
         // `kolibri1` also goes through the dense/MoE path, as its own layer
         // variant (`LayerWeights::Kolibri`).
         Self::load_dense(device, file, &policy)
@@ -737,6 +761,17 @@ impl Model {
             )?;
             return Ok((generated[0], text));
         }
+        if let Some(g) = &self.granite {
+            let (generated, text) = self.generate_granite_impl(
+                g,
+                prompt,
+                1,
+                &SamplingParams::default(),
+                |_logits| {},
+                |_id, _text| {},
+            )?;
+            return Ok((generated[0], text));
+        }
         let (generated, text, _k_caches, _v_caches, _seq_len) = self.generate_dense_impl(
             prompt,
             None,
@@ -788,7 +823,11 @@ impl Model {
     ) -> Result<(Vec<u32>, String), ReflexError> {
         match imported {
             Some(crate::kv_io::ImportedKv::Dense(cache)) => {
-                if self.hybrid.is_some() || self.mla.is_some() || self.gemma4.is_some() {
+                if self.hybrid.is_some()
+                    || self.mla.is_some()
+                    || self.gemma4.is_some()
+                    || self.granite.is_some()
+                {
                     return Err(ReflexError::KvCache("imported KV cache file is dense/MoE format, but this model is not a dense/MoE Qwen3 model".to_string()));
                 }
                 let (generated, text, _, _, _) = self.generate_dense_impl(
@@ -850,6 +889,16 @@ impl Model {
                 }
                 if let Some(g) = &self.gemma4 {
                     return self.generate_gemma4_impl(
+                        g,
+                        prompt,
+                        max_new_tokens,
+                        sampling,
+                        on_first_token,
+                        on_token,
+                    );
+                }
+                if let Some(g) = &self.granite {
+                    return self.generate_granite_impl(
                         g,
                         prompt,
                         max_new_tokens,
@@ -1007,6 +1056,9 @@ impl Model {
         }
         if let Some(g) = &self.gemma4 {
             return self.system1_evaluate_gemma4(g, prompt, candidates, temperature);
+        }
+        if let Some(g) = &self.granite {
+            return self.system1_evaluate_granite(g, prompt, candidates, temperature);
         }
         self.system1_evaluate_dense(prompt, candidates, temperature)
     }

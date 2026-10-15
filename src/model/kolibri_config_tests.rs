@@ -14,6 +14,7 @@ pub(super) enum Val {
     Bool(bool),
     Str(&'static str),
     Bools(Vec<bool>),
+    U32s(Vec<u32>),
 }
 
 pub(super) struct Header {
@@ -67,6 +68,14 @@ impl Header {
                     buf.extend_from_slice(&7u32.to_le_bytes());
                     buf.extend_from_slice(&(items.len() as u64).to_le_bytes());
                     buf.extend(items.iter().map(|&b| b as u8));
+                }
+                Val::U32s(items) => {
+                    buf.extend_from_slice(&9u32.to_le_bytes());
+                    buf.extend_from_slice(&4u32.to_le_bytes());
+                    buf.extend_from_slice(&(items.len() as u64).to_le_bytes());
+                    for v in items {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
                 }
             }
         }
