@@ -1155,6 +1155,7 @@ impl Model {
 
         let mut k = self.gemm(&normed, &w.attn_k, rows)?;
         let v = self.gemm(&normed, &w.attn_v, rows)?;
+        prof_mark(PrefillPhase::QkvGemm, LayerKind::Attn)?;
 
         q = self.rmsnorm(
             &q,
@@ -1191,6 +1192,7 @@ impl Model {
             cfg.rope_base,
             cfg.rope_type,
         )?;
+        prof_mark(PrefillPhase::NormRope, LayerKind::Attn)?;
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
         let offset = start_pos * kv_stride;
@@ -1207,6 +1209,7 @@ impl Model {
                 .dtod_copy(&v, &mut dst)
                 .map_err(|e| crate::gpu_err!(e, "gated-attn-batched kv-cache dtod v: {e}"))?;
         }
+        prof_mark(PrefillPhase::KvCopy, LayerKind::Attn)?;
         let seq_len = start_pos + rows;
 
         let k_view = k_cache.slice(0..seq_len * kv_stride);
@@ -1222,6 +1225,7 @@ impl Model {
             rows,
             0,
         )?;
+        prof_mark(PrefillPhase::Attention, LayerKind::Attn)?;
 
         {
             let n = q_elems as u32;
@@ -1243,6 +1247,7 @@ impl Model {
 
         let o_proj = self.gemm(&attn_out, &w.attn_output, rows)?;
         self.add_inplace(&mut hidden, &o_proj)?;
+        prof_mark(PrefillPhase::OProj, LayerKind::Attn)?;
         Ok(hidden)
     }
 
@@ -1585,13 +1590,15 @@ impl Model {
                 let post_mixer = self.forward_gated_attn_mixer_batched(
                     h, w, hidden, start_pos, rows, k_cache, v_cache,
                 )?;
-                self.forward_hybrid_layer_ffn_batched(
+                let out = self.forward_hybrid_layer_ffn_batched(
                     h,
                     post_mixer,
                     &w.post_attn_norm,
                     &w.ffn,
                     rows,
-                )
+                )?;
+                prof_mark(PrefillPhase::Ffn, LayerKind::Attn)?;
+                Ok(out)
             }
             (
                 HybridLayerWeights::GatedDeltaNet(w),
@@ -1609,6 +1616,7 @@ impl Model {
                         self.forward_hybrid_layer_ffn(h, post_mixer, &w.post_attn_norm, &w.ffn)?;
                     self.write_row(&mut out, row, hidden_size, &row_out)?;
                 }
+                prof_mark(PrefillPhase::Mixer, LayerKind::Ssm)?;
                 Ok(out)
             }
             _ => Err(ReflexError::Other(
@@ -1803,6 +1811,7 @@ impl Model {
 
         let mut states = self.alloc_hybrid_states(h, imported, start_pos, rows, extra_headroom)?;
 
+        let prof = prefill_profile_begin(&self.device)?;
         let hidden_size = h.attn_cfg.hidden_size;
         let mut host_embd = vec![0.0f32; rows * hidden_size];
         for (row, &token_id) in ids.iter().enumerate() {
@@ -1813,9 +1822,13 @@ impl Model {
             .device
             .htod_sync_copy(&host_embd)
             .map_err(|e| crate::gpu_err!(e, "embedding htod: {e}"))?;
+        prof_mark(PrefillPhase::Embed, LayerKind::Layer)?;
 
         for (layer, state) in h.layers.iter().zip(states.iter_mut()) {
             hidden = self.forward_hybrid_layer_batched(h, layer, hidden, start_pos, rows, state)?;
+        }
+        if let Some(p) = prof {
+            p.finish(rows)?;
         }
 
         Ok((ids, hidden, states, start_pos + rows))

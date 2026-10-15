@@ -552,7 +552,6 @@ impl Model {
         rows: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-        prof: &mut Option<PrefillProfile>,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &m.cfg;
         let (hidden_size, eps) = (cfg.hidden_size, cfg.rmsnorm_eps);
@@ -568,7 +567,11 @@ impl Model {
                 .f32()?
         };
 
-        let global = !shape.sliding;
+        let kind = if shape.sliding {
+            LayerKind::Sliding
+        } else {
+            LayerKind::Global
+        };
         let x = self.rmsnorm(&hidden, layer.attn_norm.f32()?, rows, hidden_size, eps)?;
         let q = self.gemma4_mm(&x, &layer.attn_q, rows)?;
         let k_raw = self.gemma4_mm(&x, &layer.attn_k, rows)?;
@@ -580,7 +583,7 @@ impl Model {
             }
             None => &k_raw,
         };
-        prof_mark(prof, PrefillPhase::QkvGemm, global)?;
+        prof_mark(PrefillPhase::QkvGemm, kind)?;
 
         let mut q = self.rmsnorm(&q, layer.attn_q_norm.f32()?, rows * nq, hd, eps)?;
         m.kernels.rope_ff(
@@ -605,7 +608,7 @@ impl Model {
             shape.n_rot,
             shape.rope_base,
         )?;
-        prof_mark(prof, PrefillPhase::NormRope, global)?;
+        prof_mark(PrefillPhase::NormRope, kind)?;
 
         let kv_stride = nkv * hd;
         let range = start_pos * kv_stride..(start_pos + rows) * kv_stride;
@@ -615,29 +618,29 @@ impl Model {
         self.device
             .dtod_copy(&v, &mut v_cache.slice_mut(range))
             .map_err(|e| crate::gpu_err!(e, "gemma4 kv-cache dtod v: {e}"))?;
-        prof_mark(prof, PrefillPhase::KvCopy, global)?;
+        prof_mark(PrefillPhase::KvCopy, kind)?;
         let window = if shape.sliding { cfg.sliding_window } else { 0 };
         let attn = self.gemma4_attention(
             m, &q, k_cache, v_cache, nq, nkv, hd, start_pos, rows, window,
         )?;
-        prof_mark(prof, PrefillPhase::Attention, global)?;
+        prof_mark(PrefillPhase::Attention, kind)?;
         let o = self.gemma4_mm(&attn, &layer.attn_output, rows)?;
         let o = self.rmsnorm(&o, layer.post_attention_norm.f32()?, rows, hidden_size, eps)?;
         self.add_inplace(&mut hidden, &o)?;
-        prof_mark(prof, PrefillPhase::OProj, global)?;
+        prof_mark(PrefillPhase::OProj, kind)?;
 
         let y = self.rmsnorm(&hidden, layer.ffn_norm.f32()?, rows, hidden_size, eps)?;
         let gate = self.gemma4_mm(&y, &layer.ffn_gate, rows)?;
         let up = self.gemma4_mm(&y, &layer.ffn_up, rows)?;
         let act = m.kernels.gelu_tanh_and_mul(&self.device, &gate, &up)?;
         let f = self.gemma4_mm(&act, &layer.ffn_down, rows)?;
-        prof_mark(prof, PrefillPhase::Ffn, global)?;
+        prof_mark(PrefillPhase::Ffn, kind)?;
         let f = self.rmsnorm(&f, layer.post_ffw_norm.f32()?, rows, hidden_size, eps)?;
         self.add_inplace(&mut hidden, &f)?;
         if layer.output_scale != 1.0 {
             m.kernels.scale(&mut hidden, layer.output_scale)?;
         }
-        prof_mark(prof, PrefillPhase::FfnTail, global)?;
+        prof_mark(PrefillPhase::FfnTail, kind)?;
         Ok(hidden)
     }
 
@@ -689,19 +692,14 @@ impl Model {
             self.attn_impl.max_positions(),
         )?;
         let mut caches = self.alloc_gemma4_kv_caches(m, rows + extra_headroom)?;
-        let mut prof = if prefill_profile_enabled() {
-            Some(PrefillProfile::start(&self.device)?)
-        } else {
-            None
-        };
+        let prof = prefill_profile_begin(&self.device)?;
         let mut hidden = self.gemma4_embed(m, &ids)?;
-        prof_mark(&mut prof, PrefillPhase::Embed, false)?;
+        prof_mark(PrefillPhase::Embed, LayerKind::Layer)?;
         for ((shape, layer), (k, v)) in m.cfg.layers.iter().zip(&m.layers).zip(&mut caches) {
-            hidden =
-                self.forward_gemma4_layer(m, shape, layer, hidden, 0, rows, k, v, &mut prof)?;
+            hidden = self.forward_gemma4_layer(m, shape, layer, hidden, 0, rows, k, v)?;
         }
         if let Some(p) = prof {
-            p.report(&self.device, rows)?;
+            p.finish(rows)?;
         }
         Ok((ids, hidden, caches, rows))
     }
@@ -716,8 +714,7 @@ impl Model {
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut hidden = self.gemma4_embed(m, &[token_id])?;
         for ((shape, layer), (k, v)) in m.cfg.layers.iter().zip(&m.layers).zip(caches) {
-            hidden =
-                self.forward_gemma4_layer(m, shape, layer, hidden, position, 1, k, v, &mut None)?;
+            hidden = self.forward_gemma4_layer(m, shape, layer, hidden, position, 1, k, v)?;
         }
         Ok(hidden)
     }

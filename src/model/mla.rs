@@ -841,6 +841,7 @@ impl Model {
         // kv_cmpr_pe_batched: [rows, kv_lora_rank + qk_rope_head_dim] flat (single
         // shared "head" per row).
         let kv_cmpr_pe_batched = self.gemm(&normed, &w.wkv_a_mqa, rows)?;
+        prof_mark(PrefillPhase::QkvGemm, LayerKind::Layer)?;
 
         // Extract k_pe/kv_cmpr into their own contiguous [rows, 1, width] buffers
         // (num_heads=1: the whole fused wkv_a_mqa row is treated as a single head).
@@ -931,6 +932,7 @@ impl Model {
                 cfg.rope_base,
             )?,
         }
+        prof_mark(PrefillPhase::NormRope, LayerKind::Layer)?;
 
         // Absorption: q_nope (read directly out of q_batched via strides -- no
         // separate gather) times wk_b's per-head slice, batched over every row and
@@ -957,6 +959,7 @@ impl Model {
             kv_lora,
             qk_rope,
         )?;
+        prof_mark(PrefillPhase::Absorb, LayerKind::Layer)?;
 
         // Write this batch's compressed Kcur into the preallocated per-layer cache.
         self.mla_write_kv_cache_batch(
@@ -969,6 +972,7 @@ impl Model {
             kv_lora,
             qk_rope,
         )?;
+        prof_mark(PrefillPhase::KvCopy, LayerKind::Layer)?;
         let seq_len = start_pos + rows;
 
         let kv_view = kv_cache.slice(0..seq_len * qk_dim);
@@ -987,6 +991,7 @@ impl Model {
             rows,
             scale,
         )?;
+        prof_mark(PrefillPhase::Attention, LayerKind::Layer)?;
 
         // Decompression: already-contiguous [rows, n_head, v_dim] input, standard
         // strides.
@@ -1000,9 +1005,11 @@ impl Model {
             v_dim,
             0,
         )?;
+        prof_mark(PrefillPhase::Absorb, LayerKind::Layer)?;
 
         let o_proj = self.gemm(&decompressed_batched, &w.wo, rows)?;
         self.add_inplace(&mut hidden, &o_proj)?;
+        prof_mark(PrefillPhase::OProj, LayerKind::Layer)?;
         Ok(hidden)
     }
 
@@ -1032,7 +1039,7 @@ impl Model {
         let ffn_hidden_size = cfg.ffn_hidden_size;
         let eps = cfg.rmsnorm_eps;
 
-        match &layer.ffn {
+        let out = match &layer.ffn {
             MlaFfn::Dense {
                 ffn_gate,
                 ffn_up,
@@ -1047,16 +1054,18 @@ impl Model {
                 ffn_hidden_size,
                 rows,
                 eps,
-            ),
+            )?,
             MlaFfn::Moe { .. } => {
                 let moe_cfg = cfg.moe.as_ref().ok_or_else(|| {
                     ReflexError::Other(
                         "internal error: MlaFfn::Moe layer but MlaConfig::moe is None".to_string(),
                     )
                 })?;
-                self.forward_mla_moe_ffn_batched(layer, post_attn, hidden_size, rows, moe_cfg, eps)
+                self.forward_mla_moe_ffn_batched(layer, post_attn, hidden_size, rows, moe_cfg, eps)?
             }
-        }
+        };
+        prof_mark(PrefillPhase::Ffn, LayerKind::Layer)?;
+        Ok(out)
     }
 
     /// MLA-model counterpart to [`Self::forward_prompt`]/[`Self::forward_prompt_hybrid`]:
@@ -1382,6 +1391,7 @@ impl Model {
         let mut kv_caches =
             self.alloc_mla_kv_caches(m, imported, start_pos, rows, extra_headroom)?;
 
+        let prof = prefill_profile_begin(&self.device)?;
         let hidden_size = m.cfg.hidden_size;
         let mut host_embd = vec![0.0f32; rows * hidden_size];
         for (row, &token_id) in ids.iter().enumerate() {
@@ -1392,6 +1402,7 @@ impl Model {
             .device
             .htod_sync_copy(&host_embd)
             .map_err(|e| crate::gpu_err!(e, "embedding htod: {e}"))?;
+        prof_mark(PrefillPhase::Embed, LayerKind::Layer)?;
 
         for (layer_idx, layer) in m.layers.iter().enumerate() {
             hidden = self.forward_mla_layer_batched(
@@ -1402,6 +1413,9 @@ impl Model {
                 rows,
                 &mut kv_caches[layer_idx],
             )?;
+        }
+        if let Some(p) = prof {
+            p.finish(rows)?;
         }
 
         Ok((ids, hidden, kv_caches, start_pos + rows))
