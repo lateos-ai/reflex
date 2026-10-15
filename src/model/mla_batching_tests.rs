@@ -232,10 +232,10 @@ fn prefill_mla_batched_import_kv_resume_matches_sequential() {
 
     let continuation = " Paris";
     let (seq_ids, seq_hidden, _, seq_position) = model
-        .prefill_mla(m, continuation, Some(&cache), 0)
+        .prefill_mla(m, continuation, Some(PrefixSource::Host(&cache)), 0)
         .expect("prefill_mla resume failed");
     let (batch_ids, batch_hidden, _, batch_position) = model
-        .prefill_mla_batched(m, continuation, Some(&cache), 0)
+        .prefill_mla_batched(m, continuation, Some(PrefixSource::Host(&cache)), 0)
         .expect("prefill_mla_batched resume failed");
 
     assert_eq!(

@@ -27,6 +27,9 @@ pub(super) type DenseGenerateResult = (
     usize,
 );
 
+/// Per-layer K and V cache buffers, from `alloc_dense_kv_caches`.
+pub(super) type DenseKvBuffers = (Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>);
+
 pub(super) struct DenseLayerWeights {
     pub(super) attn_norm: Weight,
     pub(super) attn_q: Weight,
@@ -1689,10 +1692,10 @@ impl Model {
     pub(super) fn prefill_dense(
         &self,
         prompt: &str,
-        imported: Option<&crate::kv_io::DenseKvCache>,
+        imported: Option<DensePrefix<'_>>,
         extra_headroom: usize,
     ) -> Result<DensePrefillResult, ReflexError> {
-        let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
+        let start_pos = start_pos_of(imported);
 
         let mut ids = self.tokenizer.encode(prompt)?;
         if start_pos == 0 {
@@ -1708,62 +1711,8 @@ impl Model {
             ));
         }
 
-        crate::limits::check_positions_up_to(
-            start_pos,
-            ids.len(),
-            extra_headroom,
-            self.attn_impl.max_positions(),
-        )?;
-        let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
-        // Preallocated up front (Phase 2 round 2 sized this to exactly the
-        // prompt's token count; round 2 of Phase 3 sizes it for the whole
-        // run -- imported positions, the continuation prompt, and headroom
-        // for every position a caller might still write -- since
-        // `forward_attn_block` indexes into it by absolute position and
-        // needs the buffer to already be that big).
-        let total_len = start_pos + ids.len() + extra_headroom;
-        let mut k_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
-            .map(|_| self.device.alloc_zeros::<f32>(total_len * kv_stride))
-            .collect::<Result<_, _>>()
-            .map_err(|e| crate::gpu_err!(e, "alloc k_cache: {e}"))?;
-        let mut v_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
-            .map(|_| self.device.alloc_zeros::<f32>(total_len * kv_stride))
-            .collect::<Result<_, _>>()
-            .map_err(|e| crate::gpu_err!(e, "alloc v_cache: {e}"))?;
-
-        if let Some(cache) = imported {
-            if cache.num_kv_heads != self.cfg.num_kv_heads || cache.head_dim != self.cfg.head_dim {
-                return Err(crate::reflex_err!(KvCache,
-                    "imported KV cache shape mismatch: file has num_kv_heads={} head_dim={}, model expects num_kv_heads={} head_dim={}",
-                    cache.num_kv_heads, cache.head_dim, self.cfg.num_kv_heads, self.cfg.head_dim
-                ));
-            }
-            if cache.k_caches.len() != self.layers.len() {
-                return Err(crate::reflex_err!(
-                    Other,
-                    "imported KV cache has {} layers, model has {}",
-                    cache.k_caches.len(),
-                    self.layers.len()
-                ));
-            }
-            let imported_len = cache.seq_len * kv_stride;
-            for (layer_idx, (k_host, v_host)) in
-                cache.k_caches.iter().zip(&cache.v_caches).enumerate()
-            {
-                let mut k_dst = k_caches[layer_idx].slice_mut(0..imported_len);
-                self.device
-                    .htod_sync_copy_into(k_host, &mut k_dst)
-                    .map_err(|e| {
-                        crate::gpu_err!(e, "import k_cache htod layer {layer_idx}: {e}")
-                    })?;
-                let mut v_dst = v_caches[layer_idx].slice_mut(0..imported_len);
-                self.device
-                    .htod_sync_copy_into(v_host, &mut v_dst)
-                    .map_err(|e| {
-                        crate::gpu_err!(e, "import v_cache htod layer {layer_idx}: {e}")
-                    })?;
-            }
-        }
+        let (mut k_caches, mut v_caches) =
+            self.alloc_dense_kv_caches(imported, start_pos, ids.len(), extra_headroom)?;
 
         let mut position = start_pos;
         let mut hidden_dev: Option<CudaSlice<f32>> = None;
@@ -1782,39 +1731,18 @@ impl Model {
         Ok((ids, hidden, k_caches, v_caches, position))
     }
 
-    /// Batched-prefill variant of [`Self::prefill_dense`]: same signature and
-    /// KV-cache allocation/import logic (kept byte-identical to `prefill_dense`
-    /// so the two stay directly comparable -- see
-    /// `prefill_dense_batched_matches_sequential_prefill` below), but runs
-    /// every prompt token through each layer in one batched pass
-    /// (`Self::forward_layer_batched`, `rows = ids.len()`) instead of looping
-    /// `forward_one_token_dense` once per token. Unlike `prefill_dense`,
-    /// whose returned `hidden` is already the single last-position vector,
-    /// this returns the *whole* `[rows, hidden_size]` batched hidden state --
-    /// callers that only want the last prompt position (every current
-    /// caller) must slice it out with [`Self::last_row`].
-    pub(super) fn prefill_dense_batched(
+    /// Shared K/V cache allocation behind [`Self::prefill_dense`] and
+    /// [`Self::prefill_dense_batched`]: allocates every layer's `k_cache`/`v_cache`
+    /// for `start_pos + rows + extra_headroom` positions and seeds the first
+    /// `start_pos` from `imported` when resuming -- uploaded from a cache file, or
+    /// copied device-to-device from a pinned prefix (`super::prefix`).
+    pub(super) fn alloc_dense_kv_caches(
         &self,
-        prompt: &str,
-        imported: Option<&crate::kv_io::DenseKvCache>,
+        imported: Option<DensePrefix<'_>>,
+        start_pos: usize,
+        rows: usize,
         extra_headroom: usize,
-    ) -> Result<DensePrefillResult, ReflexError> {
-        let start_pos = imported.map(|c| c.seq_len).unwrap_or(0);
-
-        let mut ids = self.tokenizer.encode(prompt)?;
-        if start_pos == 0 {
-            if let Some(bos) = self.tokenizer.prompt_bos() {
-                if ids.first() != Some(&bos) {
-                    ids.insert(0, bos);
-                }
-            }
-        }
-        if ids.is_empty() {
-            return Err(ReflexError::InvalidInput(
-                "encode produced no tokens".to_string(),
-            ));
-        }
-        let rows = ids.len();
+    ) -> Result<DenseKvBuffers, ReflexError> {
         crate::limits::check_positions_up_to(
             start_pos,
             rows,
@@ -1833,39 +1761,115 @@ impl Model {
             .collect::<Result<_, _>>()
             .map_err(|e| crate::gpu_err!(e, "alloc v_cache: {e}"))?;
 
-        if let Some(cache) = imported {
-            if cache.num_kv_heads != self.cfg.num_kv_heads || cache.head_dim != self.cfg.head_dim {
-                return Err(crate::reflex_err!(KvCache,
+        let imported_len = start_pos * kv_stride;
+        match imported {
+            None => {}
+            Some(PrefixSource::Host(cache)) => {
+                if cache.num_kv_heads != self.cfg.num_kv_heads
+                    || cache.head_dim != self.cfg.head_dim
+                {
+                    return Err(crate::reflex_err!(KvCache,
                     "imported KV cache shape mismatch: file has num_kv_heads={} head_dim={}, model expects num_kv_heads={} head_dim={}",
                     cache.num_kv_heads, cache.head_dim, self.cfg.num_kv_heads, self.cfg.head_dim
                 ));
+                }
+                if cache.k_caches.len() != self.layers.len() {
+                    return Err(crate::reflex_err!(
+                        Other,
+                        "imported KV cache has {} layers, model has {}",
+                        cache.k_caches.len(),
+                        self.layers.len()
+                    ));
+                }
+                for (layer_idx, (k_host, v_host)) in
+                    cache.k_caches.iter().zip(&cache.v_caches).enumerate()
+                {
+                    let mut k_dst = k_caches[layer_idx].slice_mut(0..imported_len);
+                    self.device
+                        .htod_sync_copy_into(k_host, &mut k_dst)
+                        .map_err(|e| {
+                            crate::gpu_err!(e, "import k_cache htod layer {layer_idx}: {e}")
+                        })?;
+                    let mut v_dst = v_caches[layer_idx].slice_mut(0..imported_len);
+                    self.device
+                        .htod_sync_copy_into(v_host, &mut v_dst)
+                        .map_err(|e| {
+                            crate::gpu_err!(e, "import v_cache htod layer {layer_idx}: {e}")
+                        })?;
+                }
             }
-            if cache.k_caches.len() != self.layers.len() {
-                return Err(crate::reflex_err!(
-                    Other,
-                    "imported KV cache has {} layers, model has {}",
-                    cache.k_caches.len(),
-                    self.layers.len()
-                ));
-            }
-            let imported_len = cache.seq_len * kv_stride;
-            for (layer_idx, (k_host, v_host)) in
-                cache.k_caches.iter().zip(&cache.v_caches).enumerate()
-            {
-                let mut k_dst = k_caches[layer_idx].slice_mut(0..imported_len);
-                self.device
-                    .htod_sync_copy_into(k_host, &mut k_dst)
-                    .map_err(|e| {
-                        crate::gpu_err!(e, "import k_cache htod layer {layer_idx}: {e}")
-                    })?;
-                let mut v_dst = v_caches[layer_idx].slice_mut(0..imported_len);
-                self.device
-                    .htod_sync_copy_into(v_host, &mut v_dst)
-                    .map_err(|e| {
-                        crate::gpu_err!(e, "import v_cache htod layer {layer_idx}: {e}")
-                    })?;
+            Some(PrefixSource::Device { state, copy_ms }) => {
+                if state.k_caches.len() != self.layers.len() {
+                    return Err(crate::reflex_err!(
+                        KvCache,
+                        "pinned prefix has {} layers, model has {}",
+                        state.k_caches.len(),
+                        self.layers.len()
+                    ));
+                }
+                self.timed_prefix_copy(copy_ms, || {
+                    for (layer_idx, (k_src, v_src)) in
+                        state.k_caches.iter().zip(&state.v_caches).enumerate()
+                    {
+                        self.device
+                            .dtod_copy(
+                                &k_src.slice(0..imported_len),
+                                &mut k_caches[layer_idx].slice_mut(0..imported_len),
+                            )
+                            .map_err(|e| {
+                                crate::gpu_err!(e, "fork k_cache layer {layer_idx}: {e}")
+                            })?;
+                        self.device
+                            .dtod_copy(
+                                &v_src.slice(0..imported_len),
+                                &mut v_caches[layer_idx].slice_mut(0..imported_len),
+                            )
+                            .map_err(|e| {
+                                crate::gpu_err!(e, "fork v_cache layer {layer_idx}: {e}")
+                            })?;
+                    }
+                    Ok(())
+                })?;
             }
         }
+        Ok((k_caches, v_caches))
+    }
+
+    /// Batched-prefill variant of [`Self::prefill_dense`]: same signature and
+    /// KV-cache allocation/import logic (kept byte-identical to `prefill_dense`
+    /// so the two stay directly comparable -- see
+    /// `prefill_dense_batched_matches_sequential_prefill` below), but runs
+    /// every prompt token through each layer in one batched pass
+    /// (`Self::forward_layer_batched`, `rows = ids.len()`) instead of looping
+    /// `forward_one_token_dense` once per token. Unlike `prefill_dense`,
+    /// whose returned `hidden` is already the single last-position vector,
+    /// this returns the *whole* `[rows, hidden_size]` batched hidden state --
+    /// callers that only want the last prompt position (every current
+    /// caller) must slice it out with [`Self::last_row`].
+    pub(super) fn prefill_dense_batched(
+        &self,
+        prompt: &str,
+        imported: Option<DensePrefix<'_>>,
+        extra_headroom: usize,
+    ) -> Result<DensePrefillResult, ReflexError> {
+        let start_pos = start_pos_of(imported);
+
+        let mut ids = self.tokenizer.encode(prompt)?;
+        if start_pos == 0 {
+            if let Some(bos) = self.tokenizer.prompt_bos() {
+                if ids.first() != Some(&bos) {
+                    ids.insert(0, bos);
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Err(ReflexError::InvalidInput(
+                "encode produced no tokens".to_string(),
+            ));
+        }
+        let rows = ids.len();
+        let (mut k_caches, mut v_caches) =
+            self.alloc_dense_kv_caches(imported, start_pos, rows, extra_headroom)?;
 
         let prof = prefill_profile_begin(&self.device)?;
         let hidden_size = self.cfg.hidden_size;
@@ -1915,7 +1919,7 @@ impl Model {
     pub(super) fn generate_dense_impl(
         &self,
         prompt: &str,
-        imported: Option<&crate::kv_io::DenseKvCache>,
+        imported: Option<DensePrefix<'_>>,
         max_new_tokens: usize,
         sampling: &SamplingParams,
         mut on_first_token: impl FnMut(&[f32]),
@@ -2106,35 +2110,45 @@ impl Model {
         on_first_token: impl FnMut(&[f32]),
         on_token: impl FnMut(u32, &str),
     ) -> Result<(Vec<u32>, String, crate::kv_io::DenseKvCache), ReflexError> {
-        let (generated, text, k_caches, v_caches, seq_len) =
-            self.generate_dense_impl(prompt, imported, 1, sampling, on_first_token, on_token)?;
-
-        let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
-        let per_layer_len = seq_len * kv_stride;
-        let k_caches = k_caches
-            .iter()
-            .map(|c| {
-                self.device
-                    .dtoh_sync_copy(&c.slice(0..per_layer_len))
-                    .map_err(|e| crate::gpu_err!(e, "k_cache dtoh: {e}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let v_caches = v_caches
-            .iter()
-            .map(|c| {
-                self.device
-                    .dtoh_sync_copy(&c.slice(0..per_layer_len))
-                    .map_err(|e| crate::gpu_err!(e, "v_cache dtoh: {e}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let cache = crate::kv_io::DenseKvCache {
+        let (generated, text, k_caches, v_caches, seq_len) = self.generate_dense_impl(
+            prompt,
+            imported.map(PrefixSource::Host),
+            1,
+            sampling,
+            on_first_token,
+            on_token,
+        )?;
+        let cache = self.download_dense_kv(&DenseDeviceKv {
             seq_len,
-            num_kv_heads: self.cfg.num_kv_heads,
-            head_dim: self.cfg.head_dim,
             k_caches,
             v_caches,
-        };
+        })?;
         Ok((generated, text, cache))
+    }
+
+    /// Downloads a device-resident dense/MoE state's first `seq_len` positions
+    /// (its buffers may carry generation headroom past that) for export.
+    pub(super) fn download_dense_kv(
+        &self,
+        d: &DenseDeviceKv,
+    ) -> Result<crate::kv_io::DenseKvCache, ReflexError> {
+        let per_layer_len = d.seq_len * self.cfg.num_kv_heads * self.cfg.head_dim;
+        let download = |caches: &[CudaSlice<f32>], what: &str| {
+            caches
+                .iter()
+                .map(|c| {
+                    self.device
+                        .dtoh_sync_copy(&c.slice(0..per_layer_len))
+                        .map_err(|e| crate::gpu_err!(e, "{what} dtoh: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        Ok(crate::kv_io::DenseKvCache {
+            seq_len: d.seq_len,
+            num_kv_heads: self.cfg.num_kv_heads,
+            head_dim: self.cfg.head_dim,
+            k_caches: download(&d.k_caches, "k_cache")?,
+            v_caches: download(&d.v_caches, "v_cache")?,
+        })
     }
 }

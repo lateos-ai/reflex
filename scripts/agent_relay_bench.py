@@ -11,7 +11,8 @@ multi-agent loop produces. Reports p50/p95 per hop of:
   first_token   engine: model call start -> first generated token
   model         engine: whole model call
   overhead      rtt - engine time (transport, JSON, process boundary)
-  kv_io         engine: reading the imported KV cache file (--reuse-prefix)
+  kv_io         engine: reading the imported KV cache file (--reuse-prefix), or
+                copying the pinned prefix in VRAM (--pin-prefix)
 
 Targets:
   stdio         spawns `reflex stdio <model>` and talks over its pipes
@@ -28,13 +29,17 @@ rest of its prompt with `import_kv` pointing at that file. This is Reflex's
 counterpart to llama-server's `--llama-cache-prompt`. --system-prompt-file
 swaps in a longer shared prefix, since the saving grows with its size.
 
+--pin-prefix (stdio/uds): the same, but the system prompt's state stays in
+VRAM (`pin_prefix`) and every hop resumes from it (`use_pinned`), copying it
+device-to-device instead of reading a file.
+
 Usage:
   scripts/agent_relay_bench.py stdio --reflex target/release/reflex --model m.gguf
   scripts/agent_relay_bench.py uds --reflex target/release/reflex --model m.gguf
   scripts/agent_relay_bench.py llama-server --url http://127.0.0.1:8080
   common: [--hops 20] [--warmup 3] [--max-tokens 32] [--carry-chars 400]
           [--system-prompt-file f.txt] [--json-out results.json]
-  stdio/uds: [--reuse-prefix [--kv-dir /dev/shm]]
+  stdio/uds: [--reuse-prefix [--kv-dir /dev/shm] | --pin-prefix]
 
 Standard library only, so it runs anywhere Python 3.8+ does.
 """
@@ -122,8 +127,10 @@ def reflex_request(client, payload):
     return msg, rtt
 
 
-def reflex_hop(client, system, suffix, max_tokens, prefix_kv):
-    if prefix_kv:
+def reflex_hop(client, system, suffix, max_tokens, prefix_kv, pinned):
+    if pinned:
+        payload = {"prompt": suffix, "use_pinned": True}
+    elif prefix_kv:
         payload = {"prompt": suffix, "import_kv": prefix_kv}
     else:
         payload = {"prompt": system + suffix}
@@ -218,7 +225,7 @@ def print_table(target, summary, n):
         ("first_token_ms", "first token (ms)"),
         ("model_ms", "engine total (ms)"),
         ("overhead_ms", "overhead (ms)"),
-        ("kv_io_ms", "KV file read (ms)"),
+        ("kv_io_ms", "prefix read/copy (ms)"),
         ("tokens", "tokens generated"),
     ):
         if key in summary:
@@ -257,6 +264,11 @@ def main(argv=None):
         help="stdio/uds: export the system prompt's KV once, import it on every hop",
     )
     ap.add_argument(
+        "--pin-prefix",
+        action="store_true",
+        help="stdio/uds: pin the system prompt's state in VRAM once, resume from it on every hop",
+    )
+    ap.add_argument(
         "--kv-dir",
         help="where --reuse-prefix writes its cache file (default: a temp dir; tmpfs is best)",
     )
@@ -268,8 +280,10 @@ def main(argv=None):
     ap.add_argument("--ready-timeout", type=float, default=600.0)
     ap.add_argument("--json-out")
     args = ap.parse_args(argv)
-    if args.reuse_prefix and args.target == "llama-server":
-        ap.error("--reuse-prefix is for stdio/uds; use --llama-cache-prompt for llama-server")
+    if (args.reuse_prefix or args.pin_prefix) and args.target == "llama-server":
+        ap.error("--reuse-prefix/--pin-prefix are for stdio/uds; use --llama-cache-prompt")
+    if args.reuse_prefix and args.pin_prefix:
+        ap.error("pick one of --reuse-prefix and --pin-prefix")
     system = SYSTEM_PROMPT
     if args.system_prompt_file:
         with open(args.system_prompt_file, encoding="utf-8") as f:
@@ -320,8 +334,19 @@ def main(argv=None):
                     file=sys.stderr,
                 )
 
+            if args.pin_prefix:
+                msg, _ = reflex_request(
+                    client, {"prompt": system, "pin_prefix": True, "max_tokens": 1}
+                )
+                print(
+                    f"pinned prefix in {msg['timings']['model_ms']:.1f} ms",
+                    file=sys.stderr,
+                )
+
             def do_hop(suffix, max_tokens):
-                return reflex_hop(client, system, suffix, max_tokens, prefix_kv)
+                return reflex_hop(
+                    client, system, suffix, max_tokens, prefix_kv, args.pin_prefix
+                )
 
         samples = run_chain(do_hop, args.hops, args.warmup, args.max_tokens, args.carry_chars)
     finally:
@@ -332,7 +357,9 @@ def main(argv=None):
             os.remove(prefix_kv)
 
     summary = summarize(samples)
-    label = args.target + (", prefix reused" if args.reuse_prefix else "")
+    label = args.target + (
+        ", prefix reused" if args.reuse_prefix else ", prefix pinned" if args.pin_prefix else ""
+    )
     print_table(label, summary, len(samples))
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:
@@ -346,6 +373,7 @@ def main(argv=None):
                     "carry_chars": args.carry_chars,
                     "llama_cache_prompt": args.llama_cache_prompt,
                     "reuse_prefix": args.reuse_prefix,
+                    "pin_prefix": args.pin_prefix,
                     "system_prompt_chars": len(system),
                     "summary": summary,
                     "samples": samples,

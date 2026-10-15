@@ -315,7 +315,11 @@ no multi-tenant LoRA router, no internal NVMe/S3 KV-cache manager, no concurrent
 gRPC server. Multi-tenancy and persistent state belong in a *host orchestrator*, never
 inside this engine — see README's "Non-goals" section for the full rationale before
 proposing anything in this direction. If a warm-context mode is ever added, it accepts
-one job at a time, strictly sequentially, never a thread pool.
+one job at a time, strictly sequentially, never a thread pool. The warm `reflex stdio`/
+`uds` loop may hold exactly **one** pinned prefix in VRAM (`pin_prefix`/`use_pinned`,
+`ipc::PrefixSlot`): no second slot, no names, no LRU/eviction, no background work. More
+than that (several prefixes, picking which to keep, sharing across processes) is the
+orchestrator's job, through cache files or one warm process per prefix.
 
 No in-core HTTP/gRPC server, ever — this is the same rule as `batch_size`-always-1/
 no-thread-pool above, not a separate exception any adoption/UX ask gets to reopen. If
