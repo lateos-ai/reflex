@@ -13,6 +13,12 @@ What has been built, in order. Measurements live in
   ~1,550 positions; TinyLlama is 23% faster at ~1,550. `REFLEX_ATTN_DECODE=online`
   restores the previous kernel. See
   [docs/design/decode-speed.md](docs/design/decode-speed.md).
+- **Agent handoff benchmark.** `scripts/agent_relay_bench.py` measures the per-hop
+  round trip of a chain of sequential agent requests against `reflex stdio`,
+  `reflex uds` or llama-server. The IPC protocol gains an opt-in `"timings": true`
+  request field, which adds `parse_ms`/`first_token_ms`/`model_ms` to the final
+  line; when the field is omitted, responses are unchanged. See
+  [docs/design/agent-relay.md](docs/design/agent-relay.md).
 
 ## 2026-10-15
 

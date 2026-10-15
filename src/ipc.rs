@@ -28,6 +28,11 @@
 //! **Sampling** (`generate` path only): `sampling` omitted (the default) is greedy
 //! argmax, byte-identical to this protocol's pre-sampling behavior. See
 //! [`IpcSamplingParams`]/`crate::sampling::SamplingParams`.
+//!
+//! **Timings** (opt-in, `"timings": true`): the final line gains an [`IpcTimings`]
+//! object, so a caller chaining requests (an agent handing off to another agent)
+//! can split its measured round trip into engine time and transport overhead.
+//! Omitted (the default), the response is byte-identical to before.
 
 use crate::error::ReflexError;
 use crate::model::{Model, System1Candidate};
@@ -95,6 +100,14 @@ pub struct IpcRequest {
     /// [`handle_request_streaming`].
     #[serde(default)]
     pub stream: bool,
+    /// Opt-in: attach an [`IpcTimings`] to the final response line.
+    #[serde(default)]
+    pub timings: bool,
+    /// Milliseconds spent parsing this request's JSON line, filled in by
+    /// [`run_request_loop`] (not a wire field) so [`IpcTimings::parse_ms`] can
+    /// report it.
+    #[serde(skip)]
+    parse_ms: f64,
 }
 
 impl IpcRequest {
@@ -152,6 +165,44 @@ pub struct IpcResponse {
     /// `crate::model::System1Response::entropy`'s doc comment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entropy: Option<f32>,
+    /// Present only when the request set `"timings": true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<IpcTimings>,
+}
+
+/// Per-request engine-side timing breakdown, in milliseconds (`"timings": true`).
+/// A caller's measured round trip minus `parse_ms + model_ms` is what the
+/// transport (pipe or socket, plus serializing the response) costs it.
+#[derive(Debug, Serialize)]
+pub struct IpcTimings {
+    /// Parsing the request line's JSON.
+    pub parse_ms: f64,
+    /// From the start of the model call to its first generated token: tokenize,
+    /// prefill, LM head and the first sampling step. `generate` path only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_token_ms: Option<f64>,
+    /// The whole model call (`Model::generate` or `Model::system1_evaluate`). On
+    /// a streaming request this includes writing and flushing each token line,
+    /// since those happen inside the decode loop.
+    pub model_ms: f64,
+}
+
+fn elapsed_ms(since: std::time::Instant) -> f64 {
+    since.elapsed().as_secs_f64() * 1000.0
+}
+
+/// Builds a request's [`IpcTimings`] if it asked for one.
+fn timings_if(
+    requested: bool,
+    parse_ms: f64,
+    model_start: std::time::Instant,
+    first_token_ms: Option<f64>,
+) -> Option<IpcTimings> {
+    requested.then(|| IpcTimings {
+        parse_ms,
+        first_token_ms,
+        model_ms: elapsed_ms(model_start),
+    })
 }
 
 impl IpcResponse {
@@ -166,6 +217,7 @@ impl IpcResponse {
             text: None,
             candidates: None,
             entropy: None,
+            timings: None,
         }
     }
 }
@@ -195,14 +247,16 @@ pub struct IpcStreamToken {
 /// [`handle_request_streaming`] for the streaming path.
 pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
     let id = req.id.clone();
+    let model_start = std::time::Instant::now();
     if req.candidates.is_empty() {
         let sampling = req.sampling_params();
+        let mut first_token_ms = None;
         match model.generate(
             &req.prompt,
             req.max_tokens.max(1),
             None,
             &sampling,
-            |_logits| {},
+            |_logits| first_token_ms = Some(elapsed_ms(model_start)),
             |_token_id, _text| {},
         ) {
             Ok((token_ids, text)) => IpcResponse {
@@ -215,6 +269,7 @@ pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
                 text: Some(text),
                 candidates: None,
                 entropy: None,
+                timings: timings_if(req.timings, req.parse_ms, model_start, first_token_ms),
             },
             Err(e) => IpcResponse::err(id, e),
         }
@@ -247,6 +302,7 @@ pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
                     text: None,
                     candidates: Some(candidates),
                     entropy: Some(response.entropy),
+                    timings: timings_if(req.timings, req.parse_ms, model_start, None),
                 }
             }
             Err(e) => IpcResponse::err(id, e),
@@ -296,12 +352,14 @@ pub fn handle_request_streaming<W: Write>(
     let sampling = req.sampling_params();
     let max_tokens = req.max_tokens.max(1);
     let mut write_err: Option<String> = None;
+    let model_start = std::time::Instant::now();
+    let mut first_token_ms = None;
     let result = model.generate(
         &req.prompt,
         max_tokens,
         None,
         &sampling,
-        |_logits| {},
+        |_logits| first_token_ms = Some(elapsed_ms(model_start)),
         |token_id, text| {
             if write_err.is_some() {
                 return; // A prior token's write already failed this call; stop trying.
@@ -332,6 +390,7 @@ pub fn handle_request_streaming<W: Write>(
             text: Some(text),
             candidates: None,
             entropy: None,
+            timings: timings_if(req.timings, req.parse_ms, model_start, first_token_ms),
         },
         Err(e) => IpcResponse::err(id, e),
     };
@@ -365,8 +424,12 @@ pub fn run_request_loop<R: BufRead, W: Write>(
             continue;
         }
 
+        let parse_start = std::time::Instant::now();
         match serde_json::from_str::<IpcRequest>(trimmed) {
-            Ok(req) => handle_request_streaming(model, req, &mut output)?,
+            Ok(mut req) => {
+                req.parse_ms = elapsed_ms(parse_start);
+                handle_request_streaming(model, req, &mut output)?
+            }
             Err(e) => {
                 let response = IpcResponse::err(
                     None,
@@ -461,9 +524,11 @@ mod tests {
             text: Some("x".to_string()),
             candidates: None,
             entropy: None,
+            timings: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("error_kind"), "{json}");
+        assert!(!json.contains("timings"), "{json}");
     }
 
     #[test]
@@ -548,5 +613,27 @@ mod tests {
             "should write exactly one line: {text:?}"
         );
         assert!(text.trim_end().starts_with('{') && text.trim_end().ends_with('}'));
+    }
+
+    #[test]
+    fn test_ipc_request_timings_defaults_off_and_parses_on() {
+        let req: IpcRequest = serde_json::from_str(r#"{"prompt": "p"}"#).unwrap();
+        assert!(!req.timings);
+        let req: IpcRequest = serde_json::from_str(r#"{"prompt": "p", "timings": true}"#).unwrap();
+        assert!(req.timings);
+        // `parse_ms` is filled in by the request loop, never read off the wire.
+        let req: IpcRequest = serde_json::from_str(r#"{"prompt": "p", "parse_ms": 5.0}"#).unwrap();
+        assert_eq!(req.parse_ms, 0.0);
+    }
+
+    #[test]
+    fn test_timings_if_only_builds_when_requested() {
+        let start = std::time::Instant::now();
+        assert!(timings_if(false, 1.0, start, Some(2.0)).is_none());
+        let t = timings_if(true, 1.0, start, None).expect("requested");
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains("\"parse_ms\":1.0"), "{json}");
+        assert!(json.contains("\"model_ms\""), "{json}");
+        assert!(!json.contains("first_token_ms"), "{json}");
     }
 }
