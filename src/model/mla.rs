@@ -1552,15 +1552,29 @@ impl Model {
                 "forward_prompt_capture_kv_mla called on a non-MLA model".to_string(),
             )
         })?;
-        let (generated, text, kv_caches, seq_len) = self.generate_mla_impl(
+        let (generated, text, cache) = self.generate_capture_kv_mla(
             m,
             prompt,
             None,
-            1,
             &SamplingParams::default(),
             |_logits| {},
             |_id, _text| {},
         )?;
+        Ok(((generated[0], text), cache))
+    }
+
+    /// MLA counterpart to `generate_capture_kv_dense`.
+    pub(super) fn generate_capture_kv_mla(
+        &self,
+        m: &MlaModel,
+        prompt: &str,
+        imported: Option<&crate::kv_io::MlaKvCache>,
+        sampling: &SamplingParams,
+        on_first_token: impl FnMut(&[f32]),
+        on_token: impl FnMut(u32, &str),
+    ) -> Result<(Vec<u32>, String, crate::kv_io::MlaKvCache), ReflexError> {
+        let (generated, text, kv_caches, seq_len) =
+            self.generate_mla_impl(m, prompt, imported, 1, sampling, on_first_token, on_token)?;
 
         let qk_dim = m.cfg.kv_lora_rank + m.cfg.qk_rope_head_dim;
         let per_layer_len = seq_len * qk_dim;
@@ -1578,7 +1592,7 @@ impl Model {
             qk_dim,
             kv_caches,
         };
-        Ok(((generated[0], text), cache))
+        Ok((generated, text, cache))
     }
 }
 

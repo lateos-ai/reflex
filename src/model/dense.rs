@@ -2084,14 +2084,30 @@ impl Model {
                 "--export-kv is not supported for granitehybrid (Granite 4.0-H) models yet"
             ));
         }
-        let (generated, text, k_caches, v_caches, seq_len) = self.generate_dense_impl(
+        let (generated, text, cache) = self.generate_capture_kv_dense(
             prompt,
             None,
-            1,
             &SamplingParams::default(),
             |_logits| {},
             |_id, _text| {},
         )?;
+        Ok(((generated[0], text), cache))
+    }
+
+    /// The body of [`Self::forward_prompt_capture_kv`], also reached through
+    /// `Model::generate_capture_kv`: generates one token after `prompt`
+    /// (resuming from `imported` when given) and downloads the caches, which
+    /// then hold exactly the imported positions plus the prompt's.
+    pub(super) fn generate_capture_kv_dense(
+        &self,
+        prompt: &str,
+        imported: Option<&crate::kv_io::DenseKvCache>,
+        sampling: &SamplingParams,
+        on_first_token: impl FnMut(&[f32]),
+        on_token: impl FnMut(u32, &str),
+    ) -> Result<(Vec<u32>, String, crate::kv_io::DenseKvCache), ReflexError> {
+        let (generated, text, k_caches, v_caches, seq_len) =
+            self.generate_dense_impl(prompt, imported, 1, sampling, on_first_token, on_token)?;
 
         let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
         let per_layer_len = seq_len * kv_stride;
@@ -2119,6 +2135,6 @@ impl Model {
             k_caches,
             v_caches,
         };
-        Ok(((generated[0], text), cache))
+        Ok((generated, text, cache))
     }
 }
