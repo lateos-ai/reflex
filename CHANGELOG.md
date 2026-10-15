@@ -24,6 +24,15 @@ What has been built, in order. Measurements live in
   one. They use the same cache formats as `--export-kv`/`--import-kv`, and a request
   can set both to layer prefixes. The caller owns the files, so the engine still keeps
   nothing between requests. `agent_relay_bench.py --reuse-prefix` measures it.
+- **Faster quantized-resident decode.** With `REFLEX_QUANT_RESIDENT=1`, the decode-step
+  Q4_K GEMV computes 4 output rows per warp and reuses each activation load across them.
+  It is 1.6-1.8x faster per call and bit-identical to the previous kernel. Dense
+  models' Q6_K layer tensors now stay quantized too (as Kolibri-1's already did), with a
+  coalesced Q6_K dequant for prefill, and the Q4_K/Q6_K GEMVs no longer zero their
+  outputs first. On a T4, decode is 16-31% faster: Qwen3-0.6B 6.09 -> 4.86 ms/token,
+  Mistral 7B 45.8 -> 31.7 ms/token. Prefill costs 1-8% more, and Mistral's first token
+  comes ~650 ms sooner. See
+  [docs/design/quantized-resident-weights.md](docs/design/quantized-resident-weights.md).
 
 ## 2026-10-15
 

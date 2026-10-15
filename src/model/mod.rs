@@ -197,12 +197,19 @@ pub struct Model {
     /// `gemv_q4k_kernel` (`kernels_cuda/gemv_q4k.cu`), loaded only when the
     /// dense path keeps weights quantized (`REFLEX_QUANT_RESIDENT=1`).
     gemv_q4k_k: Option<AotKernel>,
+    /// `gemv_q4k_r1_kernel` (same module): the one-row (decode) form of
+    /// `gemv_q4k_k`, several output rows per warp.
+    gemv_q4k_r1_k: Option<AotKernel>,
     /// `dequantize_q4k_coalesced_kernel` (same module), for the
     /// quantized-resident prefill path's scratch buffer with `--weights f32`.
     dequant_q4k_coalesced_k: Option<AotKernel>,
     /// `dequantize_q4k_coalesced_f16_kernel` (same module): the same, writing
     /// the `--weights f16` scratch buffer.
     dequant_q4k_coalesced_f16_k: Option<AotKernel>,
+    /// `dequantize_q6k_coalesced_kernel`/`_f16_kernel` (same module): Q6_K
+    /// layer tensors' prefill scratch, `--weights f32` and `f16`.
+    dequant_q6k_coalesced_k: Option<AotKernel>,
+    dequant_q6k_coalesced_f16_k: Option<AotKernel>,
     /// `gemv_q6k_kernel` (same module), for a quantized-resident LM head.
     gemv_q6k_k: Option<AotKernel>,
     /// `kernels_cuda/gemv_q8_0.cu`, loaded only when the Gemma 4 path keeps

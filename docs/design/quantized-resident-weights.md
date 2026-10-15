@@ -891,3 +891,85 @@ shapes (weight GB/s, A40):
    needs its own numerics check. For a warm Gemma 4 classifier, flag off is still the
    faster choice when the model fits in f16 (109 vs 73 ms).
 4. **Not done:** the 12B on an actual 24 GB card, and Q4_0 files.
+
+## Faster Q4_K/Q6_K decode on the dense path (2026-10-15)
+
+**Where decode time went.** A T4 nsys profile of Qwen3-0.6B with the flag on, at ~1,550
+positions of context, cost 7.9 ms per decode step:
+- `gemv_q4k_kernel`, 2.71 ms. It reads ~250 MB at ~92 GB/s, about 29% of the T4's
+  bandwidth.
+- The file's Q6_K `attn_v`/`ffn_down`, still dequantized to f16 at load: 0.5 ms of f16
+  GEMV.
+- The Q6_K LM head: 0.66 ms.
+- 169 memsets per step zeroing GEMV outputs: 0.21 ms of GPU time and 0.66 ms of host time.
+
+**Why the Q4_K GEMV was slow.** It isn't DRAM-bound: shapes that sit in the 4 MB L2 ran
+no faster. Each lane reads its own 32 f32 activations per super-block, about 4 bytes of
+`x` for every 0.56 bytes of weight. Two variants were tried and changed nothing:
+- one accumulator instead of eight;
+- the block header as one 16-byte load, with `x` staged in shared memory.
+llama.cpp avoids the problem by quantizing `x` to Q8_1 and using `dp4a`. This path keeps
+`x` in f32.
+
+**What changed.**
+- **`gemv_q4k_r1_kernel`** (`kernels_cuda/gemv_q4k.cu`) handles `rows == 1`. Each warp
+  computes 4 output rows. A lane loads its activations once per super-block and reuses
+  them for all 4 rows, and it issues every row's header and `qs` loads before using any.
+  A nibble becomes a float through the exponent trick, which is exact for 0..15, instead
+  of an I2F (quarter rate on Turing). Per row, the lane layout, decode expression and
+  summation order are `gemv_q4k_kernel`'s, so outputs are bit-identical
+  (`gemv_q4k_decode_variants_timings` asserts it). The other variants measured were all
+  slower: 1 or 2 rows per warp, 8 rows with 2-warp blocks, and two super-block groups in
+  flight per lane. Gemma 4's `gemv_q8_0` came to the same 4 rows.
+- **Dense Q6_K layer tensors stay quantized** (`attn_v`/`ffn_down` in half the layers of a
+  Q4_K_M file), as Kolibri-1's already did. Decode reads them with `gemv_q6k_kernel`.
+  Prefills above one row dequantize them into the scratch with the new
+  `dequantize_q6k_coalesced{,_f16}_kernel`: one thread per element, bit-identical to the
+  load-time kernel (`quant_resident_q6k_dequant_coalesced_bit_exact`). That kernel gives
+  each thread a whole block and would cost tens of ms per prefill here. Kolibri-1's Q6_K
+  scratch uses it too now.
+- **`gemv_q4k` and `gemv_q6k` allocate their outputs without zeroing** (`alloc_out`); both
+  kernels write every element.
+
+**Kernel times** (T4, synthetic weights, each timing cycles through enough copies to miss
+the L2):
+
+| shape (in x out) | Q4_K MB | `gemv_q4k_kernel` | `gemv_q4k_r1_kernel` | f16 GEMV |
+|---|---:|---:|---:|---:|
+| 1024 x 2048 | 1.18 | 15.6 us | 9.2 us | 18.5 us |
+| 1024 x 1024 | 0.59 | 10.4 us | 6.7 us | 10.7 us |
+| 1024 x 3072 | 1.77 | 20.7 us | 12.0 us | 26.4 us |
+| 3072 x 1024 | 1.77 | 22.1 us | 13.1 us | 26.9 us |
+| 4096 x 4096 | 9.44 | 84.8 us | 50.2 us | 126.3 us |
+| 4096 x 14336 | 33.0 | 295 us | 166 us | 434 us |
+
+**End to end** (T4, `reflex generate`, 257 tokens, the old and new binaries alternated
+three times, medians; every run generated all 257 tokens). Decode per token is (last
+token − first token) / 256:
+
+| model, flag on | context | decode before | decode after | prefill before | prefill after |
+|---|---|---:|---:|---:|---:|
+| Qwen3-0.6B | short | 6.09 ms | 4.86 ms | 55.0 ms | 56.0 ms |
+| Qwen3-0.6B | ~1,550 | 7.55 ms | 6.37 ms | 284.9 ms | 287.1 ms |
+| Mistral 7B | short | 45.8 ms | 31.7 ms | 276.9 ms | 300.0 ms |
+| Mistral 7B | ~1,550 | 47.8 ms | 33.5 ms | 1,594 ms | 1,627 ms |
+
+- **Decode is 16-31% faster.** Mistral 7B gains the most, because nearly all of its step
+  is weight GEMVs.
+- **Prefill costs 1-8% more.** Q6_K tensors are now dequantized into the scratch on every
+  prefill above one row, where before they were f16 weights read by cuBLAS directly.
+  That's 23 ms on Mistral's short prompt.
+- **Mistral's first token is ~650 ms sooner** (2.18 → 1.53 s from process start), because
+  its Q6_K tensors are no longer dequantized to f16 at load.
+- The flag-off f16 path is unchanged (8.31 ms per token before and after).
+- The GPU nightly suite passes (86 passed, 0 failed, 4 skipped), including every
+  quantized-resident and Kolibri-1 test.
+
+**What's left** (Qwen3-0.6B, flag on, ~1,550 positions: 6.5 ms per step in the profile;
+llama.cpp decodes at 4.7):
+- Q4_K GEMVs, 1.66 ms, still only ~150 GB/s.
+- Decode attention over an f32 KV cache, 1.54 ms.
+- Q6_K GEMVs, 1.12 ms. The LM head is 0.66 ms of that, and `gemv_q6k_kernel` has the same
+  one-row-per-warp layout the Q4_K kernel just dropped, so the same change should apply.
+- rmsnorm, 0.79 ms over 113 small launches.
+- About 0.9 ms of idle GPU between steps.
