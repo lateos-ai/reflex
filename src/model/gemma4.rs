@@ -435,6 +435,7 @@ impl Model {
                 rope_freqs,
                 ones,
             }),
+            granite: None,
         })
     }
 

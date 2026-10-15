@@ -329,6 +329,10 @@ pub fn run(args: Vec<String>) {
             ArchitectureKind::Gemma4 => {
                 crate::fail("--export-kv failed", "not supported for Gemma 4 models yet")
             }
+            ArchitectureKind::GraniteHybrid => crate::fail(
+                "--export-kv failed",
+                "not supported for granitehybrid (Granite 4.0-H) models yet",
+            ),
         };
         let elapsed = t0.elapsed();
         let energy_measurement = sampler.measure();

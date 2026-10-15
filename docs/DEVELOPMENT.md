@@ -146,8 +146,9 @@ machine, or see [gpu-ci.md](gpu-ci.md) for the nightly GPU workflow.
 device-resident buffer. Matrix weights (the operands of the matmul kernels:
 `is_matrix_weight` in `src/model/loading.rs`) are stored as `f16` by default and as
 `f32` with `--weights f32` / `REFLEX_WEIGHTS=f32`. Everything else is always `f32`:
-norms, biases, the Gated DeltaNet `ssm_*` tensors, the MoE routers, activations and the
-KV cache. `Weight.data` is a `WeightData` enum (`F32`, `F16`, `Quant`), and every matmul
+norms, biases, the Gated DeltaNet `ssm_*` tensors, Mamba-2's `ssm_conv1d`, `ssm_a`,
+`ssm_d` and `ssm_norm` (2-D in the GGUF, but vectors to the kernels), the MoE routers,
+activations and the KV cache. `Weight.data` is a `WeightData` enum (`F32`, `F16`, `Quant`), and every matmul
 wrapper in `src/model/kernels.rs` dispatches on it.
 
 - **The f16 path reads f16 weights and accumulates in f32.** Decode GEMVs
@@ -163,7 +164,7 @@ wrapper in `src/model/kernels.rs` dispatches on it.
 
 **Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense Qwen3/Llama/Mistral path, and Kolibri-1,
 whose Q4_K and Q6_K tensors stay quantized including the stacked experts; other MoE
-models, hybrid and MLA print a notice and keep their normal storage). Q4_K matmul weights are uploaded
+models, hybrid, MLA and Granite 4.0-H print a notice and keep their normal storage). Q4_K matmul weights are uploaded
 as their raw GGUF blocks into one device arena and dequantized inside the matmul
 kernels (`gemv_q4k`, the fused multi-row prefill kernel), or, for longer prompts, into
 a reused device scratch buffer that cuBLAS then reads. That scratch buffer has the
@@ -309,6 +310,24 @@ in `test-data/` locally:
   `836d571` plus the community `kolibri1-llama.cpp.patch` (see
   [design/kolibri.md](design/kolibri.md)). Source and build scripts are archived as
   `test-data/tiny-kolibri1-src.tar.gz`.
+- `test-data/tiny-granitehybrid.gguf` is a synthetic `granitehybrid` (Granite 4.0-H)
+  model: 6 layers (4 Mamba-2, 2 attention without RoPE), 8 SSM heads of 32 over 2 groups,
+  `d_state` 128, non-default muP scales, tied embeddings and the real Granite 4.0-H 350M
+  tokenizer. Its shapes keep llama.cpp's CUDA backend on its SSM kernels. Dropping `D`,
+  `dt_bias`, the `z` gate, the conv bias, the grouped norm or any muP scale but the
+  logit scale changes every comparison prompt's greedy tokens in llama.cpp; the logit
+  scale is checked through the logit values. Built from a random
+  `GraniteMoeHybridForCausalLM` checkpoint through llama.cpp `79e2e74`'s unmodified
+  `convert_hf_to_gguf.py` (`transformers` 4.57.1 and 5.19 give byte-identical files).
+  Builder, prompts, references and the sensitivity check:
+  `test-data/tiny-granitehybrid-src.tar.gz`.
+- `test-data/granite-4.0-h-{350m,1b,micro,tiny}-header.gguf` are real Granite 4.0-H
+  headers (metadata and tensor table) for the `granitehybrid` config tests, and
+  `falcon-h1-tiny-90m-header.gguf`, `nemotron-3-nano-4b-header.gguf`,
+  `jamba-900m-header.gguf` and `mamba2-130m-header.gguf` back the tests that reject
+  those architectures by name. `test-data/granite-tokenizer.gguf` is the tokenizer-only
+  file for the `dbrx` pre-type golden test. Sources:
+  [design/mamba2-hybrid.md](design/mamba2-hybrid.md).
 - Tests that need a real model read its path from `REFLEX_TEST_GGUF`.
 
 [`scripts/gpu_nightly_tests.sh`](../scripts/gpu_nightly_tests.sh) maps each GPU test to
@@ -319,3 +338,9 @@ the file it needs and reports the ones it can't run as skipped.
 `reference/gated_deltanet_reference.rs` is a host (CPU) implementation of the Qwen3.5
 Gated DeltaNet recurrence. It served as the correctness oracle while the GPU kernel was
 being debugged. It is not compiled as part of the crate.
+
+`reference/mamba2_reference.rs` is the same for one Mamba-2 step (conv, scan, D skip,
+gate, grouped RMSNorm), written before `kernels_cuda/mamba2.cu`. It is plain Rust with no
+dependencies and is compiled into the test build only (`src/model/mod.rs` includes it with
+`#[path]`): its own unit tests run under `cargo test`, and the Mamba-2 kernel tests
+compare against it.

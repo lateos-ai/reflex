@@ -3,6 +3,38 @@
 What has been built, in order. Measurements live in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+## 2026-10-15
+
+- **Granite 4.0-H (`granitehybrid`), the first Mamba-2 hybrid.** Mamba-2 SSM layers
+  plus a few attention layers (no RoPE), each followed by a SwiGLU FFN, with Granite's
+  muP scales (embedding, residual, attention, logits).
+  - **New kernels** in `kernels_cuda/mamba2.cu`: causal conv with bias, the selective
+    scan (per-head `A`, softplus `dt` with bias, `B`/`C` over groups), and the D skip
+    with the `z` gate and grouped RMSNorm. They are checked against a host reference,
+    `reference/mamba2_reference.rs`. On SSM layers the projections stay batched over
+    the prompt and the recurrence walks the rows inside each kernel; there is no
+    chunked parallel scan.
+  - **Tokenizer:** new pre type `dbrx` (Granite 4.0's): the Llama-3 split without
+    `ignore_merges`, matching `llama-tokenize` 13/13.
+  - **Rejected at load, with the key or tensor named:** MoE Granite 4.0-H (Tiny,
+    Small), RoPE on the attention layers, attention/FFN biases, SSM layers without a
+    norm or conv bias, and SSM shapes the kernels don't cover. `mamba`, `mamba2`,
+    `jamba`, `falcon-h1`, `nemotron_h` and `nemotron_h_moe` are rejected by name;
+    before, Jamba and Nemotron-H MoE reached the generic MoE path and failed on a
+    missing tensor. `--lora` and `--export-kv`/`--import-kv` are rejected for this
+    architecture. `system1` takes single-token candidates only.
+  - **Verified** against llama.cpp `79e2e74` on an RTX 4000 Ada:
+    - The synthetic fixture matches 7/7 prompts × 20 greedy tokens (f32 and f16).
+    - With f32 activations, Granite 4.0-H 350M and 1B `Q8_0` match 5/6 each. The one
+      divergence per model is a near-tie (margin 0.002 and 0.033) where Reflex picks
+      llama.cpp's own runner-up.
+    - `reflex check` is unchanged on all 48 existing rows. The GPU nightly passes 65,
+      fails 0, skips 3.
+  - **Performance:** cold start on the 350M is 0.76 s p50 vs `llama-simple`'s 0.83 s.
+    Per-token decode is flat from 57 to 8,191 tokens of context.
+
+  Design, survey and results: [docs/design/mamba2-hybrid.md](docs/design/mamba2-hybrid.md).
+
 ## 2026-10-14
 
 - **Runpod Hub test job no longer depends on one data center's RTX A4500s**

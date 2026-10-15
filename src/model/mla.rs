@@ -516,6 +516,7 @@ impl Model {
                 mla_write_kv_cache_batch_k,
             }),
             gemma4: None,
+            granite: None,
         })
     }
 
