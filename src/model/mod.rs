@@ -940,6 +940,91 @@ impl Model {
         }
     }
 
+    /// Like [`Self::generate`] with `max_new_tokens == 1`, but also returns the
+    /// model's state right after the prompt (the imported positions, if any,
+    /// plus the prompt's own), ready for `crate::kv_io::export_kv`. It's one
+    /// token because that state is what a later request resumes from: the
+    /// Qwen3.5 hybrid's recurrent state can't be rolled back past tokens
+    /// generated after the prompt. Used by IPC's `export_kv` field; the CLI's
+    /// `--export-kv` predates it and calls the per-architecture
+    /// `forward_prompt_capture_kv*` functions directly. Gemma 4 and
+    /// granitehybrid have no cache file format yet.
+    pub fn generate_capture_kv(
+        &self,
+        prompt: &str,
+        imported: Option<&crate::kv_io::ImportedKv>,
+        sampling: &SamplingParams,
+        on_first_token: impl FnMut(&[f32]),
+        on_token: impl FnMut(u32, &str),
+    ) -> Result<(Vec<u32>, String, crate::kv_io::ImportedKv), ReflexError> {
+        use crate::kv_io::ImportedKv;
+        if self.gemma4.is_some() {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "KV cache export is not supported for Gemma 4 models yet"
+            ));
+        }
+        if self.granite.is_some() {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "KV cache export is not supported for granitehybrid (Granite 4.0-H) models yet"
+            ));
+        }
+        let model_format = if self.hybrid.is_some() {
+            "hybrid"
+        } else if self.mla.is_some() {
+            "MLA"
+        } else {
+            "dense/MoE"
+        };
+        let mismatch = |kv: &ImportedKv| {
+            ReflexError::KvCache(format!(
+                "imported KV cache file is {} format, but this model uses the {model_format} format",
+                kv.format_name()
+            ))
+        };
+        if let Some(h) = &self.hybrid {
+            let imported = match imported {
+                None => None,
+                Some(ImportedKv::Hybrid(c)) => Some(c),
+                Some(other) => return Err(mismatch(other)),
+            };
+            let (ids, text, cache) = self.generate_capture_kv_hybrid(
+                h,
+                prompt,
+                imported,
+                sampling,
+                on_first_token,
+                on_token,
+            )?;
+            return Ok((ids, text, ImportedKv::Hybrid(cache)));
+        }
+        if let Some(m) = &self.mla {
+            let imported = match imported {
+                None => None,
+                Some(ImportedKv::Mla(c)) => Some(c),
+                Some(other) => return Err(mismatch(other)),
+            };
+            let (ids, text, cache) = self.generate_capture_kv_mla(
+                m,
+                prompt,
+                imported,
+                sampling,
+                on_first_token,
+                on_token,
+            )?;
+            return Ok((ids, text, ImportedKv::Mla(cache)));
+        }
+        let imported = match imported {
+            None => None,
+            Some(ImportedKv::Dense(c)) => Some(c),
+            Some(other) => return Err(mismatch(other)),
+        };
+        let (ids, text, cache) =
+            self.generate_capture_kv_dense(prompt, imported, sampling, on_first_token, on_token)?;
+        Ok((ids, text, ImportedKv::Dense(cache)))
+    }
+
     /// Copies row `rows - 1` (the last prompt position) out of a batched
     /// `[rows, hidden_size]` prefill output (`Self::prefill_dense_batched`)
     /// into its own owned buffer. Every current caller only wants that row

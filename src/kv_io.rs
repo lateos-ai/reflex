@@ -100,12 +100,33 @@ pub struct MlaKvCache {
 
 /// What `import_kv` found in the file -- dispatched on by `Model::generate`
 /// to pick the matching resume path (and to reject a format/architecture
-/// mismatch with a clear error instead of silently misreading bytes).
+/// mismatch with a clear error instead of silently misreading bytes). Also
+/// what `Model::generate_capture_kv` hands back for [`export_kv`].
 #[derive(Debug)]
 pub enum ImportedKv {
     Dense(DenseKvCache),
     Hybrid(HybridKvCache),
     Mla(MlaKvCache),
+}
+
+impl ImportedKv {
+    /// The layout's name, for error messages.
+    pub fn format_name(&self) -> &'static str {
+        match self {
+            ImportedKv::Dense(_) => "dense/MoE",
+            ImportedKv::Hybrid(_) => "hybrid",
+            ImportedKv::Mla(_) => "MLA",
+        }
+    }
+}
+
+/// Writes any of the three layouts, the counterpart to [`import_kv`].
+pub fn export_kv(path: &str, cache: &ImportedKv) -> Result<(), ReflexError> {
+    match cache {
+        ImportedKv::Dense(c) => export_dense_kv(path, c),
+        ImportedKv::Hybrid(c) => export_hybrid_kv(path, c),
+        ImportedKv::Mla(c) => export_mla_kv(path, c),
+    }
 }
 
 pub fn export_dense_kv(path: &str, cache: &DenseKvCache) -> Result<(), ReflexError> {
@@ -412,6 +433,15 @@ mod tests {
         let via_import_kv = match import_kv(path_str).expect("import_kv failed") {
             ImportedKv::Dense(c) => c,
             _ => panic!("import_kv misdetected a dense file"),
+        };
+        let bytes = std::fs::read(&path).unwrap();
+        // The generic `export_kv` writes the same bytes as `export_dense_kv`.
+        let wrapped = ImportedKv::Dense(reimported);
+        assert_eq!(wrapped.format_name(), "dense/MoE");
+        export_kv(path_str, &wrapped).expect("export_kv failed");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let ImportedKv::Dense(reimported) = wrapped else {
+            unreachable!()
         };
         std::fs::remove_file(&path).ok();
 

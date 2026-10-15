@@ -1954,15 +1954,32 @@ impl Model {
                 "forward_prompt_capture_kv_hybrid called on a non-hybrid model".to_string(),
             )
         })?;
-        let (generated, text, states, seq_len) = self.generate_hybrid_impl(
+        let (generated, text, cache) = self.generate_capture_kv_hybrid(
             h,
             prompt,
             None,
-            1,
             &SamplingParams::default(),
             |_logits| {},
             |_id, _text| {},
         )?;
+        Ok(((generated[0], text), cache))
+    }
+
+    /// Hybrid counterpart to `generate_capture_kv_dense`: one generated
+    /// token, then every layer's state after the imported positions plus the
+    /// prompt. Exactly one token, because the GDN `recurrent` state can't be
+    /// rolled back to the prompt once later tokens have passed through it.
+    pub(super) fn generate_capture_kv_hybrid(
+        &self,
+        h: &HybridModel,
+        prompt: &str,
+        imported: Option<&crate::kv_io::HybridKvCache>,
+        sampling: &SamplingParams,
+        on_first_token: impl FnMut(&[f32]),
+        on_token: impl FnMut(u32, &str),
+    ) -> Result<(Vec<u32>, String, crate::kv_io::HybridKvCache), ReflexError> {
+        let (generated, text, states, seq_len) =
+            self.generate_hybrid_impl(h, prompt, imported, 1, sampling, on_first_token, on_token)?;
 
         let attn_len = seq_len * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
         let mut layers = Vec::with_capacity(states.len());
@@ -2010,6 +2027,6 @@ impl Model {
             gdn_recurrent_len: h.gdn_cfg.recurrent_len(),
             layers,
         };
-        Ok(((generated[0], text), cache))
+        Ok((generated, text, cache))
     }
 }
