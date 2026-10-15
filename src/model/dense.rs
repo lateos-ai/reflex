@@ -704,6 +704,7 @@ impl Model {
             hybrid: None,
             mla: None,
             gemma4: None,
+            granite: None,
         })
     }
 
@@ -2048,6 +2049,12 @@ impl Model {
             return Err(crate::reflex_err!(
                 UnsupportedArchitecture,
                 "--export-kv is not supported for Gemma 4 models yet"
+            ));
+        }
+        if self.granite.is_some() {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "--export-kv is not supported for granitehybrid (Granite 4.0-H) models yet"
             ));
         }
         let (generated, text, k_caches, v_caches, seq_len) = self.generate_dense_impl(

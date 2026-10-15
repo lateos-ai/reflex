@@ -118,6 +118,10 @@ pub enum PreType {
     /// runs grouped up to three (`\p{N}{1,3}`), plus llama.cpp's
     /// `ignore_merges` (a pre-token that is already one vocab entry skips BPE).
     Llama3,
+    /// `LLAMA_VOCAB_PRE_TYPE_DBRX` (`dbrx`, Granite 4.0): LLAMA3's regex
+    /// string (`llama-vocab.cpp`: "same as llama3"), so the same split, but
+    /// without `ignore_merges`.
+    Dbrx,
     /// `LLAMA_VOCAB_PRE_TYPE_GPT2` (`gpt-2`): the original GPT-2 regex.
     Gpt2,
     /// `LLAMA_VOCAB_PRE_TYPE_DEEPSEEK_LLM` (`deepseek-llm`): six regexes
@@ -152,6 +156,9 @@ impl PreType {
         // whose regex is LLAMA3's string (so `unicode_regex_split_custom_llama3`)
         // with `ignore_merges`, plus no BOS ([`PreType::value_disables_bos`]).
         ("glm4", PreType::Llama3),
+        // Granite 4.0 (`granitehybrid`): llama.cpp sets no flags for `dbrx`,
+        // so no `ignore_merges` and the BOS follows `add_bos_token`.
+        ("dbrx", PreType::Dbrx),
     ];
 
     /// Whether llama.cpp sets `special_bos_id = LLAMA_TOKEN_NULL` for this
@@ -1108,7 +1115,7 @@ fn pretokenize(pre_type: PreType, chars: &[char]) -> Vec<(usize, usize)> {
         PreType::Qwen35 => split_custom(chars, &whole, |c, e, p| {
             llama3_family_step(c, e, p, 1, true)
         }),
-        PreType::Llama3 => split_custom(chars, &whole, |c, e, p| {
+        PreType::Llama3 | PreType::Dbrx => split_custom(chars, &whole, |c, e, p| {
             llama3_family_step(c, e, p, 3, false)
         }),
         PreType::Gpt2 => split_custom(chars, &whole, gpt2_step),
@@ -2945,6 +2952,81 @@ mod tests {
                 ],
             ],
         );
+    }
+
+    /// `dbrx` (DBRX: LLAMA3's split without `ignore_merges`, the pre type of
+    /// Granite 4.0). `test-data/granite-tokenizer.gguf`: metadata of
+    /// https://huggingface.co/ibm-granite/granite-4.0-h-350m-GGUF/resolve/main/granite-4.0-h-350m-Q8_0.gguf
+    /// (HTTP range `bytes=0-41943039`, rewritten by `scripts/gguf_tokenizer_only.py`).
+    /// Strings 3, 4, 6, 9, 11 and 13 differ from what `ignore_merges` would give.
+    #[test]
+    fn test_dbrx_encode_matches_llama_tokenize_if_fixture_present() {
+        assert_pre_type_golden_if_fixture_present(
+            "granite-tokenizer.gguf",
+            PreType::Dbrx,
+            &[
+                &[
+                    4513, 1774, 220, 18, 13, 9335, 2946, 220, 4513, 10961, 16474, 15,
+                ],
+                &[
+                    15357, 956, 358, 6, 4178, 584, 3077, 814, 95253, 433, 596, 15334, 28805,
+                ],
+                &[
+                    9906, 1917, 0, 220, 57668, 53901, 3922, 3574, 244, 98220, 1811, 9080, 22656,
+                    45918, 252, 16144, 57933, 62903, 71634, 5486, 71493, 47307, 71493, 96452, 1811,
+                    24486, 89059, 255, 32179, 54535, 41953, 80052, 13,
+                ],
+                &[
+                    87533, 25, 6498, 11, 49520, 44155, 80112, 12415, 71995, 11, 8008, 243, 34586,
+                    34586, 42524, 34369, 30862, 68437, 75234, 11, 17607, 24102, 11318, 22071,
+                    74541, 11, 220, 50856, 36984, 35609,
+                ],
+                &[
+                    1074, 832, 198, 1074, 1403, 201, 1432, 220, 1280, 16243, 197, 3324, 3518, 5996,
+                ],
+                &[
+                    38623, 62904, 233, 9468, 237, 121, 11410, 236, 231, 9468, 236, 231, 71570,
+                    31643, 62904, 101, 378, 235, 9468, 239, 102, 378, 235, 9468, 239, 100,
+                ],
+                &[
+                    47, 73399, 12340, 52417, 2564, 12730, 1819, 10340, 220, 46691, 21806, 14316,
+                    571, 49177, 46999, 5, 9,
+                ],
+                &[256, 6522, 12908, 323, 28848, 262],
+                &[
+                    936, 59958, 95980, 588, 384, 54939, 264, 97649, 308, 136, 225, 78,
+                ],
+                &[
+                    87, 284, 15586, 55730, 11, 220, 2983, 317, 333, 320, 87, 2669, 220, 605, 8,
+                    314, 471, 330, 564, 5233, 457,
+                ],
+                &[4194, 5792, 23249, 95107, 3634, 378, 225, 336],
+                &[
+                    1569, 99, 15755, 243, 15755, 234, 15755, 234, 1569, 115, 15755, 231, 15755,
+                    226, 15755, 242, 15755, 230, 220, 20713, 25963, 34617, 220, 6447, 11571,
+                ],
+                &[
+                    39, 29785, 25, 15272, 101, 88344, 79468, 31584, 97, 35470, 15272, 99, 73753,
+                    61196, 43411, 107, 24810, 11, 35217, 449, 4960, 587, 266, 25, 24252, 29010,
+                    11318, 60497, 30925, 29010, 22071, 149, 233, 5821,
+                ],
+            ],
+        );
+    }
+
+    /// Granite 4.0 files declare BOS 100257 with `add_bos_token = false`, and
+    /// llama.cpp's `dbrx` sets no BOS flag of its own, so no BOS is prepended.
+    #[test]
+    fn test_dbrx_granite_adds_no_bos_if_fixture_present() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test-data/granite-tokenizer.gguf");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let file = GgufFile::open(&path).expect("open granite-tokenizer.gguf");
+        let tok = Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf");
+        assert_eq!(tok.prompt_bos(), None);
     }
 
     /// llama.cpp sets `special_bos_id = LLAMA_TOKEN_NULL` for `glm4`, so a GLM

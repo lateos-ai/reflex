@@ -188,6 +188,24 @@ pub fn parse_model_config(
         ));
     }
 
+    // SSM architectures llama.cpp supports and this engine doesn't. Some
+    // report a nonzero `expert_count` (Jamba, Nemotron-H MoE), so without
+    // this check they would reach the generic MoE path and fail on a missing
+    // tensor instead of saying why. `granitehybrid` has its own loader.
+    if let Some(why) = match architecture {
+        "mamba" | "jamba" => Some("Mamba-1 SSM layers"),
+        "mamba2" | "falcon-h1" | "nemotron_h" | "nemotron_h_moe" => {
+            Some("a Mamba-2 layout other than Granite 4.0-H's")
+        }
+        _ => None,
+    } {
+        return Err(crate::reflex_err!(
+            UnsupportedArchitecture,
+            "unsupported architecture '{architecture}' ({why}): the only SSM hybrid supported is \
+             'granitehybrid' (Granite 4.0-H); see docs/design/mamba2-hybrid.md"
+        ));
+    }
+
     let moe = match u64_meta(file, &format!("{architecture}.expert_count")).filter(|&n| n > 0) {
         Some(expert_count) => {
             let expert_used_count = u64_meta(file, &format!("{architecture}.expert_used_count"))
@@ -1435,5 +1453,297 @@ pub(super) fn parse_gemma4_config(file: &GgufFile) -> Result<Gemma4Config, Refle
         sliding_window,
         final_logit_softcap: f32_meta(file, &key("final_logit_softcapping")).filter(|&c| c != 0.0),
         layers,
+    })
+}
+
+/// The Mamba-2 SSM layers' shape, shared by every SSM layer of a model
+/// (`{arch}.ssm.*`). The math is in `reference/mamba2_reference.rs`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Mamba2Config {
+    /// `ssm.inner_size` (`D`).
+    pub(super) d_inner: usize,
+    /// `ssm.state_size` (`N`).
+    pub(super) d_state: usize,
+    /// `ssm.group_count` (`G`): head `h` reads `B`/`C` group `h / (H / G)`.
+    pub(super) n_group: usize,
+    /// `ssm.time_step_rank` (`H`): the head count, not a low-rank `dt` as in
+    /// Mamba-1.
+    pub(super) n_head: usize,
+    /// `ssm.conv_kernel`.
+    pub(super) d_conv: usize,
+}
+
+impl Mamba2Config {
+    /// `P`, each head's slice of `d_inner`.
+    pub(super) fn head_dim(&self) -> usize {
+        self.d_inner / self.n_head
+    }
+
+    /// `C = D + 2·G·N`: the channels the conv runs over (x, B, C).
+    pub(super) fn conv_dim(&self) -> usize {
+        self.d_inner + 2 * self.n_group * self.d_state
+    }
+
+    /// `ssm_in`'s output length: z (`D`), xBC (`C`), dt (`H`).
+    pub(super) fn d_in_proj(&self) -> usize {
+        self.d_inner + self.conv_dim() + self.n_head
+    }
+
+    /// Floats in one layer's conv state, `[d_conv - 1, C]`.
+    pub(super) fn conv_state_len(&self) -> usize {
+        (self.d_conv - 1) * self.conv_dim()
+    }
+
+    /// Floats in one layer's SSM state, `[H, P, N]`.
+    pub(super) fn ssm_state_len(&self) -> usize {
+        self.d_inner * self.d_state
+    }
+}
+
+/// A Granite 4.0-H (`granitehybrid`) model's configuration, read by
+/// [`parse_granite_hybrid_config`].
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct GraniteHybridConfig {
+    pub(super) hidden_size: usize,
+    /// One entry per layer: `true` = Mamba-2 SSM mixer, `false` = attention.
+    /// llama.cpp: a layer is recurrent iff its `attention.head_count_kv` is 0.
+    pub(super) ssm_layers: Vec<bool>,
+    pub(super) num_q_heads: usize,
+    /// The attention layers' KV head count (the nonzero entries of
+    /// `attention.head_count_kv`, required to agree).
+    pub(super) num_kv_heads: usize,
+    pub(super) head_dim: usize,
+    pub(super) ffn_hidden_size: usize,
+    pub(super) rmsnorm_eps: f32,
+    /// `embedding_scale`: token embeddings are multiplied by it (1.0 when the
+    /// key is absent or 0, which llama.cpp skips).
+    pub(super) embedding_scale: f32,
+    /// `residual_scale`: each sublayer's output is multiplied by it before
+    /// its residual add (1.0 when absent or 0).
+    pub(super) residual_scale: f32,
+    /// `attention.scale`: the attention's `kq_scale`, or `1/sqrt(head_dim)`
+    /// when absent or 0.
+    pub(super) attention_scale: f32,
+    /// `logit_scale`: logits are multiplied by `1 / logit_scale` (`None` when
+    /// absent or 0).
+    pub(super) logit_scale: Option<f32>,
+    pub(super) ssm: Mamba2Config,
+}
+
+/// The tensors a Granite 4.0-H layer may carry in llama.cpp that this path
+/// doesn't implement (no surveyed file has them).
+const GRANITE_UNSUPPORTED_BIASES: [&str; 7] = [
+    "attn_q.bias",
+    "attn_k.bias",
+    "attn_v.bias",
+    "attn_output.bias",
+    "ffn_gate.bias",
+    "ffn_up.bias",
+    "ffn_down.bias",
+];
+
+/// Reads `file`'s [`GraniteHybridConfig`] from `granitehybrid.*` metadata,
+/// following llama.cpp `79e2e74`'s `llama_model_granite_hybrid`
+/// (`src/models/granite-hybrid.cpp`). Rejects, naming the key or tensor,
+/// every variant this path doesn't implement: MoE FFNs (Granite 4.0-H
+/// Tiny/Small), RoPE on the attention layers (`rope.scaling.finetuned` true,
+/// or absent, which llama.cpp reads as true), a file with no SSM layer,
+/// attention/FFN biases, an SSM layer without `ssm_norm` or a conv bias, and
+/// SSM shapes the kernels don't cover. Survey and sources:
+/// `docs/design/mamba2-hybrid.md`.
+pub(super) fn parse_granite_hybrid_config(
+    file: &GgufFile,
+) -> Result<GraniteHybridConfig, ReflexError> {
+    let arch = "granitehybrid";
+    let key = |suffix: &str| format!("{arch}.{suffix}");
+    let required = |suffix: &str| {
+        u64_meta(file, &key(suffix))
+            .map(|n| n as usize)
+            .ok_or_else(|| crate::reflex_err!(Gguf, "missing {} metadata key", key(suffix)))
+    };
+    let unsupported = |what: String| crate::reflex_err!(UnsupportedArchitecture, "{what}");
+
+    if let Some(n) = u64_meta(file, &key("expert_count")).filter(|&n| n > 0) {
+        return Err(unsupported(format!(
+            "{} = {n} is not supported: MoE Granite 4.0-H models (Tiny, Small) are out of \
+             scope; only the dense-FFN ones (350M, 1B, Micro) are",
+            key("expert_count")
+        )));
+    }
+    // llama.cpp defaults this switch to true when the key is missing.
+    match file.metadata.get(&key("rope.scaling.finetuned")) {
+        Some(GgufValue::Bool(false)) => {}
+        other => {
+            let value = match other {
+                Some(v) => format!("{v:?}"),
+                None => "absent (llama.cpp reads that as true)".to_string(),
+            };
+            return Err(unsupported(format!(
+                "{} = {value} is not supported: only attention without RoPE (the key set to \
+                 false, as in Granite 4.0-H) is implemented",
+                key("rope.scaling.finetuned")
+            )));
+        }
+    }
+    if let Some(scaling) = file
+        .metadata
+        .get(&key("rope.scaling.type"))
+        .and_then(GgufValue::as_str)
+        .filter(|s| *s != "none")
+    {
+        return Err(unsupported(format!(
+            "{} = {scaling:?} is not supported",
+            key("rope.scaling.type")
+        )));
+    }
+
+    let block_count = required("block_count")?;
+    let hidden_size = required("embedding_length")?;
+    let num_q_heads = required("attention.head_count")?;
+    let ffn_hidden_size = required("feed_forward_length")?;
+
+    let kv_key = key("attention.head_count_kv");
+    let kv_heads: Vec<usize> = match file.metadata.get(&kv_key) {
+        Some(GgufValue::Array(items)) if items.len() == block_count => items
+            .iter()
+            .map(|v| {
+                v.as_u64()
+                    .map(|n| n as usize)
+                    .ok_or_else(|| crate::reflex_err!(Gguf, "{kv_key} has entry {v:?}"))
+            })
+            .collect::<Result<_, _>>()?,
+        Some(GgufValue::Array(items)) => {
+            return Err(crate::reflex_err!(
+                Gguf,
+                "{kv_key} has {} entries but block_count is {block_count}",
+                items.len()
+            ))
+        }
+        Some(v) => {
+            let n = v
+                .as_u64()
+                .ok_or_else(|| crate::reflex_err!(Gguf, "{kv_key} is not an integer"))?;
+            vec![n as usize; block_count]
+        }
+        None => return Err(crate::reflex_err!(Gguf, "missing {kv_key} metadata key")),
+    };
+    let ssm_layers: Vec<bool> = kv_heads.iter().map(|&n| n == 0).collect();
+    if !ssm_layers.iter().any(|&s| s) {
+        return Err(unsupported(format!(
+            "{kv_key} has no zero entry, so this file has no SSM layer (a non-hybrid Granite \
+             model, which llama.cpp loads as 'granite'/'granitemoe'); not supported"
+        )));
+    }
+    let mut attn_kv = kv_heads.iter().copied().filter(|&n| n > 0);
+    let num_kv_heads = attn_kv.next().unwrap_or(1);
+    if let Some(other) = attn_kv.find(|&n| n != num_kv_heads) {
+        return Err(unsupported(format!(
+            "{kv_key} has differing nonzero entries ({num_kv_heads} and {other}); not supported"
+        )));
+    }
+    if num_q_heads == 0 || !num_q_heads.is_multiple_of(num_kv_heads) {
+        return Err(crate::reflex_err!(
+            Gguf,
+            "{} ({num_q_heads}) must be a nonzero multiple of the KV head count ({num_kv_heads})",
+            key("attention.head_count")
+        ));
+    }
+    let head_dim = u64_meta(file, &key("attention.key_length"))
+        .map(|n| n as usize)
+        .unwrap_or(hidden_size / num_q_heads);
+    if let Some(v) = u64_meta(file, &key("attention.value_length")) {
+        if v as usize != head_dim {
+            return Err(unsupported(format!(
+                "{} ({v}) != head dim ({head_dim}) is not supported",
+                key("attention.value_length")
+            )));
+        }
+    }
+
+    let ssm = Mamba2Config {
+        d_inner: required("ssm.inner_size")?,
+        d_state: required("ssm.state_size")?,
+        n_group: required("ssm.group_count")?,
+        n_head: required("ssm.time_step_rank")?,
+        d_conv: required("ssm.conv_kernel")?,
+    };
+    if ssm.d_inner != 2 * hidden_size {
+        return Err(unsupported(format!(
+            "{} = {} must be 2 * {} = {}, as llama.cpp asserts for {arch}",
+            key("ssm.inner_size"),
+            ssm.d_inner,
+            key("embedding_length"),
+            2 * hidden_size
+        )));
+    }
+    if ssm.n_head == 0 || !ssm.d_inner.is_multiple_of(ssm.n_head) {
+        return Err(crate::reflex_err!(
+            Gguf,
+            "{} = {} must divide {} = {}",
+            key("ssm.time_step_rank"),
+            ssm.n_head,
+            key("ssm.inner_size"),
+            ssm.d_inner
+        ));
+    }
+    if ssm.n_group == 0 || !ssm.n_head.is_multiple_of(ssm.n_group) {
+        return Err(crate::reflex_err!(
+            Gguf,
+            "{} = {} must divide {} = {}",
+            key("ssm.group_count"),
+            ssm.n_group,
+            key("ssm.time_step_rank"),
+            ssm.n_head
+        ));
+    }
+    if ssm.d_state == 0 || !ssm.d_state.is_multiple_of(32) || ssm.d_state > 256 {
+        return Err(unsupported(format!(
+            "{} = {} is not supported: the scan kernel needs a multiple of 32 up to 256",
+            key("ssm.state_size"),
+            ssm.d_state
+        )));
+    }
+    if ssm.d_conv < 2 {
+        return Err(crate::reflex_err!(
+            Gguf,
+            "{} = {} must be at least 2",
+            key("ssm.conv_kernel"),
+            ssm.d_conv
+        ));
+    }
+
+    for (i, &is_ssm) in ssm_layers.iter().enumerate() {
+        let present = |t: &str| file.tensor_info(&format!("blk.{i}.{t}")).is_some();
+        if let Some(b) = GRANITE_UNSUPPORTED_BIASES.iter().find(|t| present(t)) {
+            return Err(unsupported(format!(
+                "tensor 'blk.{i}.{b}' is not supported: no surveyed Granite 4.0-H file has \
+                 attention or FFN biases"
+            )));
+        }
+        if is_ssm {
+            for t in ["ssm_norm.weight", "ssm_conv1d.bias"] {
+                if !present(t) {
+                    return Err(unsupported(format!(
+                        "SSM layer {i} has no 'blk.{i}.{t}'; layers without it are not supported"
+                    )));
+                }
+            }
+        }
+    }
+
+    let nonzero = |suffix: &str| f32_meta(file, &key(suffix)).filter(|&s| s != 0.0);
+    Ok(GraniteHybridConfig {
+        hidden_size,
+        ssm_layers,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        ffn_hidden_size,
+        rmsnorm_eps: f32_meta(file, &key("attention.layer_norm_rms_epsilon")).unwrap_or(1e-5),
+        embedding_scale: nonzero("embedding_scale").unwrap_or(1.0),
+        residual_scale: nonzero("residual_scale").unwrap_or(1.0),
+        attention_scale: nonzero("attention.scale").unwrap_or(1.0 / (head_dim as f32).sqrt()),
+        logit_scale: nonzero("logit_scale"),
+        ssm,
     })
 }
