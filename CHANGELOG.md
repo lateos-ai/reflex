@@ -38,6 +38,14 @@ What has been built, in order. Measurements live in
   recomputed or 547 ms from a file. `agent_relay_bench.py --pin-prefix` measures it.
   `ipc::handle_request`, `handle_request_streaming` and `run_request_loop` now take
   the session's `&mut PrefixSlot`.
+- **Faster prefill after a cached prefix.** A prompt that resumes from a pinned prefix
+  or an imported cache now runs the tiled attention kernel once `rows * group` fills
+  one of its blocks, instead of waiting for 64 rows. Below that, the online kernel
+  read the whole cached prefix once per row and head. On a T4 with Qwen3-0.6B, 41 rows
+  after 1,489 cached positions reach the first token in 38 ms instead of 107 ms, and
+  the agent relay's pinned long-prefix hop drops from 364 to 295 ms. Fresh prompts
+  are unchanged. See
+  [docs/design/tiled-prefill-attention.md](docs/design/tiled-prefill-attention.md).
 
 ## 2026-10-15
 
