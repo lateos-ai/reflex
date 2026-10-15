@@ -468,7 +468,8 @@ tiny Gemma 4 fixtures, and the 12B in both modes. A GPU test
 (`rmsnorm_tests`) checks the kernel bit for bit against a host emulation of its
 arithmetic, and the old kernel passes the same test.
 
-**Tiled prefill attention** (`attention_tiled.cu`, Gemma 4 prefill only). A block takes
+**Tiled prefill attention** (`attention_tiled.cu`; dense, MoE, Kolibri and Qwen3.5 use
+the same kernel since [Phase B](tiled-prefill-attention.md#phase-b-tiled-prefill-for-dense-moe-kolibri-and-qwen35-2026-10-15)). A block takes
 M query vectors that share a KV head: `M / group` rows times the `group` query heads of a
 GQA group, with M = 64 at head dim 256 and 32 at 512. It walks K/V in 64-position tiles
 staged in shared memory, so each loaded K/V element serves all M queries. The softmax is

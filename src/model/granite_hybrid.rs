@@ -351,6 +351,7 @@ impl Model {
             attn_online_k,
             attn_online_combine_k,
             attn_impl,
+            attn_tiled: TiledAttnKernels::from_env()?,
             add_k,
             split_qg_k,
             sigmoid_gate_k,
@@ -479,6 +480,7 @@ impl Model {
         let q = self.granite_mm(x, &w.attn_q, rows)?;
         let k = self.granite_mm(x, &w.attn_k, rows)?;
         let v = self.granite_mm(x, &w.attn_v, rows)?;
+        prof_mark(PrefillPhase::QkvGemm, LayerKind::Attn)?;
         let kv_stride = nkv * hd;
         let range = start_pos * kv_stride..(start_pos + rows) * kv_stride;
         self.device
@@ -487,6 +489,7 @@ impl Model {
         self.device
             .dtod_copy(&v, &mut v_cache.slice_mut(range))
             .map_err(|e| crate::gpu_err!(e, "granite kv-cache dtod v: {e}"))?;
+        prof_mark(PrefillPhase::KvCopy, LayerKind::Attn)?;
         let filled = 0..(start_pos + rows) * kv_stride;
         let attn = self.attention_online(
             &q,
@@ -507,6 +510,7 @@ impl Model {
                 window: 0,
             },
         )?;
+        prof_mark(PrefillPhase::Attention, LayerKind::Attn)?;
         self.granite_mm(&attn, &w.attn_output, rows)
     }
 
@@ -530,6 +534,10 @@ impl Model {
         let cfg = &m.cfg;
         let (h, eps) = (cfg.hidden_size, cfg.rmsnorm_eps);
         let x = self.rmsnorm(&hidden, layer.attn_norm.f32()?, rows, h, eps)?;
+        let (kind, mixer_phase) = match layer.mixer {
+            GraniteMixer::Ssm(_) => (LayerKind::Ssm, PrefillPhase::Mixer),
+            GraniteMixer::Attn(_) => (LayerKind::Attn, PrefillPhase::OProj),
+        };
         let mixed = match (&layer.mixer, state) {
             (
                 GraniteMixer::Ssm(w),
@@ -549,6 +557,7 @@ impl Model {
         };
         m.kernels
             .scaled_add(&mut hidden, &mixed, cfg.residual_scale)?;
+        prof_mark(mixer_phase, kind)?;
 
         let y = self.rmsnorm(&hidden, layer.ffn_norm.f32()?, rows, h, eps)?;
         let gate = self.granite_mm(&y, &layer.ffn_gate, rows)?;
@@ -556,6 +565,7 @@ impl Model {
         let act = self.silu_and_mul(&gate, &up, rows * cfg.ffn_hidden_size)?;
         let f = self.granite_mm(&act, &layer.ffn_down, rows)?;
         m.kernels.scaled_add(&mut hidden, &f, cfg.residual_scale)?;
+        prof_mark(PrefillPhase::Ffn, kind)?;
         Ok(hidden)
     }
 
@@ -623,9 +633,14 @@ impl Model {
             self.attn_impl.max_positions(),
         )?;
         let mut states = self.alloc_granite_states(m, rows + extra_headroom)?;
+        let prof = prefill_profile_begin(&self.device)?;
         let mut hidden = self.granite_embed(m, &ids)?;
+        prof_mark(PrefillPhase::Embed, LayerKind::Layer)?;
         for (layer, state) in m.layers.iter().zip(&mut states) {
             hidden = self.forward_granite_layer(m, layer, hidden, 0, rows, state)?;
+        }
+        if let Some(p) = prof {
+            p.finish(rows)?;
         }
         Ok((ids, hidden, states, rows))
     }

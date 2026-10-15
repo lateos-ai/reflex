@@ -153,6 +153,15 @@ impl AttnMode {
         rope: true,
         window: 0,
     };
+
+    /// The `REFLEX_PREFILL_PROFILE` layer kind for a layer in this mode.
+    pub(super) fn profile_kind(self) -> LayerKind {
+        if self.window > 0 {
+            LayerKind::Sliding
+        } else {
+            LayerKind::Layer
+        }
+    }
 }
 
 /// A per-row MoE router: one row's expert logits to its `(expert, weight)`
@@ -687,6 +696,7 @@ impl Model {
             attn_online_k,
             attn_online_combine_k,
             attn_impl,
+            attn_tiled: TiledAttnKernels::from_env()?,
             add_k,
             split_qg_k,
             sigmoid_gate_k,
@@ -1234,6 +1244,7 @@ impl Model {
         v_cache: &mut CudaSlice<f32>,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &self.cfg;
+        let kind = mode.profile_kind();
         let normed = self.rmsnorm(
             &hidden,
             attn_norm.f32()?,
@@ -1250,6 +1261,7 @@ impl Model {
             self.add_rows_inplace(&mut k, b.k.f32()?)?;
             self.add_rows_inplace(&mut v, b.v.f32()?)?;
         }
+        prof_mark(PrefillPhase::QkvGemm, kind)?;
 
         if let Some(qn) = attn_q_norm {
             q = self.rmsnorm(
@@ -1292,6 +1304,7 @@ impl Model {
                 cfg.rope_type,
             )?;
         }
+        prof_mark(PrefillPhase::NormRope, kind)?;
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
         let offset = start_pos * kv_stride;
@@ -1308,6 +1321,7 @@ impl Model {
                 .dtod_copy(&v, &mut dst)
                 .map_err(|e| crate::gpu_err!(e, "attn_batched kv-cache dtod v: {e}"))?;
         }
+        prof_mark(PrefillPhase::KvCopy, kind)?;
         let seq_len = start_pos + rows;
 
         let k_view = k_cache.slice(0..seq_len * kv_stride);
@@ -1323,11 +1337,13 @@ impl Model {
             rows,
             mode.window,
         )?;
+        prof_mark(PrefillPhase::Attention, kind)?;
         let mut o_proj = self.gemm(&attn_out, attn_output, rows)?;
         if let Some(w) = post_norm {
             o_proj = self.rmsnorm(&o_proj, w.f32()?, rows, cfg.hidden_size, cfg.rmsnorm_eps)?;
         }
         self.add_inplace(&mut hidden, &o_proj)?;
+        prof_mark(PrefillPhase::OProj, kind)?;
         Ok(hidden)
     }
 
@@ -1377,6 +1393,7 @@ impl Model {
         let down = self.gemm(&activated, &layer.ffn_down, rows)?;
 
         self.add_inplace(&mut post_attn, &down)?;
+        prof_mark(PrefillPhase::Ffn, LayerKind::Layer)?;
         Ok(post_attn)
     }
 
@@ -1527,6 +1544,7 @@ impl Model {
         )?;
 
         self.add_inplace(&mut post_attn, &ffn_out)?;
+        prof_mark(PrefillPhase::Ffn, LayerKind::Layer)?;
         Ok(post_attn)
     }
 
@@ -1613,6 +1631,8 @@ impl Model {
             &layer.ffn_down_exps,
             &mut ffn_out,
         )?;
+        let kind = layer.attn_mode.profile_kind();
+        prof_mark(PrefillPhase::Ffn, kind)?;
 
         let ffn_out = self.rmsnorm(
             &ffn_out,
@@ -1622,6 +1642,7 @@ impl Model {
             cfg.rmsnorm_eps,
         )?;
         self.add_inplace(&mut post_attn, &ffn_out)?;
+        prof_mark(PrefillPhase::FfnTail, kind)?;
         Ok(post_attn)
     }
 
@@ -1845,6 +1866,7 @@ impl Model {
             }
         }
 
+        let prof = prefill_profile_begin(&self.device)?;
         let hidden_size = self.cfg.hidden_size;
         let mut host_embd = vec![0.0f32; rows * hidden_size];
         for (row, &token_id) in ids.iter().enumerate() {
@@ -1855,6 +1877,7 @@ impl Model {
             .device
             .htod_sync_copy(&host_embd)
             .map_err(|e| crate::gpu_err!(e, "embedding htod: {e}"))?;
+        prof_mark(PrefillPhase::Embed, LayerKind::Layer)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             hidden = self.forward_layer_batched(
@@ -1865,6 +1888,9 @@ impl Model {
                 &mut k_caches[layer_idx],
                 &mut v_caches[layer_idx],
             )?;
+        }
+        if let Some(p) = prof {
+            p.finish(rows)?;
         }
 
         Ok((ids, hidden, k_caches, v_caches, start_pos + rows))
