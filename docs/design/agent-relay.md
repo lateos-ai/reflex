@@ -308,12 +308,16 @@ What this shows:
 - **A short prefix gains nothing, and loses nothing either.** Prefilling 40 tokens
   costs about as much as copying them, so the pinned short hop ties the recomputed
   one (229 ms each). File reuse still costs 7 ms there.
-- **The resumed prefill is now the slow part of the first token.** After the copy,
-  the first token still takes about 104 ms: prefilling the hop's ~80 new tokens
-  against ~1,490 cached ones. A whole short hop's ~120 tokens with no prefix in front
-  take under 16 ms, and llama-server's cached hop reaches its first token in 12 ms. Attention
-  over the cached prefix during a resumed prefill is the next thing to measure.
-- **Decode is still the largest gap.** 31 decode steps take 256 ms of the 364 ms
+- **The resumed prefill was the slow part of the first token, and is now fixed.**
+  After the copy, the first token took about 104 ms. The hop's ~45 new tokens were
+  under the tiled kernel's 64-row threshold, so they ran the online attention kernel,
+  which reads the whole cached prefix once per row and head. Prefills after a cached
+  prefix now switch to the tiled kernel once `rows * group` fills a block
+  ([tiled-prefill-attention.md](tiled-prefill-attention.md), "Resumed prefill"). In
+  the same T4 session the pinned hop went from 364.5 to 295.3 ms, its first token from
+  108.5 to 38.6 ms, and file reuse from 547 to 472 ms. llama-server's cached hop is
+  161.7 ms, with a 12.3 ms first token.
+- **Decode is still the largest gap.** 31 decode steps take 256 ms of the 295 ms
   pinned hop: 8.3 ms per token against llama.cpp's 4.7 ms.
 
 ## Planned next phases

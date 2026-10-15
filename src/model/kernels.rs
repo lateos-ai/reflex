@@ -105,10 +105,32 @@ impl OnlineAttnShape {
 const ATTN_TILED_THREADS: u32 = 256;
 
 /// Batched prefill runs [`Model::attention_prefill`] through the tiled kernels from
-/// this many rows up, and through [`Model::attention_online`] below it. Short prompts
+/// this many rows up, and through [`Model::attention_online`] below it (unless a
+/// cached prefix makes the tiled kernels win earlier, [`ATTN_TILED_MIN_START`]). Short prompts
 /// (and `system1`) then never load a tiled module, which a PTX build without a warm
 /// driver cache JIT-compiles in ~200 ms. See docs/design/tiled-prefill-attention.md.
 pub(super) const ATTN_TILED_MIN_ROWS: usize = 64;
+
+/// A resumed prefill (rows after `start_pos` cached positions: a pinned prefix or an
+/// imported cache) runs the tiled kernels below [`ATTN_TILED_MIN_ROWS`] too, once
+/// at least this many positions are cached and `rows * group_size` fills one block
+/// of 64 query slots ([`ATTN_TILED_MIN_QUERIES`]). The online kernel reads every
+/// cached K/V row once per (row, query head), so its cost grows with the prefix:
+/// on a T4, 41 rows after ~1,490 cached positions spent 90 ms in it on
+/// Qwen3-0.6B, against 1.4 ms with nothing cached. See
+/// `attention_tiled_crossover_timings_resumed` and
+/// docs/design/tiled-prefill-attention.md.
+pub(super) const ATTN_TILED_MIN_START: usize = 64;
+
+/// See [`ATTN_TILED_MIN_START`].
+pub(super) const ATTN_TILED_MIN_QUERIES: usize = 64;
+
+/// Whether [`Model::attention_prefill`] uses the tiled kernels for `rows` rows after
+/// `start_pos` cached positions with GQA group `group_size` (shape permitting).
+pub(super) fn attn_tiled_preferred(rows: usize, start_pos: usize, group_size: usize) -> bool {
+    rows >= ATTN_TILED_MIN_ROWS
+        || (start_pos >= ATTN_TILED_MIN_START && rows * group_size >= ATTN_TILED_MIN_QUERIES)
+}
 
 /// Query vectors per block of the tiled kernel for `head_dim`, if there is one
 /// (`kernels_cuda/attention_tiled.cuh`).
@@ -2009,7 +2031,10 @@ impl Model {
                 scale: 1.0f32 / (head_dim as f32).sqrt(),
                 window,
             };
-            if rows >= ATTN_TILED_MIN_ROWS && self.attn_tiled.enabled() && attn_tiled_fits(&shape) {
+            if attn_tiled_preferred(rows, start_pos, shape.group_size)
+                && self.attn_tiled.enabled()
+                && attn_tiled_fits(&shape)
+            {
                 if let Some(kernel) = self.attn_tiled.kernel(&self.device, head_dim)? {
                     return launch_attention_tiled(
                         &self.device,

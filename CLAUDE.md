@@ -256,7 +256,10 @@ Design and results: `docs/design/mamba2-hybrid.md`.
 Batched prefill attention for dense, MoE, Kolibri-1 and Qwen3.5 goes through
 `Model::attention_prefill`, which runs the tiled kernel (`attention_tiled<D, M>`, one
 module per head-dim family: `attention_tiled.cu` d256/d512, `_d128.cu`, `_d64.cu`) from
-`ATTN_TILED_MIN_ROWS` (64) rows up and `attention_online` below it. `TiledAttnKernels`
+`ATTN_TILED_MIN_ROWS` (64) rows up and `attention_online` below it, except that a
+resumed prefill (>= 64 positions cached: pinned prefix or imported cache) switches once
+`rows * group >= 64` (`attn_tiled_preferred`; the online kernel rereads the whole
+prefix per row and head). `TiledAttnKernels`
 loads each module lazily on the first long prefill, so short prompts, decode, `system1`
 and cold start never load one; **keep it lazy** (a PTX build without a warm driver cache
 JIT-compiles each module in ~200 ms). GQA groups that don't divide the 64-query block

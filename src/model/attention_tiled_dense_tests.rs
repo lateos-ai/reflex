@@ -61,6 +61,15 @@ fn attention_tiled_small_dims_match_online_kernel() {
         case(260, 0, 8, 2, 256, 0),
         // The smallest shape the tiled path accepts.
         case(2, 0, 16, 8, 128, 0),
+        // Few rows after a long cached prefix (a pinned or imported prefix), which
+        // `ATTN_TILED_MIN_START` sends to the tiled kernel: every head dim, a padded
+        // group and a sliding window.
+        case(41, 1489, 16, 8, 128, 0),
+        case(5, 1500, 16, 8, 128, 0),
+        case(9, 600, 12, 2, 128, 0),
+        case(7, 900, 32, 8, 128, 96),
+        case(3, 700, 14, 2, 64, 0),
+        case(17, 400, 8, 2, 256, 0),
     ];
     for c in cases {
         let kv_len = c.start_pos + c.rows;
@@ -241,4 +250,83 @@ fn attention_tiled_crossover_timings() {
             );
         }
     }
+}
+
+/// Like [`attention_tiled_crossover_timings`], but for a resumed prefill: few rows
+/// after `start_pos` cached positions (a pinned prefix or an imported cache). The
+/// online kernel reads every cached K/V row once per (row, query head), so its cost
+/// grows with `start_pos` much faster than the tiled kernel's. The data behind
+/// `ATTN_TILED_MIN_START`. Asserts only that both ran.
+#[test]
+#[ignore]
+fn attention_tiled_crossover_timings_resumed() {
+    let model = load_test_model(WeightsDtype::DEFAULT);
+    let dev = &model.device;
+    for (num_q_heads, num_kv_heads, head_dim) in [(16, 8, 128), (32, 8, 128), (14, 2, 64)] {
+        let kernel = model.attn_tiled.kernel(dev, head_dim).unwrap().unwrap();
+        for start_pos in [0, 16, 32, 64, 128, 256, 512, 1024, 2048] {
+            for rows in [2, 4, 8, 16, 32, 48, 63] {
+                let kv_stride = num_kv_heads * head_dim;
+                let q = dev
+                    .alloc_zeros::<f32>(rows * num_q_heads * head_dim)
+                    .unwrap();
+                let k = dev
+                    .alloc_zeros::<f32>((start_pos + rows) * kv_stride)
+                    .unwrap();
+                let v = dev
+                    .alloc_zeros::<f32>((start_pos + rows) * kv_stride)
+                    .unwrap();
+                let shape = || OnlineAttnShape {
+                    rows,
+                    start_pos,
+                    num_q_heads,
+                    group_size: num_q_heads / num_kv_heads,
+                    qk_dim: head_dim,
+                    v_dim: head_dim,
+                    k_pos_stride: kv_stride,
+                    k_head_stride: head_dim,
+                    v_pos_stride: kv_stride,
+                    v_head_stride: head_dim,
+                    scale: 0.1,
+                    window: 0,
+                };
+                let (kv, vv) = (k.slice(..), v.slice(..));
+                let time = |f: &dyn Fn()| {
+                    f();
+                    dev.synchronize().unwrap();
+                    let iters = 20;
+                    let t = std::time::Instant::now();
+                    for _ in 0..iters {
+                        f();
+                    }
+                    dev.synchronize().unwrap();
+                    t.elapsed().as_secs_f64() * 1e6 / iters as f64
+                };
+                let tiled_us = time(&|| {
+                    launch_attention_tiled(dev, kernel, &q, &kv, &vv, &shape()).unwrap();
+                });
+                let online_us = time(&|| {
+                    model.attention_online(&q, &kv, &vv, shape()).unwrap();
+                });
+                eprintln!(
+                    "RESUMED heads {num_q_heads}/{num_kv_heads} d {head_dim} start {start_pos} rows {rows}: tiled {tiled_us:.1} us, online {online_us:.1} us"
+                );
+            }
+        }
+    }
+}
+
+/// The dispatch rule from the `attention_tiled_crossover_timings*` data: fresh
+/// prompts switch at `ATTN_TILED_MIN_ROWS`, so short ones never load a tiled module;
+/// resumed ones switch once `rows * group_size` fills a block.
+#[test]
+fn attn_tiled_preferred_follows_rows_and_cached_prefix() {
+    assert!(!attn_tiled_preferred(41, 0, 2));
+    assert!(attn_tiled_preferred(64, 0, 2));
+    assert!(attn_tiled_preferred(41, 1489, 2));
+    assert!(attn_tiled_preferred(32, 64, 2));
+    assert!(!attn_tiled_preferred(31, 1489, 2));
+    assert!(!attn_tiled_preferred(41, 63, 2));
+    assert!(attn_tiled_preferred(16, 64, 4));
+    assert!(!attn_tiled_preferred(8, 2048, 4));
 }
