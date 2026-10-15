@@ -413,6 +413,7 @@ impl Model {
             attn_online_combine_k,
             attn_impl,
             attn_tiled: TiledAttnKernels::from_env()?,
+            attn_decode: DecodeAttnKernels::from_env()?,
             add_k,
             split_qg_k,
             sigmoid_gate_k,

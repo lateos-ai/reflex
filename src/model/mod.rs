@@ -99,6 +99,8 @@ use self::prefill_profile::*;
 use crate::error::ReflexError;
 
 #[cfg(test)]
+mod attention_decode_tests;
+#[cfg(test)]
 mod attention_online_tests;
 #[cfg(test)]
 mod attention_tiled_dense_tests;
@@ -238,6 +240,8 @@ pub struct Model {
     attn_impl: AttnImpl,
     /// Tiled batched-prefill attention, loaded lazily; see [`TiledAttnKernels`].
     attn_tiled: TiledAttnKernels,
+    /// GQA decode attention, loaded lazily; see [`DecodeAttnKernels`].
+    attn_decode: DecodeAttnKernels,
     /// In-place residual add (`a[i] += b[i]`, see `kernels_cuda/elementwise.cu`)
     /// -- keeps residual-stream adds device-resident (Phase 2 round 2)
     /// instead of downloading both operands to host just to add two vectors.
