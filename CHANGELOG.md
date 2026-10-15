@@ -3,6 +3,17 @@
 What has been built, in order. Measurements live in
 [docs/benchmarks.md](docs/benchmarks.md).
 
+## Unreleased
+
+- **Faster decode.** Decode attention for dense, MoE, Kolibri-1 and Qwen3.5 now runs a
+  GQA-aware kernel (`attention_decode.cu`). It reads each cached K/V row once for every
+  query head that shares it and keeps two loads in flight per warp; it loads on the
+  first decode step. Decode outputs that kernels fully overwrite are no longer zeroed
+  first. On a T4, Qwen3-0.6B decodes 15% faster at short context and 27% faster at
+  ~1,550 positions; TinyLlama is 23% faster at ~1,550. `REFLEX_ATTN_DECODE=online`
+  restores the previous kernel. See
+  [docs/design/decode-speed.md](docs/design/decode-speed.md).
+
 ## 2026-10-15
 
 - **Tiled prefill attention for dense, MoE, Kolibri-1 and Qwen3.5.** Batched prefills
