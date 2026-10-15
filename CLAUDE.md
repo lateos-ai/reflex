@@ -267,6 +267,19 @@ order: compare whole prefills with **f32 weights** (with f16 ones, activation ro
 turns ~1e-6 into ~5e-4 relative L2 on the logits). Design and T4 numbers:
 `docs/design/tiled-prefill-attention.md`.
 
+### Decode attention (`kernels_cuda/attention_decode.cu`)
+Single-row decode attention for dense, MoE, Kolibri-1 and Qwen3.5 goes through
+`Model::attention`, which runs `attention_decode<DL, HB>` (head dims 64/128/256, HB = the
+largest of 1/2/4/8 dividing the GQA group): one block reads each cached K/V row once for
+every query head sharing it, positions split for ~4 blocks/SM and merged by
+`attention_online_combine_kernel`. `DecodeAttnKernels` loads the module lazily on the
+first decode step, so cold start and time to first token never load it; **keep it
+lazy**. `REFLEX_ATTN_DECODE=online` restores `attention_online` for A/B runs. Gemma 4,
+Granite 4.0-H and MLA still call `attention_online`. Op outputs a kernel fully writes
+use `Model::alloc_out` (no memset) instead of `alloc_zeros`; only switch an op to it if
+its kernel really writes every element. Design and T4 numbers:
+`docs/design/decode-speed.md`.
+
 ### MoE routing (`src/moe.rs`)
 `route_top_k`: softmax over all experts, select top-k, renormalize. No new
 CUDA kernels were needed for MoE — it reuses `gemv`/`silu_and_mul` unchanged via
