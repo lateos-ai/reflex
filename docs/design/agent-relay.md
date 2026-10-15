@@ -167,6 +167,37 @@ What this shows:
   Tiled prefill attention, which is in progress, would help every long-prompt hop,
   with or without reuse.
 
+### Results with tiled prefill attention (Tesla T4, 2026-10-15)
+
+Same setup, rebuilt on top of tiled prefill attention
+([tiled-prefill-attention.md](tiled-prefill-attention.md)), with llama-server
+re-measured in the same session:
+
+| prefix | target | round trip p50 | first token p50 | KV file read p50 | decode / token |
+|---|---|---:|---:|---:|---:|
+| short | Reflex `stdio` | 263.6 ms | 15.8 ms | | 8.0 ms |
+| short | Reflex `stdio`, prefix reused | 269.0 ms | 22.4 ms | 2.5 ms | 8.0 ms |
+| long | Reflex `stdio` | 601.5 ms | 251.4 ms | | 11.3 ms |
+| long | Reflex `stdio`, prefix reused | 634.1 ms | 286.6 ms | 104.0 ms | 11.2 ms |
+| long | llama-server, no prompt cache | 319.8 ms | 167.9 ms | | 4.9 ms |
+| long | llama-server, prompt cache | 161.3 ms | 12.2 ms | | 4.7 ms |
+
+What changed:
+
+- **Prefill no longer dominates the long hop.** The first token dropped from 1,214 ms
+  to 251 ms (4.8×), and the hop from 1,564 ms to 601 ms. Exporting the long prefix
+  takes 982 ms instead of 1,891 ms.
+- **File-based reuse now loses.** With a cheap prefill, a reused long hop (634 ms) is
+  slower than recomputing the prefix (601 ms). The 104 ms file read and the upload
+  cost more than prefilling about 1,490 tokens now does. Phase A's files remain
+  useful when processes don't share a GPU, or for much longer prefixes. A per-hop win
+  inside one warm process needs the in-VRAM slot.
+- **Decode is the largest gap now.** At this context, 31 decode steps take 350 ms of
+  the 601 ms hop, at 11.3 ms per token against llama.cpp's 4.9 ms. With a short
+  prompt Reflex decodes at 8.0 ms per token, so about 3 ms per token grows with the
+  context. That is decode attention over ~1,550 cached positions plus the per-step
+  work the short-prompt numbers already show.
+
 ## Planned next phases
 
 1. **One pinned prefix in VRAM.** Inside a warm `stdio`/`uds` session, one optional
