@@ -42,9 +42,19 @@
 //! `max_tokens` to 1, since the state after a later generated token is no longer
 //! the prompt's (see `Model::generate_capture_kv`). The caller owns the files:
 //! the engine keeps nothing between requests.
+//!
+//! **Pinned prefix** (`generate` path only): a request with `pin_prefix` keeps the
+//! model's state after its prompt in VRAM, in the session's one [`PrefixSlot`],
+//! replacing whatever was there; `max_tokens` must be 1, as for `export_kv`. A
+//! request with `use_pinned` resumes from that slot, treating `prompt` as the
+//! continuation. Each use copies the slot device-to-device into a fresh cache, so
+//! the pinned state never changes. Setting both resumes from the slot and pins the
+//! longer state in its place. Neither combines with `import_kv`/`export_kv`. There
+//! is exactly one slot, with no names and no eviction: anything more belongs in the
+//! orchestrator (docs/DEVELOPMENT.md).
 
 use crate::error::ReflexError;
-use crate::model::{Model, System1Candidate};
+use crate::model::{Model, PinnedPrefix, Resume, System1Candidate};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 
@@ -120,6 +130,13 @@ pub struct IpcRequest {
     /// file. Requires `max_tokens: 1`.
     #[serde(default)]
     pub export_kv: Option<String>,
+    /// `generate` path only: keep the state after this request's prompt in the
+    /// session's [`PrefixSlot`], replacing its contents. Requires `max_tokens: 1`.
+    #[serde(default)]
+    pub pin_prefix: bool,
+    /// `generate` path only: resume from the session's [`PrefixSlot`].
+    #[serde(default)]
+    pub use_pinned: bool,
     /// Milliseconds spent parsing this request's JSON line, filled in by
     /// [`run_request_loop`] (not a wire field) so [`IpcTimings::parse_ms`] can
     /// report it.
@@ -196,7 +213,7 @@ pub struct IpcTimings {
     pub parse_ms: f64,
     /// From the start of the model call to its first generated token: tokenize,
     /// prefill, LM head and the first sampling step, plus reading the
-    /// `import_kv` file if any. `generate` path only.
+    /// `import_kv` file or copying the pinned prefix, if any. `generate` path only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_token_ms: Option<f64>,
     /// The whole model call (`Model::generate` or `Model::system1_evaluate`). On
@@ -204,7 +221,9 @@ pub struct IpcTimings {
     /// since those happen inside the decode loop. Includes `kv_io_ms`.
     pub model_ms: f64,
     /// Reading the `import_kv` file plus writing the `export_kv` file, when the
-    /// request named either.
+    /// request named either. On a `use_pinned` request, the device-to-device copy
+    /// of the pinned prefix into the request's own cache instead. Pinning itself
+    /// copies nothing, so a `pin_prefix` request alone reports none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_io_ms: Option<f64>,
 }
@@ -229,23 +248,100 @@ fn timings_if(
     })
 }
 
-/// Runs a `generate`-path request, honoring `import_kv`/`export_kv`. Shared by
-/// [`handle_request`] and [`handle_request_streaming`]. Records the time spent
-/// on the cache files in `kv_io_ms`.
+/// The one pinned prefix a `reflex stdio`/`uds` session may hold (`pin_prefix`/
+/// `use_pinned`). [`run_stdio_loop`] keeps one for the process; `reflex uds` keeps
+/// one across its connections. It holds VRAM until it is replaced or the process
+/// exits: a pinned prefix costs as much device memory as its KV cache, and each
+/// request that uses it allocates a second copy of that for its own cache.
+#[derive(Default)]
+pub struct PrefixSlot {
+    pinned: Option<PinnedPrefix>,
+}
+
+impl PrefixSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Positions held, or `None` if nothing is pinned.
+    pub fn seq_len(&self) -> Option<usize> {
+        self.pinned.as_ref().map(PinnedPrefix::seq_len)
+    }
+
+    /// VRAM held by the pinned prefix, in bytes (0 if empty).
+    pub fn device_bytes(&self) -> usize {
+        self.pinned.as_ref().map_or(0, PinnedPrefix::device_bytes)
+    }
+}
+
+/// Runs a `generate`-path request, honoring `import_kv`/`export_kv` and
+/// `pin_prefix`/`use_pinned`. Shared by [`handle_request`] and
+/// [`handle_request_streaming`]. Records the time spent on cache files, or on
+/// copying the pinned prefix, in `kv_io_ms`. A failed request leaves `slot`
+/// unchanged.
 fn run_generate(
     model: &Model,
+    slot: &mut PrefixSlot,
     req: &IpcRequest,
     kv_io_ms: &mut Option<f64>,
     on_first_token: impl FnMut(&[f32]),
     on_token: impl FnMut(u32, &str),
 ) -> Result<(Vec<u32>, String), ReflexError> {
     let sampling = req.sampling_params();
-    if req.export_kv.is_some() && req.max_tokens != 1 {
+    let uses_slot = req.pin_prefix || req.use_pinned;
+    if uses_slot && (req.import_kv.is_some() || req.export_kv.is_some()) {
         return Err(ReflexError::InvalidInput(
-            "export_kv captures the state right after the prompt, so it needs \"max_tokens\": 1"
+            "pin_prefix/use_pinned can't be combined with import_kv/export_kv".to_string(),
+        ));
+    }
+    if (req.export_kv.is_some() || req.pin_prefix) && req.max_tokens != 1 {
+        let field = if req.pin_prefix {
+            "pin_prefix"
+        } else {
+            "export_kv"
+        };
+        return Err(ReflexError::InvalidInput(format!(
+            "{field} keeps the state right after the prompt, so it needs \"max_tokens\": 1"
+        )));
+    }
+    if uses_slot {
+        model.check_prefix_state_supported()?;
+    }
+    if req.use_pinned && slot.pinned.is_none() {
+        return Err(ReflexError::InvalidInput(
+            "use_pinned: no prefix is pinned in this session; send a pin_prefix request first"
                 .to_string(),
         ));
     }
+    let pinned_resume = || match &slot.pinned {
+        Some(p) if req.use_pinned => Resume::Pinned(p),
+        _ => Resume::Fresh,
+    };
+    if req.pin_prefix {
+        let (token_ids, text, pinned, copy_ms) = model.generate_pin_prefix(
+            &req.prompt,
+            pinned_resume(),
+            &sampling,
+            on_first_token,
+            on_token,
+        )?;
+        *kv_io_ms = copy_ms;
+        slot.pinned = Some(pinned);
+        return Ok((token_ids, text));
+    }
+    if req.use_pinned {
+        let (token_ids, text, copy_ms) = model.generate_resumed(
+            &req.prompt,
+            req.max_tokens.max(1),
+            pinned_resume(),
+            &sampling,
+            on_first_token,
+            on_token,
+        )?;
+        *kv_io_ms = copy_ms;
+        return Ok((token_ids, text));
+    }
+
     let imported = match &req.import_kv {
         Some(path) => {
             let start = std::time::Instant::now();
@@ -278,11 +374,20 @@ fn run_generate(
     Ok((token_ids, text))
 }
 
-/// The error for `import_kv`/`export_kv` on a `system1_evaluate` request.
+/// The error for a prefix field (`import_kv`/`export_kv`/`pin_prefix`/
+/// `use_pinned`) on a `system1_evaluate` request.
 fn kv_fields_on_candidates_err() -> ReflexError {
     ReflexError::InvalidInput(
-        "import_kv/export_kv apply only to generate requests (empty candidates)".to_string(),
+        "import_kv/export_kv/pin_prefix/use_pinned apply only to generate requests (empty candidates)"
+            .to_string(),
     )
+}
+
+impl IpcRequest {
+    /// Whether this request names any prefix-reuse field.
+    fn uses_prefix_fields(&self) -> bool {
+        self.import_kv.is_some() || self.export_kv.is_some() || self.pin_prefix || self.use_pinned
+    }
 }
 
 impl IpcResponse {
@@ -324,8 +429,9 @@ pub struct IpcStreamToken {
 /// call becomes `ok: false` with `error` set, not a process exit, since a bad
 /// request on a long-lived stdio/UDS session must not kill the whole session.
 /// Ignores `req.stream` entirely -- this is the single-final-line path; see
-/// [`handle_request_streaming`] for the streaming path.
-pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
+/// [`handle_request_streaming`] for the streaming path. `slot` is the session's
+/// pinned prefix (`pin_prefix`/`use_pinned`).
+pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> IpcResponse {
     let id = req.id.clone();
     let model_start = std::time::Instant::now();
     if req.candidates.is_empty() {
@@ -333,6 +439,7 @@ pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
         let mut kv_io_ms = None;
         match run_generate(
             model,
+            slot,
             &req,
             &mut kv_io_ms,
             |_logits| first_token_ms = Some(elapsed_ms(model_start)),
@@ -358,7 +465,7 @@ pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
             },
             Err(e) => IpcResponse::err(id, e),
         }
-    } else if req.import_kv.is_some() || req.export_kv.is_some() {
+    } else if req.uses_prefix_fields() {
         IpcResponse::err(id, kv_fields_on_candidates_err())
     } else {
         let candidates: Vec<System1Candidate> = req
@@ -427,11 +534,12 @@ fn write_json_line<W: Write, T: Serialize>(output: &mut W, value: &T) -> Result<
 /// background task.
 pub fn handle_request_streaming<W: Write>(
     model: &Model,
+    slot: &mut PrefixSlot,
     req: IpcRequest,
     mut output: W,
 ) -> Result<(), String> {
     if !req.stream || !req.candidates.is_empty() {
-        let response = handle_request(model, req);
+        let response = handle_request(model, slot, req);
         return write_json_line(&mut output, &response);
     }
 
@@ -442,6 +550,7 @@ pub fn handle_request_streaming<W: Write>(
     let mut kv_io_ms = None;
     let result = run_generate(
         model,
+        slot,
         &req,
         &mut kv_io_ms,
         |_logits| first_token_ms = Some(elapsed_ms(model_start)),
@@ -496,8 +605,11 @@ pub fn handle_request_streaming<W: Write>(
 /// request itself was unreadable) instead of terminating the loop -- one
 /// malformed line must not kill an otherwise-healthy long-lived session. Returns
 /// only on EOF or a hard I/O error; strictly sequential, never spawns a thread.
+/// `slot` is the pinned prefix (`pin_prefix`/`use_pinned`), owned by the caller
+/// so it can outlive one connection.
 pub fn run_request_loop<R: BufRead, W: Write>(
     model: &Model,
+    slot: &mut PrefixSlot,
     mut input: R,
     mut output: W,
 ) -> Result<(), String> {
@@ -519,7 +631,7 @@ pub fn run_request_loop<R: BufRead, W: Write>(
         match serde_json::from_str::<IpcRequest>(trimmed) {
             Ok(mut req) => {
                 req.parse_ms = elapsed_ms(parse_start);
-                handle_request_streaming(model, req, &mut output)?
+                handle_request_streaming(model, slot, req, &mut output)?
             }
             Err(e) => {
                 let response = IpcResponse::err(
@@ -533,11 +645,12 @@ pub fn run_request_loop<R: BufRead, W: Write>(
 }
 
 /// [`run_request_loop`] over `std::io::stdin()`/`std::io::stdout()` specifically --
-/// the shape `reflex stdio`'s `run` needs.
+/// the shape `reflex stdio`'s `run` needs. The session's [`PrefixSlot`] lives as
+/// long as the process.
 pub fn run_stdio_loop(model: &Model) -> Result<(), String> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    run_request_loop(model, stdin.lock(), stdout.lock())
+    run_request_loop(model, &mut PrefixSlot::new(), stdin.lock(), stdout.lock())
 }
 
 #[cfg(test)]
@@ -746,5 +859,20 @@ mod tests {
         assert_eq!(req.import_kv.as_deref(), Some("/dev/shm/sys.cskv"));
         assert_eq!(req.export_kv.as_deref(), Some("out.cskv"));
         assert_eq!(req.max_tokens, 1);
+    }
+
+    #[test]
+    fn test_ipc_request_pin_fields_default_off_and_parse() {
+        let req: IpcRequest = serde_json::from_str(r#"{"prompt": "p"}"#).unwrap();
+        assert!(!req.pin_prefix && !req.use_pinned);
+        assert!(!req.uses_prefix_fields());
+        let req: IpcRequest = serde_json::from_str(
+            r#"{"prompt": "p", "pin_prefix": true, "use_pinned": true, "max_tokens": 1}"#,
+        )
+        .unwrap();
+        assert!(req.pin_prefix && req.use_pinned);
+        assert!(req.uses_prefix_fields());
+        assert_eq!(PrefixSlot::new().seq_len(), None);
+        assert_eq!(PrefixSlot::new().device_bytes(), 0);
     }
 }

@@ -198,16 +198,129 @@ What changed:
   context. That is decode attention over ~1,550 cached positions plus the per-step
   work the short-prompt numbers already show.
 
+## One pinned prefix in VRAM (phase B)
+
+A warm `reflex stdio`/`uds` session can keep one prefix's model state on the GPU:
+
+| field | effect |
+|---|---|
+| `"pin_prefix": true` | keeps the state right after this request's prompt in the session's slot, replacing what was there; needs `"max_tokens": 1` |
+| `"use_pinned": true` | resumes from the slot; `prompt` is the continuation, with no BOS added |
+
+```jsonl
+{"prompt": "<system prompt>", "pin_prefix": true, "max_tokens": 1}
+{"prompt": "<agent role>", "use_pinned": true, "pin_prefix": true, "max_tokens": 1}
+{"prompt": "<this hop's input>", "use_pinned": true, "max_tokens": 64}
+{"prompt": "<next hop's input>", "use_pinned": true, "max_tokens": 64}
+```
+
+How it works:
+
+- **Pinning copies nothing.** A `pin_prefix` request runs like an `export_kv` request,
+  but instead of downloading its caches it hands the device buffers to the slot. The
+  same max-tokens-1 rule applies, for the same reason: the Qwen3.5 hybrid's recurrent
+  state can't be rolled back past later tokens.
+- **Each use copies the slot.** A `use_pinned` request allocates its own cache, as any
+  request does, and fills the first `seq_len` positions with a device-to-device copy
+  of the slot. The hybrid's GDN conv and recurrent state are copied whole. The pinned
+  state is never written, so one pin serves any number of requests.
+- **Files and the slot share one code path.** Each architecture's cache allocation
+  (`alloc_dense_kv_caches`, `alloc_hybrid_states`, `alloc_mla_kv_caches`) takes a
+  prefix source. A cache file is uploaded host-to-device straight into the new
+  cache. A pinned prefix is copied device-to-device into it. Everything after that
+  is shared. The file is uploaded directly into the request's cache rather than first
+  into a device copy that is then forked, so an `import_kv` request never holds the
+  prefix twice in VRAM. `export_kv` is now "pin, then download".
+- **Layering works like phase A's files.** Setting both fields resumes from the slot
+  and pins the longer state in its place.
+- **The slot's lifetime.** `reflex stdio` keeps one slot for the process. `reflex uds`
+  keeps one across its connections, so a client can reconnect and still use it. A
+  failed request leaves the slot as it was.
+
+Errors:
+
+| request | `error_kind` |
+|---|---|
+| `use_pinned` with nothing pinned | `invalid_input` |
+| `pin_prefix` without `"max_tokens": 1` | `invalid_input` |
+| `pin_prefix`/`use_pinned` together with `import_kv`/`export_kv` | `invalid_input` |
+| `pin_prefix`/`use_pinned` on a `candidates` request | `invalid_input` |
+| `pin_prefix`/`use_pinned` on Gemma 4 or Granite 4.0-H | `unsupported_architecture` |
+| a use whose own cache can't be allocated | `out_of_memory` |
+
+**VRAM.** A pinned prefix holds as much device memory as its KV cache: 229 KB per
+token for Qwen3-0.6B (f32), so 342 MB for the 1,490-token prefix below. Each request
+that uses it allocates a second copy for its own cache while it runs. If that
+allocation fails, the request returns `out_of_memory` and the session and slot carry
+on. The slot holds its memory until it is replaced or the process exits.
+
+**Timings.** With `"timings": true`, a `use_pinned` request reports the copy in
+`kv_io_ms`, the field phase A uses for file reads. It is included in
+`first_token_ms` and `model_ms`. A `pin_prefix` request on its own reports no
+`kv_io_ms`, since pinning copies nothing.
+
+**One slot is the boundary.** There are no names, no second slot, no LRU or eviction
+policy and no background work. Keeping several prefixes, choosing which to keep, or
+sharing one between processes is the orchestrator's job: cache files through
+`import_kv`/`export_kv`, or one warm process per prefix. See
+[DEVELOPMENT.md](../DEVELOPMENT.md)'s Non-goals.
+
+`scripts/agent_relay_bench.py --pin-prefix` pins the shared system prompt once and
+uses it on every hop.
+
+### Results (Tesla T4, 2026-10-15)
+
+Correctness: on the T4, every use of the slot gives the same 12 greedy ids as one
+request over the joined text and as the same chain through files. This holds for real
+Qwen3-0.6B (f16 weights) and for the Qwen3-MoE, Qwen3.5-hybrid, MLA, Qwen2 and
+Kolibri-1 fixtures. The tests pin a prefix, layer a second part on it, use the slot
+three times, check it's unchanged, re-pin a shorter prefix and check that it replaced
+the slot (`src/ipc/relay_tests.rs`). The GPU nightly suite passes, 83 of 83 (4
+skipped for absent optional models).
+
+Setup is the same as phases 0 and A (Qwen3-0.6B Q4_K_M, 30 hops after 3 warm-up
+hops, 32 greedy tokens per hop, every hop generated all 32), on top of decode-speed
+and tiled prefill attention, with llama-server in the same session. Decode per token
+is (engine total − first token) / 31.
+
+| prefix | target | round trip p50 | first token p50 | prefix read/copy p50 | decode / token |
+|---|---|---:|---:|---:|---:|
+| short | Reflex `stdio` | 229.3 ms | 15.6 ms | | 6.9 ms |
+| short | Reflex `stdio`, file reuse | 236.4 ms | 22.4 ms | 2.6 ms | 6.9 ms |
+| short | Reflex `stdio`, pinned | 229.2 ms | 15.9 ms | 0.2 ms | 6.9 ms |
+| short | llama-server, no prompt cache | 141.5 ms | 19.7 ms | | 3.9 ms |
+| short | llama-server, prompt cache | 132.5 ms | 10.5 ms | | 3.9 ms |
+| long | Reflex `stdio` | 501.3 ms | 242.8 ms | | 8.3 ms |
+| long | Reflex `stdio`, file reuse | 547.2 ms | 291.3 ms | 108.1 ms | 8.3 ms |
+| long | Reflex `stdio`, pinned | 364.1 ms | 108.1 ms | 4.4 ms | 8.3 ms |
+| long | Reflex `uds`, pinned | 365.1 ms | 108.2 ms | 4.5 ms | 8.3 ms |
+| long | llama-server, no prompt cache | 319.0 ms | 167.1 ms | | 4.8 ms |
+| long | llama-server, prompt cache | 161.8 ms | 12.3 ms | | 4.7 ms |
+
+The same session's baseline before this change matched these within 2% (long hop
+510 ms recomputed, 545 ms reused from a file).
+
+What this shows:
+
+- **The slot makes reuse pay off.** The long hop drops from 501 ms (recompute) to
+  364 ms, and the first token from 243 to 108 ms. Copying 342 MB device-to-device
+  takes 4.4 ms, against 108 ms to read the same state from a file.
+- **A short prefix gains nothing, and loses nothing either.** Prefilling 40 tokens
+  costs about as much as copying them, so the pinned short hop ties the recomputed
+  one (229 ms each). File reuse still costs 7 ms there.
+- **The resumed prefill is now the slow part of the first token.** After the copy,
+  the first token still takes about 104 ms: prefilling the hop's ~80 new tokens
+  against ~1,490 cached ones. A whole short hop's ~120 tokens with no prefix in front
+  take under 16 ms, and llama-server's cached hop reaches its first token in 12 ms. Attention
+  over the cached prefix during a resumed prefill is the next thing to measure.
+- **Decode is still the largest gap.** 31 decode steps take 256 ms of the 364 ms
+  pinned hop: 8.3 ms per token against llama.cpp's 4.7 ms.
+
 ## Planned next phases
 
-1. **One pinned prefix in VRAM.** Inside a warm `stdio`/`uds` session, one optional
-   slot holds a prompt's KV cache, and later requests fork from it with a
-   device-to-device copy. It is one slot, with no names and no eviction policy;
-   anything more belongs in the orchestrator. This skips the file read and the
-   host-to-device upload that phase A pays on every hop.
-2. **JSON Schema constrained decoding.** Logit masking ahead of sampling, so that
+1. **JSON Schema constrained decoding.** Logit masking ahead of sampling, so that
    handoff payloads and tool calls parse on the first try.
-3. **Buffer reuse across warm requests**, only if phase 0 shows allocation time on
+2. **Buffer reuse across warm requests**, only if phase 0 shows allocation time on
    the hop.
 
 ## Swarm pattern

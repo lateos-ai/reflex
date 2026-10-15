@@ -87,6 +87,9 @@ mod imp {
             model.weights_dtype()
         );
 
+        // One pinned-prefix slot for the whole process, so it survives a client
+        // reconnecting (see `ipc::PrefixSlot`).
+        let mut slot = ipc::PrefixSlot::new();
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
@@ -100,7 +103,7 @@ mod imp {
                         }
                     };
                     let writer = BufWriter::new(stream);
-                    if let Err(e) = ipc::run_request_loop(&model, reader, writer) {
+                    if let Err(e) = ipc::run_request_loop(&model, &mut slot, reader, writer) {
                         eprintln!("REFLEX_UDS_CONNECTION_ERROR error={e:?}");
                     }
                 }
