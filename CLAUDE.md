@@ -111,11 +111,13 @@ experts and Q6_K tensors, one expert at a time via `Model::quant_expert_weight`;
 MoE models, hybrid and MLA print a notice and keep their normal storage; Gemma 4 keeps
 Q8_0 instead -- layer matmuls and the tied LM head, `gemv_q8_0` in `kernels_cuda/gemv_q8_0.cu`,
 the same fused-then-scratch prefill split, kernels in `Model::q8_0_k`, which only
-`load_gemma4` fills). Q4_K matmul weights stay as raw GGUF blocks in one device
-arena (`WeightData::Quant`), read by `gemv_q4k`/the fused multi-row prefill kernel, or,
+`load_gemma4` fills). Q4_K and Q6_K matmul weights stay as raw GGUF blocks in one device
+arena (`WeightData::Quant`), read in decode by `gemv_q4k_r1_kernel` (4 output rows per
+warp, bit-identical to `gemv_q4k_kernel`) / `gemv_q6k_kernel`, in short prefills by the
+fused multi-row Q4_K kernel, or,
 above a row crossover, dequantized device-to-device into a reused scratch buffer in the
-`--weights` dtype (f16 scratch + `cublasGemmEx`, or f32 + `Sgemm`); a Q6_K LM head stays
-quantized too (`gemv_q6k_kernel`). Every other matrix weight follows `--weights`. Design,
+`--weights` dtype (f16 scratch + `cublasGemmEx`, or f32 + `Sgemm`; Q6_K through
+`dequantize_q6k_coalesced*`); a Q6_K LM head stays quantized too (`gemv_q6k_kernel`). Every other matrix weight follows `--weights`. Design,
 results and open gaps: `docs/design/quantized-resident-weights.md` — read it before
 touching weight residency, the matmul kernels or `WeightLoadPipeline`. On top of it,
 **`REFLEX_LAZY_EXPERTS=1`** (Kolibri-1 only) reserves the stacked-expert arena space

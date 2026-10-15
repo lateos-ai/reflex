@@ -137,6 +137,128 @@ extern "C" __global__ void gemv_q4k_kernel(
     }
 }
 
+// One-row (decode) Q4_K GEMV, GEMV_Q4K_R1_ROWS output rows per warp: each lane
+// loads its 32 activations of a super-block once and reuses them for every row,
+// so activation reads per weight drop four-fold. `gemv_q4k_kernel` reads ~4
+// bytes of `x` per 0.56 bytes of weight and is bound by that rather than by
+// DRAM. Per row, the lane layout, decode expression and summation order are
+// `gemv_q4k_kernel`'s, so every output matches it bit for bit. A nibble becomes
+// a float through the exponent trick (exact for 0..15) rather than an I2F,
+// which runs at quarter rate on Turing. On a T4 this is 1.6-1.8x faster than
+// `gemv_q4k_kernel` with rows == 1, on Qwen3-0.6B and Mistral 7B shapes; 8
+// rows per warp or two block groups in flight per lane were slower
+// (`quant_resident_tests::gemv_q4k_decode_variants_timings`).
+// Launch: block = 32 * GEMV_Q4K_R1_WARPS threads,
+// grid = ceil(out_features / (GEMV_Q4K_R1_WARPS * GEMV_Q4K_R1_ROWS)).
+#define GEMV_Q4K_R1_ROWS 4
+#define GEMV_Q4K_R1_WARPS 4
+
+__device__ __forceinline__ float q4k_nib(unsigned int q) {
+    return __int_as_float(0x4B000000 | q) - 8388608.0f;
+}
+
+// `dot16` on registers: the same expression, so the same rounding.
+__device__ __forceinline__ float dot16_regs(const float* xv, const float* w) {
+    float s = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        s += xv[4 * k] * w[4 * k] + xv[4 * k + 1] * w[4 * k + 1] + xv[4 * k + 2] * w[4 * k + 2] + xv[4 * k + 3] * w[4 * k + 3];
+    }
+    return s;
+}
+
+extern "C" __global__ void gemv_q4k_r1_kernel(
+    const float* __restrict__ x,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ y,
+    unsigned int in_features,
+    unsigned int out_features
+) {
+    constexpr int R = GEMV_Q4K_R1_ROWS;
+    const unsigned int warp_id = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int row0 = (blockIdx.x * GEMV_Q4K_R1_WARPS + warp_id) * R;
+    if (row0 >= out_features) {
+        return;
+    }
+    const unsigned int nb = in_features >> 8;
+    const unsigned long long row_bytes = (unsigned long long)nb * 144ull;
+    const unsigned int c = lane & 7u;
+    const unsigned int g = c >> 1;
+    const unsigned int half = c & 1u;
+
+    float acc[R];
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        acc[r] = 0.0f;
+    }
+    for (unsigned int b = lane >> 3; b < nb; b += 4u) {
+        // Issue every row's header (`d`, `dmin`, `scales[12]`: bytes 0..16) and
+        // `qs` chunk before using any of them.
+        uint4 hdr[R], qv[R];
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            if (row0 + r < out_features) {
+                const unsigned char* block = w + (row0 + r) * row_bytes + (unsigned long long)b * 144ull;
+                hdr[r] = *reinterpret_cast<const uint4*>(block);
+                qv[r] = *reinterpret_cast<const uint4*>(block + 16 + 16u * c);
+            }
+        }
+        const unsigned int e_lo = (b << 8) + (g << 6) + (half << 4);
+        float xlo[16], xhi[16];
+        const float4* xl4 = reinterpret_cast<const float4*>(x + e_lo);
+        const float4* xh4 = reinterpret_cast<const float4*>(x + e_lo + 32u);
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            const float4 a = xl4[k];
+            const float4 h = xh4[k];
+            xlo[4 * k] = a.x;
+            xlo[4 * k + 1] = a.y;
+            xlo[4 * k + 2] = a.z;
+            xlo[4 * k + 3] = a.w;
+            xhi[4 * k] = h.x;
+            xhi[4 * k + 1] = h.y;
+            xhi[4 * k + 2] = h.z;
+            xhi[4 * k + 3] = h.w;
+        }
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            if (row0 + r < out_features) {
+                unsigned char sb[16];
+                memcpy(sb, &hdr[r], 16);
+                const float d = q4k_le_f16(sb);
+                const float dmin = q4k_le_f16(sb + 2);
+                unsigned char sc, m;
+                q4k_scale_min(2u * g, sb + 4, &sc, &m);
+                const float d1 = d * (float)sc;
+                const float m1 = dmin * (float)m;
+                q4k_scale_min(2u * g + 1u, sb + 4, &sc, &m);
+                const float d2 = d * (float)sc;
+                const float m2 = dmin * (float)m;
+                const unsigned char* q = reinterpret_cast<const unsigned char*>(&qv[r]);
+                float wlo[16], whi[16];
+                #pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    wlo[i] = d1 * q4k_nib(q[i] & 0xF) - m1;
+                    whi[i] = d2 * q4k_nib(q[i] >> 4) - m2;
+                }
+                acc[r] += dot16_regs(xlo, wlo) + dot16_regs(xhi, whi);
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        float sum = acc[r];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0u && row0 + r < out_features) {
+            y[row0 + r] = sum;
+        }
+    }
+}
+
 // Q4_K -> f32 or f16, one CUDA block per 256-element super-block and one thread
 // per element, so consecutive threads write consecutive elements (dequant.cu's
 // `dequantize_q4k_kernel` gives each thread a whole block, which writes 1 KB
@@ -197,6 +319,55 @@ extern "C" __global__ void dequantize_q4k_coalesced_f16_kernel(
     unsigned int num_blocks
 ) {
     dequantize_q4k_coalesced_impl<__half>(blocks, y, num_blocks);
+}
+
+// Q6_K -> f32 or f16, one CUDA block per 256-element super-block and one thread
+// per element (`dequantize_q6k_kernel` gives each thread a whole block, whose
+// writes land 1 KB apart). Thread `j` decodes element `j` with that kernel's
+// expression `d * (float)sc * (float)q`, so the output is bit-identical; the
+// f16 form rounds with `__float2half_rn`, as `dequantize_q6k_f16_kernel` does.
+// Used by the quantized-resident prefill path's scratch buffer for dense Q6_K
+// layer tensors (`Model::gemm_quant_scratch`). Launch with grid = num_blocks,
+// block = 256.
+template <typename T>
+__device__ __forceinline__ void dequantize_q6k_coalesced_impl(
+    const unsigned char* __restrict__ blocks,
+    T* __restrict__ y,
+    unsigned int num_blocks
+) {
+    const unsigned int bi = blockIdx.x;
+    if (bi >= num_blocks) {
+        return;
+    }
+    const unsigned int j = threadIdx.x;
+    const unsigned char* block = blocks + (unsigned long long)bi * 210ull;
+    const unsigned int n = j >> 7;          // 128-element half
+    const unsigned int t = (j >> 5) & 3u;   // which of the four 32-runs
+    const unsigned int l = j & 31u;
+    const unsigned int is = l >> 4;
+    const unsigned char ql = block[64u * n + l + ((t & 1u) ? 32u : 0u)];
+    const unsigned char qh = block[128u + 32u * n + l];
+    const int lo = (t & 2u) ? (ql >> 4) : (ql & 0xF);
+    const int q = (int)(lo | (((qh >> (2u * t)) & 3) << 4)) - 32;
+    const signed char sc = ((const signed char*)(block + 192))[8u * n + is + 2u * t];
+    const float d = q4k_le_f16(block + 208);
+    y[(unsigned long long)bi * 256ull + j] = q4k_store<T>(d * (float)sc * (float)q);
+}
+
+extern "C" __global__ void dequantize_q6k_coalesced_kernel(
+    const unsigned char* __restrict__ blocks,
+    float* __restrict__ y,
+    unsigned int num_blocks
+) {
+    dequantize_q6k_coalesced_impl<float>(blocks, y, num_blocks);
+}
+
+extern "C" __global__ void dequantize_q6k_coalesced_f16_kernel(
+    const unsigned char* __restrict__ blocks,
+    __half* __restrict__ y,
+    unsigned int num_blocks
+) {
+    dequantize_q6k_coalesced_impl<__half>(blocks, y, num_blocks);
 }
 
 // y = x @ W^T for one input row, straight from Q6_K blocks (210 bytes:

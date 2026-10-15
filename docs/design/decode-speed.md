@@ -95,7 +95,12 @@ breaks the per-token arithmetic.
 At short context Qwen3-0.6B now decodes in 6.96 ms, of which 4.0 ms is f16 weight
 reads. Next candidates, roughly in order of payoff:
 - **Read fewer weight bytes.** Make the Q4_K-resident decode GEMV bandwidth-efficient;
-  at ~0.56 bytes per weight it would read about a third of today's bytes.
+  at ~0.56 bytes per weight it would read about a third of today's bytes. *Partly done
+  (2026-10-15):* the decode Q4_K GEMV is 1.6-1.8x faster and Q6_K layer tensors stay
+  quantized, so with `REFLEX_QUANT_RESIDENT=1` Qwen3-0.6B decodes in 4.86 ms at short
+  context (6.09 before) and 6.37 ms at ~1,550 positions. See
+  [quantized-resident-weights.md](quantized-resident-weights.md), "Faster Q4_K/Q6_K
+  decode".
 - **Cut the remaining per-op host cost.** Reuse output buffers across steps instead of
   allocating them, fuse the Q/K/V GEMVs, and eventually use CUDA graphs.
 - **Pick the greedy token on the device.** That would replace the 600 KB logits copy
