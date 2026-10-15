@@ -11,6 +11,7 @@ multi-agent loop produces. Reports p50/p95 per hop of:
   first_token   engine: model call start -> first generated token
   model         engine: whole model call
   overhead      rtt - engine time (transport, JSON, process boundary)
+  kv_io         engine: reading the imported KV cache file (--reuse-prefix)
 
 Targets:
   stdio         spawns `reflex stdio <model>` and talks over its pipes
@@ -21,12 +22,19 @@ Targets:
 Reflex requests set `"timings": true` (src/ipc.rs, IpcTimings). Greedy decoding
 everywhere, so runs are comparable.
 
+--reuse-prefix (stdio/uds): before the chain, one request exports the system
+prompt's KV cache to a file (`export_kv`), and every hop then sends only the
+rest of its prompt with `import_kv` pointing at that file. This is Reflex's
+counterpart to llama-server's `--llama-cache-prompt`. --system-prompt-file
+swaps in a longer shared prefix, since the saving grows with its size.
+
 Usage:
   scripts/agent_relay_bench.py stdio --reflex target/release/reflex --model m.gguf
   scripts/agent_relay_bench.py uds --reflex target/release/reflex --model m.gguf
   scripts/agent_relay_bench.py llama-server --url http://127.0.0.1:8080
   common: [--hops 20] [--warmup 3] [--max-tokens 32] [--carry-chars 400]
-          [--json-out results.json]
+          [--system-prompt-file f.txt] [--json-out results.json]
+  stdio/uds: [--reuse-prefix [--kv-dir /dev/shm]]
 
 Standard library only, so it runs anywhere Python 3.8+ does.
 """
@@ -51,10 +59,11 @@ ROLES = ["planner", "researcher", "coder", "reviewer", "tester", "summarizer"]
 TASK = "Task: design a small command-line tool that deduplicates lines in a file."
 
 
-def hop_prompt(hop, previous, carry_chars):
+def hop_suffix(hop, previous, carry_chars):
+    """The part of a hop's prompt after the shared system prompt."""
     role = ROLES[hop % len(ROLES)]
     note = previous[-carry_chars:] if previous else TASK
-    return f"{SYSTEM_PROMPT}Previous note: {note}\nYou are the {role}. Your note:"
+    return f"Previous note: {note}\nYou are the {role}. Your note:"
 
 
 class ReflexLines:
@@ -106,12 +115,19 @@ def drain_stderr(proc):
     threading.Thread(target=pump, daemon=True).start()
 
 
-def reflex_hop(client, prompt, max_tokens):
-    msg, rtt = client.request(
-        {"prompt": prompt, "max_tokens": max_tokens, "timings": True}
-    )
+def reflex_request(client, payload):
+    msg, rtt = client.request(dict(payload, timings=True))
     if not msg.get("ok"):
         raise RuntimeError(f"engine error: {msg.get('error_kind')}: {msg.get('error')}")
+    return msg, rtt
+
+
+def reflex_hop(client, system, suffix, max_tokens, prefix_kv):
+    if prefix_kv:
+        payload = {"prompt": suffix, "import_kv": prefix_kv}
+    else:
+        payload = {"prompt": system + suffix}
+    msg, rtt = reflex_request(client, dict(payload, max_tokens=max_tokens))
     t = msg.get("timings") or {}
     engine = t.get("parse_ms", 0.0) + t.get("model_ms", 0.0)
     return {
@@ -119,6 +135,7 @@ def reflex_hop(client, prompt, max_tokens):
         "first_token_ms": t.get("first_token_ms"),
         "model_ms": t.get("model_ms"),
         "overhead_ms": rtt - engine if t else None,
+        "kv_io_ms": t.get("kv_io_ms"),
         "tokens": len(msg.get("token_ids") or []),
     }, msg.get("text", "")
 
@@ -163,7 +180,7 @@ def run_chain(do_hop, hops, warmup, max_tokens, carry_chars):
     samples = []
     previous = ""
     for hop in range(warmup + hops):
-        sample, text = do_hop(hop_prompt(hop, previous, carry_chars), max_tokens)
+        sample, text = do_hop(hop_suffix(hop, previous, carry_chars), max_tokens)
         previous = text.strip()
         if hop >= warmup:
             samples.append(sample)
@@ -181,7 +198,7 @@ def percentile(values, pct):
 
 def summarize(samples):
     out = {}
-    for key in ("rtt_ms", "first_token_ms", "model_ms", "overhead_ms", "tokens"):
+    for key in ("rtt_ms", "first_token_ms", "model_ms", "overhead_ms", "kv_io_ms", "tokens"):
         vals = [s[key] for s in samples if s.get(key) is not None]
         if vals:
             out[key] = {
@@ -201,6 +218,7 @@ def print_table(target, summary, n):
         ("first_token_ms", "first token (ms)"),
         ("model_ms", "engine total (ms)"),
         ("overhead_ms", "overhead (ms)"),
+        ("kv_io_ms", "KV file read (ms)"),
         ("tokens", "tokens generated"),
     ):
         if key in summary:
@@ -231,8 +249,18 @@ def main(argv=None):
     ap.add_argument(
         "--llama-cache-prompt",
         action="store_true",
-        help="let llama-server reuse the shared prefix (default off; Reflex has no prefix reuse yet)",
+        help="let llama-server reuse the shared prefix (default off)",
     )
+    ap.add_argument(
+        "--reuse-prefix",
+        action="store_true",
+        help="stdio/uds: export the system prompt's KV once, import it on every hop",
+    )
+    ap.add_argument(
+        "--kv-dir",
+        help="where --reuse-prefix writes its cache file (default: a temp dir; tmpfs is best)",
+    )
+    ap.add_argument("--system-prompt-file", help="shared prefix to use instead of the built-in one")
     ap.add_argument("--hops", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--max-tokens", type=int, default=32)
@@ -240,13 +268,22 @@ def main(argv=None):
     ap.add_argument("--ready-timeout", type=float, default=600.0)
     ap.add_argument("--json-out")
     args = ap.parse_args(argv)
+    if args.reuse_prefix and args.target == "llama-server":
+        ap.error("--reuse-prefix is for stdio/uds; use --llama-cache-prompt for llama-server")
+    system = SYSTEM_PROMPT
+    if args.system_prompt_file:
+        with open(args.system_prompt_file, encoding="utf-8") as f:
+            system = f.read()
+        if not system.endswith("\n"):
+            system += "\n"
 
     proc = None
+    prefix_kv = None
     try:
         if args.target == "llama-server":
 
-            def do_hop(prompt, max_tokens):
-                return llama_hop(args.url, prompt, max_tokens, args.llama_cache_prompt)
+            def do_hop(suffix, max_tokens):
+                return llama_hop(args.url, system + suffix, max_tokens, args.llama_cache_prompt)
 
         else:
             if not args.model:
@@ -269,17 +306,34 @@ def main(argv=None):
                 conn.connect(sock_path)
                 client = ReflexLines(conn.makefile("rb"), conn.makefile("wb"))
 
-            def do_hop(prompt, max_tokens):
-                return reflex_hop(client, prompt, max_tokens)
+            if args.reuse_prefix:
+                prefix_kv = os.path.join(
+                    args.kv_dir or tempfile.mkdtemp(prefix="reflex-relay-kv-"),
+                    f"relay-prefix-{os.getpid()}.cskv",
+                )
+                msg, _ = reflex_request(
+                    client, {"prompt": system, "export_kv": prefix_kv, "max_tokens": 1}
+                )
+                print(
+                    f"exported prefix KV ({os.path.getsize(prefix_kv)} bytes) in "
+                    f"{msg['timings']['model_ms']:.1f} ms -> {prefix_kv}",
+                    file=sys.stderr,
+                )
+
+            def do_hop(suffix, max_tokens):
+                return reflex_hop(client, system, suffix, max_tokens, prefix_kv)
 
         samples = run_chain(do_hop, args.hops, args.warmup, args.max_tokens, args.carry_chars)
     finally:
         if proc is not None:
             proc.kill()
             proc.wait()
+        if prefix_kv and os.path.exists(prefix_kv):
+            os.remove(prefix_kv)
 
     summary = summarize(samples)
-    print_table(args.target, summary, len(samples))
+    label = args.target + (", prefix reused" if args.reuse_prefix else "")
+    print_table(label, summary, len(samples))
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:
             json.dump(
@@ -291,6 +345,8 @@ def main(argv=None):
                     "max_tokens": args.max_tokens,
                     "carry_chars": args.carry_chars,
                     "llama_cache_prompt": args.llama_cache_prompt,
+                    "reuse_prefix": args.reuse_prefix,
+                    "system_prompt_chars": len(system),
                     "summary": summary,
                     "samples": samples,
                 },

@@ -33,6 +33,15 @@
 //! object, so a caller chaining requests (an agent handing off to another agent)
 //! can split its measured round trip into engine time and transport overhead.
 //! Omitted (the default), the response is byte-identical to before.
+//!
+//! **Prefix reuse** (`generate` path only): `export_kv` names a file to write the
+//! model's state after this request's prompt to, and `import_kv` names one to resume
+//! from, in the same cache formats as `reflex generate --export-kv/--import-kv`
+//! (`crate::kv_io`). A request that sets `import_kv` treats `prompt` as the
+//! continuation after the file's positions. An `export_kv` request must set
+//! `max_tokens` to 1, since the state after a later generated token is no longer
+//! the prompt's (see `Model::generate_capture_kv`). The caller owns the files:
+//! the engine keeps nothing between requests.
 
 use crate::error::ReflexError;
 use crate::model::{Model, System1Candidate};
@@ -103,6 +112,14 @@ pub struct IpcRequest {
     /// Opt-in: attach an [`IpcTimings`] to the final response line.
     #[serde(default)]
     pub timings: bool,
+    /// `generate` path only: resume from this KV cache file. See this module's
+    /// doc comment's "Prefix reuse" section.
+    #[serde(default)]
+    pub import_kv: Option<String>,
+    /// `generate` path only: write the state after this request's prompt to this
+    /// file. Requires `max_tokens: 1`.
+    #[serde(default)]
+    pub export_kv: Option<String>,
     /// Milliseconds spent parsing this request's JSON line, filled in by
     /// [`run_request_loop`] (not a wire field) so [`IpcTimings::parse_ms`] can
     /// report it.
@@ -178,13 +195,18 @@ pub struct IpcTimings {
     /// Parsing the request line's JSON.
     pub parse_ms: f64,
     /// From the start of the model call to its first generated token: tokenize,
-    /// prefill, LM head and the first sampling step. `generate` path only.
+    /// prefill, LM head and the first sampling step, plus reading the
+    /// `import_kv` file if any. `generate` path only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_token_ms: Option<f64>,
     /// The whole model call (`Model::generate` or `Model::system1_evaluate`). On
     /// a streaming request this includes writing and flushing each token line,
-    /// since those happen inside the decode loop.
+    /// since those happen inside the decode loop. Includes `kv_io_ms`.
     pub model_ms: f64,
+    /// Reading the `import_kv` file plus writing the `export_kv` file, when the
+    /// request named either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_io_ms: Option<f64>,
 }
 
 fn elapsed_ms(since: std::time::Instant) -> f64 {
@@ -197,12 +219,70 @@ fn timings_if(
     parse_ms: f64,
     model_start: std::time::Instant,
     first_token_ms: Option<f64>,
+    kv_io_ms: Option<f64>,
 ) -> Option<IpcTimings> {
     requested.then(|| IpcTimings {
         parse_ms,
         first_token_ms,
         model_ms: elapsed_ms(model_start),
+        kv_io_ms,
     })
+}
+
+/// Runs a `generate`-path request, honoring `import_kv`/`export_kv`. Shared by
+/// [`handle_request`] and [`handle_request_streaming`]. Records the time spent
+/// on the cache files in `kv_io_ms`.
+fn run_generate(
+    model: &Model,
+    req: &IpcRequest,
+    kv_io_ms: &mut Option<f64>,
+    on_first_token: impl FnMut(&[f32]),
+    on_token: impl FnMut(u32, &str),
+) -> Result<(Vec<u32>, String), ReflexError> {
+    let sampling = req.sampling_params();
+    if req.export_kv.is_some() && req.max_tokens != 1 {
+        return Err(ReflexError::InvalidInput(
+            "export_kv captures the state right after the prompt, so it needs \"max_tokens\": 1"
+                .to_string(),
+        ));
+    }
+    let imported = match &req.import_kv {
+        Some(path) => {
+            let start = std::time::Instant::now();
+            let kv = crate::kv_io::import_kv(path)?;
+            *kv_io_ms = Some(elapsed_ms(start));
+            Some(kv)
+        }
+        None => None,
+    };
+    let Some(export_path) = &req.export_kv else {
+        return model.generate(
+            &req.prompt,
+            req.max_tokens.max(1),
+            imported.as_ref(),
+            &sampling,
+            on_first_token,
+            on_token,
+        );
+    };
+    let (token_ids, text, cache) = model.generate_capture_kv(
+        &req.prompt,
+        imported.as_ref(),
+        &sampling,
+        on_first_token,
+        on_token,
+    )?;
+    let start = std::time::Instant::now();
+    crate::kv_io::export_kv(export_path, &cache)?;
+    *kv_io_ms = Some(kv_io_ms.unwrap_or(0.0) + elapsed_ms(start));
+    Ok((token_ids, text))
+}
+
+/// The error for `import_kv`/`export_kv` on a `system1_evaluate` request.
+fn kv_fields_on_candidates_err() -> ReflexError {
+    ReflexError::InvalidInput(
+        "import_kv/export_kv apply only to generate requests (empty candidates)".to_string(),
+    )
 }
 
 impl IpcResponse {
@@ -249,13 +329,12 @@ pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
     let id = req.id.clone();
     let model_start = std::time::Instant::now();
     if req.candidates.is_empty() {
-        let sampling = req.sampling_params();
         let mut first_token_ms = None;
-        match model.generate(
-            &req.prompt,
-            req.max_tokens.max(1),
-            None,
-            &sampling,
+        let mut kv_io_ms = None;
+        match run_generate(
+            model,
+            &req,
+            &mut kv_io_ms,
             |_logits| first_token_ms = Some(elapsed_ms(model_start)),
             |_token_id, _text| {},
         ) {
@@ -269,10 +348,18 @@ pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
                 text: Some(text),
                 candidates: None,
                 entropy: None,
-                timings: timings_if(req.timings, req.parse_ms, model_start, first_token_ms),
+                timings: timings_if(
+                    req.timings,
+                    req.parse_ms,
+                    model_start,
+                    first_token_ms,
+                    kv_io_ms,
+                ),
             },
             Err(e) => IpcResponse::err(id, e),
         }
+    } else if req.import_kv.is_some() || req.export_kv.is_some() {
+        IpcResponse::err(id, kv_fields_on_candidates_err())
     } else {
         let candidates: Vec<System1Candidate> = req
             .candidates
@@ -302,7 +389,7 @@ pub fn handle_request(model: &Model, req: IpcRequest) -> IpcResponse {
                     text: None,
                     candidates: Some(candidates),
                     entropy: Some(response.entropy),
-                    timings: timings_if(req.timings, req.parse_ms, model_start, None),
+                    timings: timings_if(req.timings, req.parse_ms, model_start, None, None),
                 }
             }
             Err(e) => IpcResponse::err(id, e),
@@ -349,16 +436,14 @@ pub fn handle_request_streaming<W: Write>(
     }
 
     let id = req.id.clone();
-    let sampling = req.sampling_params();
-    let max_tokens = req.max_tokens.max(1);
     let mut write_err: Option<String> = None;
     let model_start = std::time::Instant::now();
     let mut first_token_ms = None;
-    let result = model.generate(
-        &req.prompt,
-        max_tokens,
-        None,
-        &sampling,
+    let mut kv_io_ms = None;
+    let result = run_generate(
+        model,
+        &req,
+        &mut kv_io_ms,
         |_logits| first_token_ms = Some(elapsed_ms(model_start)),
         |token_id, text| {
             if write_err.is_some() {
@@ -390,7 +475,13 @@ pub fn handle_request_streaming<W: Write>(
             text: Some(text),
             candidates: None,
             entropy: None,
-            timings: timings_if(req.timings, req.parse_ms, model_start, first_token_ms),
+            timings: timings_if(
+                req.timings,
+                req.parse_ms,
+                model_start,
+                first_token_ms,
+                kv_io_ms,
+            ),
         },
         Err(e) => IpcResponse::err(id, e),
     };
@@ -448,6 +539,9 @@ pub fn run_stdio_loop(model: &Model) -> Result<(), String> {
     let stdout = std::io::stdout();
     run_request_loop(model, stdin.lock(), stdout.lock())
 }
+
+#[cfg(test)]
+mod relay_tests;
 
 #[cfg(test)]
 mod tests {
@@ -629,11 +723,28 @@ mod tests {
     #[test]
     fn test_timings_if_only_builds_when_requested() {
         let start = std::time::Instant::now();
-        assert!(timings_if(false, 1.0, start, Some(2.0)).is_none());
-        let t = timings_if(true, 1.0, start, None).expect("requested");
+        assert!(timings_if(false, 1.0, start, Some(2.0), None).is_none());
+        let t = timings_if(true, 1.0, start, None, None).expect("requested");
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"parse_ms\":1.0"), "{json}");
         assert!(json.contains("\"model_ms\""), "{json}");
         assert!(!json.contains("first_token_ms"), "{json}");
+        assert!(!json.contains("kv_io_ms"), "{json}");
+        let t = timings_if(true, 1.0, start, None, Some(3.0)).expect("requested");
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains("\"kv_io_ms\":3.0"), "{json}");
+    }
+
+    #[test]
+    fn test_ipc_request_kv_paths_default_off_and_parse() {
+        let req: IpcRequest = serde_json::from_str(r#"{"prompt": "p"}"#).unwrap();
+        assert!(req.import_kv.is_none() && req.export_kv.is_none());
+        let req: IpcRequest = serde_json::from_str(
+            r#"{"prompt": "p", "import_kv": "/dev/shm/sys.cskv", "export_kv": "out.cskv", "max_tokens": 1}"#,
+        )
+        .unwrap();
+        assert_eq!(req.import_kv.as_deref(), Some("/dev/shm/sys.cskv"));
+        assert_eq!(req.export_kv.as_deref(), Some("out.cskv"));
+        assert_eq!(req.max_tokens, 1);
     }
 }

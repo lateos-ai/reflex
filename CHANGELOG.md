@@ -19,6 +19,11 @@ What has been built, in order. Measurements live in
   request field, which adds `parse_ms`/`first_token_ms`/`model_ms` to the final
   line; when the field is omitted, responses are unchanged. See
   [docs/design/agent-relay.md](docs/design/agent-relay.md).
+- **Prefix reuse over IPC.** `reflex stdio`/`uds` requests can name an `export_kv`
+  file, to save the state after the prompt, and an `import_kv` file, to resume from
+  one. They use the same cache formats as `--export-kv`/`--import-kv`, and a request
+  can set both to layer prefixes. The caller owns the files, so the engine still keeps
+  nothing between requests. `agent_relay_bench.py --reuse-prefix` measures it.
 
 ## 2026-10-15
 
