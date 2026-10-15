@@ -351,6 +351,7 @@ impl Model {
             attn_online_k,
             attn_online_combine_k,
             attn_impl,
+            attn_tiled: TiledAttnKernels::from_env()?,
             add_k,
             split_qg_k,
             sigmoid_gate_k,

@@ -100,3 +100,88 @@ prototype d64 and d128 kernels at M = 64 don't spill on any of sm_75/80/86/89/90
 registers; d128 is at the 128-register cap on sm_90). Today's d256 kernel spills 8 bytes
 on sm_75 and sm_80 and 4 bytes on sm_90, and none on sm_86/89, which is why an A40
 build shows no spill. d512 doesn't spill anywhere.
+
+## Phase B: tiled prefill for dense, MoE, Kolibri and Qwen3.5 (2026-10-15)
+
+**What changed.**
+- **One kernel template.** `attention_tiled.cuh` holds the kernel as
+  `attention_tiled<D, M>`, where M is the number of query vectors per block: 64, or 32
+  for d512.
+- **Padded groups.** A GQA group that doesn't divide M (3, 6, 7) now leaves
+  `M % group` query slots per block unused, masked like rows past the end, instead of
+  falling back to the online kernel. That covers Qwen2.5 (6 and 7) and the group-3
+  shape Granite uses.
+- **One module per head-dim family**, so a PTX build JIT-compiles only what its model
+  uses: `attention_tiled.cu` (d256 and d512: Gemma 4, Qwen3.5), `attention_tiled_d128.cu`
+  and `attention_tiled_d64.cu`.
+- **One dispatch point.** `Model::attention_prefill` serves dense, MoE, Kolibri-1's
+  dense layers and Qwen3.5's gated attention. It runs the tiled kernel when a prefill
+  has at least `ATTN_TILED_MIN_ROWS` (64) rows and the shape fits (`attn_tiled_fits`),
+  and `attention_online` otherwise.
+- **Lazy loading.** Each module loads on the first prefill that needs it
+  (`TiledAttnKernels`). Short prompts, decode and `system1` never load one, so
+  short-prompt cold start is unchanged.
+- **Gemma 4** keeps its eagerly loaded copy of the d256/d512 kernels and shares the
+  launcher.
+- **`REFLEX_ATTN_TILED=0`** sends every prefill back to the online kernel, for A/B runs.
+- **Not covered yet:** Granite 4.0-H calls `attention_online` directly and still uses
+  it, and MLA needs its own shared-latent variant. Both are deferred.
+
+**Correctness** (Tesla T4, sm_75 cubin):
+- `attention_tiled_small_dims_match_online_kernel` compares tiled against online on
+  random Q/K/V, for 10 shapes across d64, d128 and d256. The shapes include groups 2,
+  3, 4, 6, 7 and 8, a resumed prefill with a sliding window, and two rows. The largest
+  difference is 1.1e-6.
+- `attention_tiled_prefill_matches_online_end_to_end` runs a whole long-prompt
+  prefill with f32 weights, tiled vs online, on Qwen3-0.6B (794 tokens), TinyLlama
+  (971) and Qwen3.5-0.8B (807). The first-token logits agree to 1.8e-6 relative L2 or
+  better, and 8 greedy ids match. With f16 weights the first-token logits differ by 3.6e-4 to
+  7.0e-4 relative L2: every GEMM rounds its activations to f16, which amplifies the
+  attention's summation-order differences.
+- The GPU nightly suite passes with every fixture: Gemma 4's tiled tests, and
+  batched-vs-sequential prefill for dense, MoE, Kolibri, Qwen2 and Qwen3.5.
+
+**Registers** (CUDA 12.4, every Dockerfile arch): d64 uses 110-118 registers and d128
+uses 124-127, with no spills on sm_75/80/86/89/90. d256 still spills 8 bytes on sm_75,
+as before.
+
+**Where tiled starts to win.** These are kernel times on the T4
+(`attention_tiled_crossover_timings`, fresh prefill):
+
+| shape | 16 rows | 32 rows | 64 rows | 128 rows | 512 rows | 2,048 rows |
+|---|---|---|---|---|---|---|
+| d128, 16 q / 8 kv: tiled | 32 us | 34 us | 35 us | 68 us | 0.62 ms | 7.0 ms |
+| d128, 16 q / 8 kv: online | 17 us | 37 us | 93 us | 289 us | 4.15 ms | 63.2 ms |
+| d128, 32 q / 8 kv: tiled | 34 us | 35 us | 39 us | 116 us | 1.07 ms | 13.9 ms |
+| d128, 32 q / 8 kv: online | 29 us | 63 us | 162 us | 596 us | 8.32 ms | 126.4 ms |
+| d64, 14 q / 2 kv: tiled | 22 us | 22 us | 23 us | 42 us | 0.26 ms | 3.5 ms |
+| d64, 14 q / 2 kv: online | 14 us | 25 us | 57 us | 162 us | 2.56 ms | 39.4 ms |
+
+Online wins below about 32 rows, where a tiled grid has too few blocks to fill the
+GPU. From 64 rows up, tiled is 2.5x faster or more. The threshold of 64 also keeps the
+tiled modules out of short prompts entirely.
+
+**Whole prefill** (`REFLEX_PREFILL_PROFILE=1`, GPU total, `REFLEX_ATTN_TILED=0` vs
+default). The prompts and the method are Phase A's (`profile.py`), and Mistral 7B runs
+with `REFLEX_QUANT_RESIDENT=1` to fit in 16 GB:
+
+| model | tokens | online | tiled | speedup | attention share, tiled |
+|---|---|---|---|---|---|
+| Qwen3-0.6B (d128, group 2) | 514 | 171 ms | 62 ms | 2.8x | 34% |
+| | 2,008 | 2.03 s | 378 ms | 5.4x | 60% |
+| | 8,164 | 43.1 s | 4.12 s | 10.5x | 87% |
+| TinyLlama 1.1B (d64, group 8) | 511 | 222 ms | 93 ms | 2.4x | 18% |
+| | 2,022 | 2.39 s | 448 ms | 5.3x | 51% |
+| | 8,144 | 35.2 s | 4.19 s | 8.4x | 81% |
+| Mistral 7B (d128, group 4) | 509 | 851 ms | 598 ms | 1.4x | 8% |
+| | 2,023 | 6.25 s | 2.22 s | 2.8x | 34% |
+| Qwen3.5-0.8B (d256, group 4) | 2,025 | 12.33 s | 12.04 s | 1.02x | 0.3% |
+| | 8,330 | 58.5 s | 50.0 s | 1.17x | 1.5% |
+
+Takeaways:
+- **Dense prefill is no longer quadratic-bound up to 2K.** On Qwen3-0.6B, attention
+  drops from 93% to 60% of a 2K prefill.
+- **At 8K attention is still 87% of the prefill**, and this f32 SIMT kernel is the
+  next limit. Tensor cores (f16 Q/K/V tiles) would be the next step.
+- **Qwen3.5's attention shrinks 12x**, but its prefill stays bound by the token-by-token
+  Gated DeltaNet loop, as Phase A found.

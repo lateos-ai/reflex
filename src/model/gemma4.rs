@@ -412,6 +412,7 @@ impl Model {
             attn_online_k,
             attn_online_combine_k,
             attn_impl,
+            attn_tiled: TiledAttnKernels::from_env()?,
             add_k,
             split_qg_k,
             sigmoid_gate_k,
@@ -877,17 +878,6 @@ pub(super) struct Gemma4Kernels {
     attn_tiled_d512: AotKernel,
 }
 
-/// `attention_tiled.cu`'s block size, and its query vectors per block for a
-/// head dim it has a kernel for.
-const ATTN_TILED_THREADS: u32 = 256;
-fn attn_tiled_queries_per_block(head_dim: usize) -> Option<usize> {
-    match head_dim {
-        256 => Some(64),
-        512 => Some(32),
-        _ => None,
-    }
-}
-
 impl Gemma4Kernels {
     pub(super) fn load(device: &Arc<CudaDevice>) -> Result<Self, ReflexError> {
         let mut fns = aot::load_kernel_module(
@@ -930,11 +920,10 @@ impl Gemma4Kernels {
 
     /// Batched-prefill attention with `attention_tiled.cu`, which reuses each
     /// K/V tile across a block of query rows and the query heads of a GQA
-    /// group. `None` when the shape isn't one it covers (a single row, head
-    /// dims other than 256/512, `qk_dim != v_dim`, or a group size that
-    /// neither divides nor is a multiple of the queries per block); the
-    /// caller then uses [`Model::attention_online`]. Same layout, masking and
-    /// output as that kernel; only the f32 summation order differs.
+    /// group. `None` when the shape isn't one it covers (see
+    /// [`attn_tiled_fits`]; head dims other than 256/512 too); the caller then
+    /// uses [`Model::attention_online`]. Same layout, masking and output as
+    /// that kernel; only the f32 summation order differs.
     pub(super) fn attention_prefill_tiled(
         &self,
         device: &Arc<CudaDevice>,
@@ -943,46 +932,15 @@ impl Gemma4Kernels {
         v: &CudaView<f32>,
         s: &OnlineAttnShape,
     ) -> Result<Option<CudaSlice<f32>>, ReflexError> {
-        let Some(m) = attn_tiled_queries_per_block(s.qk_dim) else {
-            return Ok(None);
+        let kernel = match s.qk_dim {
+            256 => &self.attn_tiled_d256,
+            512 => &self.attn_tiled_d512,
+            _ => return Ok(None),
         };
-        let g = s.group_size;
-        if s.rows < 2
-            || s.v_dim != s.qk_dim
-            || g == 0
-            || !s.num_q_heads.is_multiple_of(g)
-            || !(m.is_multiple_of(g) || g.is_multiple_of(m))
-        {
+        if !attn_tiled_fits(s) {
             return Ok(None);
         }
-        let kernel = if s.qk_dim == 256 {
-            &self.attn_tiled_d256
-        } else {
-            &self.attn_tiled_d512
-        };
-        let heads_per_block = g.min(m);
-        let rows_per_block = m / heads_per_block;
-        let num_kv_heads = s.num_q_heads / g;
-        let cfg = LaunchConfig {
-            grid_dim: (
-                s.rows.div_ceil(rows_per_block) as u32,
-                (num_kv_heads * (g / heads_per_block)) as u32,
-                1,
-            ),
-            block_dim: (ATTN_TILED_THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut out = device
-            .alloc_zeros::<f32>(s.rows * s.num_q_heads * s.v_dim)
-            .map_err(|e| crate::gpu_err!(e, "attn_tiled alloc out: {e}"))?;
-        unsafe {
-            kernel
-                .function
-                .clone()
-                .launch(cfg, (q, k, v, &mut out, s.unsplit_params(), s.rows as u32))
-                .map_err(|e| crate::gpu_err!(e, "attn_tiled launch: {e}"))?;
-        }
-        Ok(Some(out))
+        launch_attention_tiled(device, kernel, q, k, v, s).map(Some)
     }
 
     /// NEOX RoPE with per-pair frequency factors, in place over `t`
