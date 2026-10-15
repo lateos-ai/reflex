@@ -236,6 +236,22 @@ stopping, because Reflex stops only at `<eos>` and llama.cpp also at `<turn|>`. 
 12B on an A40, 31B on an A100 80 GB (f16 weights); run the 31B's GPU tests with
 `--test-threads=1`. Design, results and numbers: `docs/design/gemma4.md`.
 
+`general.architecture == "granitehybrid"` dispatches to `Model::load_granite_hybrid`
+(`src/model/granite_hybrid.rs`, `Model.granite: Option<GraniteHybridModel>`,
+`ArchitectureKind::GraniteHybrid`): Granite 4.0-H, Mamba-2 SSM layers plus a few attention
+layers without RoPE (a layer is SSM iff its `attention.head_count_kv` entry is 0), each
+followed by a SwiGLU FFN, with muP scales (embedding, residual via `scaled_add_kernel`
+with no FMA, attention `kq_scale`, logits). Kernels in `kernels_cuda/mamba2.cu`; the host
+oracle `reference/mamba2_reference.rs` is compiled into the test build (unlike the GDN
+reference). SSM prefill keeps projections batched and walks the rows inside each kernel;
+no chunked SSD scan. `ssm_a` is already `-exp(A_log)`; the gate comes **before** the
+grouped RMSNorm (opposite of GDN's gated norm). Other SSM archs (`mamba`, `mamba2`,
+`jamba`, `falcon-h1`, `nemotron_h(_moe)`) are rejected by name in `parse_model_config`.
+Dense-FFN Granite only (350M/1B/Micro); MoE Tiny/Small, LoRA, KV export/import rejected.
+Compare against llama.cpp with f32 activations (`LLAMA_NO_Q8=1`). llama.cpp's CUDA scan
+only runs `d_state` in {96,128,256} with head_dim%16 and conv_dim%128, else silently on CPU.
+Design and results: `docs/design/mamba2-hybrid.md`.
+
 ### MoE routing (`src/moe.rs`)
 `route_top_k`: softmax over all experts, select top-k, renormalize. No new
 CUDA kernels were needed for MoE — it reuses `gemv`/`silu_and_mul` unchanged via
@@ -325,6 +341,15 @@ small layer outputs a random model just repeats one token, so keep the scales if
 rebuilding. `test-data/qwen2.5-*-header.gguf` are real Qwen2.5 headers (metadata +
 tensor table, no data; `scripts/gguf_tokenizer_only.py --keep-tensor-table`) for host-only
 config and tokenizer tests.
+
+`test-data/tiny-granitehybrid.gguf` is the Mamba-2 hybrid fixture (random
+`GraniteMoeHybridForCausalLM`, n_groups 2, d_state 128, real Granite tokenizer, through
+`79e2e74`'s unmodified converter; source, refs, ablation patch and GPU outputs in
+`test-data/tiny-granitehybrid-src.tar.gz`). Dropping D, dt_bias, the gate, the conv bias,
+the norm or any muP scale but the logit scale changes 7/7 prompts in llama.cpp; keep the
+weight scales (tied embeddings otherwise repeat one token or give near-ties).
+`test-data/granite-4.0-h-*-header.gguf` and the Falcon-H1/Nemotron/Jamba/mamba2 headers back
+the config and rejection tests.
 
 `test-data/tiny-mla-v3.gguf` is the second MLA fixture (random `DeepseekV3ForCausalLM`
 through the same unmodified converter; source, llama.cpp references and the sensitivity
