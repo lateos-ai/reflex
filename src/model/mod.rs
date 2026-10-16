@@ -388,6 +388,28 @@ impl Model {
         Ok(self.tokenizer.encode(prompt)?.len())
     }
 
+    /// The ids `prompt` encodes to as a fresh prompt (BOS not included).
+    #[cfg(all(test, feature = "ipc"))]
+    pub(crate) fn encode_prompt(&self, prompt: &str) -> Result<Vec<u32>, ReflexError> {
+        self.tokenizer.encode(prompt)
+    }
+
+    /// Each of `parts`' ids as a chain of requests encodes them, each resuming
+    /// after the parts before it (BOS not included): for tests that check a
+    /// split falls on a token boundary.
+    #[cfg(all(test, feature = "ipc"))]
+    pub(crate) fn encode_split(&self, parts: &[&str]) -> Result<Vec<Vec<u32>>, ReflexError> {
+        let mut after_special = true;
+        parts
+            .iter()
+            .map(|p| {
+                let ids = self.tokenizer.encode_continuation(p, after_special)?;
+                after_special = self.tokenizer.ends_after_special(p, after_special);
+                Ok(ids)
+            })
+            .collect()
+    }
+
     /// Decodes each id in `ids` to its own individual text piece (unlike
     /// `Model::generate`'s combined whole-sequence `text`, which merges every
     /// generated id's bytes into one string) -- for callers like

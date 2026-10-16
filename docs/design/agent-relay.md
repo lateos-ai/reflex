@@ -130,6 +130,20 @@ spent reading and writing them. It is included in `model_ms`, and the read is al
 included in `first_token_ms`. The files hold f32 values, so a long prefix makes a
 large file; tmpfs keeps the read cheap.
 
+**The continuation is tokenized as if it followed the prefix.** With the same cache
+reused, the prompt resumes exactly where the joined text would have, provided the
+split falls on a token boundary. That matters for SentencePiece tokenizers (Llama-2,
+Mistral, TinyLlama). Like llama.cpp, they give a stretch of raw text a leading `▁`
+space only when it starts the text or follows a special token. So a continuation
+gets that space only when the prefix ended on a special token, such as `</s>`.
+- Dense cache files record which case applies. They use KV format version 4, the
+  version-1 dense layout plus one byte.
+- A pinned prefix keeps the same bit.
+- A version-1 file, written before this, is resumed as if its prefix ended on a
+  special token, which was the earlier behavior. Re-export it to resume exactly.
+- gpt2-style vocabularies (Qwen, Llama-3, DeepSeek) have no such space, so they're
+  unaffected.
+
 `scripts/agent_relay_bench.py --reuse-prefix` exports the shared system prompt once and
 imports it on every hop. `--system-prompt-file` sets a longer prefix.
 

@@ -69,14 +69,15 @@ fn final_ok(resp: &Value) -> Vec<u64> {
         .collect()
 }
 
+/// Checks that a chain of requests resuming part by part encodes `parts` to the
+/// same ids as one request over the joined text. Ids, not counts: on a
+/// SentencePiece model a continuation encoded with a stray dummy-prefix space
+/// (`▁<` where the joined text has `<`) can have the same length.
 fn assert_split_tokenizes_alike(model: &Model, parts: &[&str]) {
-    let split: usize = parts
-        .iter()
-        .map(|p| model.encoded_prompt_len(p).unwrap())
-        .sum();
-    let joined = model.encoded_prompt_len(&parts.concat()).unwrap();
+    let split: Vec<u32> = model.encode_split(parts).unwrap().concat();
     assert_eq!(
-        split, joined,
+        split,
+        model.encode_prompt(&parts.concat()).unwrap(),
         "test prompts must split on a token boundary for this tokenizer"
     );
 }
@@ -252,7 +253,7 @@ fn assert_pinned_resumes_exactly(model: &Model, tag: &str) {
     let task_len = slot.seq_len().unwrap();
     assert_eq!(
         task_len,
-        sys_len + model.encoded_prompt_len(PARTS[1]).unwrap(),
+        sys_len + model.encode_split(&PARTS[..2]).unwrap()[1].len(),
         "{tag}: layered pin holds both parts"
     );
     let bytes = slot.device_bytes();
@@ -500,6 +501,70 @@ fn ipc_pinned_prefix_qwen2_fixture_resumes_exactly() {
 fn ipc_pinned_prefix_kolibri1_fixture_resumes_exactly() {
     let model = load(KOLIBRI1_FIXTURE, WeightsDtype::F32);
     assert_pinned_resumes_exactly(&model, "kolibri1");
+}
+
+/// Resumes `parts[1]` after `parts[0]` through a file and through the slot; both
+/// must match one request over the joined text.
+fn assert_two_part_resume(model: &Model, parts: [&str; 2], tag: &str) {
+    const N: usize = 12;
+    assert_split_tokenizes_alike(model, &parts);
+    let file = tmp_path(&format!("{tag}_two_part"));
+    let lines = session(
+        model,
+        &[
+            serde_json::json!({"prompt": parts[0], "export_kv": file, "max_tokens": 1}),
+            serde_json::json!({"prompt": parts[1], "import_kv": file, "max_tokens": N}),
+            serde_json::json!({"prompt": parts[0], "pin_prefix": true, "max_tokens": 1}),
+            serde_json::json!({"prompt": parts[1], "use_pinned": true, "max_tokens": N}),
+            serde_json::json!({"prompt": parts.concat(), "max_tokens": N}),
+        ],
+    );
+    std::fs::remove_file(&file).ok();
+    final_ok(&lines[0]);
+    final_ok(&lines[2]);
+    let (imported, pinned, joined) = (
+        final_ok(&lines[1]),
+        final_ok(&lines[3]),
+        final_ok(&lines[4]),
+    );
+    eprintln!("{tag}: joined={joined:?}");
+    assert_eq!(
+        imported, joined,
+        "{tag}: import_kv differs from one joined request"
+    );
+    assert_eq!(
+        pinned, joined,
+        "{tag}: use_pinned differs from one joined request"
+    );
+}
+
+/// A real SentencePiece chat model (`SPM_GGUF` in the nightly, e.g.
+/// TinyLlama-1.1B-Chat). Its tokenizer gives a raw-text span a dummy-prefix
+/// space only at the start of the text or after a special token, so a
+/// continuation must get one exactly when the joined text would: not after
+/// raw text (`PARTS`, a chat turn ending in a newline), but after `</s>`.
+#[test]
+#[ignore]
+fn ipc_kv_relay_spm_model_resumes_exactly() {
+    let path = std::env::var("REFLEX_TEST_GGUF")
+        .expect("set REFLEX_TEST_GGUF to a SentencePiece GGUF (the nightly's SPM_GGUF)");
+    let model = load(&path, WeightsDtype::DEFAULT);
+    assert_relay_resumes_exactly(&model, "spm");
+    assert_pinned_resumes_exactly(&model, "spm");
+    let user = "<|user|>\nWhat is the capital of France?</s>\n<|assistant|>\n";
+    assert_two_part_resume(
+        &model,
+        ["<|system|>\nYou are a careful assistant.</s>\n", user],
+        "spm after raw text",
+    );
+    assert_two_part_resume(
+        &model,
+        [
+            "<|system|>\nYou are a careful assistant.</s>",
+            &format!("\n{user}"),
+        ],
+        "spm after a special token",
+    );
 }
 
 #[test]
