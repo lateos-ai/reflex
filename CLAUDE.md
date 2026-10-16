@@ -285,6 +285,19 @@ use `Model::alloc_out` (no memset) instead of `alloc_zeros`; only switch an op t
 its kernel really writes every element. Design and T4 numbers:
 `docs/design/decode-speed.md`.
 
+### JSON Schema constrained decoding (`src/grammar.rs`)
+Agent relay phase C. `SamplingParams::json_schema` (IPC `json_schema`, CLI
+`--json-schema`) masks the host logits to `-inf` before greedy/temperature sampling;
+every architecture's decode loop goes through `crate::sampling::TokenPicker`
+(`Model::token_picker`), so the six loops must keep calling `picker.pick`/
+`stream_text`/`finish` rather than `sampling::sample` directly. The vocabulary trie
+(`TokenIndex`) is built lazily on the first constrained request and cached in
+`Model::grammar_index`; **keep it lazy** (cold start must not pay for it). Schema
+JSON is parsed by the module's own order-preserving parser (IPC keeps it as a
+`serde_json` `RawValue`): `serde_json::Value` sorts keys, and properties come out in
+schema order. Subset, compact output format and its rationale, results:
+`docs/design/agent-relay.md` phase C.
+
 ### MoE routing (`src/moe.rs`)
 `route_top_k`: softmax over all experts, select top-k, renormalize. No new
 CUDA kernels were needed for MoE — it reuses `gemv`/`silu_and_mul` unchanged via
@@ -387,6 +400,11 @@ the norm or any muP scale but the logit scale changes 7/7 prompts in llama.cpp; 
 weight scales (tied embeddings otherwise repeat one token or give near-ties).
 `test-data/granite-4.0-h-*-header.gguf` and the Falcon-H1/Nemotron/Jamba/mamba2 headers back
 the config and rejection tests.
+
+`test-data/qwen3-0.6b-tokenizer.gguf` and `tinyllama-1.1b-chat-tokenizer.gguf`
+(tokenizer-only, `scripts/gguf_tokenizer_only.py`) back `src/grammar/tests.rs`'s
+mask-vs-brute-force tests; the GPU nightly passes `SPM_GGUF` (TinyLlama-Chat on the T4,
+`/root/models/tinyllama.gguf`) to the `ipc_json_schema_spm_model_*` tests.
 
 `test-data/tiny-mla-v3.gguf` is the second MLA fixture (random `DeepseekV3ForCausalLM`
 through the same unmodified converter; source, llama.cpp references and the sensitivity

@@ -334,11 +334,246 @@ What this shows:
 - **Decode is still the largest gap.** 31 decode steps take 256 ms of the 295 ms
   pinned hop: 8.3 ms per token against llama.cpp's 4.7 ms.
 
+## JSON Schema constrained decoding (phase C)
+
+A handoff payload or a tool call that doesn't parse costs the orchestrator a retry,
+which is a whole extra hop. A `generate` request can name a JSON Schema, and the
+output is then one JSON value that validates against it:
+
+```jsonl
+{"prompt": "<hop prompt>", "json_schema": {"type": "object", "properties": {"status": {"enum": ["done", "blocked"]}, "note": {"type": "string"}}, "required": ["status", "note"]}, "max_tokens": 64}
+```
+
+```sh
+reflex generate model.gguf "<prompt>" --max-tokens 64 --json-schema handoff.json
+```
+
+`text` is the value alone; `token_ids` end with EOS. Constraining covers only the
+generated text, never the prompt, so `json_schema` works with `use_pinned` and
+`import_kv` like any other request.
+
+### The supported subset
+
+`type` (one name or an array of them), `properties`, `required`,
+`additionalProperties` (`false` or omitted), `items`, `enum`, `const`, `anyOf`, and a
+local `$ref` (`#` or `#/$defs/<name>`, recursion allowed). The annotations `title`,
+`description`, `$comment`, `$schema`, `default` and `examples` are accepted, since
+they never change which values are valid.
+
+Every other keyword is rejected with `invalid_input`, and the message names it:
+`minLength`, `pattern`, `format`, `minimum`, `oneOf`, `allOf`, `prefixItems` and so on.
+A schema the engine accepts never carries a constraint it silently drops, so an
+accepted schema means what it says. Other rejections:
+- `additionalProperties: true` or a schema value;
+- a `required` name missing from `properties`;
+- `$defs` anywhere but the root;
+- a `$ref` cycle that never consumes input;
+- `anyOf` or `$ref` next to other validation keywords in the same object;
+- an `enum` none of whose values pass the sibling keywords.
+
+### A fixed output format
+
+The output is compact JSON:
+- no whitespace outside strings;
+- object properties in schema order, each optional one present or absent;
+- generation ends at EOS as soon as the value is complete. Once the value is closed,
+  EOS is the only token allowed.
+
+"Schema order" is the order of the request's bytes: the engine parses the schema
+itself and never reorders it. A client that builds the request through a JSON type
+that sorts keys (`serde_json::Value` without `preserve_order`, for one) sends the
+properties alphabetically, and gets them back in that order. Python's `json` keeps
+insertion order.
+
+With `properties` given, the object has no other properties, whether
+`additionalProperties` is `false` or omitted. llama.cpp's `json_schema_to_grammar`
+does the same. An object schema with neither `properties` nor
+`additionalProperties: false` allows any object. Every output still validates against
+the schema, since this is a subset of what the schema allows.
+
+Why the format is fixed rather than free:
+- **A smaller automaton.** Optional whitespace between every token of the value, and
+  properties in any order, multiply the states the matcher has to track. An object
+  with *n* optional properties in any order needs a state per subset already
+  emitted; in schema order it needs about 2*n* rules.
+- **Fewer tokens.** Whitespace and indentation are tokens the model has to decode, at
+  8 ms each on the T4. Compact output is the shortest form of the value.
+- **Deterministic output for the orchestrator.** The same value always comes out as
+  the same bytes, so an orchestrator can compare, hash or cache handoff payloads
+  without parsing them.
+
+### How masking works
+
+`src/grammar.rs` compiles the schema into a context-free grammar over bytes. At each
+generated position it sets the logit of every token that can't continue a
+conforming value to `-inf`, before greedy argmax and before temperature/top-k/top-p.
+Nothing else about the logits changes. So when the unconstrained greedy output
+already conforms, the constrained output is identical, token for token.
+
+- **The matcher** runs the grammar as a set of pushdown stacks, so `anyOf` branches
+  and `enum` values may overlap until the bytes tell them apart. Stacks are
+  hash-consed, and each distinct set of them becomes one state of a DFA over bytes,
+  built lazily. Once a state has seen a byte, stepping it is one table lookup.
+- **The token index** is the vocabulary as a byte trie in preorder, with a skip
+  pointer per node. Each token's bytes are exactly what it adds to the decoded text.
+  For gpt2 byte-level BPE that is the byte-level decoding. For SentencePiece, `▁`
+  becomes a space and a `<0xNN>` token is the raw byte. Control, unknown and unused
+  tokens are never allowed. EOS is allowed only when the value is complete.
+- **A mask** is one linear pass over the trie that skips every subtree whose prefix is
+  already rejected. It is cached per DFA state, since the state inside a long string
+  repeats token after token.
+- **Tokens that split a character or an escape.** The grammar checks UTF-8 byte by
+  byte (no overlongs, no surrogates, nothing past U+10FFFF), and checks escapes the
+  same way: a `\u` high surrogate must be followed by a low one. A token that ends
+  partway through a sequence is allowed whenever the bytes so far can still be
+  completed, and the next tokens must then complete it. A gpt2 byte token `0xE4`, or
+  SentencePiece's `<0xE4>`, is allowed inside a string and nowhere else.
+- **U+2581 on SentencePiece models.** The decoder turns every `▁` into a space, even
+  one assembled from three byte-fallback tokens. So the grammar keeps U+2581 out of
+  strings for those tokenizers, and a schema literal that contains it is rejected.
+- **Numbers.** The number grammar is RFC 8259's, as in llama.cpp, with no limit on
+  digits. So `1e400` is accepted, although some parsers (`serde_json`) refuse it as
+  out of range.
+
+**The index is built lazily.** The first constrained request in a process builds it
+and keeps it on the `Model`. That takes 66 ms for Qwen3's 152K-token vocabulary
+(333,054 trie nodes) on the T4 host. Cold start and unconstrained requests never
+build it.
+
+### Errors and timings
+
+| request | `error_kind` |
+|---|---|
+| a bad or unsupported schema | `invalid_input` |
+| `json_schema` with `candidates` | `invalid_input` |
+| `json_schema` with `pin_prefix` or `export_kv` | `invalid_input` |
+| `max_tokens` ran out before the value was complete | `grammar_dead_end` |
+
+A `grammar_dead_end` response carries the partial `text` and `token_ids`. A pinned or
+exported prefix is the state right after the prompt, before any value exists, so
+there is nothing for a schema to constrain there.
+
+With `"timings": true`, a constrained request reports `mask_ms_total`. That is the
+time spent computing and applying masks and following each chosen token through the
+grammar, summed over the request. It is included in `first_token_ms` (the first mask)
+and in `model_ms`. A failed `generate` request now also carries `timings` when asked,
+so a dead end's work can be accounted for.
+
+`scripts/agent_relay_bench.py --json-schema <file>` constrains every hop and adds the
+masking time and the count of hops whose output parsed.
+`scripts/relay_handoff_schema.json` is a sample schema.
+`scripts/json_schema_compare.py` runs 20 schema-and-prompt cases on Reflex and
+llama-server, with and without the schema. It reports the validity rate and the
+decode time per token.
+
+### Results (Tesla T4, 2026-10-16)
+
+Setup: Qwen3-0.6B Q4_K_M (gpt2 byte-level BPE, 152K tokens) and
+TinyLlama-1.1B-Chat Q4_K_M (SentencePiece, 32K tokens). The host CPU is a Xeon
+Platinum 8259CL. llama.cpp is at `22bdcc4`, run as `llama-server -ngl 99 -c 4096`.
+
+**Correctness.**
+- Host tests (`src/grammar/tests.rs`) cover schema compile and rejection, and the
+  automaton on valid and invalid byte streams: UTF-8, escapes, surrogates, order and
+  required properties. Random walks of the automaton always give output that parses
+  and validates.
+- Every mask was compared with a walk of every vocabulary token, after 18 prefixes
+  that stop mid-string, mid-escape, mid-UTF-8 and mid-number. They agree on the real
+  Qwen3 and TinyLlama vocabularies.
+- GPU tests (`src/ipc/json_schema_tests.rs`, 11 tests) cover a nested schema, an enum
+  and an anyOf on both models. They also run a `use_pinned` and an `import_kv` hop
+  with a schema, the dead end and the request errors, and a finite schema on the
+  Qwen3-MoE, Qwen3.5, MLA, Granite 4.0-H and Gemma 4 fixtures. Every output parses with
+  `serde_json` and validates.
+- **Identity:** on Qwen3, the two test prompts whose unconstrained greedy output
+  already conformed gave identical ids under the schema.
+- The GPU nightly passes 94 tests, with 4 skipped for absent optional models. The 3
+  failures in that run were fixed in the tests, and all 25 IPC GPU tests then passed.
+
+**Mask cost.**
+
+| | Qwen3 (152K) | TinyLlama (32K) |
+|---|---:|---:|
+| index build, once per process | 66 ms | 18 ms |
+| first mask inside a string (whole trie) | 5.4 ms | |
+| a mask the per-state cache already has | < 0.001 ms | |
+| mask at a structural position | 0.03 ms | |
+| per generated token, mean over the 20 comparison cases | 0.27 ms (max 0.52) | 0.06 ms (max 0.11) |
+
+That is well under the ~1 ms per token budget, so nothing past the token trie was
+needed.
+
+**Cold start is unchanged.** `bench_cold_start_phases.sh`, 10 runs per round,
+interleaved. p50 `process_start_to_first_token_ms`: master 634.1 / 639.3 ms against
+this branch's 632.4 / 633.9 ms. A cold `reflex generate --json-schema` reaches its
+first token about 66 ms later, which is the index build.
+
+**Against llama-server** (`scripts/json_schema_compare.py`: 20 cases over 5 schemas,
+greedy, `max_tokens` 192). Validity means the output parses and validates with
+`jsonschema`.
+
+| model | engine | valid with schema | decode/token, free | decode/token, schema | mask/token |
+|---|---|---:|---:|---:|---:|
+| Qwen3-0.6B | Reflex | 20/20 | 6.92 ms | 7.20 ms | 0.27 ms |
+| Qwen3-0.6B | llama-server | 20/20 | 4.05 ms | 7.84 ms | |
+| TinyLlama | Reflex | 17/20 | 9.91 ms | 10.00 ms | 0.06 ms |
+| TinyLlama | llama-server | 17/20 | 4.45 ms | 5.43 ms | |
+
+Without a schema, 0 of 20 outputs validate on either engine; most are wrapped in a
+`` ```json `` fence. The 3 TinyLlama failures are the same handoff cases on both
+engines: the model keeps adding items to the `steps` array until `max_tokens`. Grammar
+costs llama-server about 3.8 ms per token on Qwen3, and Reflex 0.3 ms.
+
+**The compact format's cost: content on a small model.** Qwen3-0.6B writes
+`"key": "value"`, and its space-and-quote token is masked. Without it, the model
+often picks `", "` as the whole string. Every output validates, but the content gets
+worse. 3 of 4 handoffs open with `{"agent":", "`, and 2 of 4 tool calls pair one tool's
+name with another tool's arguments. llama-server, which allows whitespace, gets those
+right. A one-line hint in the prompt (`--hint`, "Answer with compact JSON with no
+spaces, for example ...") fixes most of it:
+- Reflex's handoff and tool-call outputs then match llama-server's exactly in 6 of 8
+  cases, and none of them has a degenerate string.
+- The four extraction cases still come out as `{"people":[],"city":null}` on Reflex,
+  where llama-server, with its spaces, lists the people.
+
+TinyLlama's content is about the same on both engines.
+
+**Relay hops** (the pinned ~1,490-token prefix, 30 hops):
+
+| hop | target | round trip p50 | masking p50 | tokens | valid |
+|---|---|---:|---:|---:|---:|
+| 32 tokens, free | Reflex | 296.5 ms | | 32 | |
+| 32 tokens, schema | Reflex | 304.0 ms | 7.7 ms | 32 | 0/30 |
+| 64 tokens, free | Reflex | 567.1 ms | | 64 | |
+| 64 tokens, schema | Reflex | 578.8 ms | 11.4 ms | 64 | 0/30 |
+| JSON-note prompt, 96 max, free | Reflex | 846.1 ms | | 96 | |
+| JSON-note prompt, 96 max, schema | Reflex | 220.2 ms | 6.7 ms | 22 | 30/30 |
+| JSON-note prompt, 96 max, free | llama-server, cached | 464.7 ms | | 96 | |
+| JSON-note prompt, 96 max, schema | llama-server, cached | 174.9 ms | | 22 | 30/30 |
+
+- **Masking adds 2 to 4% to a hop.** At the same token count it costs 7.7 to 11.4 ms.
+- **The default bench prompt asks for a free-text note.** Under the schema, Qwen3-0.6B
+  fills the `note` string with `. . . .` until `max_tokens`, so no hop completes, even
+  at 160 tokens. llama-server completes all 30 hops at 160 tokens (136 tokens each),
+  and none at 64.
+- **With a system prompt that shows a compact JSON note**, both engines produce valid
+  22-token handoffs on every hop. Ending at EOS as soon as the value closes makes the
+  hop 3.8× shorter than a free 96-token note (220 vs 846 ms).
+
+**Prefix reuse on SentencePiece models.** A `use_pinned` or `import_kv` continuation
+is encoded with the tokenizer's dummy-prefix space: `<|user|>` becomes `▁<`, where the
+joined prompt has `<`. So on TinyLlama a resumed request is not token-identical to
+one joined request, with or without a schema. The phase A/B tests only compared token
+counts, which happened to match. They now compare ids. The constrained hop test
+checks `use_pinned` against `import_kv` on SentencePiece models, and against the joined
+request only where the split tokenizes alike. This predates phase C and is not
+changed here.
+
+Raw data: `bench-results/agent-relay-t4-phase-c/` (not committed).
+
 ## Planned next phases
 
-1. **JSON Schema constrained decoding.** Logit masking ahead of sampling, so that
-   handoff payloads and tool calls parse on the first try.
-2. **Buffer reuse across warm requests**, only if phase 0 shows allocation time on
+1. **Buffer reuse across warm requests**, only if phase 0 shows allocation time on
    the hop.
 
 ## Swarm pattern

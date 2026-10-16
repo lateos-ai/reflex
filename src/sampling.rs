@@ -13,6 +13,11 @@
 //! Host-side only, same small-`Vec`-in/no-CUDA-coupling convention as
 //! `crate::calibration` -- the GPU produces raw logits (already downloaded
 //! to host by `Model::lm_head_logits`), sampling itself needs no kernel.
+//!
+//! A `json_schema` constraint (`SamplingParams::json_schema`, `crate::grammar`)
+//! masks the logits before either path: tokens that can't continue a value
+//! conforming to the schema get `-inf`, and nothing else changes. [`TokenPicker`]
+//! is the per-generation state both share.
 
 use crate::error::ReflexError;
 use rand::rngs::StdRng;
@@ -26,13 +31,16 @@ use rand::{Rng, SeedableRng};
 /// combined (`top_k` narrows the candidate set first, `top_p` further narrows
 /// what's left -- the common llama.cpp/HF convention). `seed` makes a
 /// sampled run reproducible (`StdRng::seed_from_u64`); omitted, each call
-/// draws fresh OS entropy.
-#[derive(Debug, Clone, Copy)]
+/// draws fresh OS entropy. `json_schema` (see `crate::grammar`) constrains every
+/// generated token to continue a value that conforms to the schema; `None` (the
+/// default) leaves the logits untouched.
+#[derive(Debug, Clone)]
 pub struct SamplingParams {
     pub temperature: f32,
     pub top_k: Option<usize>,
     pub top_p: Option<f32>,
     pub seed: Option<u64>,
+    pub json_schema: Option<std::sync::Arc<crate::grammar::JsonSchema>>,
 }
 
 impl Default for SamplingParams {
@@ -42,6 +50,7 @@ impl Default for SamplingParams {
             top_k: None,
             top_p: None,
             seed: None,
+            json_schema: None,
         }
     }
 }
@@ -59,6 +68,86 @@ pub fn make_rng(seed: Option<u64>) -> StdRng {
     match seed {
         Some(s) => StdRng::seed_from_u64(s),
         None => StdRng::from_entropy(),
+    }
+}
+
+/// One generation's token choice: the RNG, and the `json_schema` matcher when the
+/// request has one. Every architecture's decode loop calls [`Self::pick`] once per
+/// position and [`Self::finish`] at the end (see `Model::token_picker`).
+pub struct TokenPicker<'a> {
+    params: &'a SamplingParams,
+    rng: StdRng,
+    constraint: Option<crate::grammar::Constrained<'a>>,
+    eos: Option<u32>,
+    generated: Vec<u32>,
+}
+
+impl<'a> TokenPicker<'a> {
+    pub fn new(
+        params: &'a SamplingParams,
+        constraint: Option<crate::grammar::Constrained<'a>>,
+        eos: Option<u32>,
+    ) -> Self {
+        TokenPicker {
+            params,
+            rng: make_rng(params.seed),
+            constraint,
+            eos,
+            generated: Vec::new(),
+        }
+    }
+
+    /// Chooses the next token from `logits`. With a constraint, the disallowed
+    /// logits are set to `-inf` first (in place, so a caller looking at `logits`
+    /// afterwards sees the masked values) and the matcher then follows the choice.
+    pub fn pick(&mut self, logits: &mut [f32]) -> Result<u32, ReflexError> {
+        if let Some(c) = &mut self.constraint {
+            c.mask(logits, &self.generated)?;
+        }
+        let id = sample(logits, self.params, &mut self.rng)?;
+        if let Some(c) = &mut self.constraint {
+            c.accept(id)?;
+        }
+        self.generated.push(id);
+        Ok(id)
+    }
+
+    /// The streamed text for token `id` (`Tokenizer::decode_stream`). A constrained
+    /// generation's EOS streams as empty text, so the streamed pieces join up to
+    /// exactly the value.
+    pub fn stream_text(
+        &self,
+        tokenizer: &crate::tokenizer::Tokenizer,
+        pending: &mut Vec<u8>,
+        id: u32,
+    ) -> String {
+        if self.constraint.is_some() && Some(id) == self.eos {
+            return String::new();
+        }
+        tokenizer.decode_stream(pending, id)
+    }
+
+    /// The generation's text: `tokenizer.decode(generated)`, or with a constraint the
+    /// value alone (without EOS's text). A constrained generation that stopped before
+    /// the value was complete returns `GrammarDeadEnd` with the partial text.
+    pub fn finish(
+        self,
+        tokenizer: &crate::tokenizer::Tokenizer,
+        generated: &[u32],
+    ) -> Result<String, ReflexError> {
+        let Some(c) = self.constraint else {
+            return Ok(tokenizer.decode(generated));
+        };
+        if !c.is_complete() {
+            return Err(c.dead_end(
+                format!(
+                    "max_tokens ran out after {} tokens, before the value was complete",
+                    generated.len()
+                ),
+                generated,
+            ));
+        }
+        Ok(c.text())
     }
 }
 
@@ -205,6 +294,7 @@ mod tests {
             top_k: Some(1),
             top_p: Some(0.1),
             seed: Some(42),
+            ..Default::default()
         };
         let mut rng = make_rng(params.seed);
         let id = sample(&logits, &params, &mut rng).expect("sample should succeed");
@@ -219,6 +309,7 @@ mod tests {
             top_k: None,
             top_p: None,
             seed: Some(7),
+            ..Default::default()
         };
         let mut rng_a = make_rng(params.seed);
         let mut rng_b = make_rng(params.seed);
@@ -239,6 +330,7 @@ mod tests {
             top_k: Some(1),
             top_p: None,
             seed: Some(1),
+            ..Default::default()
         };
         let mut rng = make_rng(params.seed);
         for _ in 0..10 {
@@ -255,6 +347,7 @@ mod tests {
             top_k: None,
             top_p: Some(1e-6),
             seed: Some(1),
+            ..Default::default()
         };
         let mut rng = make_rng(params.seed);
         for _ in 0..10 {
@@ -271,6 +364,7 @@ mod tests {
             top_k: Some(3),
             top_p: Some(0.9),
             seed: Some(99),
+            ..Default::default()
         };
         let mut rng = make_rng(params.seed);
         for _ in 0..200 {
@@ -293,6 +387,7 @@ mod tests {
             top_k: None,
             top_p: Some(1.5),
             seed: Some(1),
+            ..Default::default()
         };
         let mut rng = make_rng(params.seed);
         assert!(sample(&[1.0, 2.0], &params, &mut rng).is_err());

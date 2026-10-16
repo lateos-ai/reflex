@@ -55,6 +55,12 @@
 //! sampling (`--top-k N`, `--top-p F`, `--seed N` for a reproducible draw) -- see
 //! `reflex_engine::sampling`'s doc comment.
 //!
+//! `--json-schema <file>` constrains the output to one compact JSON value that
+//! validates against the schema in `<file>` (see `reflex_engine::grammar` for the
+//! supported subset); `token_text` is then the value alone. If `--max-tokens` runs
+//! out first, the run fails with a `grammar_dead_end` error and prints the partial
+//! text. It can't be combined with `--export-kv`.
+//!
 //! `--lora <adapter.gguf>` applies a llama.cpp-format LoRA adapter to the
 //! loaded model's weights once, at load time, before any forward pass runs
 //! (see `model::Model::apply_lora` and `lora`'s module doc comment for the
@@ -161,6 +167,7 @@ pub fn run(args: Vec<String>) {
     let mut top_p: Option<f32> = None;
     let mut seed: Option<u64> = None;
     let mut json = false;
+    let mut json_schema_path: Option<String> = None;
 
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -173,6 +180,9 @@ pub fn run(args: Vec<String>) {
                 import_kv = Some(args.next().expect("--import-kv requires a file path"))
             }
             "--lora" => lora_path = Some(args.next().expect("--lora requires a file path")),
+            "--json-schema" => {
+                json_schema_path = Some(args.next().expect("--json-schema requires a file path"))
+            }
             "--weights" => {
                 weights_flag = Some(args.next().expect("--weights requires `f16` or `f32`"))
             }
@@ -218,11 +228,12 @@ pub fn run(args: Vec<String>) {
             other => positional.push(other.to_string()),
         }
     }
-    let sampling = reflex_engine::sampling::SamplingParams {
+    let mut sampling = reflex_engine::sampling::SamplingParams {
         temperature,
         top_k,
         top_p,
         seed,
+        json_schema: None,
     };
     if quickstart && model_spec.is_some() {
         panic!("--quickstart and --model cannot be combined in the same run");
@@ -233,7 +244,7 @@ pub fn run(args: Vec<String>) {
         None => {
             let gguf_path = positional.next().unwrap_or_else(|| {
                 panic!(
-                    "usage: reflex generate <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>] [--lora <adapter.gguf>] [--weights f16|f32] | \
+                    "usage: reflex generate <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>] [--json-schema <file>] [--lora <adapter.gguf>] [--weights f16|f32] | \
                      reflex generate --model <org/repo:file.gguf> [prompt] | reflex generate --quickstart [prompt]"
                 )
             });
@@ -246,6 +257,9 @@ pub fn run(args: Vec<String>) {
     }
     if export_kv.is_some() && import_kv.is_some() {
         panic!("--export-kv and --import-kv cannot be combined in the same run");
+    }
+    if export_kv.is_some() && json_schema_path.is_some() {
+        panic!("--json-schema can't be combined with --export-kv: the export keeps the state after the prompt, before any value is generated");
     }
     if export_kv.is_some() && max_tokens != 1 {
         panic!("--export-kv only captures the cache after the initial prompt pass -- omit --max-tokens (defaults to 1) when exporting");
@@ -385,6 +399,15 @@ pub fn run(args: Vec<String>) {
     let imported = import_kv.as_ref().map(|path| {
         kv_io::import_kv(path).unwrap_or_else(|e| crate::fail("failed to import KV cache", e))
     });
+    if let Some(path) = &json_schema_path {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| crate::fail(&format!("failed to read --json-schema {path}"), e));
+        sampling.json_schema = Some(
+            model
+                .compile_json_schema(&text)
+                .unwrap_or_else(|e| crate::fail("invalid --json-schema", e)),
+        );
+    }
 
     let mut first_token_ms: Option<f64> = None;
     let mut first_token_energy: Option<energy::EnergyMeasurement> = None;
@@ -400,7 +423,12 @@ pub fn run(args: Vec<String>) {
             },
             |_id, _text| {},
         )
-        .unwrap_or_else(|e| crate::fail("generate failed", e));
+        .unwrap_or_else(|e| {
+            if let reflex_engine::error::ReflexError::GrammarDeadEnd { text, .. } = &e {
+                eprintln!("partial_text={text:?}");
+            }
+            crate::fail(&format!("generate failed ({})", e.kind()), e)
+        });
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let energy_measurement = sampler.measure();
     let prompt_eval_ms = first_token_ms.unwrap_or(total_ms) - model_ready_ms;
