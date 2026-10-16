@@ -40,6 +40,12 @@ Reflex only) and how many hop outputs parsed as JSON. A hop that runs out of
 --max-tokens before its value is complete counts as invalid
 (`grammar_dead_end` on Reflex). scripts/relay_handoff_schema.json is a sample.
 
+--json-prompt: appends JSON_NOTE_INSTRUCTION (write the note as compact JSON, with
+an example) to the shared system prompt. It doesn't depend on --json-schema, so
+a run with the schema and one without can share the same prompt. A small model
+asked for a free-text note under a schema tends to fill the string until
+--max-tokens runs out.
+
 Usage:
   scripts/agent_relay_bench.py stdio --reflex target/release/reflex --model m.gguf
   scripts/agent_relay_bench.py uds --reflex target/release/reflex --model m.gguf
@@ -47,7 +53,7 @@ Usage:
   common: [--hops 20] [--warmup 3] [--max-tokens 32] [--carry-chars 400]
           [--system-prompt-file f.txt] [--json-out results.json]
   stdio/uds: [--reuse-prefix [--kv-dir /dev/shm] | --pin-prefix]
-  any target: [--json-schema scripts/relay_handoff_schema.json]
+  any target: [--json-schema scripts/relay_handoff_schema.json] [--json-prompt]
 
 Standard library only, so it runs anywhere Python 3.8+ does.
 """
@@ -70,6 +76,10 @@ SYSTEM_PROMPT = (
 )
 ROLES = ["planner", "researcher", "coder", "reviewer", "tester", "summarizer"]
 TASK = "Task: design a small command-line tool that deduplicates lines in a file."
+JSON_NOTE_INSTRUCTION = (
+    'Write your note as compact JSON, for example {"from": "planner", "status": "done", '
+    '"note": "Split the work into parsing and output."}\n'
+)
 
 
 def hop_suffix(hop, previous, carry_chars):
@@ -319,6 +329,11 @@ def main(argv=None):
     )
     ap.add_argument("--system-prompt-file", help="shared prefix to use instead of the built-in one")
     ap.add_argument("--json-schema", help="constrain every hop's output to the JSON Schema in this file")
+    ap.add_argument(
+        "--json-prompt",
+        action="store_true",
+        help="ask for the note as compact JSON in the shared system prompt",
+    )
     ap.add_argument("--hops", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--max-tokens", type=int, default=32)
@@ -336,6 +351,8 @@ def main(argv=None):
             system = f.read()
         if not system.endswith("\n"):
             system += "\n"
+    if args.json_prompt:
+        system += JSON_NOTE_INSTRUCTION
     schema = None
     if args.json_schema:
         with open(args.json_schema, encoding="utf-8") as f:
@@ -427,6 +444,7 @@ def main(argv=None):
                     "reuse_prefix": args.reuse_prefix,
                     "pin_prefix": args.pin_prefix,
                     "json_schema": args.json_schema,
+                    "json_prompt": args.json_prompt,
                     "system_prompt_chars": len(system),
                     "summary": summary,
                     "samples": samples,

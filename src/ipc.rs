@@ -54,7 +54,8 @@
 //! orchestrator (docs/DEVELOPMENT.md).
 //!
 //! **JSON Schema** (`generate` path only): `json_schema` constrains the output to
-//! one compact JSON value that validates against the schema (`crate::grammar` has
+//! one JSON value that validates against the schema, compact but for an optional
+//! space after each `:` and `,` (`crate::grammar` has
 //! the supported subset). `text` is then the value alone, and `token_ids` end with
 //! EOS. If `max_tokens` runs out first, the request fails with `grammar_dead_end`,
 //! and the error line carries the partial `text` and `token_ids`. It combines with

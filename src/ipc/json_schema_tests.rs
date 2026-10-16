@@ -122,10 +122,10 @@ fn assert_valid(resp: &Value, schema: &str) -> String {
     compiled
         .validate(&parsed)
         .unwrap_or_else(|e| panic!("{text}: {e}"));
-    if !text.contains('\\') {
-        // No escapes to normalize: the output is exactly the compact serialization.
-        assert_eq!(parsed.to_compact(), text, "output is compact");
-    }
+    assert!(
+        compiled.accepts(&text),
+        "output is outside the format: {text}"
+    );
     assert!(!ids.is_empty());
     text
 }
@@ -211,13 +211,11 @@ fn assert_identity_where_conforming(model: &Model, cases: &[(&str, String)], tag
         let free = final_ok(&lines[0]);
         let free_text = model.decode_tokens(&free.iter().map(|&i| i as u32).collect::<Vec<_>>());
         let compiled = crate::grammar::JsonSchema::compile(schema).unwrap();
-        // Conforms: everything before the last id is one compact valid value and the
-        // last id ends the generation.
+        // Conforms: everything before the last id is one value the output format
+        // allows, and the last id ends the generation.
         let body: String = free_text[..free_text.len().saturating_sub(1)].concat();
         let ends = free.len() < 48;
-        let fits = ends
-            && JsonValue::parse(&body)
-                .is_ok_and(|v| compiled.validate(&v).is_ok() && v.to_compact() == body);
+        let fits = ends && compiled.accepts(&body);
         eprintln!("{tag}: unconstrained {body:?} conforms={fits}");
         if fits {
             conforming += 1;

@@ -55,8 +55,9 @@
 //! sampling (`--top-k N`, `--top-p F`, `--seed N` for a reproducible draw) -- see
 //! `reflex_engine::sampling`'s doc comment.
 //!
-//! `--json-schema <file>` constrains the output to one compact JSON value that
-//! validates against the schema in `<file>` (see `reflex_engine::grammar` for the
+//! `--json-schema <file>` constrains the output to one JSON value (compact but for
+//! an optional space after each `:` and `,`) that validates against the schema in
+//! `<file>` (see `reflex_engine::grammar` for the
 //! supported subset); `token_text` is then the value alone. If `--max-tokens` runs
 //! out first, the run fails with a `grammar_dead_end` error and prints the partial
 //! text. It can't be combined with `--export-kv`.

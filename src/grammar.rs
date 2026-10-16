@@ -18,13 +18,16 @@
 //! rejected with `invalid_input` naming it: a schema this module accepts never has a
 //! constraint it silently drops.
 //!
-//! **Fixed output format.** The value is compact JSON: no whitespace outside strings,
-//! and object properties in schema order, each optional one either present or absent.
+//! **Fixed output format.** The value is compact JSON with properties in schema
+//! order, each optional one present or absent. The only whitespace outside strings
+//! is one optional space after a `:` or a `,`, so a model can keep its usual
+//! `"key": "value"` tokens; `enum`/`const` values are matched exactly as written
+//! compactly.
 //! When `properties` is given, the object has no other properties, whether
 //! `additionalProperties` is `false` or absent (llama.cpp's `json_schema_to_grammar`
 //! does the same); an object schema without `properties` and without
 //! `additionalProperties: false` allows any object. Every output therefore validates
-//! against the schema, and the orchestrator gets the same bytes for the same value.
+//! against the schema.
 //!
 //! **How masking works.** The grammar is run as a set of pushdown stacks
 //! (nondeterministic, so `anyOf` branches and `enum` values may overlap). Stacks are
@@ -121,7 +124,7 @@ impl JsonValue {
         }
     }
 
-    /// Compact serialization, the form generated output takes: no whitespace,
+    /// Compact serialization, the form `enum`/`const` values are generated in: no whitespace,
     /// members in their stored order, strings escaped minimally (`"`, `\` and
     /// control characters; everything else as raw UTF-8).
     pub fn to_compact(&self) -> String {
@@ -443,6 +446,23 @@ impl JsonSchema {
         self.grammar(tok.architecture != "gpt2").map(|_| ())
     }
 
+    /// Whether `text` is exactly a value this schema's output format can produce
+    /// (with `forbid_u2581` false). Bytes, not semantics: a valid value with
+    /// whitespace the format doesn't allow is not accepted.
+    pub fn accepts(&self, text: &str) -> bool {
+        let Ok(g) = self.grammar(false) else {
+            return false;
+        };
+        let (mut dfa, mut st) = Dfa::new(g);
+        for &b in text.as_bytes() {
+            st = dfa.step(st, b);
+            if st == DEAD {
+                return false;
+            }
+        }
+        dfa.accepting[st as usize]
+    }
+
     /// Total time spent computing and applying token masks with this schema.
     pub fn mask_ms_total(&self) -> f64 {
         self.mask_ns.load(Ordering::Relaxed) as f64 / 1e6
@@ -750,7 +770,7 @@ impl JsonSchema {
 }
 
 /// Turns a checked schema into [`Builder`] rules, one rule per schema position, each
-/// matching exactly the compact serializations this module generates for it.
+/// matching exactly the serializations this module's output format allows for it.
 struct Compiler<'s> {
     schema: &'s JsonSchema,
     b: Builder,
@@ -909,7 +929,7 @@ impl Compiler<'_> {
         let end = self.b.rule(vec![close]);
         let mut next = [end, end];
         for (name, sub) in props.iter().rev() {
-            let key = JsonValue::String(name.clone()).to_compact() + ":";
+            let key = JsonValue::String(name.clone()).to_compact();
             if self.forbid_u2581 && key.contains('\u{2581}') {
                 return Err(schema_err(format!(
                     "the property name \"{name}\" at {path} contains U+2581, which this model's tokenizer decodes as a space, so it can't be generated"
@@ -917,11 +937,12 @@ impl Compiler<'_> {
             }
             let value = self.value(sub, &format!("{path}/properties/{name}"))?;
             let mut kv = self.b.lit(key.as_bytes());
+            kv.extend(self.sep(b':'));
             kv.push(Sym::Rule(value));
             let kv = self.b.rule(vec![kv]);
             let mut cur = [0u32; 2];
             for comma in [false, true] {
-                let mut emit = if comma { self.b.lit(b",") } else { Vec::new() };
+                let mut emit = if comma { self.sep(b',') } else { Vec::new() };
                 emit.extend([Sym::Rule(kv), Sym::Rule(next[1])]);
                 let mut alts = vec![emit];
                 if !required.contains(&name.as_str()) {
@@ -936,11 +957,19 @@ impl Compiler<'_> {
         Ok(self.b.rule(vec![open]))
     }
 
+    /// `byte` (`:` or `,`) and the one optional space that may follow it, the only
+    /// whitespace the output format allows.
+    fn sep(&mut self, byte: u8) -> Vec<Sym> {
+        let mut out = self.b.lit(&[byte]);
+        out.push(Sym::Rule(self.prim("space")));
+        out
+    }
+
     /// `[` `]` or `[` item (`,` item)* `]`.
     fn array(&mut self, item: u32) -> u32 {
         let tail = self.b.reserve();
         let close = self.b.lit(b"]");
-        let mut more = self.b.lit(b",");
+        let mut more = self.sep(b',');
         more.extend([Sym::Rule(item), Sym::Rule(tail)]);
         self.b.define(tail, vec![close.clone(), more]);
         let rest = self
@@ -959,6 +988,7 @@ impl Compiler<'_> {
         self.prims.insert(name, r);
         let alts = match name {
             "null" => vec![self.b.lit(b"null")],
+            "space" => vec![vec![], self.b.lit(b" ")],
             "boolean" => vec![self.b.lit(b"true"), self.b.lit(b"false")],
             "digits" => {
                 // [0-9]*
@@ -1019,12 +1049,12 @@ impl Compiler<'_> {
                 let string = self.prim("string");
                 let value = self.prim("value");
                 let mut member = vec![Sym::Rule(string)];
-                member.extend(self.b.lit(b":"));
+                member.extend(self.sep(b':'));
                 member.push(Sym::Rule(value));
                 let member = self.b.rule(vec![member]);
                 let tail = self.b.reserve();
                 let close = self.b.lit(b"}");
-                let mut more = self.b.lit(b",");
+                let mut more = self.sep(b',');
                 more.extend([Sym::Rule(member), Sym::Rule(tail)]);
                 self.b.define(tail, vec![close.clone(), more]);
                 let rest = self

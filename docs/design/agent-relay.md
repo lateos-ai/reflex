@@ -373,9 +373,11 @@ accepted schema means what it says. Other rejections:
 
 ### A fixed output format
 
-The output is compact JSON:
-- no whitespace outside strings;
+The output is compact JSON, with one allowance:
+- no whitespace outside strings, except **one optional space after each `:` and
+  `,`**;
 - object properties in schema order, each optional one present or absent;
+- `enum` and `const` values exactly as written compactly;
 - generation ends at EOS as soon as the value is complete. Once the value is closed,
   EOS is the only token allowed.
 
@@ -395,12 +397,22 @@ Why the format is fixed rather than free:
 - **A smaller automaton.** Optional whitespace between every token of the value, and
   properties in any order, multiply the states the matcher has to track. An object
   with *n* optional properties in any order needs a state per subset already
-  emitted; in schema order it needs about 2*n* rules.
-- **Fewer tokens.** Whitespace and indentation are tokens the model has to decode, at
-  8 ms each on the T4. Compact output is the shortest form of the value.
-- **Deterministic output for the orchestrator.** The same value always comes out as
-  the same bytes, so an orchestrator can compare, hash or cache handoff payloads
-  without parsing them.
+  emitted; in schema order it needs about 2*n* rules. One optional space after a
+  separator adds one nullable rule.
+- **Fewer tokens.** Newlines and indentation are tokens the model has to decode, at
+  about 8 ms each on the T4.
+- **Output the orchestrator can predict.** There is no layout to normalize: the bytes
+  differ only in those single spaces, and greedy decoding gives the same bytes for
+  the same request every time.
+
+**Why one space is allowed.** The first version allowed no whitespace at all, and
+that cost content on a small model. Qwen3-0.6B writes `"key": "value"`. With its
+` "` token masked after a colon, it often picked `", "` as the whole string, which
+gives `{"agent":", "}`. That output validates but carries nothing. The single space
+lets a model keep its usual tokens. Pretty-printing (newlines and indentation) stays
+out: a model that prefers it is pushed onto one line at the first newline, which
+happens before any value is written. The before/after measurements are under
+"Results" below.
 
 ### How masking works
 
@@ -471,105 +483,107 @@ decode time per token.
 Setup: Qwen3-0.6B Q4_K_M (gpt2 byte-level BPE, 152K tokens) and
 TinyLlama-1.1B-Chat Q4_K_M (SentencePiece, 32K tokens). The host CPU is a Xeon
 Platinum 8259CL. llama.cpp is at `22bdcc4`, run as `llama-server -ngl 99 -c 4096`.
+The numbers are for the format above, with the optional space. The first version,
+without it, is compared where it matters.
 
 **Correctness.**
 - Host tests (`src/grammar/tests.rs`) cover schema compile and rejection, and the
-  automaton on valid and invalid byte streams: UTF-8, escapes, surrogates, order and
-  required properties. Random walks of the automaton always give output that parses
-  and validates.
-- Every mask was compared with a walk of every vocabulary token, after 18 prefixes
-  that stop mid-string, mid-escape, mid-UTF-8 and mid-number. They agree on the real
-  Qwen3 and TinyLlama vocabularies.
+  automaton on valid and invalid byte streams: UTF-8, escapes, surrogates, spaces,
+  order and required properties. Random walks of the automaton always give output
+  that parses and validates.
+- Every mask was compared with a walk of every vocabulary token, after 21 prefixes
+  that stop after a separator, mid-string, mid-escape, mid-UTF-8 and mid-number. They
+  agree on the real Qwen3 and TinyLlama vocabularies.
 - GPU tests (`src/ipc/json_schema_tests.rs`, 11 tests) cover a nested schema, an enum
   and an anyOf on both models. They also run a `use_pinned` and an `import_kv` hop
-  with a schema, the dead end and the request errors, and a finite schema on the
-  Qwen3-MoE, Qwen3.5, MLA, Granite 4.0-H and Gemma 4 fixtures. Every output parses with
-  `serde_json` and validates.
+  with a schema, each equal to one joined request on both models, and the dead end
+  and the request errors. A finite schema runs on the Qwen3-MoE, Qwen3.5, MLA,
+  Granite 4.0-H and Gemma 4 fixtures. Every output parses with `serde_json`,
+  validates, and is within the format.
 - **Identity:** on Qwen3, the two test prompts whose unconstrained greedy output
   already conformed gave identical ids under the schema.
-- The GPU nightly passes 94 tests, with 4 skipped for absent optional models. The 3
-  failures in that run were fixed in the tests, and all 25 IPC GPU tests then passed.
+- The GPU nightly passes 98 tests, with 4 skipped for absent optional models.
 
 **Mask cost.**
 
 | | Qwen3 (152K) | TinyLlama (32K) |
 |---|---:|---:|
-| index build, once per process | 66 ms | 18 ms |
-| first mask inside a string (whole trie) | 5.4 ms | |
+| index build, once per process | 67 ms | 18 ms |
+| first mask inside a string (whole trie) | 3.6 to 5.4 ms | |
 | a mask the per-state cache already has | < 0.001 ms | |
 | mask at a structural position | 0.03 ms | |
-| per generated token, mean over the 20 comparison cases | 0.27 ms (max 0.52) | 0.06 ms (max 0.11) |
+| per generated token, mean over the 20 comparison cases | 0.32 ms (max 0.53) | 0.08 ms (max 0.13) |
 
 That is well under the ~1 ms per token budget, so nothing past the token trie was
 needed.
 
 **Cold start is unchanged.** `bench_cold_start_phases.sh`, 10 runs per round,
-interleaved. p50 `process_start_to_first_token_ms`: master 634.1 / 639.3 ms against
-this branch's 632.4 / 633.9 ms. A cold `reflex generate --json-schema` reaches its
+interleaved. p50 `process_start_to_first_token_ms`: master 655.4 / 657.3 ms against
+this branch's 659.8 / 655.8 ms. A cold `reflex generate --json-schema` reaches its
 first token about 66 ms later, which is the index build.
 
 **Against llama-server** (`scripts/json_schema_compare.py`: 20 cases over 5 schemas,
-greedy, `max_tokens` 192). Validity means the output parses and validates with
-`jsonschema`.
+greedy, `max_tokens` 192, no prompt hint). Validity means the output parses and
+validates with `jsonschema`.
 
 | model | engine | valid with schema | decode/token, free | decode/token, schema | mask/token |
 |---|---|---:|---:|---:|---:|
-| Qwen3-0.6B | Reflex | 20/20 | 6.92 ms | 7.20 ms | 0.27 ms |
-| Qwen3-0.6B | llama-server | 20/20 | 4.05 ms | 7.84 ms | |
-| TinyLlama | Reflex | 17/20 | 9.91 ms | 10.00 ms | 0.06 ms |
-| TinyLlama | llama-server | 17/20 | 4.45 ms | 5.43 ms | |
+| Qwen3-0.6B | Reflex | 20/20 | 6.96 ms | 7.28 ms | 0.32 ms |
+| Qwen3-0.6B | llama-server | 20/20 | 4.25 ms | 8.71 ms | |
+| TinyLlama | Reflex | 16/20 | 10.02 ms | 10.12 ms | 0.08 ms |
+| TinyLlama | llama-server | 17/20 | 4.64 ms | 5.68 ms | |
 
-Without a schema, 0 of 20 outputs validate on either engine; most are wrapped in a
-`` ```json `` fence. The 3 TinyLlama failures are the same handoff cases on both
-engines: the model keeps adding items to the `steps` array until `max_tokens`. Grammar
-costs llama-server about 3.8 ms per token on Qwen3, and Reflex 0.3 ms.
+- Without a schema, 0 of 20 outputs validate on either engine; most are wrapped in a
+  `` ```json `` fence.
+- Grammar costs llama-server about 4.5 ms per token on Qwen3, and Reflex 0.3 ms.
+- TinyLlama's failures are the four handoff cases on Reflex and three of the same
+  four on llama-server. The model keeps adding items to the `steps` array until
+  `max_tokens`.
 
-**The compact format's cost: content on a small model.** Qwen3-0.6B writes
-`"key": "value"`, and its space-and-quote token is masked. Without it, the model
-often picks `", "` as the whole string. Every output validates, but the content gets
-worse. 3 of 4 handoffs open with `{"agent":", "`, and 2 of 4 tool calls pair one tool's
-name with another tool's arguments. llama-server, which allows whitespace, gets those
-right. A one-line hint in the prompt (`--hint`, "Answer with compact JSON with no
-spaces, for example ...") fixes most of it:
-- Reflex's handoff and tool-call outputs then match llama-server's exactly in 6 of 8
-  cases, and none of them has a degenerate string.
-- The four extraction cases still come out as `{"people":[],"city":null}` on Reflex,
-  where llama-server, with its spaces, lists the people.
+**Content, with and without the optional space** (Qwen3-0.6B, the same 20 cases):
 
-TinyLlama's content is about the same on both engines.
+| | no whitespace (first version) | one optional space |
+|---|---|---|
+| handoffs whose `agent` is a degenerate `", "` | 3 of 4 | 0 of 4 |
+| tool calls pairing one tool's name with another's arguments | 2 of 4 | 0 of 4 |
+| extractions that list the people in the text | 0 of 3 | 3 of 3 |
 
-**Relay hops** (the pinned ~1,490-token prefix, 30 hops):
+The fourth extraction case has no people, and both versions return an empty list.
+Without the space, Qwen3-0.6B's ` "` token after a colon was masked, and the model
+often picked `", "` as the whole string. That output was valid and empty. A prompt
+hint showing compact JSON fixed most of it, but not extraction. With the space, the
+outputs match llama-server's in substance, without a hint.
 
-| hop | target | round trip p50 | masking p50 | tokens | valid |
+**Relay hops** (the pinned ~1,490-token prefix, 30 hops, Qwen3-0.6B):
+
+| prompt | target | round trip p50 | masking p50 | tokens | valid |
 |---|---|---:|---:|---:|---:|
-| 32 tokens, free | Reflex | 296.5 ms | | 32 | |
-| 32 tokens, schema | Reflex | 304.0 ms | 7.7 ms | 32 | 0/30 |
-| 64 tokens, free | Reflex | 567.1 ms | | 64 | |
-| 64 tokens, schema | Reflex | 578.8 ms | 11.4 ms | 64 | 0/30 |
-| JSON-note prompt, 96 max, free | Reflex | 846.1 ms | | 96 | |
-| JSON-note prompt, 96 max, schema | Reflex | 220.2 ms | 6.7 ms | 22 | 30/30 |
-| JSON-note prompt, 96 max, free | llama-server, cached | 464.7 ms | | 96 | |
-| JSON-note prompt, 96 max, schema | llama-server, cached | 174.9 ms | | 22 | 30/30 |
+| default (free-text note), 64 max | Reflex, free | 575.7 ms | | 64 | |
+| default, 64 max | Reflex, schema | 447.5 ms | 10.9 ms | 48 | 30/30 |
+| default, 64 max | llama-server cached, schema | 240.9 ms | | 28 | 30/30 |
+| `--json-prompt`, 96 max | Reflex, free | 858.5 ms | | 96 | |
+| `--json-prompt`, 96 max | Reflex, schema | 267.0 ms | 8.4 ms | 27 | 30/30 |
+| `--json-prompt`, 96 max | llama-server cached, free | 491.3 ms | | 96 | |
+| `--json-prompt`, 96 max | llama-server cached, schema | 213.7 ms | | 27 | 30/30 |
 
-- **Masking adds 2 to 4% to a hop.** At the same token count it costs 7.7 to 11.4 ms.
-- **The default bench prompt asks for a free-text note.** Under the schema, Qwen3-0.6B
-  fills the `note` string with `. . . .` until `max_tokens`, so no hop completes, even
-  at 160 tokens. llama-server completes all 30 hops at 160 tokens (136 tokens each),
-  and none at 64.
-- **With a system prompt that shows a compact JSON note**, both engines produce valid
-  22-token handoffs on every hop. Ending at EOS as soon as the value closes makes the
-  hop 3.8× shorter than a free 96-token note (220 vs 846 ms).
+- **Masking costs 0.2 to 0.3 ms per token**, about 2% of a hop.
+- **A schema makes the hop shorter, not longer.** Generation stops at EOS once the
+  value closes, so the hop decodes only the handoff. That makes it 1.3× shorter with
+  the default prompt and 3.2× with `--json-prompt` (267 vs 858 ms).
+- **Without the optional space, no default-prompt hop completed** (0/30, even at 160
+  tokens): the model filled the `note` string with `. . .`. With it, all 30 do.
+- The remaining gap to llama-server is decode speed (7.3 against 4.3 ms per token
+  free), not the grammar.
 
-**Prefix reuse on SentencePiece models.** A `use_pinned` or `import_kv` continuation
-is encoded with the tokenizer's dummy-prefix space: `<|user|>` becomes `▁<`, where the
-joined prompt has `<`. So on TinyLlama a resumed request is not token-identical to
-one joined request, with or without a schema. The phase A/B tests only compared token
-counts, which happened to match. They now compare ids. The constrained hop test
-checks `use_pinned` against `import_kv` on SentencePiece models, and against the joined
-request only where the split tokenizes alike. This predates phase C and is not
-changed here.
+**Prefix reuse on SentencePiece models.** These runs found that a `use_pinned` or
+`import_kv` continuation on TinyLlama got the tokenizer's dummy-prefix space where
+the joined text has none (`▁<` for `<`). The phase A/B tests compared only token
+counts, which happened to match. That is fixed now (see "Prefix reuse through
+files", above), the tests compare ids, and the constrained hop test checks
+`use_pinned` and `import_kv` against one joined request on TinyLlama too.
 
-Raw data: `bench-results/agent-relay-t4-phase-c/` (not committed).
+Raw data: `bench-results/agent-relay-t4-phase-c/` (not committed; `run4` has the
+numbers above, `run1` to `run3` the first version's).
 
 ## Planned next phases
 

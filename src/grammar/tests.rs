@@ -325,13 +325,33 @@ fn primitives_accept_exactly_compact_json() {
         ),
         (
             r##"{"type":"array","items":{"type":"integer"}}"##,
-            &["[]", "[1]", "[1,2,-3]"],
-            &["[", "[,]", "[1,]", "[ 1]", "[1, 2]", "[\"1\"]", "[1]]"],
+            &["[]", "[1]", "[1,2,-3]", "[1, 2]", "[1,2, 3]"],
+            &[
+                "[", "[,]", "[1,]", "[ 1]", "[1 ]", "[1 ,2]", "[1,  2]", "[1,\n2]", "[\"1\"]",
+                "[1]]", "[1] ",
+            ],
         ),
         (
             r##"{"type":"object"}"##,
-            &["{}", "{\"a\":1}", "{\"a\":{\"b\":[null,{}]},\"c\":\"d\"}"],
-            &["{", "{a:1}", "{\"a\":1,}", "{\"a\" :1}", "{\"a\":}", "{ }"],
+            &[
+                "{}",
+                "{\"a\":1}",
+                "{\"a\":{\"b\":[null,{}]},\"c\":\"d\"}",
+                "{\"a\": 1, \"b\": [1, 2]}",
+            ],
+            &[
+                "{",
+                "{a:1}",
+                "{\"a\":1,}",
+                "{\"a\" :1}",
+                "{\"a\":}",
+                "{ }",
+                "{ \"a\":1}",
+                "{\"a\":1 }",
+                "{\"a\":  1}",
+                "{\"a\":\t1}",
+                "{\"a\":\n1}",
+            ],
         ),
         (
             "{}",
@@ -417,6 +437,8 @@ fn objects_follow_schema_order_and_required() {
         r##"{"a":1,"b":"x"}"##,
         r##"{"b":"x","c":true}"##,
         r##"{"a":1,"b":"x","c":false}"##,
+        r##"{"a": 1, "b": "x"}"##,
+        r##"{"b": "x","c":true}"##,
     ] {
         assert!(accepts(s, good.as_bytes()), "{good}");
     }
@@ -430,7 +452,11 @@ fn objects_follow_schema_order_and_required() {
         r##"{,"b":"x"}"##,
         r##"{"b":"x","b":"y"}"##,
         r##"{ "b":"x"}"##,
-        r##"{"b": "x"}"##,
+        r##"{"b" :"x"}"##,
+        r##"{"b":  "x"}"##,
+        r##"{"b":"x" }"##,
+        r##"{"b":"x" ,"c":true}"##,
+        "{\n\"b\":\"x\"}",
     ] {
         assert!(!accepts(s, bad.as_bytes()), "{bad}");
     }
@@ -634,6 +660,9 @@ fn assert_masks_match_brute_force(tok: &Tokenizer) {
     let prefixes: &[&[u8]] = &[
         b"",
         b"{",
+        b"{\"agent\":",
+        b"{\"agent\": ",
+        b"{\"agent\": \"x\", ",
         b"{\"agent\":\"",
         b"{\"agent\":\"pl",
         b"{\"agent\":\"a\\",
@@ -852,57 +881,61 @@ fn constrained_generations_decode_to_valid_json() {
 
 /// When the preferred (greedy) tokens already spell a conforming value, the
 /// constrained output is exactly those tokens; when they don't, it still conforms.
+/// Runs `value`'s own tokens (then EOS) as the greedy choices.
+fn greedy_through(
+    tok: &Tokenizer,
+    index: &TokenIndex,
+    schema: &Arc<JsonSchema>,
+    value: &str,
+    seed: u64,
+) -> Result<(Vec<u32>, String, Vec<u32>), ReflexError> {
+    let mut want = tok.encode(value).unwrap();
+    if tok.decode(&want).starts_with(' ') {
+        // SentencePiece's dummy-prefix space: a model continuing a prompt emits
+        // the bare `{` token.
+        let piece = tok.tokens[want[0] as usize].clone();
+        want[0] = id_of(tok, piece.strip_prefix('\u{2581}').expect("space marker"));
+    }
+    assert_eq!(tok.decode(&want), value, "test value must round-trip");
+    want.push(tok.eos_token_id.unwrap());
+    let w = want.clone();
+    let (ids, text) = fake_generate(tok, index, schema, 400, |i| w.get(i).copied(), None, seed)?;
+    Ok((ids, text, want))
+}
+
+/// When the preferred (greedy) tokens already spell a value the format allows,
+/// compact or with one space after each `:` and `,`, the constrained output is
+/// exactly those tokens; when they don't (a newline), it still conforms.
 #[test]
 fn greedy_conforming_output_is_unchanged() {
     for name in [QWEN3_TOKENIZER, TINYLLAMA_TOKENIZER] {
         let Some(tok) = tokenizer(name) else { continue };
         let index = TokenIndex::build(&tok);
         let schema = Arc::new(JsonSchema::compile(HANDOFF).unwrap());
-        let eos = tok.eos_token_id.unwrap();
-        let value = r##"{"agent":"planner","status":"needs_review","confidence":0.75,"steps":[{"tool":"search","args":{"q":"naïve café ☕ 😀"},"ok":true}],"notes":"tab\tquote\" done"}"##;
-        let mut want = tok.encode(value).unwrap();
-        if tok.decode(&want).starts_with(' ') {
-            // SentencePiece's dummy-prefix space: a model continuing a prompt emits
-            // the bare `{` token.
-            let piece = tok.tokens[want[0] as usize].clone();
-            want[0] = id_of(&tok, piece.strip_prefix('\u{2581}').expect("space marker"));
+        for value in [
+            r##"{"agent":"planner","status":"needs_review","confidence":0.75,"steps":[{"tool":"search","args":{"q":"naïve café ☕ 😀"},"ok":true}],"notes":"tab\tquote\" done"}"##,
+            r##"{"agent": "planner", "status": "done", "steps": [{"tool": "search", "ok": true}, {"tool": "search", "args": {}, "ok": false}]}"##,
+        ] {
+            assert!(schema.accepts(value), "{value}");
+            let (ids, text, want) = greedy_through(&tok, &index, &schema, value, 1).unwrap();
+            assert_eq!(
+                ids, want,
+                "{name}: masking changed a conforming greedy output"
+            );
+            assert_eq!(text, value);
         }
-        assert_eq!(
-            tok.decode(&want),
-            value,
-            "{name}: test value must round-trip"
-        );
-        want.push(eos);
-        let w = want.clone();
-        let (ids, text) =
-            fake_generate(&tok, &index, &schema, 400, |i| w.get(i).copied(), None, 1).unwrap();
-        assert_eq!(
-            ids, want,
-            "{name}: masking changed a conforming greedy output"
-        );
-        assert_eq!(text, value);
 
-        // Greedy wants spaces after the colons: the mask takes those tokens away,
-        // and the output (complete or not) stays compact.
-        let spaced = tok
-            .encode(r##"{"agent": "a", "status": "done", "steps": []}"##)
-            .unwrap();
-        let out = fake_generate(
-            &tok,
-            &index,
-            &schema,
-            spaced.len(),
-            |i| spaced.get(i).copied(),
-            None,
-            2,
-        );
-        let text = match out {
-            Ok((_, t)) => t,
+        // Pretty-printed: the newline isn't allowed, so the output leaves the greedy
+        // path there and stays within the format.
+        let pretty = "{\n  \"agent\": \"a\",\n  \"status\": \"done\",\n  \"steps\": []\n}";
+        assert!(!schema.accepts(pretty));
+        let text = match greedy_through(&tok, &index, &schema, pretty, 2) {
+            Ok((_, t, _)) => t,
             Err(ReflexError::GrammarDeadEnd { text, .. }) => text,
             Err(e) => panic!("{e}"),
         };
         assert!(
-            text.starts_with('{') && !text.contains(": "),
+            text.starts_with('{') && !text.contains('\n'),
             "{name}: {text}"
         );
     }

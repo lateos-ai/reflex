@@ -251,8 +251,8 @@ sampling. It works for every architecture.
   `anyOf`, and a local `$ref` (`#` or `#/$defs/<name>`). The annotations `title`,
   `description`, `$comment`, `$schema`, `default` and `examples` are accepted. Any
   other keyword is rejected with `invalid_input`, and the message names it.
-- **Output format:** compact JSON, with no whitespace outside strings and properties
-  in schema order, which is the order they appear in the request (a client library
+- **Output format:** compact JSON. The only whitespace outside strings is one
+  optional space after each `:` and `,`. Properties come in schema order, which is the order they appear in the request (a client library
   that sorts JSON keys sorts them). When `properties` is given, no other properties
   are generated. The generation ends at EOS as soon as the value is complete.
 - **Result:** `text` (IPC) or `token_text` (CLI) is the value alone; the token ids end
