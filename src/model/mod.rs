@@ -84,6 +84,7 @@ mod kernels;
 mod loading;
 mod mla;
 mod prefill_profile;
+mod prefix;
 
 use self::config::*;
 pub use self::config::{parse_model_config, LayerConfig, MoeMetaConfig, RopeType};
@@ -96,6 +97,8 @@ use self::loading::*;
 pub use self::loading::{F16ActivationStats, LoadOptions, WeightsDtype};
 use self::mla::*;
 use self::prefill_profile::*;
+use self::prefix::*;
+pub use self::prefix::{PinnedPrefix, Resume};
 use crate::error::ReflexError;
 
 #[cfg(test)]
@@ -829,115 +832,16 @@ impl Model {
         on_first_token: impl FnMut(&[f32]),
         on_token: impl FnMut(u32, &str),
     ) -> Result<(Vec<u32>, String), ReflexError> {
-        match imported {
-            Some(crate::kv_io::ImportedKv::Dense(cache)) => {
-                if self.hybrid.is_some()
-                    || self.mla.is_some()
-                    || self.gemma4.is_some()
-                    || self.granite.is_some()
-                {
-                    return Err(ReflexError::KvCache("imported KV cache file is dense/MoE format, but this model is not a dense/MoE Qwen3 model".to_string()));
-                }
-                let (generated, text, _, _, _) = self.generate_dense_impl(
-                    prompt,
-                    Some(cache),
-                    max_new_tokens,
-                    sampling,
-                    on_first_token,
-                    on_token,
-                )?;
-                Ok((generated, text))
-            }
-            Some(crate::kv_io::ImportedKv::Hybrid(cache)) => {
-                let h = self
-                    .hybrid
-                    .as_ref()
-                    .ok_or_else(|| ReflexError::KvCache("imported KV cache file is hybrid format, but this model is not a Qwen3.5 hybrid model".to_string()))?;
-                let (generated, text, _, _) = self.generate_hybrid_impl(
-                    h,
-                    prompt,
-                    Some(cache),
-                    max_new_tokens,
-                    sampling,
-                    on_first_token,
-                    on_token,
-                )?;
-                Ok((generated, text))
-            }
-            Some(crate::kv_io::ImportedKv::Mla(cache)) => {
-                let m = self.mla.as_ref().ok_or_else(|| {
-                    ReflexError::KvCache(
-                        "imported KV cache file is MLA format, but this model is not an MLA model"
-                            .to_string(),
-                    )
-                })?;
-                let (generated, text, _, _) = self.generate_mla_impl(
-                    m,
-                    prompt,
-                    Some(cache),
-                    max_new_tokens,
-                    sampling,
-                    on_first_token,
-                    on_token,
-                )?;
-                Ok((generated, text))
-            }
-            None => {
-                if let Some(h) = &self.hybrid {
-                    let (generated, text, _, _) = self.generate_hybrid_impl(
-                        h,
-                        prompt,
-                        None,
-                        max_new_tokens,
-                        sampling,
-                        on_first_token,
-                        on_token,
-                    )?;
-                    return Ok((generated, text));
-                }
-                if let Some(g) = &self.gemma4 {
-                    return self.generate_gemma4_impl(
-                        g,
-                        prompt,
-                        max_new_tokens,
-                        sampling,
-                        on_first_token,
-                        on_token,
-                    );
-                }
-                if let Some(g) = &self.granite {
-                    return self.generate_granite_impl(
-                        g,
-                        prompt,
-                        max_new_tokens,
-                        sampling,
-                        on_first_token,
-                        on_token,
-                    );
-                }
-                if let Some(m) = &self.mla {
-                    let (generated, text, _, _) = self.generate_mla_impl(
-                        m,
-                        prompt,
-                        None,
-                        max_new_tokens,
-                        sampling,
-                        on_first_token,
-                        on_token,
-                    )?;
-                    return Ok((generated, text));
-                }
-                let (generated, text, _, _, _) = self.generate_dense_impl(
-                    prompt,
-                    None,
-                    max_new_tokens,
-                    sampling,
-                    on_first_token,
-                    on_token,
-                )?;
-                Ok((generated, text))
-            }
-        }
+        let resume = imported.map_or(Resume::Fresh, Resume::File);
+        let (token_ids, text, _copy_ms) = self.generate_resumed(
+            prompt,
+            max_new_tokens,
+            resume,
+            sampling,
+            on_first_token,
+            on_token,
+        )?;
+        Ok((token_ids, text))
     }
 
     /// Like [`Self::generate`] with `max_new_tokens == 1`, but also returns the
@@ -948,7 +852,8 @@ impl Model {
     /// generated after the prompt. Used by IPC's `export_kv` field; the CLI's
     /// `--export-kv` predates it and calls the per-architecture
     /// `forward_prompt_capture_kv*` functions directly. Gemma 4 and
-    /// granitehybrid have no cache file format yet.
+    /// granitehybrid have no cache file format yet. This is
+    /// [`Self::generate_pin_prefix`] followed by [`Self::download_prefix`].
     pub fn generate_capture_kv(
         &self,
         prompt: &str,
@@ -957,72 +862,10 @@ impl Model {
         on_first_token: impl FnMut(&[f32]),
         on_token: impl FnMut(u32, &str),
     ) -> Result<(Vec<u32>, String, crate::kv_io::ImportedKv), ReflexError> {
-        use crate::kv_io::ImportedKv;
-        if self.gemma4.is_some() {
-            return Err(crate::reflex_err!(
-                UnsupportedArchitecture,
-                "KV cache export is not supported for Gemma 4 models yet"
-            ));
-        }
-        if self.granite.is_some() {
-            return Err(crate::reflex_err!(
-                UnsupportedArchitecture,
-                "KV cache export is not supported for granitehybrid (Granite 4.0-H) models yet"
-            ));
-        }
-        let model_format = if self.hybrid.is_some() {
-            "hybrid"
-        } else if self.mla.is_some() {
-            "MLA"
-        } else {
-            "dense/MoE"
-        };
-        let mismatch = |kv: &ImportedKv| {
-            ReflexError::KvCache(format!(
-                "imported KV cache file is {} format, but this model uses the {model_format} format",
-                kv.format_name()
-            ))
-        };
-        if let Some(h) = &self.hybrid {
-            let imported = match imported {
-                None => None,
-                Some(ImportedKv::Hybrid(c)) => Some(c),
-                Some(other) => return Err(mismatch(other)),
-            };
-            let (ids, text, cache) = self.generate_capture_kv_hybrid(
-                h,
-                prompt,
-                imported,
-                sampling,
-                on_first_token,
-                on_token,
-            )?;
-            return Ok((ids, text, ImportedKv::Hybrid(cache)));
-        }
-        if let Some(m) = &self.mla {
-            let imported = match imported {
-                None => None,
-                Some(ImportedKv::Mla(c)) => Some(c),
-                Some(other) => return Err(mismatch(other)),
-            };
-            let (ids, text, cache) = self.generate_capture_kv_mla(
-                m,
-                prompt,
-                imported,
-                sampling,
-                on_first_token,
-                on_token,
-            )?;
-            return Ok((ids, text, ImportedKv::Mla(cache)));
-        }
-        let imported = match imported {
-            None => None,
-            Some(ImportedKv::Dense(c)) => Some(c),
-            Some(other) => return Err(mismatch(other)),
-        };
-        let (ids, text, cache) =
-            self.generate_capture_kv_dense(prompt, imported, sampling, on_first_token, on_token)?;
-        Ok((ids, text, ImportedKv::Dense(cache)))
+        let resume = imported.map_or(Resume::Fresh, Resume::File);
+        let (token_ids, text, pinned, _copy_ms) =
+            self.generate_pin_prefix(prompt, resume, sampling, on_first_token, on_token)?;
+        Ok((token_ids, text, self.download_prefix(&pinned)?))
     }
 
     /// Copies row `rows - 1` (the last prompt position) out of a batched

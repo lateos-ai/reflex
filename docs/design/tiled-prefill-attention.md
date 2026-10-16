@@ -185,3 +185,75 @@ Takeaways:
   next limit. Tensor cores (f16 Q/K/V tiles) would be the next step.
 - **Qwen3.5's attention shrinks 12x**, but its prefill stays bound by the token-by-token
   Gated DeltaNet loop, as Phase A found.
+
+## Resumed prefill: switching on the cached length (2026-10-15)
+
+**The problem.** A resumed prefill is a few new rows after many cached positions: a
+pinned prefix or an imported cache (docs/design/agent-relay.md). The 64-row threshold
+above was measured on fresh prefills, so a 45-row continuation after 1,490 cached
+positions still ran `attention_online`. That kernel runs one block per (row, query
+head), and each block reads every cached K/V row, so its cost grows with the prefix.
+On the T4 with Qwen3-0.6B (`REFLEX_PREFILL_PROFILE=1`, attention GPU time over all 28
+layers):
+
+| new rows | 0 cached | 489 cached | 1,489 cached |
+|---:|---:|---:|---:|
+| 17 (online) | 0.5 ms | 12 ms | 38 ms |
+| 41 (online) | 1.4 ms | 31 ms | 90 ms |
+| 82 (tiled) | 1.8 ms | 8 ms | 23 ms |
+
+The agent relay hops land in the slow row: each carries the previous hop's 32-token
+note, so the continuation is about 45 tokens.
+
+**Where tiled wins on a resumed prefill.** These are kernel times
+(`attention_tiled_crossover_timings_resumed`), shown as online / tiled:
+
+| shape | cached | 8 rows | 16 rows | 32 rows | 63 rows |
+|---|---:|---:|---:|---:|---:|
+| d128, 16 q / 8 kv | 64 | 0.5x | 0.9x | 1.6x | 3.4x |
+| | 512 | 0.9x | 1.4x | 2.3x | 4.3x |
+| | 2,048 | 1.0x | 1.9x | 3.1x | 5.1x |
+| d128, 32 q / 8 kv | 64 | 0.9x | 1.5x | 2.9x | 6.0x |
+| | 2,048 | 1.9x | 3.1x | 5.3x | 8.5x |
+| d64, 14 q / 2 kv | 64 | 0.6x | 0.8x | 1.6x | 2.9x |
+| | 2,048 | 0.8x | 1.2x | 2.3x | 4.5x |
+
+Once anything is cached, the crossover depends mostly on how full the tiled block's
+64 query slots are, `rows * group`, and hardly on the prefix length.
+
+**The rule** (`attn_tiled_preferred` in `kernels.rs`): run the tiled kernel from 64
+rows up, as before, or, with at least `ATTN_TILED_MIN_START` (64) positions cached,
+once `rows * group >= ATTN_TILED_MIN_QUERIES` (64). Fresh prompts are unchanged, so short
+prompts and cold start still never load a tiled module. A short resumed prompt now
+loads it. With a PTX build and no warm driver cache, that adds a one-time ~200 ms JIT
+to a cold `reflex generate --import-kv` process; a warm session pays it once. Prompts
+with fewer rows than the rule allows (17 rows here) still use the online kernel. At
+long offsets tiled would win there too, by up to 1.9x, and a finer rule could pick
+that up later.
+
+**Correctness.** `attention_tiled_small_dims_match_online_kernel` gained six resumed
+shapes: 41 and 5 rows after about 1,500 cached positions, a padded group, a sliding
+window, d64 and d256. They match the online kernel, like the existing shapes. The pinned-prefix relay test
+still gives the same greedy ids as one joined request, and the GPU nightly suite passes
+(84 passed, 0 failed, 4 skipped for absent optional models).
+
+**Result** (T4, same session, the phase-B binary and this one run alternately):
+
+| resumed prefill, 1,489 cached | before | after |
+|---|---:|---:|
+| 41 rows: attention / first token | 90 ms / 107 ms | 21 ms / 38 ms |
+| 82 rows: attention / first token | 23 ms / 41 ms | 23 ms / 41 ms |
+
+| agent relay hop, ~1,490-token prefix, 32 tokens | round trip p50 | first token p50 |
+|---|---:|---:|
+| pinned prefix, before | 364.5 ms | 108.5 ms |
+| pinned prefix, after | 295.3 ms | 38.6 ms |
+| file reuse, after (547.2 ms before) | 472.5 ms | 216.3 ms |
+| recomputed prefix (unchanged) | 504.8 ms | 246.1 ms |
+| llama-server, prompt cache | 161.7 ms | 12.3 ms |
+
+The resumed first token is now about 39 ms, of which about 21 ms is attention.
+llama.cpp's f16 tensor-core flash attention reaches 12 ms. The tiled kernel's f32 math
+runs at about 1.3-1.4 TFLOPS whether or not anything is cached, so closing the rest of
+that gap would take an f16 tensor-core kernel. Splitting the cached keys across
+blocks would help prompts too short to fill the GPU.
