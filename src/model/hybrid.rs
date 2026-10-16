@@ -579,6 +579,7 @@ impl Model {
             weights_dtype: policy.matrix_dtype,
             f16_act_stats,
             tokenizer,
+            grammar_index: Default::default(),
             hybrid: Some(HybridModel {
                 attn_cfg,
                 gdn_cfg,
@@ -1983,31 +1984,31 @@ impl Model {
         let eps = h.attn_cfg.rmsnorm_eps;
         let mut hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
 
-        let mut rng = crate::sampling::make_rng(sampling.seed);
+        let mut picker = self.token_picker(sampling)?;
         let mut pending_bytes: Vec<u8> = Vec::new();
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
-        let first_logits = self.lm_head_logits(&hidden, hidden_size, eps)?;
-        let mut next_id = crate::sampling::sample(&first_logits, sampling, &mut rng)?;
+        let mut first_logits = self.lm_head_logits(&hidden, hidden_size, eps)?;
+        let mut next_id = picker.pick(&mut first_logits)?;
         on_first_token(&first_logits);
         generated.push(next_id);
         on_token(
             next_id,
-            &self.tokenizer.decode_stream(&mut pending_bytes, next_id),
+            &picker.stream_text(&self.tokenizer, &mut pending_bytes, next_id),
         );
 
         while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
             hidden = self.forward_one_token_hybrid(h, next_id, position, &mut states)?;
             position += 1;
-            let logits = self.lm_head_logits(&hidden, hidden_size, eps)?;
-            next_id = crate::sampling::sample(&logits, sampling, &mut rng)?;
+            let mut logits = self.lm_head_logits(&hidden, hidden_size, eps)?;
+            next_id = picker.pick(&mut logits)?;
             generated.push(next_id);
             on_token(
                 next_id,
-                &self.tokenizer.decode_stream(&mut pending_bytes, next_id),
+                &picker.stream_text(&self.tokenizer, &mut pending_bytes, next_id),
             );
         }
 
-        let text = self.tokenizer.decode(&generated);
+        let text = picker.finish(&self.tokenizer, &generated)?;
         Ok((generated, text, states, position))
     }
 

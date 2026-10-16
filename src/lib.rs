@@ -15,6 +15,7 @@ pub mod error;
 pub mod ffi;
 pub mod gated_deltanet;
 pub mod gguf;
+pub mod grammar;
 #[cfg(feature = "download")]
 pub mod hf;
 #[cfg(feature = "ipc")]

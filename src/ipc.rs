@@ -52,6 +52,15 @@
 //! longer state in its place. Neither combines with `import_kv`/`export_kv`. There
 //! is exactly one slot, with no names and no eviction: anything more belongs in the
 //! orchestrator (docs/DEVELOPMENT.md).
+//!
+//! **JSON Schema** (`generate` path only): `json_schema` constrains the output to
+//! one JSON value that validates against the schema, compact but for an optional
+//! space after each `:` and `,` (`crate::grammar` has
+//! the supported subset). `text` is then the value alone, and `token_ids` end with
+//! EOS. If `max_tokens` runs out first, the request fails with `grammar_dead_end`,
+//! and the error line carries the partial `text` and `token_ids`. It combines with
+//! `import_kv` and `use_pinned` (only the generated text is constrained, never the
+//! prompt), not with `pin_prefix`/`export_kv` or `candidates`.
 
 use crate::error::ReflexError;
 use crate::model::{Model, PinnedPrefix, Resume, System1Candidate};
@@ -137,6 +146,10 @@ pub struct IpcRequest {
     /// `generate` path only: resume from the session's [`PrefixSlot`].
     #[serde(default)]
     pub use_pinned: bool,
+    /// `generate` path only: a JSON Schema the output must conform to. Kept as raw
+    /// text so `crate::grammar` sees the properties in the order they're written.
+    #[serde(default)]
+    pub json_schema: Option<Box<serde_json::value::RawValue>>,
     /// Milliseconds spent parsing this request's JSON line, filled in by
     /// [`run_request_loop`] (not a wire field) so [`IpcTimings::parse_ms`] can
     /// report it.
@@ -156,6 +169,7 @@ impl IpcRequest {
                 top_k: s.top_k,
                 top_p: s.top_p,
                 seed: s.seed,
+                json_schema: None,
             },
         }
     }
@@ -226,6 +240,12 @@ pub struct IpcTimings {
     /// copies nothing, so a `pin_prefix` request alone reports none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_io_ms: Option<f64>,
+    /// `json_schema` requests only: computing and applying the token masks, and
+    /// following each chosen token through the grammar, summed over the request.
+    /// Included in `first_token_ms` (the first mask) and `model_ms`. Building the
+    /// vocabulary index on the session's first constrained request is not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask_ms_total: Option<f64>,
 }
 
 fn elapsed_ms(since: std::time::Instant) -> f64 {
@@ -239,12 +259,14 @@ fn timings_if(
     model_start: std::time::Instant,
     first_token_ms: Option<f64>,
     kv_io_ms: Option<f64>,
+    mask_ms_total: Option<f64>,
 ) -> Option<IpcTimings> {
     requested.then(|| IpcTimings {
         parse_ms,
         first_token_ms,
         model_ms: elapsed_ms(model_start),
         kv_io_ms,
+        mask_ms_total,
     })
 }
 
@@ -278,16 +300,54 @@ impl PrefixSlot {
 /// `pin_prefix`/`use_pinned`. Shared by [`handle_request`] and
 /// [`handle_request_streaming`]. Records the time spent on cache files, or on
 /// copying the pinned prefix, in `kv_io_ms`. A failed request leaves `slot`
-/// unchanged.
+/// unchanged. A `json_schema` request records its masking time in `mask_ms`.
 fn run_generate(
     model: &Model,
     slot: &mut PrefixSlot,
     req: &IpcRequest,
     kv_io_ms: &mut Option<f64>,
+    mask_ms: &mut Option<f64>,
     on_first_token: impl FnMut(&[f32]),
     on_token: impl FnMut(u32, &str),
 ) -> Result<(Vec<u32>, String), ReflexError> {
-    let sampling = req.sampling_params();
+    let mut sampling = req.sampling_params();
+    if let Some(raw) = &req.json_schema {
+        if req.pin_prefix || req.export_kv.is_some() {
+            let field = if req.pin_prefix {
+                "pin_prefix"
+            } else {
+                "export_kv"
+            };
+            return Err(ReflexError::InvalidInput(format!(
+                "json_schema can't be combined with {field}: that keeps the state after the prompt, before any value is generated"
+            )));
+        }
+        sampling.json_schema = Some(model.compile_json_schema(raw.get())?);
+    }
+    let result = run_generate_with(
+        model,
+        slot,
+        req,
+        &sampling,
+        kv_io_ms,
+        on_first_token,
+        on_token,
+    );
+    *mask_ms = sampling.json_schema.as_ref().map(|s| s.mask_ms_total());
+    result
+}
+
+/// [`run_generate`] after the request's sampling parameters are built.
+#[allow(clippy::too_many_arguments)]
+fn run_generate_with(
+    model: &Model,
+    slot: &mut PrefixSlot,
+    req: &IpcRequest,
+    sampling: &crate::sampling::SamplingParams,
+    kv_io_ms: &mut Option<f64>,
+    on_first_token: impl FnMut(&[f32]),
+    on_token: impl FnMut(u32, &str),
+) -> Result<(Vec<u32>, String), ReflexError> {
     let uses_slot = req.pin_prefix || req.use_pinned;
     if uses_slot && (req.import_kv.is_some() || req.export_kv.is_some()) {
         return Err(ReflexError::InvalidInput(
@@ -321,7 +381,7 @@ fn run_generate(
         let (token_ids, text, pinned, copy_ms) = model.generate_pin_prefix(
             &req.prompt,
             pinned_resume(),
-            &sampling,
+            sampling,
             on_first_token,
             on_token,
         )?;
@@ -334,7 +394,7 @@ fn run_generate(
             &req.prompt,
             req.max_tokens.max(1),
             pinned_resume(),
-            &sampling,
+            sampling,
             on_first_token,
             on_token,
         )?;
@@ -356,7 +416,7 @@ fn run_generate(
             &req.prompt,
             req.max_tokens.max(1),
             imported.as_ref(),
-            &sampling,
+            sampling,
             on_first_token,
             on_token,
         );
@@ -364,7 +424,7 @@ fn run_generate(
     let (token_ids, text, cache) = model.generate_capture_kv(
         &req.prompt,
         imported.as_ref(),
-        &sampling,
+        sampling,
         on_first_token,
         on_token,
     )?;
@@ -391,15 +451,23 @@ impl IpcRequest {
 }
 
 impl IpcResponse {
+    /// An `ok: false` line. A `grammar_dead_end` error also carries the partial
+    /// `text` and `token_ids`.
     fn err(id: Option<String>, error: ReflexError) -> Self {
+        let (token_ids, text) = match &error {
+            ReflexError::GrammarDeadEnd {
+                text, token_ids, ..
+            } => (Some(token_ids.clone()), Some(text.clone())),
+            _ => (None, None),
+        };
         IpcResponse {
             id,
             event: "final",
             ok: false,
             error_kind: Some(error.kind()),
             error: Some(error.to_string()),
-            token_ids: None,
-            text: None,
+            token_ids,
+            text,
             candidates: None,
             entropy: None,
             timings: None,
@@ -437,11 +505,13 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
     if req.candidates.is_empty() {
         let mut first_token_ms = None;
         let mut kv_io_ms = None;
+        let mut mask_ms = None;
         match run_generate(
             model,
             slot,
             &req,
             &mut kv_io_ms,
+            &mut mask_ms,
             |_logits| first_token_ms = Some(elapsed_ms(model_start)),
             |_token_id, _text| {},
         ) {
@@ -461,12 +531,32 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
                     model_start,
                     first_token_ms,
                     kv_io_ms,
+                    mask_ms,
                 ),
             },
-            Err(e) => IpcResponse::err(id, e),
+            // A failed generate request still reports its timings when asked, so a
+            // caller can account for a `grammar_dead_end`'s work too.
+            Err(e) => IpcResponse {
+                timings: timings_if(
+                    req.timings,
+                    req.parse_ms,
+                    model_start,
+                    first_token_ms,
+                    kv_io_ms,
+                    mask_ms,
+                ),
+                ..IpcResponse::err(id, e)
+            },
         }
     } else if req.uses_prefix_fields() {
         IpcResponse::err(id, kv_fields_on_candidates_err())
+    } else if req.json_schema.is_some() {
+        IpcResponse::err(
+            id,
+            ReflexError::InvalidInput(
+                "json_schema applies only to generate requests (empty candidates)".to_string(),
+            ),
+        )
     } else {
         let candidates: Vec<System1Candidate> = req
             .candidates
@@ -496,7 +586,7 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
                     text: None,
                     candidates: Some(candidates),
                     entropy: Some(response.entropy),
-                    timings: timings_if(req.timings, req.parse_ms, model_start, None, None),
+                    timings: timings_if(req.timings, req.parse_ms, model_start, None, None, None),
                 }
             }
             Err(e) => IpcResponse::err(id, e),
@@ -548,11 +638,13 @@ pub fn handle_request_streaming<W: Write>(
     let model_start = std::time::Instant::now();
     let mut first_token_ms = None;
     let mut kv_io_ms = None;
+    let mut mask_ms = None;
     let result = run_generate(
         model,
         slot,
         &req,
         &mut kv_io_ms,
+        &mut mask_ms,
         |_logits| first_token_ms = Some(elapsed_ms(model_start)),
         |token_id, text| {
             if write_err.is_some() {
@@ -590,9 +682,22 @@ pub fn handle_request_streaming<W: Write>(
                 model_start,
                 first_token_ms,
                 kv_io_ms,
+                mask_ms,
             ),
         },
-        Err(e) => IpcResponse::err(id, e),
+        // A failed generate request still reports its timings when asked, so a
+        // caller can account for a `grammar_dead_end`'s work too.
+        Err(e) => IpcResponse {
+            timings: timings_if(
+                req.timings,
+                req.parse_ms,
+                model_start,
+                first_token_ms,
+                kv_io_ms,
+                mask_ms,
+            ),
+            ..IpcResponse::err(id, e)
+        },
     };
     write_json_line(&mut output, &response)
 }
@@ -653,6 +758,8 @@ pub fn run_stdio_loop(model: &Model) -> Result<(), String> {
     run_request_loop(model, &mut PrefixSlot::new(), stdin.lock(), stdout.lock())
 }
 
+#[cfg(test)]
+mod json_schema_tests;
 #[cfg(test)]
 mod relay_tests;
 
@@ -836,16 +943,17 @@ mod tests {
     #[test]
     fn test_timings_if_only_builds_when_requested() {
         let start = std::time::Instant::now();
-        assert!(timings_if(false, 1.0, start, Some(2.0), None).is_none());
-        let t = timings_if(true, 1.0, start, None, None).expect("requested");
+        assert!(timings_if(false, 1.0, start, Some(2.0), None, None).is_none());
+        let t = timings_if(true, 1.0, start, None, None, None).expect("requested");
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"parse_ms\":1.0"), "{json}");
         assert!(json.contains("\"model_ms\""), "{json}");
         assert!(!json.contains("first_token_ms"), "{json}");
         assert!(!json.contains("kv_io_ms"), "{json}");
-        let t = timings_if(true, 1.0, start, None, Some(3.0)).expect("requested");
+        let t = timings_if(true, 1.0, start, None, Some(3.0), Some(0.5)).expect("requested");
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"kv_io_ms\":3.0"), "{json}");
+        assert!(json.contains("\"mask_ms_total\":0.5"), "{json}");
     }
 
     #[test]

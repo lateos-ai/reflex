@@ -54,6 +54,14 @@ pub enum ReflexError {
     InvalidInput(String),
     /// Anything not classified above, mostly internal invariant violations.
     Other(String),
+    /// A `json_schema`-constrained generation stopped before its value was complete,
+    /// almost always because `max_tokens` ran out (see `crate::grammar`). `text` and
+    /// `token_ids` are what was generated so far.
+    GrammarDeadEnd {
+        message: String,
+        text: String,
+        token_ids: Vec<u32>,
+    },
 }
 
 /// Stable machine-readable error categories, shared by the C FFI
@@ -78,6 +86,7 @@ pub enum ReflexErrorCode {
     Other = 12,
     /// The engine panicked; only the C FFI reports this (it catches the panic).
     Panic = 13,
+    GrammarDeadEnd = 14,
 }
 
 impl ReflexErrorCode {
@@ -98,6 +107,7 @@ impl ReflexErrorCode {
             ReflexErrorCode::InvalidInput => "invalid_input",
             ReflexErrorCode::Other => "other",
             ReflexErrorCode::Panic => "panic",
+            ReflexErrorCode::GrammarDeadEnd => "grammar_dead_end",
         }
     }
 }
@@ -117,6 +127,7 @@ impl ReflexError {
             ReflexError::Io(_) => ReflexErrorCode::Io,
             ReflexError::InvalidInput(_) => ReflexErrorCode::InvalidInput,
             ReflexError::Other(_) => ReflexErrorCode::Other,
+            ReflexError::GrammarDeadEnd { .. } => ReflexErrorCode::GrammarDeadEnd,
         }
     }
 
@@ -145,6 +156,13 @@ impl ReflexError {
             ReflexError::Io(_) => ReflexError::Io(message),
             ReflexError::InvalidInput(_) => ReflexError::InvalidInput(message),
             ReflexError::Other(_) => ReflexError::Other(message),
+            ReflexError::GrammarDeadEnd {
+                text, token_ids, ..
+            } => ReflexError::GrammarDeadEnd {
+                message,
+                text: text.clone(),
+                token_ids: token_ids.clone(),
+            },
         }
     }
 
@@ -194,7 +212,8 @@ impl fmt::Display for ReflexError {
             | ReflexError::Lora(m)
             | ReflexError::Io(m)
             | ReflexError::InvalidInput(m)
-            | ReflexError::Other(m) => f.write_str(m),
+            | ReflexError::Other(m)
+            | ReflexError::GrammarDeadEnd { message: m, .. } => f.write_str(m),
         }
     }
 }

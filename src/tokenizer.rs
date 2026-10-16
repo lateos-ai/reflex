@@ -966,6 +966,43 @@ impl Tokenizer {
         }
     }
 
+    /// The bytes token `id` adds to [`Self::decode`]'s output: [`Self::token_bytes`],
+    /// with the SentencePiece word-boundary marker already turned into a space for
+    /// every scheme but gpt2. `crate::grammar` matches these against the schema. The
+    /// one difference from `decode` is a `▁` assembled from byte-fallback tokens
+    /// across several ids, which `decode` also turns into a space; the grammar keeps
+    /// U+2581 out of its strings for these tokenizers, so it never builds one.
+    pub(crate) fn token_text_bytes(&self, id: u32) -> Vec<u8> {
+        let bytes = self.token_bytes(id);
+        if self.architecture == "gpt2" || parse_byte_fallback(&self.tokens[id as usize]).is_some() {
+            return bytes;
+        }
+        match String::from_utf8(bytes) {
+            Ok(s) => s.replace(WORD_BOUNDARY, " ").into_bytes(),
+            Err(e) => e.into_bytes(),
+        }
+    }
+
+    /// Whether token `id` stands for text a constrained value may contain: not a
+    /// `CONTROL` (3), `UNKNOWN` (2) or `UNUSED` (5) token per `tokenizer.ggml.token_type`
+    /// (or, when the vocab has no types, not the BOS/EOS/unknown/padding id).
+    /// `USER_DEFINED` tokens count as text, as they do in llama.cpp's grammar sampler.
+    pub(crate) fn is_text_token(&self, id: u32) -> bool {
+        if (id as usize) >= self.tokens.len() {
+            return false;
+        }
+        match self.token_type.get(id as usize) {
+            Some(&t) => !matches!(t, 2 | 3 | 5),
+            None => ![
+                self.bos_token_id,
+                self.eos_token_id,
+                self.unk_token_id,
+                self.pad_token_id,
+            ]
+            .contains(&Some(id)),
+        }
+    }
+
     /// Decode token ids back to text: byte-fallback tokens (`<0xXX>`)
     /// contribute one raw byte each, every other token contributes its
     /// UTF-8 bytes verbatim, then [`WORD_BOUNDARY`] is replaced with a

@@ -29,7 +29,7 @@ const PARTS: [&str; 3] = [
     " Paris, and the capital of Italy is",
 ];
 
-fn load(path: &str, weights: WeightsDtype) -> Model {
+pub(super) fn load(path: &str, weights: WeightsDtype) -> Model {
     let file = GgufFile::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
     let opts = LoadOptions {
@@ -58,7 +58,7 @@ fn session_with(model: &Model, slot: &mut PrefixSlot, requests: &[Value]) -> Vec
         .collect()
 }
 
-fn final_ok(resp: &Value) -> Vec<u64> {
+pub(super) fn final_ok(resp: &Value) -> Vec<u64> {
     assert_eq!(resp["event"], "final", "{resp}");
     assert_eq!(resp["ok"], true, "{resp}");
     resp["token_ids"]
@@ -73,7 +73,7 @@ fn final_ok(resp: &Value) -> Vec<u64> {
 /// same ids as one request over the joined text. Ids, not counts: on a
 /// SentencePiece model a continuation encoded with a stray dummy-prefix space
 /// (`▁<` where the joined text has `<`) can have the same length.
-fn assert_split_tokenizes_alike(model: &Model, parts: &[&str]) {
+pub(super) fn assert_split_tokenizes_alike(model: &Model, parts: &[&str]) {
     let split: Vec<u32> = model.encode_split(parts).unwrap().concat();
     assert_eq!(
         split,
@@ -82,7 +82,7 @@ fn assert_split_tokenizes_alike(model: &Model, parts: &[&str]) {
     );
 }
 
-fn tmp_path(tag: &str) -> String {
+pub(super) fn tmp_path(tag: &str) -> String {
     std::env::temp_dir()
         .join(format!(
             "reflex_ipc_relay_{tag}_{}.cskv",
