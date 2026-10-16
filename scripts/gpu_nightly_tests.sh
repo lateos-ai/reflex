@@ -18,6 +18,8 @@
 #                            qwen2.5-1.5b-instruct-q4_k_m.gguf (the 0.5B has none)
 #   GRANITE_GGUF   optional  a real Granite 4.0-H (granitehybrid) GGUF, e.g.
 #                            granite-4.0-h-350m-Q8_0.gguf
+#   SPM_GGUF       optional  a real SentencePiece-tokenizer chat GGUF, e.g.
+#                            tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 #   test-data/*.gguf         optional synthetic fixtures (see docs/DEVELOPMENT.md "Known
 #                            test-fixture limitations"); tests needing them SKIP if absent
 #   CARGO_TEST_FLAGS         default "--release --features ipc"
@@ -33,6 +35,7 @@ IQ_GGUF="${IQ_GGUF:-}"
 MLA_REAL_GGUF="${MLA_REAL_GGUF:-}"
 QWEN2_GGUF="${QWEN2_GGUF:-}"
 GRANITE_GGUF="${GRANITE_GGUF:-}"
+SPM_GGUF="${SPM_GGUF:-}"
 read -r -a cargo_flags <<<"${CARGO_TEST_FLAGS:---release --features ipc}"
 LOG_DIR="${LOG_DIR:-bench-results/gpu-tests-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$LOG_DIR"
@@ -49,6 +52,7 @@ requirement() {
     *::qwen2_fixture_lora_*) echo "|test-data/tiny-qwen2-lora.gguf|fixture missing" ;;
     model::qwen2_tests::*) echo "|test-data/tiny-qwen2.gguf|fixture missing" ;;
     *::granite_real_model_*) echo "$GRANITE_GGUF|$GRANITE_GGUF|set GRANITE_GGUF" ;;
+    *::ipc_kv_relay_spm_model_*) echo "$SPM_GGUF|$SPM_GGUF|set SPM_GGUF" ;;
     model::granite_hybrid_tests::*) echo "|test-data/tiny-granitehybrid.gguf|fixture missing" ;;
     model::mla_widening_tests::*) echo "|test-data/tiny-mla-v3.gguf|fixture missing" ;;
     lora::moe_expert_lora_fixture_tests::*) echo "|test-data/tiny-qwen3moe-lora.gguf|fixture missing" ;;

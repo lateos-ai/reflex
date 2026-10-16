@@ -55,6 +55,18 @@ What has been built, in order. Measurements live in
   the agent relay's pinned long-prefix hop drops from 364 to 295 ms. Fresh prompts
   are unchanged. See
   [docs/design/tiled-prefill-attention.md](docs/design/tiled-prefill-attention.md).
+- **Exact prefix reuse on SentencePiece models.** An `import_kv`/`use_pinned`
+  continuation (and `reflex generate --import-kv`) on Llama-2, Mistral or TinyLlama
+  used to be encoded with the tokenizer's leading `▁` space even when the prefix ended
+  on raw text. So it wasn't token-identical to one request over the joined text: on
+  TinyLlama, `<|user|>` after a cached `…</s>\n` became `▁<` instead of `<`. A
+  continuation now gets that space only when the prefix ended on a special token, as
+  llama.cpp's tokenizer does for the joined text.
+  - Dense KV cache files gain one byte for this (format version 4). Version-1 files
+    still import, with the old behavior.
+  - The relay tests compare the split prompt's ids instead of its token count, and
+    cover TinyLlama (`SPM_GGUF` in the GPU nightly).
+  - gpt2-style tokenizers are unaffected.
 
 ## 2026-10-15
 
