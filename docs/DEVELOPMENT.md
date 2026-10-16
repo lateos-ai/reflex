@@ -27,6 +27,12 @@ rationale [below](#the-full-rationale):
 - **No multi-tenant LoRA router, no internal NVMe/S3 KV-cache manager.** Multi-tenancy
   and persistent state belong in a host orchestrator, never inside this engine. For
   example, `kv_io.rs` reads and writes a cache file but never decides where it lives.
+  The warm `reflex stdio`/`uds` loop may hold **one** pinned prefix in VRAM
+  (`pin_prefix`/`use_pinned`, see [design/agent-relay.md](design/agent-relay.md)), and
+  that is the boundary: no second slot, no names, no LRU or eviction policy, no
+  background work. Keeping several prefixes, choosing which to keep, or sharing them
+  between processes is the orchestrator's job (cache files through
+  `import_kv`/`export_kv`, or one warm process per prefix).
 - **No network server in the core engine, ever.** HTTP access is provided by the
   separate [`sidecar/openai-adapter`](../sidecar/openai-adapter/README.md) crate, which
   talks to the engine over local IPC. The engine itself may only grow sequential,

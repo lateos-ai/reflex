@@ -24,15 +24,28 @@ What has been built, in order. Measurements live in
   one. They use the same cache formats as `--export-kv`/`--import-kv`, and a request
   can set both to layer prefixes. The caller owns the files, so the engine still keeps
   nothing between requests. `agent_relay_bench.py --reuse-prefix` measures it.
-- **Faster quantized-resident decode.** With `REFLEX_QUANT_RESIDENT=1`, the decode-step
-  Q4_K GEMV computes 4 output rows per warp and reuses each activation load across them.
-  It is 1.6-1.8x faster per call and bit-identical to the previous kernel. Dense
-  models' Q6_K layer tensors now stay quantized too (as Kolibri-1's already did), with a
-  coalesced Q6_K dequant for prefill, and the Q4_K/Q6_K GEMVs no longer zero their
-  outputs first. On a T4, decode is 16-31% faster: Qwen3-0.6B 6.09 -> 4.86 ms/token,
-  Mistral 7B 45.8 -> 31.7 ms/token. Prefill costs 1-8% more, and Mistral's first token
-  comes ~650 ms sooner. See
-  [docs/design/quantized-resident-weights.md](docs/design/quantized-resident-weights.md).
+- **One pinned prefix in VRAM over IPC.** A `reflex stdio`/`uds` request with
+  `"pin_prefix": true` (and `"max_tokens": 1`) keeps the state after its prompt in the
+  session's one slot. Later requests with `"use_pinned": true` resume from it through
+  a device-to-device copy, with no file read or upload, and the slot itself never
+  changes. Setting both fields layers a longer prefix on top. There is one slot, with
+  no names and no eviction; anything more is left to the orchestrator. Each use needs
+  a second copy of the prefix's KV in VRAM while it runs, and fails with
+  `out_of_memory`, leaving the session working, if that can't be allocated. It covers
+  dense/MoE (Qwen3, Qwen2, Llama/Mistral, Kolibri-1), Qwen3.5 and MLA; Gemma 4 and
+  Granite 4.0-H return `unsupported_architecture`. On a T4 with Qwen3-0.6B and a
+  ~1,490-token shared prefix, a 32-token hop takes 364 ms instead of 501 ms
+  recomputed or 547 ms from a file. `agent_relay_bench.py --pin-prefix` measures it.
+  `ipc::handle_request`, `handle_request_streaming` and `run_request_loop` now take
+  the session's `&mut PrefixSlot`.
+- **Faster prefill after a cached prefix.** A prompt that resumes from a pinned prefix
+  or an imported cache now runs the tiled attention kernel once `rows * group` fills
+  one of its blocks, instead of waiting for 64 rows. Below that, the online kernel
+  read the whole cached prefix once per row and head. On a T4 with Qwen3-0.6B, 41 rows
+  after 1,489 cached positions reach the first token in 38 ms instead of 107 ms, and
+  the agent relay's pinned long-prefix hop drops from 364 to 295 ms. Fresh prompts
+  are unchanged. See
+  [docs/design/tiled-prefill-attention.md](docs/design/tiled-prefill-attention.md).
 
 ## 2026-10-15
 
