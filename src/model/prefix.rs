@@ -52,6 +52,11 @@ pub(super) struct DenseDeviceKv {
     pub(super) seq_len: usize,
     pub(super) k_caches: Vec<CudaSlice<f32>>,
     pub(super) v_caches: Vec<CudaSlice<f32>>,
+    /// Whether the cached prompt's encoding ended on a special token: the
+    /// `after_special` a continuation is encoded with
+    /// (`Tokenizer::encode_continuation`). Only the SentencePiece scheme, which
+    /// only the dense path runs, depends on it.
+    pub(super) space_prefix_next: bool,
 }
 
 pub(super) struct HybridDeviceState {
@@ -147,6 +152,24 @@ impl<H: SeqLen, D: SeqLen> PrefixSource<'_, H, D> {
             PrefixSource::Device { state, .. } => state.seq_len(),
         }
     }
+}
+
+impl DensePrefix<'_> {
+    /// The `after_special` state to encode a continuation of this prefix with. A
+    /// version-1 cache file doesn't record it; resuming from one adds the
+    /// SentencePiece space, as before version 4.
+    pub(super) fn space_prefix_next(&self) -> bool {
+        match self {
+            PrefixSource::Host(c) => c.space_prefix_next.unwrap_or(true),
+            PrefixSource::Device { state, .. } => state.space_prefix_next,
+        }
+    }
+}
+
+/// The `after_special` state a dense prompt resumed from `src` (fresh: `None`)
+/// is encoded with.
+pub(super) fn dense_after_special(src: Option<DensePrefix<'_>>) -> bool {
+    src.is_none_or(|s| s.space_prefix_next())
 }
 
 /// `Option<PrefixSource>`'s start position: 0 for a fresh prompt.
@@ -396,6 +419,9 @@ impl Model {
             }),
             _ => return Err(mismatch()),
         };
+        let space_prefix_next = self
+            .tokenizer
+            .ends_after_special(prompt, dense_after_special(src));
         let (token_ids, text, k_caches, v_caches, seq_len) = self.generate_dense_impl(
             prompt,
             src,
@@ -411,6 +437,7 @@ impl Model {
                 seq_len,
                 k_caches,
                 v_caches,
+                space_prefix_next,
             })),
             copy_ms: copy_ms.get(),
         })

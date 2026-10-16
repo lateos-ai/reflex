@@ -1705,7 +1705,9 @@ impl Model {
     ) -> Result<DensePrefillResult, ReflexError> {
         let start_pos = start_pos_of(imported);
 
-        let mut ids = self.tokenizer.encode(prompt)?;
+        let mut ids = self
+            .tokenizer
+            .encode_continuation(prompt, dense_after_special(imported))?;
         if start_pos == 0 {
             if let Some(bos) = self.tokenizer.prompt_bos() {
                 if ids.first() != Some(&bos) {
@@ -1862,7 +1864,9 @@ impl Model {
     ) -> Result<DensePrefillResult, ReflexError> {
         let start_pos = start_pos_of(imported);
 
-        let mut ids = self.tokenizer.encode(prompt)?;
+        let mut ids = self
+            .tokenizer
+            .encode_continuation(prompt, dense_after_special(imported))?;
         if start_pos == 0 {
             if let Some(bos) = self.tokenizer.prompt_bos() {
                 if ids.first() != Some(&bos) {
@@ -2118,18 +2122,17 @@ impl Model {
         on_first_token: impl FnMut(&[f32]),
         on_token: impl FnMut(u32, &str),
     ) -> Result<(Vec<u32>, String, crate::kv_io::DenseKvCache), ReflexError> {
-        let (generated, text, k_caches, v_caches, seq_len) = self.generate_dense_impl(
-            prompt,
-            imported.map(PrefixSource::Host),
-            1,
-            sampling,
-            on_first_token,
-            on_token,
-        )?;
+        let src = imported.map(PrefixSource::Host);
+        let space_prefix_next = self
+            .tokenizer
+            .ends_after_special(prompt, dense_after_special(src));
+        let (generated, text, k_caches, v_caches, seq_len) =
+            self.generate_dense_impl(prompt, src, 1, sampling, on_first_token, on_token)?;
         let cache = self.download_dense_kv(&DenseDeviceKv {
             seq_len,
             k_caches,
             v_caches,
+            space_prefix_next,
         })?;
         Ok((generated, text, cache))
     }
@@ -2157,6 +2160,7 @@ impl Model {
             head_dim: self.cfg.head_dim,
             k_caches: download(&d.k_caches, "k_cache")?,
             v_caches: download(&d.v_caches, "v_cache")?,
+            space_prefix_next: Some(d.space_prefix_next),
         })
     }
 }

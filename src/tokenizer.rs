@@ -205,6 +205,13 @@ impl PreType {
     }
 }
 
+/// One piece of [`Tokenizer::fragments`]: a literal special-token match, or the
+/// raw text between two of them.
+enum Fragment<'t> {
+    Special(u32),
+    Raw(&'t str),
+}
+
 /// A tokenizer extracted from a GGUF file's `tokenizer.ggml.*` metadata keys.
 pub struct Tokenizer {
     pub architecture: String,
@@ -384,11 +391,64 @@ impl Tokenizer {
     /// SentencePiece path unchanged, this module's original Phase 21.5.1
     /// scope.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
-        if self.special_tokens.is_empty() {
-            return self.encode_plain(text);
-        }
+        self.encode_continuation(text, true)
+    }
 
+    /// Encodes `text` as the continuation of earlier text whose encoding ended
+    /// on a special token (`after_special`, also true at the very start) or on
+    /// raw text. It matters only for the SentencePiece scheme: like llama.cpp's
+    /// `llm_tokenizer_spm` (`is_prev_special`), every raw-text span that starts
+    /// the text or follows a special token gets the dummy-prefix
+    /// [`WORD_BOUNDARY`], and one that continues raw text doesn't. So encoding
+    /// `a`, then `b` with `after_special = self.ends_after_special(a, true)`,
+    /// gives the same ids as encoding `a + b` whenever the split falls on a
+    /// token boundary. That's what resuming from a cached prefix
+    /// (`Model::generate`'s `import_kv`/`use_pinned`) relies on. `encode(text)`
+    /// is `encode_continuation(text, true)`.
+    pub fn encode_continuation(
+        &self,
+        text: &str,
+        after_special: bool,
+    ) -> Result<Vec<u32>, ReflexError> {
         let mut ids = Vec::new();
+        let mut prev_special = after_special;
+        for fragment in self.fragments(text) {
+            match fragment {
+                Fragment::Special(id) => {
+                    ids.push(id);
+                    prev_special = true;
+                }
+                Fragment::Raw(span) => {
+                    ids.extend(self.encode_plain(span, prev_special)?);
+                    prev_special = false;
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Whether `text`, encoded with [`Self::encode_continuation`] after a state
+    /// of `after_special`, ends on a special token: the `after_special` to encode
+    /// whatever comes next with. Empty text leaves the state unchanged.
+    pub fn ends_after_special(&self, text: &str, after_special: bool) -> bool {
+        match self.fragments(text).last() {
+            Some(Fragment::Special(_)) => true,
+            Some(Fragment::Raw(_)) => false,
+            None => after_special,
+        }
+    }
+
+    /// Splits `text` into literal special-token matches and the raw spans
+    /// between them (see [`Self::encode`]'s doc for why special tokens are
+    /// matched first). Raw spans are never empty.
+    fn fragments<'t>(&self, text: &'t str) -> Vec<Fragment<'t>> {
+        let mut out = Vec::new();
+        if self.special_tokens.is_empty() {
+            if !text.is_empty() {
+                out.push(Fragment::Raw(text));
+            }
+            return out;
+        }
         let mut plain_start = 0usize;
         let mut i = 0usize;
         while i < text.len() {
@@ -402,11 +462,11 @@ impl Tokenizer {
             match matched {
                 Some(special) => {
                     if plain_start < i {
-                        ids.extend(self.encode_plain(&text[plain_start..i])?);
+                        out.push(Fragment::Raw(&text[plain_start..i]));
                     }
                     // Only reachable when `special_tokens` (built from `tokens`) is
                     // non-empty, so the lookup below always succeeds.
-                    ids.push(self.token_to_id[special.as_str()]);
+                    out.push(Fragment::Special(self.token_to_id[special.as_str()]));
                     i += special.len();
                     plain_start = i;
                 }
@@ -416,21 +476,23 @@ impl Tokenizer {
             }
         }
         if plain_start < text.len() {
-            ids.extend(self.encode_plain(&text[plain_start..])?);
+            out.push(Fragment::Raw(&text[plain_start..]));
         }
-        Ok(ids)
+        out
     }
 
     /// The general encode path (regex-pretokenization + BPE, dispatched on
     /// `self.architecture`) -- used for every span of `text` that isn't a
     /// literal special-token match. See [`Self::encode`]'s doc for why
     /// special tokens (this struct's `special_tokens` field) are matched
-    /// separately, before this ever runs on their text.
-    fn encode_plain(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
+    /// separately, before this ever runs on their text. `dummy_prefix` is the
+    /// SentencePiece scheme's leading [`WORD_BOUNDARY`] (see
+    /// [`Self::encode_continuation`]); the other schemes have none.
+    fn encode_plain(&self, text: &str, dummy_prefix: bool) -> Result<Vec<u32>, ReflexError> {
         match self.architecture.as_str() {
             "gpt2" => self.encode_gpt2(text),
             "gemma4" => self.encode_gemma4(text),
-            _ => self.encode_sentencepiece(text),
+            _ => self.encode_sentencepiece(text, dummy_prefix),
         }
     }
 
@@ -445,8 +507,9 @@ impl Tokenizer {
     /// a vocab with no scores (the synthetic test vocabs) falls back to
     /// greedy lowest-rank merging over `merge_rank`.
     ///
-    /// Preprocessing: every space becomes [`WORD_BOUNDARY`] and a leading
-    /// `WORD_BOUNDARY` is prepended for non-empty text (SentencePiece's
+    /// Preprocessing: every space becomes [`WORD_BOUNDARY`] and, with
+    /// `dummy_prefix`, a leading `WORD_BOUNDARY` is prepended for non-empty
+    /// text (SentencePiece's
     /// "text is preceded by an implicit space" convention — confirmed
     /// against the real TinyLlama reference tokenizer, see
     /// `PHASE21_5_PLAN.md`'s Known risks; empty text is the one case where
@@ -456,9 +519,13 @@ impl Tokenizer {
     /// vocab has it directly; otherwise it's decomposed into UTF-8 bytes,
     /// each represented by a `<0xXX>` byte-fallback token. Errs if a
     /// byte-fallback token or a final merged symbol isn't in the vocab.
-    fn encode_sentencepiece(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
+    fn encode_sentencepiece(
+        &self,
+        text: &str,
+        dummy_prefix: bool,
+    ) -> Result<Vec<u32>, ReflexError> {
         let mut preprocessed = String::with_capacity(text.len() + 1);
-        if !text.is_empty() {
+        if dummy_prefix && !text.is_empty() {
             preprocessed.push(WORD_BOUNDARY);
         }
         for ch in text.chars() {
@@ -3285,5 +3352,103 @@ mod tests {
             assert_eq!(ids, expected, "ids differ from llama-tokenize for {text:?}");
             assert_eq!(tok.decode(&ids), text, "round trip failed for {text:?}");
         }
+    }
+
+    fn fixture_tokenizer(file_name: &str) -> Option<Tokenizer> {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test-data")
+            .join(file_name);
+        if !path.exists() {
+            eprintln!("Skipping: test-data/{file_name} not present");
+            return None;
+        }
+        let file = GgufFile::open(&path).expect("open tokenizer GGUF");
+        Some(Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf"))
+    }
+
+    /// Encodes `parts` the way a chain of resumed requests does: each part after
+    /// the state the parts before it left.
+    fn encode_chain(tok: &Tokenizer, parts: &[&str]) -> Vec<u32> {
+        let mut after_special = true;
+        let mut ids = Vec::new();
+        for p in parts {
+            ids.extend(tok.encode_continuation(p, after_special).unwrap());
+            after_special = tok.ends_after_special(p, after_special);
+        }
+        ids
+    }
+
+    /// On a real SentencePiece vocab (TinyLlama-1.1B-Chat,
+    /// `test-data/tinyllama-1.1b-chat-tokenizer.gguf`), a chain of continuations
+    /// encodes like the joined text, whether a split falls after raw text (no
+    /// dummy-prefix space) or after the special token `</s>` (a space). Encoding
+    /// each part as a fresh prompt gets the raw-text splits wrong.
+    #[test]
+    fn test_spm_continuation_matches_joined_text_if_fixture_present() {
+        let Some(tok) = fixture_tokenizer("tinyllama-1.1b-chat-tokenizer.gguf") else {
+            return;
+        };
+        assert_eq!(tok.architecture, "llama");
+        let user = "<|user|>\nWhat is the capital of France?</s>\n<|assistant|>\n";
+        let cases: [(&[&str], bool); 5] = [
+            (
+                &["<|system|>\nYou are a careful assistant.</s>\n", user],
+                false,
+            ),
+            (
+                &[
+                    "<|system|>\nYou are a careful assistant.</s>",
+                    &format!("\n{user}"),
+                ],
+                true,
+            ),
+            (
+                &[
+                    "You are a careful assistant in a team of agents. Answer briefly.",
+                    " The capital of France is",
+                    " Paris, and the capital of Italy is",
+                ],
+                false,
+            ),
+            (&["Hello world", "</s>", "Bye", " now"], false),
+            (&["</s>", "\nHi"], true),
+        ];
+        for (parts, fresh_encoding_works) in cases {
+            let joined = tok.encode(&parts.concat()).unwrap();
+            assert_eq!(encode_chain(&tok, parts), joined, "{parts:?}");
+            let fresh: Vec<u32> = parts.iter().flat_map(|p| tok.encode(p).unwrap()).collect();
+            assert_eq!(fresh == joined, fresh_encoding_works, "{parts:?}");
+        }
+        assert!(tok.ends_after_special("abc</s>", false));
+        assert!(!tok.ends_after_special("</s>\n", true));
+        assert!(tok.ends_after_special("", true));
+        assert!(!tok.ends_after_special("", false));
+        // The SentencePiece dummy prefix is the only difference.
+        assert_eq!(
+            tok.encode_continuation("Hi", true).unwrap()[0],
+            tok.token_to_id["\u{2581}Hi"]
+        );
+    }
+
+    /// gpt2 byte-level BPE has no dummy prefix: a continuation encodes the same
+    /// in either state.
+    #[test]
+    fn test_gpt2_continuation_ignores_state_if_fixture_present() {
+        let Some(tok) = fixture_tokenizer("qwen3-0.6b-tokenizer.gguf") else {
+            return;
+        };
+        for text in [
+            "Hello world",
+            " leading space",
+            "<|im_start|>user\nHi<|im_end|>\n",
+        ] {
+            assert_eq!(
+                tok.encode_continuation(text, false).unwrap(),
+                tok.encode(text).unwrap(),
+                "{text:?}"
+            );
+        }
+        assert!(tok.ends_after_special("hi<|im_end|>", false));
+        assert!(!tok.ends_after_special("<|im_end|>\n", true));
     }
 }

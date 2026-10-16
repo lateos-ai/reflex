@@ -28,6 +28,13 @@
 //! LE | per layer, k_cache then v_cache, each `seq_len * num_kv_heads *
 //! head_dim` f32 LE values.
 //!
+//! Version 4 (dense/MoE, what [`export_dense_kv`] writes now): version 1's
+//! layout with version = 4 and one byte after `head_dim`: `space_prefix_next`
+//! (0 or 1), whether the cached prompt's encoding ended on a special token, so a
+//! SentencePiece continuation gets its dummy-prefix space exactly when the
+//! joined text would (`Tokenizer::encode_continuation`). A version-1 file has
+//! no such byte; resuming from one adds the space, as before.
+//!
 //! Version 2 (hybrid) layout: `b"CSKV"` | version:u32 LE (=2) |
 //! num_layers:u32 LE | seq_len:u32 LE (attn positions cached so far) |
 //! attn_num_kv_heads:u32 LE | attn_head_dim:u32 LE | gdn_conv_state_len:u32
@@ -51,6 +58,7 @@ const MAGIC: &[u8; 4] = b"CSKV";
 const VERSION_DENSE: u32 = 1;
 const VERSION_HYBRID: u32 = 2;
 const VERSION_MLA: u32 = 3;
+const VERSION_DENSE_V4: u32 = 4;
 
 #[derive(Debug)]
 pub struct DenseKvCache {
@@ -59,6 +67,9 @@ pub struct DenseKvCache {
     pub head_dim: usize,
     pub k_caches: Vec<Vec<f32>>,
     pub v_caches: Vec<Vec<f32>>,
+    /// Whether the cached prompt's encoding ended on a special token (see the
+    /// module doc's version 4). `None` for a version-1 file, which predates it.
+    pub space_prefix_next: Option<bool>,
 }
 
 /// One hybrid layer's cached state, matching `model.rs`'s `HybridLayerState`
@@ -134,7 +145,7 @@ pub fn export_dense_kv(path: &str, cache: &DenseKvCache) -> Result<(), ReflexErr
         std::fs::File::create(path).map_err(|e| crate::reflex_err!(Io, "create {path}: {e}"))?;
     f.write_all(MAGIC)
         .map_err(|e| crate::reflex_err!(Io, "write magic: {e}"))?;
-    f.write_all(&VERSION_DENSE.to_le_bytes())
+    f.write_all(&VERSION_DENSE_V4.to_le_bytes())
         .map_err(|e| crate::reflex_err!(Io, "write version: {e}"))?;
     f.write_all(&(cache.k_caches.len() as u32).to_le_bytes())
         .map_err(|e| crate::reflex_err!(Io, "write num_layers: {e}"))?;
@@ -144,6 +155,10 @@ pub fn export_dense_kv(path: &str, cache: &DenseKvCache) -> Result<(), ReflexErr
         .map_err(|e| crate::reflex_err!(Io, "write num_kv_heads: {e}"))?;
     f.write_all(&(cache.head_dim as u32).to_le_bytes())
         .map_err(|e| crate::reflex_err!(Io, "write head_dim: {e}"))?;
+    // A cache built by this engine always knows; a re-export of a version-1
+    // file keeps that file's behavior (a space).
+    f.write_all(&[u8::from(cache.space_prefix_next.unwrap_or(true))])
+        .map_err(|e| crate::reflex_err!(Io, "write space_prefix_next: {e}"))?;
 
     for (k, v) in cache.k_caches.iter().zip(&cache.v_caches) {
         write_f32_slice(&mut f, k)?;
@@ -155,10 +170,10 @@ pub fn export_dense_kv(path: &str, cache: &DenseKvCache) -> Result<(), ReflexErr
 pub fn import_dense_kv(path: &str) -> Result<DenseKvCache, ReflexError> {
     let mut f = open_and_check_magic(path)?;
     let version = read_u32(&mut f)?;
-    if version != VERSION_DENSE {
-        return Err(crate::reflex_err!(KvCache, "{path}: unsupported dense KV cache format version {version} (expected {VERSION_DENSE})"));
+    if version != VERSION_DENSE && version != VERSION_DENSE_V4 {
+        return Err(crate::reflex_err!(KvCache, "{path}: unsupported dense KV cache format version {version} (expected {VERSION_DENSE} or {VERSION_DENSE_V4})"));
     }
-    read_dense_body(&mut f)
+    read_dense_body(&mut f, version == VERSION_DENSE_V4)
 }
 
 pub fn export_hybrid_kv(path: &str, cache: &HybridKvCache) -> Result<(), ReflexError> {
@@ -258,11 +273,12 @@ pub fn import_kv(path: &str) -> Result<ImportedKv, ReflexError> {
     let mut f = open_and_check_magic(path)?;
     let version = read_u32(&mut f)?;
     match version {
-        VERSION_DENSE => Ok(ImportedKv::Dense(read_dense_body(&mut f)?)),
+        VERSION_DENSE => Ok(ImportedKv::Dense(read_dense_body(&mut f, false)?)),
+        VERSION_DENSE_V4 => Ok(ImportedKv::Dense(read_dense_body(&mut f, true)?)),
         VERSION_HYBRID => Ok(ImportedKv::Hybrid(read_hybrid_body(&mut f)?)),
         VERSION_MLA => Ok(ImportedKv::Mla(read_mla_body(&mut f)?)),
         other => Err(crate::reflex_err!(KvCache,
-            "{path}: unsupported KV cache format version {other} (expected {VERSION_DENSE}, {VERSION_HYBRID}, or {VERSION_MLA})"
+            "{path}: unsupported KV cache format version {other} (expected {VERSION_DENSE}, {VERSION_HYBRID}, {VERSION_MLA} or {VERSION_DENSE_V4})"
         )),
     }
 }
@@ -282,12 +298,30 @@ fn open_and_check_magic(path: &str) -> Result<std::fs::File, ReflexError> {
     Ok(f)
 }
 
-fn read_dense_body(f: &mut std::fs::File) -> Result<DenseKvCache, ReflexError> {
+/// The dense body after the version field; `with_flag` for version 4.
+fn read_dense_body(f: &mut std::fs::File, with_flag: bool) -> Result<DenseKvCache, ReflexError> {
     let num_layers = read_u32(f)? as usize;
     let seq_len = read_u32(f)? as usize;
     crate::limits::check_positions(seq_len, 0, 0)?;
     let num_kv_heads = read_u32(f)? as usize;
     let head_dim = read_u32(f)? as usize;
+    let space_prefix_next = if with_flag {
+        let mut b = [0u8; 1];
+        f.read_exact(&mut b)
+            .map_err(|e| crate::reflex_err!(KvCache, "read space_prefix_next: {e}"))?;
+        match b[0] {
+            0 => Some(false),
+            1 => Some(true),
+            other => {
+                return Err(crate::reflex_err!(
+                    KvCache,
+                    "invalid space_prefix_next byte {other}"
+                ))
+            }
+        }
+    } else {
+        None
+    };
     let per_layer_len = seq_len * num_kv_heads * head_dim;
 
     let mut k_caches = Vec::with_capacity(num_layers);
@@ -303,6 +337,7 @@ fn read_dense_body(f: &mut std::fs::File) -> Result<DenseKvCache, ReflexError> {
         head_dim,
         k_caches,
         v_caches,
+        space_prefix_next,
     })
 }
 
@@ -420,6 +455,7 @@ mod tests {
                 (0..24).map(|i| (i as f32).sin()).collect(),
                 (0..24).map(|i| f32::MIN_POSITIVE * i as f32).collect(),
             ],
+            space_prefix_next: Some(false),
         };
 
         let path = std::env::temp_dir().join(format!(
@@ -451,6 +487,42 @@ mod tests {
         assert_eq!(reimported.k_caches, cache.k_caches);
         assert_eq!(reimported.v_caches, cache.v_caches);
         assert_eq!(via_import_kv.k_caches, cache.k_caches);
+        assert_eq!(reimported.space_prefix_next, Some(false));
+        assert_eq!(via_import_kv.space_prefix_next, Some(false));
+    }
+
+    /// A version-1 file (no `space_prefix_next` byte) still imports, as `None`.
+    #[test]
+    fn import_reads_version_1_dense_files() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        for v in [VERSION_DENSE, 1, 1, 1, 2] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        for x in [1.5f32, -2.0, 0.25, 4.0] {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        let path = std::env::temp_dir().join(format!("reflex_kv_io_v1_{}.bin", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let path_str = path.to_str().unwrap();
+        let ImportedKv::Dense(c) = import_kv(path_str).expect("v1 import") else {
+            panic!("not dense")
+        };
+        assert_eq!(c.space_prefix_next, None);
+        assert_eq!(c.k_caches, vec![vec![1.5, -2.0]]);
+        assert_eq!(c.v_caches, vec![vec![0.25, 4.0]]);
+        assert_eq!(import_dense_kv(path_str).unwrap().space_prefix_next, None);
+        // Re-exporting writes version 4 and keeps the version-1 behavior (a space).
+        export_dense_kv(path_str, &c).unwrap();
+        assert_eq!(
+            &std::fs::read(&path).unwrap()[4..8],
+            &VERSION_DENSE_V4.to_le_bytes()
+        );
+        assert_eq!(
+            import_dense_kv(path_str).unwrap().space_prefix_next,
+            Some(true)
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -462,6 +534,7 @@ mod tests {
             head_dim: 1,
             k_caches: vec![vec![0.0; seq_len]],
             v_caches: vec![vec![0.0; seq_len]],
+            space_prefix_next: None,
         };
 
         let path = std::env::temp_dir().join(format!(

@@ -334,7 +334,14 @@ in `test-data/` locally:
   those architectures by name. `test-data/granite-tokenizer.gguf` is the tokenizer-only
   file for the `dbrx` pre-type golden test. Sources:
   [design/mamba2-hybrid.md](design/mamba2-hybrid.md).
-- Tests that need a real model read its path from `REFLEX_TEST_GGUF`.
+- `test-data/tinyllama-1.1b-chat-tokenizer.gguf` and `qwen3-0.6b-tokenizer.gguf` are
+  tokenizer-only files (`scripts/gguf_tokenizer_only.py`) for the continuation-encoding
+  tests in `src/tokenizer.rs`. Sources: `TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF`'s
+  `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` (SentencePiece, the first 8 MB) and
+  `unsloth/Qwen3-0.6B-GGUF`'s `Qwen3-0.6B-Q4_K_M.gguf` (gpt2 byte-level BPE).
+- Tests that need a real model read its path from `REFLEX_TEST_GGUF`. The nightly
+  passes `SPM_GGUF` (a SentencePiece chat model, e.g. TinyLlama-1.1B-Chat) to the
+  tests that need one (`ipc_kv_relay_spm_model_*`).
 
 [`scripts/gpu_nightly_tests.sh`](../scripts/gpu_nightly_tests.sh) maps each GPU test to
 the file it needs and reports the ones it can't run as skipped.
