@@ -962,6 +962,8 @@ token − first token) / 256:
 - **Mistral's first token is ~650 ms sooner** (2.18 → 1.53 s from process start), because
   its Q6_K tensors are no longer dequantized to f16 at load.
 - The flag-off f16 path is unchanged (8.31 ms per token before and after).
+- The pinned-prefix agent relay hop (docs/design/agent-relay.md) with the flag on drops
+  from 280.6 to 245.7 ms.
 - The GPU nightly suite passes (86 passed, 0 failed, 4 skipped), including every
   quantized-resident and Kolibri-1 test.
 

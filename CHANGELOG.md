@@ -38,6 +38,15 @@ What has been built, in order. Measurements live in
   recomputed or 547 ms from a file. `agent_relay_bench.py --pin-prefix` measures it.
   `ipc::handle_request`, `handle_request_streaming` and `run_request_loop` now take
   the session's `&mut PrefixSlot`.
+- **Faster quantized-resident decode.** With `REFLEX_QUANT_RESIDENT=1`, the decode-step
+  Q4_K GEMV computes 4 output rows per warp and reuses each activation load across them.
+  It is 1.6-1.8x faster per call and bit-identical to the previous kernel. Dense
+  models' Q6_K layer tensors now stay quantized too (as Kolibri-1's already did), with a
+  coalesced Q6_K dequant for prefill, and the Q4_K/Q6_K GEMVs no longer zero their
+  outputs first. On a T4, decode is 16-31% faster: Qwen3-0.6B 6.09 -> 4.86 ms/token,
+  Mistral 7B 45.8 -> 31.7 ms/token. Prefill costs 1-8% more, and Mistral's first token
+  comes ~650 ms sooner. See
+  [docs/design/quantized-resident-weights.md](docs/design/quantized-resident-weights.md).
 - **Faster prefill after a cached prefix.** A prompt that resumes from a pinned prefix
   or an imported cache now runs the tiled attention kernel once `rows * group` fills
   one of its blocks, instead of waiting for 64 rows. Below that, the online kernel
