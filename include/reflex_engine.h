@@ -69,6 +69,7 @@ typedef enum {
      * The engine panicked; only the C FFI reports this (it catches the panic).
      */
     REFLEX_ERROR_CODE_PANIC = 13,
+    REFLEX_ERROR_CODE_GRAMMAR_DEAD_END = 14,
 } ReflexErrorCode;
 
 /**

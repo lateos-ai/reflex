@@ -33,6 +33,19 @@ swaps in a longer shared prefix, since the saving grows with its size.
 VRAM (`pin_prefix`) and every hop resumes from it (`use_pinned`), copying it
 device-to-device instead of reading a file.
 
+--json-schema FILE: every hop's output is constrained to the JSON Schema in FILE
+(Reflex's `json_schema` request field; llama-server's `json_schema` /completion
+field). Adds two rows: the engine's masking time per hop (`mask_ms_total`,
+Reflex only) and how many hop outputs parsed as JSON. A hop that runs out of
+--max-tokens before its value is complete counts as invalid
+(`grammar_dead_end` on Reflex). scripts/relay_handoff_schema.json is a sample.
+
+--json-prompt: appends JSON_NOTE_INSTRUCTION (write the note as compact JSON, with
+an example) to the shared system prompt. It doesn't depend on --json-schema, so
+a run with the schema and one without can share the same prompt. A small model
+asked for a free-text note under a schema tends to fill the string until
+--max-tokens runs out.
+
 Usage:
   scripts/agent_relay_bench.py stdio --reflex target/release/reflex --model m.gguf
   scripts/agent_relay_bench.py uds --reflex target/release/reflex --model m.gguf
@@ -40,6 +53,7 @@ Usage:
   common: [--hops 20] [--warmup 3] [--max-tokens 32] [--carry-chars 400]
           [--system-prompt-file f.txt] [--json-out results.json]
   stdio/uds: [--reuse-prefix [--kv-dir /dev/shm] | --pin-prefix]
+  any target: [--json-schema scripts/relay_handoff_schema.json] [--json-prompt]
 
 Standard library only, so it runs anywhere Python 3.8+ does.
 """
@@ -62,6 +76,10 @@ SYSTEM_PROMPT = (
 )
 ROLES = ["planner", "researcher", "coder", "reviewer", "tester", "summarizer"]
 TASK = "Task: design a small command-line tool that deduplicates lines in a file."
+JSON_NOTE_INSTRUCTION = (
+    'Write your note as compact JSON, for example {"from": "planner", "status": "done", '
+    '"note": "Split the work into parsing and output."}\n'
+)
 
 
 def hop_suffix(hop, previous, carry_chars):
@@ -120,44 +138,62 @@ def drain_stderr(proc):
     threading.Thread(target=pump, daemon=True).start()
 
 
-def reflex_request(client, payload):
+def reflex_request(client, payload, allow=()):
     msg, rtt = client.request(dict(payload, timings=True))
-    if not msg.get("ok"):
+    if not msg.get("ok") and msg.get("error_kind") not in allow:
         raise RuntimeError(f"engine error: {msg.get('error_kind')}: {msg.get('error')}")
     return msg, rtt
 
 
-def reflex_hop(client, system, suffix, max_tokens, prefix_kv, pinned):
+def parses(text):
+    try:
+        json.loads(text)
+        return True
+    except ValueError:
+        return False
+
+
+def reflex_hop(client, system, suffix, max_tokens, prefix_kv, pinned, schema):
     if pinned:
         payload = {"prompt": suffix, "use_pinned": True}
     elif prefix_kv:
         payload = {"prompt": suffix, "import_kv": prefix_kv}
     else:
         payload = {"prompt": system + suffix}
-    msg, rtt = reflex_request(client, dict(payload, max_tokens=max_tokens))
+    payload["max_tokens"] = max_tokens
+    if schema is not None:
+        payload["json_schema"] = schema
+    msg, rtt = reflex_request(client, payload, allow=("grammar_dead_end",))
     t = msg.get("timings") or {}
     engine = t.get("parse_ms", 0.0) + t.get("model_ms", 0.0)
+    text = msg.get("text", "")
+    tokens = len(msg.get("token_ids") or [])
+    mask = t.get("mask_ms_total")
     return {
         "rtt_ms": rtt,
         "first_token_ms": t.get("first_token_ms"),
         "model_ms": t.get("model_ms"),
         "overhead_ms": rtt - engine if t else None,
         "kv_io_ms": t.get("kv_io_ms"),
-        "tokens": len(msg.get("token_ids") or []),
-    }, msg.get("text", "")
+        "mask_ms": mask,
+        "mask_ms_per_token": mask / tokens if mask is not None and tokens else None,
+        "tokens": tokens,
+        "valid": (bool(msg.get("ok")) and parses(text)) if schema is not None else None,
+    }, text
 
 
-def llama_hop(url, prompt, max_tokens, cache_prompt):
-    body = json.dumps(
-        {
-            "prompt": prompt,
-            "n_predict": max_tokens,
-            "temperature": 0.0,
-            "top_k": 1,
-            "cache_prompt": cache_prompt,
-            "stream": False,
-        }
-    ).encode("utf-8")
+def llama_hop(url, prompt, max_tokens, cache_prompt, schema):
+    fields = {
+        "prompt": prompt,
+        "n_predict": max_tokens,
+        "temperature": 0.0,
+        "top_k": 1,
+        "cache_prompt": cache_prompt,
+        "stream": False,
+    }
+    if schema is not None:
+        fields["json_schema"] = schema
+    body = json.dumps(fields).encode("utf-8")
     req = urllib.request.Request(
         url.rstrip("/") + "/completion",
         data=body,
@@ -180,6 +216,7 @@ def llama_hop(url, prompt, max_tokens, cache_prompt):
         "model_ms": model if t else None,
         "overhead_ms": rtt - model if t else None,
         "tokens": t.get("predicted_n"),
+        "valid": parses(msg.get("content", "")) if schema is not None else None,
     }, msg.get("content", "")
 
 
@@ -205,7 +242,16 @@ def percentile(values, pct):
 
 def summarize(samples):
     out = {}
-    for key in ("rtt_ms", "first_token_ms", "model_ms", "overhead_ms", "kv_io_ms", "tokens"):
+    for key in (
+        "rtt_ms",
+        "first_token_ms",
+        "model_ms",
+        "overhead_ms",
+        "kv_io_ms",
+        "mask_ms",
+        "mask_ms_per_token",
+        "tokens",
+    ):
         vals = [s[key] for s in samples if s.get(key) is not None]
         if vals:
             out[key] = {
@@ -213,6 +259,9 @@ def summarize(samples):
                 "p95": percentile(vals, 95),
                 "mean": statistics.fmean(vals),
             }
+    valid = [s["valid"] for s in samples if s.get("valid") is not None]
+    if valid:
+        out["valid"] = {"count": sum(valid), "of": len(valid)}
     return out
 
 
@@ -226,11 +275,17 @@ def print_table(target, summary, n):
         ("model_ms", "engine total (ms)"),
         ("overhead_ms", "overhead (ms)"),
         ("kv_io_ms", "prefix read/copy (ms)"),
+        ("mask_ms", "json_schema masking (ms)"),
+        ("mask_ms_per_token", "masking per token (ms)"),
         ("tokens", "tokens generated"),
     ):
         if key in summary:
             s = summary[key]
-            print(f"| {label} | {s['p50']:.2f} | {s['p95']:.2f} | {s['mean']:.2f} |")
+            d = 3 if key.startswith("mask") else 2
+            print(f"| {label} | {s['p50']:.{d}f} | {s['p95']:.{d}f} | {s['mean']:.{d}f} |")
+    if "valid" in summary:
+        v = summary["valid"]
+        print(f"\nvalid JSON outputs: {v['count']}/{v['of']}")
 
 
 def spawn_reflex(args, extra):
@@ -273,6 +328,12 @@ def main(argv=None):
         help="where --reuse-prefix writes its cache file (default: a temp dir; tmpfs is best)",
     )
     ap.add_argument("--system-prompt-file", help="shared prefix to use instead of the built-in one")
+    ap.add_argument("--json-schema", help="constrain every hop's output to the JSON Schema in this file")
+    ap.add_argument(
+        "--json-prompt",
+        action="store_true",
+        help="ask for the note as compact JSON in the shared system prompt",
+    )
     ap.add_argument("--hops", type=int, default=20)
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--max-tokens", type=int, default=32)
@@ -290,6 +351,12 @@ def main(argv=None):
             system = f.read()
         if not system.endswith("\n"):
             system += "\n"
+    if args.json_prompt:
+        system += JSON_NOTE_INSTRUCTION
+    schema = None
+    if args.json_schema:
+        with open(args.json_schema, encoding="utf-8") as f:
+            schema = json.load(f)
 
     proc = None
     prefix_kv = None
@@ -297,7 +364,9 @@ def main(argv=None):
         if args.target == "llama-server":
 
             def do_hop(suffix, max_tokens):
-                return llama_hop(args.url, system + suffix, max_tokens, args.llama_cache_prompt)
+                return llama_hop(
+                    args.url, system + suffix, max_tokens, args.llama_cache_prompt, schema
+                )
 
         else:
             if not args.model:
@@ -345,7 +414,7 @@ def main(argv=None):
 
             def do_hop(suffix, max_tokens):
                 return reflex_hop(
-                    client, system, suffix, max_tokens, prefix_kv, args.pin_prefix
+                    client, system, suffix, max_tokens, prefix_kv, args.pin_prefix, schema
                 )
 
         samples = run_chain(do_hop, args.hops, args.warmup, args.max_tokens, args.carry_chars)
@@ -359,7 +428,7 @@ def main(argv=None):
     summary = summarize(samples)
     label = args.target + (
         ", prefix reused" if args.reuse_prefix else ", prefix pinned" if args.pin_prefix else ""
-    )
+    ) + (", json_schema" if schema is not None else "")
     print_table(label, summary, len(samples))
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:
@@ -374,6 +443,8 @@ def main(argv=None):
                     "llama_cache_prompt": args.llama_cache_prompt,
                     "reuse_prefix": args.reuse_prefix,
                     "pin_prefix": args.pin_prefix,
+                    "json_schema": args.json_schema,
+                    "json_prompt": args.json_prompt,
                     "system_prompt_chars": len(system),
                     "summary": summary,
                     "samples": samples,

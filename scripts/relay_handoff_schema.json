@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "from": {"enum": ["planner", "researcher", "coder", "reviewer", "tester", "summarizer"]},
+    "status": {"enum": ["done", "blocked", "needs_review"]},
+    "note": {"type": "string"}
+  },
+  "required": ["from", "status", "note"],
+  "additionalProperties": false
+}

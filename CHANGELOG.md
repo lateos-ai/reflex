@@ -67,6 +67,35 @@ What has been built, in order. Measurements live in
   - The relay tests compare the split prompt's ids instead of its token count, and
     cover TinyLlama (`SPM_GGUF` in the GPU nightly).
   - gpt2-style tokenizers are unaffected.
+- **JSON Schema constrained decoding.** A `reflex stdio`/`uds` request with
+  `"json_schema": {...}`, or `reflex generate --json-schema <file>`, produces one
+  JSON value that validates against the schema, so handoff payloads and tool
+  calls parse on the first try. Tokens that can't continue a conforming value get a
+  `-inf` logit before greedy or temperature/top-k/top-p sampling, and nothing else
+  changes: a greedy output that already conforms comes out identical. It works on
+  every architecture, with `use_pinned` and `import_kv`.
+  - The supported subset is `type`, `properties`, `required`,
+    `additionalProperties: false`, `items`, `enum`, `const`, `anyOf` and local `$ref`.
+    Any other keyword is rejected with `invalid_input`, naming it.
+  - Output is compact JSON with properties in schema order. The only whitespace is
+    one optional space after each `:` and `,`, so a model keeps its usual
+    `"key": "value"` tokens. If `max_tokens` runs out
+    first, the request fails with the new `grammar_dead_end` error kind (C code 14),
+    which carries the partial text.
+  - The vocabulary trie that masking walks is built on the first constrained request,
+    so cold start and unconstrained requests don't pay for it.
+  - With `"timings": true`, `mask_ms_total` reports the masking time. Failed
+    `generate` requests now carry `timings` too when asked.
+  - `agent_relay_bench.py --json-schema` and `scripts/json_schema_compare.py` (against
+    llama-server) measure it.
+  - On a T4, masking costs 0.32 ms per token on Qwen3's 152K vocabulary. llama-server's
+    grammar adds about 4.5 ms per token there. 20 of 20 comparison cases validate on
+    both engines, and cold start is unchanged.
+  - A constrained relay hop stops at the end of the value, so it is shorter than a
+    free one: 447 against 576 ms with the default 64-token hop.
+
+  See [docs/design/agent-relay.md](docs/design/agent-relay.md) and
+  [docs/reference.md](docs/reference.md#json-schema-output).
 
 ## 2026-10-15
 

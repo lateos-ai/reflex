@@ -297,6 +297,10 @@ pub struct Model {
     /// and the saturated-element count. See [`Self::f16_activation_stats`].
     f16_act_stats: CudaSlice<u32>,
     tokenizer: Tokenizer,
+    /// The vocabulary trie `json_schema` masking walks, built on the first
+    /// constrained request (see [`Self::token_picker`]), so cold start and
+    /// unconstrained requests never pay for it.
+    grammar_index: std::cell::OnceCell<crate::grammar::TokenIndex>,
     /// `Some` iff this is a Qwen3.5 hybrid model (see `Self::load_hybrid`);
     /// `cfg`/`layers`/`expert_used_count` above are unused garbage in that
     /// case (`forward_prompt` branches on this before touching them).
@@ -408,6 +412,49 @@ impl Model {
                 Ok(ids)
             })
             .collect()
+    }
+
+    /// Compiles a `json_schema` for generation with this model
+    /// (`SamplingParams::json_schema`). Errs with `InvalidInput` on a schema
+    /// outside the supported subset (see `crate::grammar`), or one this model's
+    /// tokenizer can't produce.
+    pub fn compile_json_schema(
+        &self,
+        text: &str,
+    ) -> Result<Arc<crate::grammar::JsonSchema>, ReflexError> {
+        let schema = crate::grammar::JsonSchema::compile(text)?;
+        schema.check_tokenizer(&self.tokenizer)?;
+        Ok(Arc::new(schema))
+    }
+
+    /// Time spent building the `json_schema` vocabulary index and its trie node
+    /// count, or `None` if no constrained request has built it yet.
+    pub fn grammar_index_stats(&self) -> Option<(f64, usize)> {
+        self.grammar_index
+            .get()
+            .map(|i| (i.build_ms, i.node_count()))
+    }
+
+    /// One generation's token chooser (`crate::sampling::TokenPicker`). The first
+    /// `json_schema` request builds the vocabulary index and keeps it.
+    pub(crate) fn token_picker<'a>(
+        &'a self,
+        sampling: &'a SamplingParams,
+    ) -> Result<crate::sampling::TokenPicker<'a>, ReflexError> {
+        let constraint = match &sampling.json_schema {
+            None => None,
+            Some(schema) => {
+                let index = self
+                    .grammar_index
+                    .get_or_init(|| crate::grammar::TokenIndex::build(&self.tokenizer));
+                Some(crate::grammar::Constrained::new(schema, index)?)
+            }
+        };
+        Ok(crate::sampling::TokenPicker::new(
+            sampling,
+            constraint,
+            self.tokenizer.eos_token_id,
+        ))
     }
 
     /// Decodes each id in `ids` to its own individual text piece (unlike

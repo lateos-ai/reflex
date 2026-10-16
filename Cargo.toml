@@ -35,7 +35,9 @@ rand = "0.8"
 # project's default `cargo build` stays at its original 3-dependency footprint
 # for users who never touch the IPC subcommands.
 serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
+# `raw_value`: IPC keeps a request's `json_schema` as raw text, so `src/grammar.rs`
+# sees its properties in the order they were written.
+serde_json = { version = "1", optional = true, features = ["raw_value"] }
 # Python bindings (see src/python.rs), feature-gated for the same reason as `ipc`
 # above. abi3-py38 targets the stable/limited Python C API so one build works
 # across CPython 3.8+ without a per-version build matrix.

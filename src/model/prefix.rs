@@ -260,6 +260,11 @@ impl Model {
         on_token: impl FnMut(u32, &str),
     ) -> Result<(Vec<u32>, String, PinnedPrefix, Option<f64>), ReflexError> {
         self.check_prefix_state_supported()?;
+        if sampling.json_schema.is_some() {
+            return Err(ReflexError::InvalidInput(
+                "json_schema can't be combined with pinning or exporting a prefix: that keeps the state after the prompt, before any value is generated".to_string(),
+            ));
+        }
         let r = self.run_resumed(prompt, 1, resume, sampling, on_first_token, on_token)?;
         let state = r.state.ok_or_else(|| {
             ReflexError::Other("internal error: no device state to pin".to_string())
