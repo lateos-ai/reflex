@@ -348,17 +348,13 @@ impl Model {
         if quant_on && expert_used_count.is_some() && kolibri.is_none() {
             eprintln!("note: REFLEX_QUANT_RESIDENT=1 is not supported for this MoE model yet; using f32 weights");
         }
-        // Dense layer matmuls stay quantized if Q4_K; an untied `output.weight`
-        // (the LM head) if Q6_K or Q4_K. A tied LM head is handled lazily in
-        // `Model::lm_head_resident`. Kolibri-1 keeps every matmul tensor,
-        // stacked experts included, if Q4_K or Q6_K: its Q4_K_M file has Q6_K
-        // `attn_v`/`ffn_down_exps`/`ffn_down_shexp` in half the layers.
+        // Layer matmuls stay quantized if Q4_K or Q6_K (a Q4_K_M file has Q6_K
+        // `attn_v`/`ffn_down` in half the layers; Kolibri-1 also has Q6_K
+        // `ffn_down_exps`/`ffn_down_shexp`), stacked experts included; an
+        // untied `output.weight` (the LM head) if Q6_K or Q4_K. A tied LM head
+        // is handled lazily in `Model::lm_head_resident`.
         let quant_dense = quant_on && (expert_used_count.is_none() || kolibri.is_some());
-        let layer_quant_types: &[GgmlType] = if kolibri.is_some() {
-            &[GgmlType::Q4K, GgmlType::Q6K]
-        } else {
-            &[GgmlType::Q4K]
-        };
+        let layer_quant_types: &[GgmlType] = &[GgmlType::Q4K, GgmlType::Q6K];
         let mut arena = if quant_dense {
             let layer_tensors: &[&str] = if kolibri.is_some() {
                 &KOLIBRI_MATMUL_TENSORS
@@ -390,27 +386,36 @@ impl Model {
         } else {
             None
         };
-        let (gemv_q4k_k, dequant_q4k_coalesced_k, dequant_q4k_coalesced_f16_k, gemv_q6k_k) =
-            if quant_dense {
-                let mut fns = aot::load_kernel_module(
-                    &device,
-                    include_bytes!(env!("REFLEX_KERNEL_GEMV_Q4K")),
-                    "gemv_q4k",
-                    &[
-                        "gemv_q4k_kernel",
-                        "dequantize_q4k_coalesced_kernel",
-                        "dequantize_q4k_coalesced_f16_kernel",
-                        "gemv_q6k_kernel",
-                    ],
-                )?;
-                let q6 = fns.pop().expect("four kernels requested");
-                let dq16 = fns.pop().expect("four kernels requested");
-                let dq = fns.pop().expect("four kernels requested");
-                let gemv = fns.pop().expect("four kernels requested");
-                (Some(gemv), Some(dq), Some(dq16), Some(q6))
-            } else {
-                (None, None, None, None)
-            };
+        let (
+            gemv_q4k_k,
+            gemv_q4k_r1_k,
+            dequant_q4k_coalesced_k,
+            dequant_q4k_coalesced_f16_k,
+            dequant_q6k_coalesced_k,
+            dequant_q6k_coalesced_f16_k,
+            gemv_q6k_k,
+        ) = if quant_dense {
+            let mut fns = aot::load_kernel_module(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_Q4K")),
+                "gemv_q4k",
+                &[
+                    "gemv_q4k_kernel",
+                    "gemv_q4k_r1_kernel",
+                    "dequantize_q4k_coalesced_kernel",
+                    "dequantize_q4k_coalesced_f16_kernel",
+                    "dequantize_q6k_coalesced_kernel",
+                    "dequantize_q6k_coalesced_f16_kernel",
+                    "gemv_q6k_kernel",
+                ],
+            )?
+            .into_iter()
+            .map(Some);
+            let mut next = || fns.next().expect("seven kernels requested");
+            (next(), next(), next(), next(), next(), next(), next())
+        } else {
+            (None, None, None, None, None, None, None)
+        };
         let modules_ms = t_modules.elapsed().as_secs_f64() * 1000.0;
         let t_weights = std::time::Instant::now();
 
@@ -687,8 +692,11 @@ impl Model {
             gemv_gather_k,
             gemv_gather_f16_k,
             gemv_q4k_k,
+            gemv_q4k_r1_k,
             dequant_q4k_coalesced_k,
             dequant_q4k_coalesced_f16_k,
+            dequant_q6k_coalesced_k,
+            dequant_q6k_coalesced_f16_k,
             gemv_q6k_k,
             q8_0_k: None,
             quant_scratch: RefCell::new(None),

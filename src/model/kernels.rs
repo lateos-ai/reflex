@@ -871,10 +871,8 @@ impl Model {
                 x.len()
             ));
         }
-        let mut dev_y = self
-            .device
-            .alloc_zeros::<f32>(out_features)
-            .map_err(|e| crate::gpu_err!(e, "gemv_q6k alloc y: {e}"))?;
+        // Every output row is written (one warp per row).
+        let mut dev_y = self.alloc_out(out_features, "gemv_q6k")?;
         let threads = 256u32;
         let warps_per_block = threads / WARP_SIZE;
         let launch_cfg = LaunchConfig {
@@ -904,7 +902,8 @@ impl Model {
     /// `y[rows, out_features] = x[rows, in_features] @ w^T` straight from a
     /// quantized-resident Q4_K weight (`gemv_q4k_kernel`), launched in chunks
     /// of [`GEMV_Q4K_MAX_ROWS`] rows -- each chunk reads the weight's bytes
-    /// once for all its rows. `rows == 1` is the decode GEMV.
+    /// once for all its rows. `rows == 1` is the decode GEMV, which takes
+    /// `gemv_q4k_r1_kernel` (several output rows per warp; bit-identical).
     pub(super) fn gemv_q4k(
         &self,
         x: &CudaSlice<f32>,
@@ -926,10 +925,34 @@ impl Model {
                 x.len()
             ));
         }
-        let dev_y = self
-            .device
-            .alloc_zeros::<f32>(rows * out_features)
-            .map_err(|e| crate::gpu_err!(e, "gemv_q4k alloc y: {e}"))?;
+        // Both kernels write every output element.
+        let mut dev_y = self.alloc_out(rows * out_features, "gemv_q4k")?;
+        if rows == 1 {
+            if let Some(r1) = &self.gemv_q4k_r1_k {
+                let per_block = (GEMV_Q4K_R1_WARPS * GEMV_Q4K_R1_ROWS) as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: ((out_features as u32).div_ceil(per_block).max(1), 1, 1),
+                    block_dim: (GEMV_Q4K_R1_WARPS as u32 * WARP_SIZE, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    r1.function
+                        .clone()
+                        .launch(
+                            cfg,
+                            (
+                                x,
+                                w_ptr,
+                                &mut dev_y,
+                                in_features as u32,
+                                out_features as u32,
+                            ),
+                        )
+                        .map_err(|e| crate::gpu_err!(e, "gemv_q4k_r1 launch: {e}"))?;
+                }
+                return Ok(dev_y);
+            }
+        }
         let threads = 256u32;
         let warps_per_block = threads / WARP_SIZE;
         let launch_cfg = LaunchConfig {
@@ -1035,9 +1058,10 @@ impl Model {
     /// traffic) in the model's `--weights` dtype, then take the same cuBLAS
     /// path a weight stored in that dtype takes (`Sgemm` for `f32`; activation
     /// cast + `cublasGemmEx` for `f16`). Q4_K uses the coalesced dequant
-    /// kernel (one thread block per Q4_K block); Q6_K the load-time dequant
-    /// kernel (one thread per block), which writes the same values the load
-    /// would have; Q8_0 its coalesced kernel (one thread per element).
+    /// kernel (one thread block per Q4_K block); Q6_K its coalesced kernel
+    /// when the module that has it is loaded, else the load-time dequant kernel
+    /// (one thread per block), both writing the same values the load would
+    /// have; Q8_0 its coalesced kernel (one thread per element).
     #[allow(clippy::too_many_arguments)]
     fn gemm_quant_scratch(
         &self,
@@ -1081,18 +1105,31 @@ impl Model {
                 (dq, num_blocks, cfg)
             }
             GgmlType::Q6K => {
-                let dq = match dtype {
-                    WeightsDtype::F32 => &self.dequant_kernels.f32.q6k,
-                    WeightsDtype::F16 => &self.dequant_kernels.f16.q6k,
-                };
                 let num_blocks = len / Q6K_BLOCK_BYTES;
-                let threads = 256u32;
-                let cfg = LaunchConfig {
-                    grid_dim: ((num_blocks as u32).div_ceil(threads).max(1), 1, 1),
-                    block_dim: (threads, 1, 1),
-                    shared_mem_bytes: 0,
+                let coalesced = match dtype {
+                    WeightsDtype::F32 => &self.dequant_q6k_coalesced_k,
+                    WeightsDtype::F16 => &self.dequant_q6k_coalesced_f16_k,
                 };
-                (dq, num_blocks, cfg)
+                if let Some(dq) = coalesced {
+                    let cfg = LaunchConfig {
+                        grid_dim: (num_blocks as u32, 1, 1),
+                        block_dim: (QK_K as u32, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    (dq, num_blocks, cfg)
+                } else {
+                    let dq = match dtype {
+                        WeightsDtype::F32 => &self.dequant_kernels.f32.q6k,
+                        WeightsDtype::F16 => &self.dequant_kernels.f16.q6k,
+                    };
+                    let threads = 256u32;
+                    let cfg = LaunchConfig {
+                        grid_dim: ((num_blocks as u32).div_ceil(threads).max(1), 1, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    (dq, num_blocks, cfg)
+                }
             }
             GgmlType::Q8_0 => {
                 let k = self.q8_0_k.as_ref().ok_or_else(|| {
@@ -2687,6 +2724,11 @@ pub(super) fn gemm_ex_f16_raw(
 /// Rows per `gemv_q4k_kernel` launch -- must equal `GEMV_Q4K_MAX_ROWS` in
 /// `kernels_cuda/gemv_q4k.cu`.
 pub(super) const GEMV_Q4K_MAX_ROWS: usize = 8;
+
+/// `gemv_q4k_r1_kernel`'s output rows per warp and warps per block -- must equal
+/// `GEMV_Q4K_R1_ROWS`/`GEMV_Q4K_R1_WARPS` in `kernels_cuda/gemv_q4k.cu`.
+pub(super) const GEMV_Q4K_R1_ROWS: usize = 4;
+pub(super) const GEMV_Q4K_R1_WARPS: usize = 4;
 
 /// Rows per `gemv_q8_0_kernel` launch -- must equal `GEMV_Q8_0_MAX_ROWS` in
 /// `kernels_cuda/gemv_q8_0.cu`.

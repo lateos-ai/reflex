@@ -887,3 +887,221 @@ fn gemma4_q8_0_rows_are_16_byte_aligned() {
         assert_eq!((in_f / QK_LEGACY * Q8_0_BLOCK_BYTES) % 16, 0, "{in_f}");
     }
 }
+
+/// Synthetic Q4_K blocks for an `[in_f, out_f]` weight: small positive f16 `d`
+/// and `dmin`, every other byte (6-bit scales, nibbles) random.
+fn synthetic_q4k(in_f: usize, out_f: usize, seed: u64) -> Vec<u8> {
+    let blocks = in_f / QK_K * out_f;
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut out = Vec::with_capacity(blocks * Q4K_BLOCK_BYTES);
+    for _ in 0..blocks {
+        for _ in 0..2 {
+            let v = ((next() >> 40) as f32 / (1u64 << 24) as f32) * 0.01 + 1e-4;
+            out.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+        }
+        out.extend((0..Q4K_BLOCK_BYTES - 4).map(|_| next() as u8));
+    }
+    out
+}
+
+/// One-row Q4_K decode GEMV: `gemv_q4k_kernel` (rows = 1) against
+/// `gemv_q4k_r1_kernel`, which must match it bit for bit, timed next to the f16 GEMV on
+/// the same shape. Each timing cycles through enough copies of the weight to
+/// exceed the L2, as a decode step's layers do. Qwen3-0.6B and Mistral 7B layer
+/// shapes. Prints GB/s of weight bytes; asserts only the bit-identity.
+#[test]
+#[ignore]
+fn gemv_q4k_decode_variants_timings() {
+    let path = std::env::var("REFLEX_TEST_GGUF").expect("set REFLEX_TEST_GGUF to a dense GGUF");
+    let file = GgufFile::open(&path).expect("open GGUF");
+    let device = CudaDevice::new(0).expect("CUDA device 0");
+    let model = load_model(device.clone(), &file, WeightsDtype::DEFAULT, false);
+    let dev = &model.device;
+    // (name, output rows per warp, warps per block; 0 rows = the multi-row
+    // kernel's own layout)
+    let variants = [
+        ("gemv_q4k_kernel", 0u32, 8u32),
+        (
+            "gemv_q4k_r1_kernel",
+            GEMV_Q4K_R1_ROWS as u32,
+            GEMV_Q4K_R1_WARPS as u32,
+        ),
+    ];
+    let names: Vec<&'static str> = variants.iter().map(|v| v.0).collect();
+    let kernels = aot::load_kernel_module(
+        dev,
+        include_bytes!(env!("REFLEX_KERNEL_GEMV_Q4K")),
+        "gemv_q4k_bench",
+        &names,
+    )
+    .expect("load gemv_q4k module");
+    let time = |f: &dyn Fn(usize)| {
+        for i in 0..3 {
+            f(i);
+        }
+        dev.synchronize().unwrap();
+        let iters = 200;
+        let t = std::time::Instant::now();
+        for i in 0..iters {
+            f(i);
+        }
+        dev.synchronize().unwrap();
+        t.elapsed().as_secs_f64() * 1e6 / iters as f64
+    };
+    for (in_f, out_f) in [
+        (1024, 2048),
+        (1024, 1024),
+        (2048, 1024),
+        (1024, 3072),
+        (3072, 1024),
+        (4096, 4096),
+        (4096, 1024),
+        (4096, 14336),
+        (14336, 4096),
+    ] {
+        let bytes = synthetic_q4k(in_f, out_f, (in_f * 31 + out_f) as u64);
+        let copies = (48_000_000 / bytes.len()).clamp(1, 64);
+        let ws: Vec<CudaSlice<u8>> = (0..copies)
+            .map(|_| dev.htod_sync_copy(&bytes).unwrap())
+            .collect();
+        let x = dev.htod_sync_copy(&activations(in_f, 7)).unwrap();
+        let run = |k: usize, w: &CudaSlice<u8>, y: &mut CudaSlice<f32>| unsafe {
+            let f = kernels[k].function.clone();
+            let (_, r, warps) = variants[k];
+            if r == 0 {
+                let cfg = LaunchConfig {
+                    grid_dim: ((out_f as u32).div_ceil(8), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                f.launch(cfg, (&x, w, y, in_f as u32, out_f as u32, 1u32))
+            } else {
+                let cfg = LaunchConfig {
+                    grid_dim: ((out_f as u32).div_ceil(warps * r), 1, 1),
+                    block_dim: (32 * warps, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                f.launch(cfg, (&x, w, y, in_f as u32, out_f as u32))
+            }
+            .unwrap();
+        };
+        let mut reference = dev.alloc_zeros::<f32>(out_f).unwrap();
+        run(0, &ws[0], &mut reference);
+        let reference = dev.dtoh_sync_copy(&reference).unwrap();
+        let mut line = format!("Q4K {in_f}x{out_f} ({:.2} MB):", bytes.len() as f64 / 1e6);
+        for (k, (name, _, _)) in variants.iter().enumerate() {
+            let mut y = dev.alloc_zeros::<f32>(out_f).unwrap();
+            run(k, &ws[0], &mut y);
+            let got = dev.dtoh_sync_copy(&y).unwrap();
+            let same = got
+                .iter()
+                .zip(&reference)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            assert!(
+                same,
+                "{name} differs from gemv_q4k_kernel at {in_f}x{out_f}"
+            );
+            let us = time(&|i| {
+                let mut y = unsafe { dev.alloc::<f32>(out_f) }.unwrap();
+                run(k, &ws[i % copies], &mut y);
+            });
+            line += &format!(
+                " {name} {us:.1} us ({:.0} GB/s)",
+                bytes.len() as f64 / us / 1e3
+            );
+        }
+        let f16_copies = (48_000_000 / (in_f * out_f * 2)).clamp(1, 64);
+        let wf16: Vec<half::f16> = activations(in_f * out_f, 3)
+            .into_iter()
+            .map(half::f16::from_f32)
+            .collect();
+        let wf16s: Vec<CudaSlice<half::f16>> = (0..f16_copies)
+            .map(|_| dev.htod_sync_copy(&wf16).unwrap())
+            .collect();
+        let us = time(&|i| {
+            model
+                .gemv_view(
+                    &x,
+                    WeightView::F16(wf16s[i % f16_copies].slice(..)),
+                    in_f,
+                    out_f,
+                )
+                .unwrap();
+        });
+        line += &format!(
+            " | f16 {us:.1} us ({:.0} GB/s)",
+            (in_f * out_f * 2) as f64 / us / 1e3
+        );
+        eprintln!("{line}");
+    }
+}
+
+/// `dequantize_q6k_coalesced_kernel`/`_f16_kernel` (the prefill scratch for
+/// quantized-resident Q6_K layer tensors) against the host dequant, which is
+/// byte-exact with gguf-py and with the load-time `dequantize_q6k_kernel`: f32
+/// bit for bit, f16 as its round-to-nearest-even. Synthetic blocks with signed
+/// scales and every 6-bit quant value; `d` includes zero and negatives.
+#[test]
+#[ignore]
+fn quant_resident_q6k_dequant_coalesced_bit_exact() {
+    let path = std::env::var("REFLEX_TEST_GGUF").expect("set REFLEX_TEST_GGUF to a dense GGUF");
+    let file = GgufFile::open(&path).expect("open GGUF");
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let model = load_model(device.clone(), &file, WeightsDtype::F16, true);
+    let k32 = model.dequant_q6k_coalesced_k.as_ref().expect("loaded");
+    let k16 = model.dequant_q6k_coalesced_f16_k.as_ref().expect("loaded");
+    let num_blocks = 999usize;
+    let mut s = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut bytes = Vec::with_capacity(num_blocks * Q6K_BLOCK_BYTES);
+    for b in 0..num_blocks {
+        bytes.extend((0..Q6K_BLOCK_BYTES - 2).map(|_| next() as u8));
+        let d = match b % 8 {
+            0 => 0.0,
+            1 => -0.003,
+            _ => ((next() >> 40) as f32 / (1u64 << 24) as f32) * 0.01 + 1e-5,
+        };
+        bytes.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+    }
+    let n = num_blocks * QK_K;
+    let want = dequant::dequantize(GgmlType::Q6K, &bytes, n as u64).expect("host dequant");
+    let src = device.htod_sync_copy(&bytes).expect("upload");
+    let cfg = LaunchConfig {
+        grid_dim: (num_blocks as u32, 1, 1),
+        block_dim: (QK_K as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut out32 = device.alloc_zeros::<f32>(n).expect("alloc");
+    let mut out16 = device.alloc_zeros::<half::f16>(n).expect("alloc");
+    unsafe {
+        k32.function
+            .clone()
+            .launch(cfg, (&src, &mut out32, num_blocks as u32))
+            .expect("launch f32");
+        k16.function
+            .clone()
+            .launch(cfg, (&src, &mut out16, num_blocks as u32))
+            .expect("launch f16");
+    }
+    let got32 = device.dtoh_sync_copy(&out32).expect("dtoh");
+    let got16 = device.dtoh_sync_copy(&out16).expect("dtoh");
+    for i in 0..n {
+        assert_eq!(got32[i].to_bits(), want[i].to_bits(), "f32 element {i}");
+        assert_eq!(
+            got16[i].to_bits(),
+            half::f16::from_f32(want[i]).to_bits(),
+            "f16 element {i}"
+        );
+    }
+}
