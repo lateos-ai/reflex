@@ -1018,14 +1018,19 @@ impl Model {
     /// SentencePiece merge boundaries depend on what precedes the candidate
     /// text. Errs if `encode(prompt)` is not an exact prefix of
     /// `encode(prompt + candidate)`, or the candidate contributes zero new
-    /// tokens.
+    /// tokens. `after_special` is the state `prompt` is encoded with
+    /// (`Tokenizer::encode_continuation`): `true` for a fresh prompt, and what
+    /// the cached prefix ended on when `prompt` resumes one.
     fn resolve_candidate_token_ids(
         &self,
         prompt: &str,
         candidate: &str,
+        after_special: bool,
     ) -> Result<Vec<u32>, ReflexError> {
-        let prompt_ids = self.tokenizer.encode(prompt)?;
-        let full_ids = self.tokenizer.encode(&format!("{prompt}{candidate}"))?;
+        let prompt_ids = self.tokenizer.encode_continuation(prompt, after_special)?;
+        let full_ids = self
+            .tokenizer
+            .encode_continuation(&format!("{prompt}{candidate}"), after_special)?;
         if full_ids.len() <= prompt_ids.len() || full_ids[..prompt_ids.len()] != prompt_ids[..] {
             return Err(crate::reflex_err!(InvalidInput, "system1: candidate {candidate:?} does not tokenize as a clean continuation of the prompt"));
         }
@@ -1054,25 +1059,16 @@ impl Model {
     /// Every candidate must resolve to at least one token (see
     /// `Self::resolve_candidate_token_ids`); a resolution failure for one
     /// candidate fails the whole call.
+    ///
+    /// [`Self::system1_evaluate_resumed`] scores after a cached prefix instead.
     pub fn system1_evaluate(
         &self,
         prompt: &str,
         candidates: &[System1Candidate],
         temperature: f32,
     ) -> Result<System1Response, ReflexError> {
-        if let Some(h) = &self.hybrid {
-            return self.system1_evaluate_hybrid(h, prompt, candidates, temperature);
-        }
-        if let Some(m) = &self.mla {
-            return self.system1_evaluate_mla(m, prompt, candidates, temperature);
-        }
-        if let Some(g) = &self.gemma4 {
-            return self.system1_evaluate_gemma4(g, prompt, candidates, temperature);
-        }
-        if let Some(g) = &self.granite {
-            return self.system1_evaluate_granite(g, prompt, candidates, temperature);
-        }
-        self.system1_evaluate_dense(prompt, candidates, temperature)
+        self.system1_evaluate_resumed(prompt, Resume::Fresh, candidates, temperature)
+            .map(|(response, _copy_ms)| response)
     }
 
     /// Shared tail of every `system1_evaluate_*` impl: turns raw per-candidate

@@ -76,6 +76,15 @@ Reflex only) and how many hop outputs parsed as JSON. A hop that runs out of
 --max-tokens before its value is complete counts as invalid
 (`grammar_dead_end` on Reflex). scripts/relay_handoff_schema.json is a sample.
 
+--system1 LABELS (stdio/uds): every turn starts with a System-1 routing hop, one
+`candidates` request that scores the comma-separated LABELS (each sent with a
+leading space) after the previous note and SYSTEM1_QUESTION, before the generate
+hop. With --pin-prefix it resumes from the pinned system prompt (`use_pinned`),
+with --reuse-prefix from its cache file, and otherwise sends the whole prompt.
+Adds rows for its round trip, engine time and prefix copy or read, and for the
+turn (routing hop plus generate hop); each sample keeps the chosen label and the
+probabilities, so runs can be diffed.
+
 --json-prompt: appends JSON_NOTE_INSTRUCTION (write the note as compact JSON, with
 an example) to the shared system prompt. It doesn't depend on --json-schema, so
 a run with the schema and one without can share the same prompt. A small model
@@ -95,6 +104,7 @@ Usage:
           [--energy [--reflex-energy target/release/reflex-energy]
                     [--energy-idle-ms 2000]]
   stdio/uds: [--reuse-prefix [--kv-dir /dev/shm] | --pin-prefix]
+             [--system1 planner,coder,reviewer,tester]
   stdio/uds/llama-server: [--json-schema scripts/relay_handoff_schema.json]
   any target: [--json-prompt]
   llama-cli: [--llama-cli-args "-ngl 99 --no-warmup ..."] [--llama-prompt-cache]
@@ -131,6 +141,7 @@ JSON_NOTE_INSTRUCTION = (
     '"note": "Split the work into parsing and output."}\n'
 )
 
+SYSTEM1_QUESTION = "The agent who should act on this note next is the"
 
 ROLE_LINE = "\nYou are the "
 
@@ -382,6 +393,29 @@ def reflex_hop(client, system, suffix, max_tokens, prefix_kv, pinned, schema):
     }, text
 
 
+def system1_hop(client, system, note, labels, prefix_kv, pinned):
+    """One System-1 routing request: scores `labels` after the note."""
+    prompt = note + SYSTEM1_QUESTION
+    if pinned:
+        payload = {"prompt": prompt, "use_pinned": True}
+    elif prefix_kv:
+        payload = {"prompt": prompt, "import_kv": prefix_kv}
+    else:
+        payload = {"prompt": system + prompt}
+    payload["candidates"] = labels
+    msg, rtt = reflex_request(client, payload)
+    t = msg["timings"]
+    return {
+        "s1_rtt_ms": rtt,
+        "s1_model_ms": t["model_ms"],
+        "s1_kv_io_ms": t.get("kv_io_ms"),
+        "s1_chosen": labels[msg["chosen"]].strip(),
+        "s1_probabilities": [c["probability"] for c in msg["candidates"]],
+        "pinned_seq_len": t.get("pinned_seq_len"),
+        "pinned_bytes": t.get("pinned_bytes"),
+    }
+
+
 def llama_hop(url, prompt, max_tokens, cache_prompt, schema):
     fields = {
         "prompt": prompt,
@@ -533,6 +567,10 @@ def percentile(values, pct):
 
 METRICS = (
     ("hop_ms", "hop total (ms)"),
+    ("turn_ms", "turn: System-1 hop + generate hop (ms)"),
+    ("s1_rtt_ms", "System-1 round trip (ms)"),
+    ("s1_model_ms", "System-1 engine total (ms)"),
+    ("s1_kv_io_ms", "System-1 prefix read/copy (ms)"),
     ("cold_wall_ms", "cold export process (ms)"),
     ("wall_ms", "process wall, spawn to exit (ms)"),
     ("rtt_ms", "round trip (ms)"),
@@ -567,6 +605,9 @@ def summarize(samples):
     valid = [s["valid"] for s in samples if s.get("valid") is not None]
     if valid:
         out["valid"] = {"count": sum(valid), "of": len(valid)}
+    chosen = [s["s1_chosen"] for s in samples if s.get("s1_chosen") is not None]
+    if chosen:
+        out["s1_chosen"] = {c: chosen.count(c) for c in sorted(set(chosen))}
     return out
 
 
@@ -582,6 +623,9 @@ def print_table(target, summary, n):
     if "valid" in summary:
         v = summary["valid"]
         print(f"\nvalid JSON outputs: {v['count']}/{v['of']}")
+    if "s1_chosen" in summary:
+        counts = ", ".join(f"{k} {n}" for k, n in summary["s1_chosen"].items())
+        print(f"\nSystem-1 chosen labels: {counts}")
 
 
 def spawn_reflex(args, extra, subcommand):
@@ -655,6 +699,30 @@ def selftest():
 
     summary = summarize([{"wall_ms": 1.0, "energy_j": 2.0}, {"wall_ms": 3.0, "energy_j": 4.0}])
     assert summary["wall_ms"]["p50"] == 2.0 and summary["energy_j"]["mean"] == 3.0, summary
+
+    class Canned:
+        def __init__(self, reply):
+            self.reply, self.sent = reply, []
+
+        def request(self, payload):
+            self.sent.append(payload)
+            return self.reply, 5.0
+
+    reply = {
+        "event": "final", "ok": True, "chosen": 1, "entropy": 0.5,
+        "candidates": [{"probability": 0.25}, {"probability": 0.75}],
+        "timings": {"parse_ms": 0.01, "model_ms": 3.0, "kv_io_ms": 0.2,
+                    "pinned_seq_len": 40, "pinned_bytes": 9},
+    }
+    c = Canned(reply)
+    s1 = system1_hop(c, "SYS\n", "Previous note: x\n", [" planner", " coder"], None, True)
+    assert c.sent[0]["use_pinned"] and c.sent[0]["prompt"] == "Previous note: x\n" + SYSTEM1_QUESTION
+    assert c.sent[0]["candidates"] == [" planner", " coder"] and c.sent[0]["timings"]
+    assert s1["s1_chosen"] == "coder" and s1["s1_kv_io_ms"] == 0.2, s1
+    system1_hop(c, "SYS\n", "n\n", [" a", " b"], None, False)
+    assert "use_pinned" not in c.sent[1] and c.sent[1]["prompt"].startswith("SYS\nn\n")
+    summary = summarize([{"s1_chosen": "coder", "s1_rtt_ms": 1.0}, {"s1_chosen": "coder"}])
+    assert summary["s1_chosen"] == {"coder": 2} and summary["s1_rtt_ms"]["p50"] == 1.0, summary
     print("selftest ok")
     return 0
 
@@ -716,6 +784,11 @@ def main(argv=None):
     ap.add_argument("--system-prompt-file", help="shared prefix to use instead of the built-in one")
     ap.add_argument("--json-schema", help="constrain every hop's output to the JSON Schema in this file")
     ap.add_argument(
+        "--system1",
+        metavar="LABELS",
+        help="stdio/uds: comma-separated labels to score with a System-1 hop on every turn",
+    )
+    ap.add_argument(
         "--json-prompt",
         action="store_true",
         help="ask for the note as compact JSON in the shared system prompt",
@@ -741,6 +814,11 @@ def main(argv=None):
         ap.error("--reuse-prefix/--pin-prefix are for stdio/uds; use --llama-cache-prompt")
     if args.reuse_prefix and args.pin_prefix:
         ap.error("pick one of --reuse-prefix and --pin-prefix")
+    if args.system1 and args.target not in ("stdio", "uds"):
+        ap.error("--system1 is for stdio/uds")
+    labels = [" " + l.strip() for l in args.system1.split(",")] if args.system1 else None
+    if labels is not None and (len(labels) < 2 or not all(l.strip() for l in labels)):
+        ap.error("--system1 needs at least two non-empty comma-separated labels")
     if args.json_schema and args.target not in WARM_TARGETS:
         ap.error("--json-schema is for stdio/uds/llama-server")
     if args.llama_prompt_cache and args.target != "llama-cli":
@@ -884,9 +962,17 @@ def main(argv=None):
             else:
 
                 def do_hop(suffix, max_tokens):
-                    return reflex_hop(
+                    s1 = None
+                    if labels is not None:
+                        note, _ = split_suffix(suffix)
+                        s1 = system1_hop(client, system, note, labels, prefix_kv, args.pin_prefix)
+                    sample, text = reflex_hop(
                         client, system, suffix, max_tokens, prefix_kv, args.pin_prefix, schema
                     )
+                    if s1 is not None:
+                        sample.update(s1)
+                        sample["turn_ms"] = s1["s1_rtt_ms"] + sample["rtt_ms"]
+                    return sample, text
 
         samples = run_chain(
             do_hop, args.hops, args.warmup, args.max_tokens, args.carry_chars, on_measure_start
@@ -910,7 +996,7 @@ def main(argv=None):
         ", prefix reused" if args.reuse_prefix else ", prefix pinned" if args.pin_prefix else ""
     ) + (", prompt cache" if args.llama_prompt_cache else "") + (
         ", json_schema" if schema is not None else ""
-    )
+    ) + (", system1" if labels is not None else "")
     print_table(label, summary, len(samples))
     if setup is not None:
         fields = (f"{k}={v:.2f}" for k, v in setup.items() if v is not None)
@@ -940,6 +1026,7 @@ def main(argv=None):
                     "kv_dir": cold.kv_dir if cold is not None else args.kv_dir,
                     "json_schema": args.json_schema,
                     "json_prompt": args.json_prompt,
+                    "system1_labels": labels,
                     "energy": args.energy,
                     "energy_idle_ms": args.energy_idle_ms if args.energy else None,
                     "system_prompt_chars": len(system),
