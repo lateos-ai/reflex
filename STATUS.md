@@ -1834,3 +1834,33 @@ and worktrees removed:
   - The first version allowed no whitespace. That degraded Qwen3-0.6B's content
     (`"agent":", "`, empty extractions, no relay hop completing), and the user chose
     the optional space.
+
+## Planned next work: agent relay round 2, composable hops (queued 2026-10-16)
+
+Prompted by an outside pitch on inter-agent communication. It keeps the Non-goals:
+batch 1, no socket in the core, one slot, and the envelope stays orchestrator-side.
+Full plan: `docs/design/agent-relay-round2.md`. Each phase gets its own branch and
+public PR, T4-verified.
+
+- [ ] **D: multi-process chains + energy.** `agent_relay_bench.py` gets `cold-chain`
+  and `cold-warm` targets and `--energy` (wrapping each process in `reflex-energy`),
+  against a llama-cli cold chain and llama-server warm. Do this first: it decides F.
+- [ ] **E: System-1 over a resumed prefix (main deliverable).**
+  - `candidates` work with `use_pinned`/`import_kv`, by passing a `Resume` into
+    `system1_evaluate` for dense/MoE and MLA. The hybrid takes single-token
+    candidates only.
+  - The response gains `chosen`. `timings` gains `pinned_seq_len`/`pinned_bytes`.
+  - Relay tests require results equal to one joined request.
+- [ ] **F: f16 cache files**, only if D shows file read plus upload is more than about
+  20% of a cold hop.
+- [ ] **G: sidecar.** Map `response_format: json_schema` onto IPC `json_schema`,
+  keeping property order. `/v1/classify` passes `chosen`/`entropy` through. No
+  pin/slot/file fields over HTTP.
+- [ ] **H: composition docs and examples.** A "Composing agents" boundary section,
+  `examples/relay_envelope.schema.json`, `relay_orchestrator.py`, `relay_chain.sh`.
+- Out of scope:
+  - an engine-side envelope, carry text or blob references;
+  - zero-copy pinned use;
+  - a second slot;
+  - A2A cards or discovery.
+- Decode speed stays its own track.
