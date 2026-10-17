@@ -1842,9 +1842,21 @@ batch 1, no socket in the core, one slot, and the envelope stays orchestrator-si
 Full plan: `docs/design/agent-relay-round2.md`. Each phase gets its own branch and
 public PR, T4-verified.
 
-- [ ] **D: multi-process chains + energy.** `agent_relay_bench.py` gets `cold-chain`
-  and `cold-warm` targets and `--energy` (wrapping each process in `reflex-energy`),
-  against a llama-cli cold chain and llama-server warm. Do this first: it decides F.
+- [x] **D: multi-process chains + energy** (done 2026-10-17, branch
+  `agent-relay-phase-d`, local only; no public PR yet, user decides). The bench gained
+  `cold`/`cold-chain`/`cold-warm`/`llama-cli` targets, `--energy` and a `selftest`
+  target. `reflex generate` gained `kv_io_ms` (`--json` schema 1.2.0).
+  - Shape: a resumed cold hop is one `--import-kv` + `--max-tokens N` process. The
+    CLI can't import and export in one run (IPC can).
+  - T4, Qwen3-0.6B: cold 1,048 ms (llama.cpp 1,466) vs warm 230 ms. Long prefix: cold
+    recompute 1,322, `cold-chain` 1,499, pinned warm 295 ms. All Reflex chains gave
+    identical text, 30/30.
+  - Cold KV read is 284 ms vs 110 ms warm: +83K minor faults (one per 4 KB page of
+    the 342 MB buffer).
+  - **F gate: PASSES** (read+upload ≈ 24% of a `cold-chain` hop, 27% of `cold-warm`).
+    Caveat: f16 alone would only tie cold recompute, and the page-fault fix is
+    format-independent. Weigh it with F.
+  - Raw: `bench-results/agent-relay-t4-phase-d/`.
 - [ ] **E: System-1 over a resumed prefix (main deliverable).**
   - `candidates` work with `use_pinned`/`import_kv`, by passing a `Resume` into
     `system1_evaluate` for dense/MoE and MLA. The hybrid takes single-token
