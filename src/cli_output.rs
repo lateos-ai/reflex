@@ -53,7 +53,7 @@ use serde::Serialize;
 /// keep working across a minor bump, so a *major* bump is the signal that an
 /// existing field changed meaning or was removed. Keep in sync with the
 /// docs/reference.md's "`--json` output contract" section.
-pub const SCHEMA_VERSION: &str = "1.1.0";
+pub const SCHEMA_VERSION: &str = "1.2.0";
 
 /// Serializes `value` as one line of JSON to stdout, matching `src/ipc.rs`'s
 /// `write_json_line` discipline (flushed immediately) but deliberately not
@@ -108,6 +108,10 @@ pub struct GenerateResultJson {
     pub energy_method: Option<&'static str>,
     /// `f16` or `f32`: the element type matrix weights were stored in.
     pub weights_dtype: &'static str,
+    /// Time spent reading the `--import-kv` file or writing the `--export-kv` file;
+    /// absent when neither is given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_io_ms: Option<f64>,
 }
 
 /// `REFLEX_SYSTEM1_CANDIDATE_OK`.
@@ -281,7 +285,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"schema_version":"1.1.0","process_start_to_first_result_ms":1.0}"#
+            r#"{"schema_version":"1.2.0","process_start_to_first_result_ms":1.0}"#
         );
     }
 
@@ -297,7 +301,35 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"schema_version":"1.1.0","phase":"prompt_eval","duration_ms":1.0}"#
+            r#"{"schema_version":"1.2.0","phase":"prompt_eval","duration_ms":1.0}"#
+        );
+    }
+
+    #[test]
+    fn generate_json_has_kv_io_ms_only_with_a_cache_file() {
+        let result = |kv_io_ms| GenerateResultJson {
+            schema_version: SCHEMA_VERSION,
+            process_start_to_first_token_ms: 1.0,
+            process_start_to_last_token_ms: None,
+            gguf_open_ms: 0.0,
+            cuda_init_ms: 0.0,
+            model_load_ms: 0.0,
+            prompt_eval_ms: 0.0,
+            num_generated: None,
+            token_id: 7,
+            token_ids: None,
+            token_text: String::new(),
+            joules: None,
+            energy_method: None,
+            weights_dtype: "f16",
+            kv_io_ms,
+        };
+        let without = serde_json::to_string(&result(None)).unwrap();
+        assert!(!without.contains("kv_io_ms"), "{without}");
+        let with = serde_json::to_string(&result(Some(2.5))).unwrap();
+        assert!(
+            with.ends_with(r#""weights_dtype":"f16","kv_io_ms":2.5}"#),
+            "{with}"
         );
     }
 }

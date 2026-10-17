@@ -40,7 +40,10 @@
 //! it as the starting state, and resumes generation from it -- `prompt` is
 //! then the continuation text appended after the cached positions, not a
 //! fresh prompt. `--max-tokens N` (default 1) generates up to N tokens,
-//! feeding each one back in, stopping early on the tokenizer's EOS.
+//! feeding each one back in, stopping early on the tokenizer's EOS. With either
+//! flag, `REFLEX_GENERATE_OK` gains `kv_io_ms`: the file read (import) or write
+//! (export), not the upload into the model's cache. The two flags can't be
+//! combined in one run (IPC's `import_kv`+`export_kv` can).
 //!
 //! Usage: `reflex generate <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>] [--json]`
 //!        `reflex generate <path-to-gguf> [continuation-prompt] [--max-tokens N] --import-kv <file>`
@@ -297,13 +300,21 @@ pub fn run(args: Vec<String>) {
     }
 
     if let Some(export_path) = &export_kv {
+        let mut write_ms = 0.0;
+        let mut timed_write = |write: &mut dyn FnMut()| {
+            let start = Instant::now();
+            write();
+            write_ms = start.elapsed().as_secs_f64() * 1000.0;
+        };
         let (token_id, text) = match model.architecture_kind() {
             ArchitectureKind::Hybrid => {
                 let ((token_id, text), cache) = model
                     .forward_prompt_capture_kv_hybrid(&prompt)
                     .unwrap_or_else(|e| crate::fail("forward_prompt_capture_kv_hybrid failed", e));
-                kv_io::export_hybrid_kv(export_path, &cache)
-                    .expect("failed to export hybrid KV cache");
+                timed_write(&mut || {
+                    kv_io::export_hybrid_kv(export_path, &cache)
+                        .expect("failed to export hybrid KV cache")
+                });
                 print_kv_export_ok(
                     json,
                     export_path,
@@ -324,7 +335,9 @@ pub fn run(args: Vec<String>) {
                     cache.seq_len,
                     cache.k_caches.len(),
                 );
-                kv_io::export_dense_kv(export_path, &cache).expect("failed to export KV cache");
+                timed_write(&mut || {
+                    kv_io::export_dense_kv(export_path, &cache).expect("failed to export KV cache")
+                });
                 (token_id, text)
             }
             ArchitectureKind::Mla => {
@@ -338,7 +351,10 @@ pub fn run(args: Vec<String>) {
                     cache.seq_len,
                     cache.kv_caches.len(),
                 );
-                kv_io::export_mla_kv(export_path, &cache).expect("failed to export MLA KV cache");
+                timed_write(&mut || {
+                    kv_io::export_mla_kv(export_path, &cache)
+                        .expect("failed to export MLA KV cache")
+                });
                 (token_id, text)
             }
             ArchitectureKind::Gemma4 => {
@@ -382,13 +398,14 @@ pub fn run(args: Vec<String>) {
                     joules: energy_measurement.as_ref().map(|m| m.joules),
                     energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
                     weights_dtype,
+                    kv_io_ms: Some(write_ms),
                 },
             );
             #[cfg(not(feature = "json-output"))]
             json_output_unavailable();
         } else {
             println!(
-                "REFLEX_GENERATE_OK process_start_to_first_token_ms={process_start_to_first_token_ms:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} token_id={token_id} token_text={text:?}{} weights_dtype={weights_dtype}",
+                "REFLEX_GENERATE_OK process_start_to_first_token_ms={process_start_to_first_token_ms:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} token_id={token_id} token_text={text:?}{} weights_dtype={weights_dtype} kv_io_ms={write_ms:.3}",
                 energy_suffix(energy_measurement.as_ref()),
             );
         }
@@ -397,8 +414,13 @@ pub fn run(args: Vec<String>) {
         reflex_engine::fast_exit(0);
     }
 
+    let mut read_ms: Option<f64> = None;
     let imported = import_kv.as_ref().map(|path| {
-        kv_io::import_kv(path).unwrap_or_else(|e| crate::fail("failed to import KV cache", e))
+        let start = Instant::now();
+        let kv =
+            kv_io::import_kv(path).unwrap_or_else(|e| crate::fail("failed to import KV cache", e));
+        read_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+        kv
     });
     if let Some(path) = &json_schema_path {
         let text = std::fs::read_to_string(path)
@@ -464,6 +486,7 @@ pub fn run(args: Vec<String>) {
                 joules: energy_measurement.as_ref().map(|m| m.joules),
                 energy_method: energy_measurement.as_ref().map(|m| m.method.as_str()),
                 weights_dtype,
+                kv_io_ms: read_ms,
             },
         );
         #[cfg(not(feature = "json-output"))]
@@ -471,13 +494,14 @@ pub fn run(args: Vec<String>) {
     } else {
         let token_ids: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
         println!(
-            "REFLEX_GENERATE_OK process_start_to_first_token_ms={:.3} process_start_to_last_token_ms={:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} num_generated={} token_id={} token_ids=[{}] token_text={text:?}{} weights_dtype={weights_dtype}",
+            "REFLEX_GENERATE_OK process_start_to_first_token_ms={:.3} process_start_to_last_token_ms={:.3} gguf_open_ms={gguf_open_ms:.3} cuda_init_ms={cuda_init_ms:.3} model_load_ms={model_load_ms:.3} prompt_eval_ms={prompt_eval_ms:.3} num_generated={} token_id={} token_ids=[{}] token_text={text:?}{} weights_dtype={weights_dtype}{}",
             first_token_ms.unwrap_or(total_ms),
             total_ms,
             tokens.len(),
             tokens[0],
             token_ids.join(","),
             energy_suffix(energy_measurement.as_ref()),
+            read_ms.map_or(String::new(), |ms| format!(" kv_io_ms={ms:.3}")),
         );
     }
     crate::report_f16_activation_stats(&model);
