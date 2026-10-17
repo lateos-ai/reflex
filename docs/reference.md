@@ -216,8 +216,11 @@ objects also carry a **`schema_version`** field so a consumer can detect a shape
 {"schema_version":"1.0.0","process_start_to_first_token_ms":456.4,"gguf_open_ms":37.3,...}
 ```
 
-- **Current version: `1.1.0`** (`SCHEMA_VERSION` in `src/cli_output.rs`). 1.1.0 added
+- **Current version: `1.2.0`** (`SCHEMA_VERSION` in `src/cli_output.rs`). 1.1.0 added
   `weights_dtype` to the `generate`, `system1`, `bench` and `check` result objects.
+  1.2.0 added `kv_io_ms` to `generate`'s result: the time spent reading the
+  `--import-kv` file or writing the `--export-kv` file, present only with one of them
+  (the plain-text line gains the same `kv_io_ms=` field).
 - The four versioned objects are `generate`'s `REFLEX_GENERATE_OK` result, `system1`'s
   `REFLEX_SYSTEM1_OK` result, `smoke`'s `REFLEX_SMOKE_OK` result, and each additive
   `REFLEX_PHASE_OK` phase object. Per-item lines (`REFLEX_SYSTEM1_CANDIDATE_OK`,
