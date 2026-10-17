@@ -1985,10 +1985,13 @@ impl Model {
     /// multi-token candidates: multi-token continuation reuses the shared
     /// post-prompt KV headroom sequentially per candidate, safe since K/V is
     /// position-indexed and each candidate is scored to completion before
-    /// the next one starts.
+    /// the next one starts. `imported` resumes `prompt` after a cached prefix
+    /// (`Model::system1_evaluate_resumed`), through the same prefill
+    /// `generate_dense_impl` uses; the prefix itself is never written.
     pub(super) fn system1_evaluate_dense(
         &self,
         prompt: &str,
+        imported: Option<DensePrefix<'_>>,
         candidates: &[System1Candidate],
         temperature: f32,
     ) -> Result<System1Response, ReflexError> {
@@ -1998,14 +2001,15 @@ impl Model {
             ));
         }
 
+        let after_special = dense_after_special(imported);
         let resolved: Vec<Vec<u32>> = candidates
             .iter()
-            .map(|c| self.resolve_candidate_token_ids(prompt, &c.text))
+            .map(|c| self.resolve_candidate_token_ids(prompt, &c.text, after_special))
             .collect::<Result<_, _>>()?;
         let max_len = resolved.iter().map(Vec::len).max().unwrap_or(1);
 
         let (ids, hidden_batched, mut k_caches, mut v_caches, base_position) =
-            self.prefill_dense_batched(prompt, None, max_len.saturating_sub(1))?;
+            self.prefill_dense_batched(prompt, imported, max_len.saturating_sub(1))?;
         let hidden = self.last_row(&hidden_batched, ids.len(), self.cfg.hidden_size)?;
 
         // Batched first-token gather: the sub-50ms win for the common

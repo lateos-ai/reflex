@@ -97,6 +97,15 @@ short prefix and the ~1,490-token one.
 
 ### Phase E: System-1 over a resumed prefix, and facts for the orchestrator (main deliverable)
 
+**Done (2026-10-17).** Design and T4 results:
+[agent-relay.md](agent-relay.md), "System-1 over a resumed prefix (phase E)". With the
+~1,490-token prefix, a routing request against the pin takes 45 ms against 285 ms
+fresh. One change from this plan: with f32 weights the resumed scores match the joined
+request up to summation order (bit-identical on the MoE fixture, 1 to 10 ulps on MLA
+and the hybrid), not bit for bit, because the resumed prefill runs fewer rows. The
+fresh path is `system1_evaluate_resumed` with `Resume::Fresh`; `system1_evaluate` keeps
+its signature for the CLI, FFI and Python callers.
+
 Engine (`src/model/`):
 - `system1_evaluate` takes a `Resume`. The dense/MoE path (`system1_evaluate_dense`,
   whose `prefill_dense_batched` already takes an optional prefix) reuses the prefix

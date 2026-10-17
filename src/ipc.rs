@@ -34,7 +34,7 @@
 //! can split its measured round trip into engine time and transport overhead.
 //! Omitted (the default), the response is byte-identical to before.
 //!
-//! **Prefix reuse** (`generate` path only): `export_kv` names a file to write the
+//! **Prefix reuse**: `export_kv` names a file to write the
 //! model's state after this request's prompt to, and `import_kv` names one to resume
 //! from, in the same cache formats as `reflex generate --export-kv/--import-kv`
 //! (`crate::kv_io`). A request that sets `import_kv` treats `prompt` as the
@@ -43,7 +43,7 @@
 //! the prompt's (see `Model::generate_capture_kv`). The caller owns the files:
 //! the engine keeps nothing between requests.
 //!
-//! **Pinned prefix** (`generate` path only): a request with `pin_prefix` keeps the
+//! **Pinned prefix**: a request with `pin_prefix` keeps the
 //! model's state after its prompt in VRAM, in the session's one [`PrefixSlot`],
 //! replacing whatever was there; `max_tokens` must be 1, as for `export_kv`. A
 //! request with `use_pinned` resumes from that slot, treating `prompt` as the
@@ -52,6 +52,20 @@
 //! longer state in its place. Neither combines with `import_kv`/`export_kv`. There
 //! is exactly one slot, with no names and no eviction: anything more belongs in the
 //! orchestrator (docs/DEVELOPMENT.md).
+//!
+//! **System-1 over a resumed prefix**: a `candidates` request may set `use_pinned`
+//! or `import_kv` (not both), and then scores the candidates after the cached
+//! prefix plus `prompt`, which must add at least one token. Its scores and
+//! probabilities are those of one request over the joined text. `pin_prefix` and
+//! `export_kv` stay `generate`-only, since scoring writes past the prompt. On the
+//! Qwen3.5 hybrid every candidate must be one token, as without a prefix; Gemma 4
+//! and granitehybrid reject a prefix with `unsupported_architecture`. Every
+//! `candidates` response carries `chosen`, the index of the most probable
+//! candidate.
+//!
+//! **Slot facts**: with `"timings": true`, every response's timings also report
+//! the slot as it is after the request: `pinned_seq_len` positions and
+//! `pinned_bytes` of VRAM (both 0 when nothing is pinned).
 //!
 //! **JSON Schema** (`generate` path only): `json_schema` constrains the output to
 //! one JSON value that validates against the schema, compact but for an optional
@@ -131,8 +145,8 @@ pub struct IpcRequest {
     /// Opt-in: attach an [`IpcTimings`] to the final response line.
     #[serde(default)]
     pub timings: bool,
-    /// `generate` path only: resume from this KV cache file. See this module's
-    /// doc comment's "Prefix reuse" section.
+    /// Resume from this KV cache file, on either path. See this module's doc
+    /// comment's "Prefix reuse" and "System-1 over a resumed prefix" sections.
     #[serde(default)]
     pub import_kv: Option<String>,
     /// `generate` path only: write the state after this request's prompt to this
@@ -143,7 +157,7 @@ pub struct IpcRequest {
     /// session's [`PrefixSlot`], replacing its contents. Requires `max_tokens: 1`.
     #[serde(default)]
     pub pin_prefix: bool,
-    /// `generate` path only: resume from the session's [`PrefixSlot`].
+    /// Resume from the session's [`PrefixSlot`], on either path.
     #[serde(default)]
     pub use_pinned: bool,
     /// `generate` path only: a JSON Schema the output must conform to. Kept as raw
@@ -213,6 +227,10 @@ pub struct IpcResponse {
     /// `crate::model::System1Response::entropy`'s doc comment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entropy: Option<f32>,
+    /// `Model::system1_evaluate` path only: the index into `candidates` of the
+    /// highest `probability` (the first one on a tie).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen: Option<usize>,
     /// Present only when the request set `"timings": true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<IpcTimings>,
@@ -235,7 +253,8 @@ pub struct IpcTimings {
     /// since those happen inside the decode loop. Includes `kv_io_ms`.
     pub model_ms: f64,
     /// Reading the `import_kv` file plus writing the `export_kv` file, when the
-    /// request named either. On a `use_pinned` request, the device-to-device copy
+    /// request named either (on a `candidates` request too). On a `use_pinned`
+    /// request, generating or scoring, the device-to-device copy
     /// of the pinned prefix into the request's own cache instead. Pinning itself
     /// copies nothing, so a `pin_prefix` request alone reports none.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -246,13 +265,20 @@ pub struct IpcTimings {
     /// vocabulary index on the session's first constrained request is not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mask_ms_total: Option<f64>,
+    /// Positions held by the session's [`PrefixSlot`] after this request (0 if
+    /// nothing is pinned). With `pinned_bytes`, what an orchestrator needs to
+    /// choose between keeping the pin, recomputing and a cache file.
+    pub pinned_seq_len: usize,
+    /// VRAM held by the session's [`PrefixSlot`] after this request, in bytes.
+    pub pinned_bytes: usize,
 }
 
 fn elapsed_ms(since: std::time::Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 
-/// Builds a request's [`IpcTimings`] if it asked for one.
+/// Builds a request's [`IpcTimings`] if it asked for one. `slot` is read as it
+/// is after the request.
 fn timings_if(
     requested: bool,
     parse_ms: f64,
@@ -260,6 +286,7 @@ fn timings_if(
     first_token_ms: Option<f64>,
     kv_io_ms: Option<f64>,
     mask_ms_total: Option<f64>,
+    slot: &PrefixSlot,
 ) -> Option<IpcTimings> {
     requested.then(|| IpcTimings {
         parse_ms,
@@ -267,6 +294,8 @@ fn timings_if(
         model_ms: elapsed_ms(model_start),
         kv_io_ms,
         mask_ms_total,
+        pinned_seq_len: slot.seq_len().unwrap_or(0),
+        pinned_bytes: slot.device_bytes(),
     })
 }
 
@@ -434,20 +463,91 @@ fn run_generate_with(
     Ok((token_ids, text))
 }
 
-/// The error for a prefix field (`import_kv`/`export_kv`/`pin_prefix`/
-/// `use_pinned`) on a `system1_evaluate` request.
+/// The error for a field that keeps a prefix (`export_kv`/`pin_prefix`) on a
+/// `system1_evaluate` request: scoring writes past the prompt, so there is no
+/// state right after it to keep.
 fn kv_fields_on_candidates_err() -> ReflexError {
     ReflexError::InvalidInput(
-        "import_kv/export_kv/pin_prefix/use_pinned apply only to generate requests (empty candidates)"
-            .to_string(),
+        "export_kv/pin_prefix apply only to generate requests (empty candidates); a candidates request can resume from use_pinned or import_kv".to_string(),
     )
 }
 
-impl IpcRequest {
-    /// Whether this request names any prefix-reuse field.
-    fn uses_prefix_fields(&self) -> bool {
-        self.import_kv.is_some() || self.export_kv.is_some() || self.pin_prefix || self.use_pinned
+/// Checks a `system1_evaluate` request's fields before any model work: it may
+/// resume from `use_pinned` or `import_kv` (not both), and can't keep a prefix
+/// or take a `json_schema`.
+fn check_candidates_fields(req: &IpcRequest) -> Result<(), ReflexError> {
+    if req.export_kv.is_some() || req.pin_prefix {
+        return Err(kv_fields_on_candidates_err());
     }
+    if req.use_pinned && req.import_kv.is_some() {
+        return Err(ReflexError::InvalidInput(
+            "use_pinned can't be combined with import_kv".to_string(),
+        ));
+    }
+    if req.json_schema.is_some() {
+        return Err(ReflexError::InvalidInput(
+            "json_schema applies only to generate requests (empty candidates)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Runs a `system1_evaluate` request, resuming from the session's [`PrefixSlot`]
+/// (`use_pinned`) or a cache file (`import_kv`) when it names one. Records the
+/// file read, or the copy of the pinned prefix, in `kv_io_ms`. Never changes
+/// `slot`.
+fn run_system1(
+    model: &Model,
+    slot: &PrefixSlot,
+    req: &IpcRequest,
+    kv_io_ms: &mut Option<f64>,
+) -> Result<crate::model::System1Response, ReflexError> {
+    check_candidates_fields(req)?;
+    let candidates: Vec<System1Candidate> = req
+        .candidates
+        .iter()
+        .map(|text| System1Candidate { text: text.clone() })
+        .collect();
+    if !req.use_pinned && req.import_kv.is_none() {
+        return model.system1_evaluate(&req.prompt, &candidates, req.temperature);
+    }
+    model.check_prefix_state_supported()?;
+    let imported = match &req.import_kv {
+        Some(path) => {
+            let start = std::time::Instant::now();
+            let kv = crate::kv_io::import_kv(path)?;
+            *kv_io_ms = Some(elapsed_ms(start));
+            Some(kv)
+        }
+        None => None,
+    };
+    let resume =
+        match (&imported, &slot.pinned) {
+            (Some(kv), _) => Resume::File(kv),
+            (None, Some(p)) => Resume::Pinned(p),
+            (None, None) => return Err(ReflexError::InvalidInput(
+                "use_pinned: no prefix is pinned in this session; send a pin_prefix request first"
+                    .to_string(),
+            )),
+        };
+    let (response, copy_ms) =
+        model.system1_evaluate_resumed(&req.prompt, resume, &candidates, req.temperature)?;
+    if copy_ms.is_some() {
+        *kv_io_ms = copy_ms;
+    }
+    Ok(response)
+}
+
+/// The index of the highest of `probabilities` (the first one on a tie): a
+/// `candidates` response's `chosen`.
+fn chosen_index(probabilities: &[f32]) -> usize {
+    let mut best = 0;
+    for (i, &p) in probabilities.iter().enumerate() {
+        if p > probabilities[best] {
+            best = i;
+        }
+    }
+    best
 }
 
 impl IpcResponse {
@@ -470,6 +570,7 @@ impl IpcResponse {
             text,
             candidates: None,
             entropy: None,
+            chosen: None,
             timings: None,
         }
     }
@@ -525,6 +626,7 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
                 text: Some(text),
                 candidates: None,
                 entropy: None,
+                chosen: None,
                 timings: timings_if(
                     req.timings,
                     req.parse_ms,
@@ -532,6 +634,7 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
                     first_token_ms,
                     kv_io_ms,
                     mask_ms,
+                    slot,
                 ),
             },
             // A failed generate request still reports its timings when asked, so a
@@ -544,27 +647,16 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
                     first_token_ms,
                     kv_io_ms,
                     mask_ms,
+                    slot,
                 ),
                 ..IpcResponse::err(id, e)
             },
         }
-    } else if req.uses_prefix_fields() {
-        IpcResponse::err(id, kv_fields_on_candidates_err())
-    } else if req.json_schema.is_some() {
-        IpcResponse::err(
-            id,
-            ReflexError::InvalidInput(
-                "json_schema applies only to generate requests (empty candidates)".to_string(),
-            ),
-        )
     } else {
-        let candidates: Vec<System1Candidate> = req
-            .candidates
-            .iter()
-            .map(|text| System1Candidate { text: text.clone() })
-            .collect();
-        match model.system1_evaluate(&req.prompt, &candidates, req.temperature) {
+        let mut kv_io_ms = None;
+        match run_system1(model, slot, &req, &mut kv_io_ms) {
             Ok(response) => {
+                let chosen = chosen_index(&response.probabilities);
                 let candidates = response
                     .results
                     .into_iter()
@@ -586,7 +678,16 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
                     text: None,
                     candidates: Some(candidates),
                     entropy: Some(response.entropy),
-                    timings: timings_if(req.timings, req.parse_ms, model_start, None, None, None),
+                    chosen: Some(chosen),
+                    timings: timings_if(
+                        req.timings,
+                        req.parse_ms,
+                        model_start,
+                        None,
+                        kv_io_ms,
+                        None,
+                        slot,
+                    ),
                 }
             }
             Err(e) => IpcResponse::err(id, e),
@@ -676,6 +777,7 @@ pub fn handle_request_streaming<W: Write>(
             text: Some(text),
             candidates: None,
             entropy: None,
+            chosen: None,
             timings: timings_if(
                 req.timings,
                 req.parse_ms,
@@ -683,6 +785,7 @@ pub fn handle_request_streaming<W: Write>(
                 first_token_ms,
                 kv_io_ms,
                 mask_ms,
+                slot,
             ),
         },
         // A failed generate request still reports its timings when asked, so a
@@ -695,6 +798,7 @@ pub fn handle_request_streaming<W: Write>(
                 first_token_ms,
                 kv_io_ms,
                 mask_ms,
+                slot,
             ),
             ..IpcResponse::err(id, e)
         },
@@ -838,6 +942,7 @@ mod tests {
             text: Some("x".to_string()),
             candidates: None,
             entropy: None,
+            chosen: None,
             timings: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -943,14 +1048,15 @@ mod tests {
     #[test]
     fn test_timings_if_only_builds_when_requested() {
         let start = std::time::Instant::now();
-        assert!(timings_if(false, 1.0, start, Some(2.0), None, None).is_none());
-        let t = timings_if(true, 1.0, start, None, None, None).expect("requested");
+        let slot = PrefixSlot::new();
+        assert!(timings_if(false, 1.0, start, Some(2.0), None, None, &slot).is_none());
+        let t = timings_if(true, 1.0, start, None, None, None, &slot).expect("requested");
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"parse_ms\":1.0"), "{json}");
         assert!(json.contains("\"model_ms\""), "{json}");
         assert!(!json.contains("first_token_ms"), "{json}");
         assert!(!json.contains("kv_io_ms"), "{json}");
-        let t = timings_if(true, 1.0, start, None, Some(3.0), Some(0.5)).expect("requested");
+        let t = timings_if(true, 1.0, start, None, Some(3.0), Some(0.5), &slot).expect("requested");
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"kv_io_ms\":3.0"), "{json}");
         assert!(json.contains("\"mask_ms_total\":0.5"), "{json}");
@@ -973,14 +1079,103 @@ mod tests {
     fn test_ipc_request_pin_fields_default_off_and_parse() {
         let req: IpcRequest = serde_json::from_str(r#"{"prompt": "p"}"#).unwrap();
         assert!(!req.pin_prefix && !req.use_pinned);
-        assert!(!req.uses_prefix_fields());
         let req: IpcRequest = serde_json::from_str(
             r#"{"prompt": "p", "pin_prefix": true, "use_pinned": true, "max_tokens": 1}"#,
         )
         .unwrap();
         assert!(req.pin_prefix && req.use_pinned);
-        assert!(req.uses_prefix_fields());
         assert_eq!(PrefixSlot::new().seq_len(), None);
         assert_eq!(PrefixSlot::new().device_bytes(), 0);
+    }
+
+    fn candidates_req(extra: &str) -> IpcRequest {
+        serde_json::from_str(&format!(
+            r#"{{"prompt": "p", "candidates": [" a", " b"]{extra}}}"#
+        ))
+        .expect("should parse")
+    }
+
+    #[test]
+    fn test_candidates_allow_resuming_from_a_prefix() {
+        for extra in [
+            "",
+            r#", "use_pinned": true"#,
+            r#", "import_kv": "sys.cskv""#,
+            r#", "use_pinned": true, "timings": true"#,
+        ] {
+            let req = candidates_req(extra);
+            assert!(check_candidates_fields(&req).is_ok(), "{extra}");
+        }
+        let req = candidates_req(r#", "use_pinned": true, "import_kv": "sys.cskv""#);
+        assert!(req.use_pinned && req.import_kv.is_some());
+    }
+
+    #[test]
+    fn test_candidates_reject_keeping_a_prefix_and_other_fields() {
+        for extra in [
+            r#", "pin_prefix": true"#,
+            r#", "pin_prefix": true, "max_tokens": 1"#,
+            r#", "export_kv": "out.cskv""#,
+            r#", "use_pinned": true, "pin_prefix": true"#,
+            r#", "import_kv": "sys.cskv", "export_kv": "out.cskv""#,
+            r#", "use_pinned": true, "import_kv": "sys.cskv""#,
+            r#", "json_schema": {"type": "string"}"#,
+            r#", "use_pinned": true, "json_schema": {"type": "string"}"#,
+        ] {
+            let err = check_candidates_fields(&candidates_req(extra)).unwrap_err();
+            assert_eq!(err.kind(), "invalid_input", "{extra}: {err}");
+        }
+        let err = check_candidates_fields(&candidates_req(r#", "pin_prefix": true"#)).unwrap_err();
+        assert!(err.to_string().contains("export_kv/pin_prefix"), "{err}");
+        assert!(!err.to_string().contains("use_pinned apply"), "{err}");
+    }
+
+    #[test]
+    fn test_chosen_index_picks_the_first_highest_probability() {
+        assert_eq!(chosen_index(&[0.7, 0.2, 0.1]), 0);
+        assert_eq!(chosen_index(&[0.1, 0.2, 0.7]), 2);
+        assert_eq!(chosen_index(&[0.2, 0.4, 0.4]), 1);
+        assert_eq!(chosen_index(&[1.0]), 0);
+    }
+
+    fn candidates_response(chosen: Option<usize>, timings: Option<IpcTimings>) -> IpcResponse {
+        IpcResponse {
+            id: None,
+            event: "final",
+            ok: true,
+            error: None,
+            error_kind: None,
+            token_ids: None,
+            text: None,
+            candidates: Some(vec![IpcCandidateResult {
+                text: " a".to_string(),
+                token_ids: vec![1],
+                score: 2.0,
+                probability: 1.0,
+            }]),
+            entropy: Some(0.0),
+            chosen,
+            timings,
+        }
+    }
+
+    #[test]
+    fn test_chosen_serializes_on_candidates_only() {
+        let json = serde_json::to_string(&candidates_response(Some(0), None)).unwrap();
+        assert!(json.contains("\"chosen\":0"), "{json}");
+        let err =
+            serde_json::to_string(&IpcResponse::err(None, ReflexError::Other("x".into()))).unwrap();
+        assert!(!err.contains("chosen"), "{err}");
+    }
+
+    #[test]
+    fn test_slot_facts_appear_only_with_timings() {
+        let json = serde_json::to_string(&candidates_response(Some(0), None)).unwrap();
+        assert!(!json.contains("pinned_"), "{json}");
+        let start = std::time::Instant::now();
+        let t = timings_if(true, 0.5, start, None, None, None, &PrefixSlot::new());
+        let json = serde_json::to_string(&candidates_response(Some(0), t)).unwrap();
+        assert!(json.contains("\"pinned_seq_len\":0"), "{json}");
+        assert!(json.contains("\"pinned_bytes\":0"), "{json}");
     }
 }

@@ -167,6 +167,19 @@ see `Model::system1_evaluate`'s doc comment in `src/model/mod.rs`. `system1` sup
 every architecture; on the Qwen3.5 hybrid models each candidate must be a single token
 (multi-token candidates are rejected with an `invalid_input` error).
 
+Over IPC (`reflex stdio`/`uds`), a request with `"candidates": [...]` runs the same
+scoring. Its response lists each candidate's `token_ids`, `score` and `probability`,
+plus `entropy` and `chosen` (the index of the most probable candidate). It can score
+after a cached prefix: with `"use_pinned": true` (the session's pinned prefix) or
+`"import_kv": "<file>"` (not both), `prompt` is the continuation after the prefix and
+must add at least one token. The token ids and `chosen` match one request over the
+joined text, and the scores match it up to float summation order.
+`pin_prefix` and `export_kv` are `generate`-only (`invalid_input` here). Gemma 4 and
+Granite 4.0-H score fresh prompts only (`unsupported_architecture` with a prefix). With
+`"timings": true`, every response also reports the pinned slot after the request:
+`pinned_seq_len` positions and `pinned_bytes` of VRAM. See
+[design/agent-relay.md](design/agent-relay.md), "System-1 over a resumed prefix".
+
 `generate` can also pull a GGUF straight from the Hub itself, via this project's own
 Rust `hf-hub` integration — `--model <org/repo:file.gguf>` or `--quickstart`, both
 requiring `cargo build --features download`:

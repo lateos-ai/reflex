@@ -754,7 +754,7 @@ impl Model {
         }
         let resolved: Vec<Vec<u32>> = candidates
             .iter()
-            .map(|c| self.resolve_candidate_token_ids(prompt, &c.text))
+            .map(|c| self.resolve_candidate_token_ids(prompt, &c.text, true))
             .collect::<Result<_, _>>()?;
         if resolved.iter().any(|ids| ids.len() > 1) {
             return Err(ReflexError::InvalidInput(

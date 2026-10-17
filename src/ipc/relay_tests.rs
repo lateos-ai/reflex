@@ -150,7 +150,7 @@ fn ipc_kv_relay_dense_resumes_exactly() {
         &model,
         &[
             serde_json::json!({"prompt": "p", "export_kv": out}),
-            serde_json::json!({"prompt": "p", "candidates": ["a"], "import_kv": out}),
+            serde_json::json!({"prompt": "p", "candidates": ["a"], "export_kv": out}),
             serde_json::json!({"prompt": "p", "import_kv": tmp_path("does_not_exist")}),
         ],
     );
@@ -394,7 +394,8 @@ fn ipc_pinned_prefix_dense_resumes_exactly() {
             serde_json::json!({"prompt": "p", "pin_prefix": true, "export_kv": out,
                                "max_tokens": 1}),
             serde_json::json!({"prompt": "p", "use_pinned": true, "import_kv": out}),
-            serde_json::json!({"prompt": "p", "candidates": ["a"], "use_pinned": true}),
+            serde_json::json!({"prompt": "p", "candidates": ["a"], "use_pinned": true,
+                               "import_kv": out}),
             serde_json::json!({"prompt": "p", "candidates": ["a"], "pin_prefix": true}),
             serde_json::json!({"prompt": "p", "use_pinned": true, "pin_prefix": true,
                                "max_tokens": 4}),
@@ -577,4 +578,325 @@ fn ipc_pinned_prefix_granite_fixture_rejects() {
 #[ignore]
 fn ipc_pinned_prefix_gemma4_fixture_rejects() {
     assert_pinning_rejected(&load(GEMMA4_FIXTURE, WeightsDtype::F32));
+}
+
+/// How closely a resumed System-1 request must match one over the joined text.
+/// The resumed prefill runs fewer rows than the joined one, so some kernels sum
+/// in a different order (as in `model::prefill_batching_tests`). Token ids and
+/// `chosen` must always match exactly.
+#[derive(Clone, Copy)]
+enum Match {
+    /// f32 weights: summation order only. Measured on a T4 (2026-10-17): bit-
+    /// identical on the Qwen3-MoE fixture, 1 ulp on the MLA fixture, 10 ulps
+    /// (7e-8) on the Qwen3.5 hybrid fixture.
+    F32,
+    /// f16 weights: the GEMMs also round activations to f16, so differences
+    /// accumulate. Measured: 4.9e-3 on scores near 95 (Qwen3-0.6B), 2.6e-3
+    /// (TinyLlama).
+    F16,
+}
+
+/// One candidate's `(token_ids, score, probability)` from a candidates response.
+fn scored(resp: &Value) -> Vec<(Vec<u64>, f64, f64)> {
+    assert_eq!(resp["ok"], true, "{resp}");
+    resp["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .map(|c| {
+            let ids = c["token_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .collect();
+            (
+                ids,
+                c["score"].as_f64().unwrap(),
+                c["probability"].as_f64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// Checks that a resumed candidates response gives the joined one's token ids,
+/// `chosen`, scores and probabilities, to `how`'s precision. Returns the largest
+/// score difference, for the log.
+fn assert_scores_match(resumed: &Value, joined: &Value, how: Match, what: &str) -> f64 {
+    let (r, j) = (scored(resumed), scored(joined));
+    assert_eq!(r.len(), j.len(), "{what}");
+    let (score_rel, prob_abs) = match how {
+        Match::F32 => (1e-5, 1e-5),
+        Match::F16 => (5e-3, 5e-3),
+    };
+    let mut max_diff = 0.0f64;
+    for ((r_ids, r_score, r_prob), (j_ids, j_score, j_prob)) in r.iter().zip(&j) {
+        assert_eq!(r_ids, j_ids, "{what}: candidate token ids differ");
+        max_diff = max_diff.max((r_score - j_score).abs());
+        assert!(
+            (r_score - j_score).abs() <= score_rel * j_score.abs().max(1.0),
+            "{what}: score {r_score} vs joined {j_score}"
+        );
+        assert!(
+            (r_prob - j_prob).abs() <= prob_abs,
+            "{what}: probability {r_prob} vs joined {j_prob}"
+        );
+    }
+    assert_eq!(resumed["chosen"], joined["chosen"], "{what}: chosen");
+    max_diff
+}
+
+/// Pins `parts[0]` and exports it to a file, then scores `candidates` after
+/// `parts[1]` from the slot, from the file, and from the slot again. Each must
+/// match one candidates request over the joined text (see [`Match`]), report
+/// the prefix copy or read in `kv_io_ms` and the slot in `pinned_seq_len`/
+/// `pinned_bytes`, and leave the slot unchanged.
+fn assert_system1_resumes(
+    model: &Model,
+    parts: [&str; 2],
+    candidates: &[&str],
+    how: Match,
+    tag: &str,
+) {
+    assert_split_tokenizes_alike(model, &parts);
+    let file = tmp_path(&format!("{tag}_s1").replace(' ', "_"));
+    let mut slot = PrefixSlot::new();
+    let lines = session_with(
+        model,
+        &mut slot,
+        &[
+            serde_json::json!({"prompt": parts[0], "pin_prefix": true, "max_tokens": 1}),
+            serde_json::json!({"prompt": parts[0], "export_kv": file, "max_tokens": 1}),
+        ],
+    );
+    final_ok(&lines[0]);
+    final_ok(&lines[1]);
+    let pinned_len = slot.seq_len().expect("parts[0] pinned");
+    let pinned_bytes = slot.device_bytes();
+
+    let resumed = |field: &str, value: Value| {
+        let mut req = serde_json::json!({"prompt": parts[1], "candidates": candidates,
+                                         "timings": true});
+        req[field] = value;
+        req
+    };
+    let lines = session_with(
+        model,
+        &mut slot,
+        &[
+            resumed("use_pinned", Value::Bool(true)),
+            resumed("import_kv", Value::String(file.clone())),
+            resumed("use_pinned", Value::Bool(true)),
+            serde_json::json!({"prompt": parts.concat(), "candidates": candidates,
+                               "timings": true}),
+        ],
+    );
+    std::fs::remove_file(&file).ok();
+    let (pinned, from_file, pinned_again, joined) = (&lines[0], &lines[1], &lines[2], &lines[3]);
+    assert_eq!(
+        slot.seq_len(),
+        Some(pinned_len),
+        "{tag}: a scoring request changed the slot"
+    );
+    assert_eq!(slot.device_bytes(), pinned_bytes);
+    for resp in [pinned, from_file, pinned_again, joined] {
+        let t = &resp["timings"];
+        assert_eq!(t["pinned_seq_len"].as_u64(), Some(pinned_len as u64), "{t}");
+        assert_eq!(t["pinned_bytes"].as_u64(), Some(pinned_bytes as u64), "{t}");
+        assert!(resp["chosen"].as_u64().is_some(), "{resp}");
+    }
+    for resp in [pinned, from_file, pinned_again] {
+        assert!(
+            resp["timings"]["kv_io_ms"].as_f64().unwrap() >= 0.0,
+            "{resp}"
+        );
+    }
+    assert!(joined["timings"].get("kv_io_ms").is_none(), "{joined}");
+
+    let d_pin = assert_scores_match(pinned, joined, how, &format!("{tag} use_pinned"));
+    let d_file = assert_scores_match(from_file, joined, how, &format!("{tag} import_kv"));
+    assert_scores_match(
+        pinned_again,
+        joined,
+        how,
+        &format!("{tag} second use_pinned"),
+    );
+    eprintln!(
+        "{tag}: chosen={} max |score diff| pinned={d_pin:e} file={d_file:e} copy={} read={} joined={}",
+        joined["chosen"],
+        pinned["timings"]["kv_io_ms"],
+        from_file["timings"]["kv_io_ms"],
+        joined["candidates"]
+    );
+}
+
+/// Candidates spanning one token and several, for the paths that score
+/// multi-token candidates by teacher forcing after the prompt.
+const MULTI: [&str; 4] = [" Paris", " Rome", " Paris, and the capital", " the"];
+
+/// Real dense Qwen3 (`REFLEX_TEST_GGUF`), f16 weights. Also covers the request
+/// errors, none of which may change the slot.
+#[test]
+#[ignore]
+fn ipc_system1_resumed_dense_matches_joined() {
+    let path = std::env::var("REFLEX_TEST_GGUF").expect("set REFLEX_TEST_GGUF to a dense GGUF");
+    let model = load(&path, WeightsDtype::DEFAULT);
+    assert_system1_resumes(&model, [PARTS[0], PARTS[1]], &MULTI, Match::F16, "dense");
+
+    let mut slot = PrefixSlot::new();
+    let missing = tmp_path("dense_s1_missing");
+    let lines = session_with(
+        &model,
+        &mut slot,
+        &[
+            serde_json::json!({"prompt": PARTS[1], "candidates": [" Paris"], "use_pinned": true}),
+            serde_json::json!({"prompt": PARTS[0], "pin_prefix": true, "max_tokens": 1}),
+        ],
+    );
+    assert_eq!(lines[0]["error_kind"], "invalid_input", "{}", lines[0]);
+    final_ok(&lines[1]);
+    let pinned_len = slot.seq_len();
+
+    let lines = session_with(
+        &model,
+        &mut slot,
+        &[
+            serde_json::json!({"prompt": PARTS[1], "candidates": [" Paris"], "use_pinned": true,
+                               "pin_prefix": true, "max_tokens": 1}),
+            serde_json::json!({"prompt": PARTS[1], "candidates": [" Paris"], "use_pinned": true,
+                               "export_kv": missing}),
+            serde_json::json!({"prompt": PARTS[1], "candidates": [" Paris"], "use_pinned": true,
+                               "import_kv": missing}),
+            serde_json::json!({"prompt": "", "candidates": [" Paris"], "use_pinned": true}),
+            serde_json::json!({"prompt": PARTS[1], "candidates": [" Paris"],
+                               "import_kv": missing}),
+            serde_json::json!({"prompt": PARTS[1], "candidates": [" Paris", " Rome"],
+                               "use_pinned": true}),
+        ],
+    );
+    for l in &lines[..4] {
+        assert_eq!(l["error_kind"], "invalid_input", "{l}");
+    }
+    assert_eq!(lines[4]["ok"], false, "{}", lines[4]);
+    assert!(
+        !std::path::Path::new(&missing).exists(),
+        "rejected export wrote a file"
+    );
+    assert_eq!(lines[5]["ok"], true, "{}", lines[5]);
+    assert!(lines[5]["chosen"].as_u64().unwrap() < 2, "{}", lines[5]);
+    assert_eq!(
+        slot.seq_len(),
+        pinned_len,
+        "a scoring or rejected request changed the slot"
+    );
+}
+
+#[test]
+#[ignore]
+fn qwen3moe_fixture_ipc_system1_resumed_matches_joined() {
+    let model = load(QWEN3MOE_FIXTURE, WeightsDtype::F32);
+    assert_system1_resumes(&model, [PARTS[0], PARTS[1]], &MULTI, Match::F32, "qwen3moe");
+}
+
+#[test]
+#[ignore]
+fn ipc_system1_resumed_mla_fixture_matches_joined() {
+    let model = load(MLA_FIXTURE, WeightsDtype::F32);
+    assert_system1_resumes(&model, [PARTS[0], PARTS[1]], &MULTI, Match::F32, "mla");
+}
+
+/// Qwen3.5 hybrid: single-token candidates after a resumed prefix, and a
+/// multi-token one rejected as it is without a prefix.
+#[test]
+#[ignore]
+fn qwen35moe_fixture_ipc_system1_resumed_single_token() {
+    let model = load(QWEN35MOE_FIXTURE, WeightsDtype::F32);
+    let single = [" the", " a", " and"];
+    assert_system1_resumes(
+        &model,
+        [PARTS[0], PARTS[1]],
+        &single,
+        Match::F32,
+        "qwen35moe",
+    );
+
+    let mut slot = PrefixSlot::new();
+    let lines = session_with(
+        &model,
+        &mut slot,
+        &[
+            serde_json::json!({"prompt": PARTS[0], "pin_prefix": true, "max_tokens": 1}),
+            serde_json::json!({"prompt": PARTS[1], "candidates": [" the", " Paris, and Rome"],
+                               "use_pinned": true}),
+            serde_json::json!({"prompt": PARTS[1], "candidates": [" the", " Paris, and Rome"]}),
+        ],
+    );
+    final_ok(&lines[0]);
+    for l in &lines[1..] {
+        assert_eq!(l["error_kind"], "invalid_input", "{l}");
+    }
+}
+
+/// A real SentencePiece model (`SPM_GGUF` in the nightly): the continuation and
+/// the candidates must be encoded with the dummy-prefix rule a joined request
+/// applies, after raw text and after a special token.
+#[test]
+#[ignore]
+fn ipc_system1_resumed_spm_model_matches_joined() {
+    let path = std::env::var("REFLEX_TEST_GGUF")
+        .expect("set REFLEX_TEST_GGUF to a SentencePiece GGUF (the nightly's SPM_GGUF)");
+    let model = load(&path, WeightsDtype::DEFAULT);
+    assert_system1_resumes(&model, [PARTS[0], PARTS[1]], &MULTI, Match::F16, "spm");
+    let user = "<|user|>\nWhat is the capital of France?</s>\n<|assistant|>\nThe capital is";
+    let answers = [" Paris", " Rome", " Berlin"];
+    assert_system1_resumes(
+        &model,
+        ["<|system|>\nYou are a careful assistant.</s>\n", user],
+        &answers,
+        Match::F16,
+        "spm after raw text",
+    );
+    assert_system1_resumes(
+        &model,
+        [
+            "<|system|>\nYou are a careful assistant.</s>",
+            &format!("\n{user}"),
+        ],
+        &answers,
+        Match::F16,
+        "spm after a special token",
+    );
+}
+
+/// Gemma 4 and granitehybrid have no prefix-state format: a resumed candidates
+/// request fails with `unsupported_architecture` (before reading any file), and
+/// a fresh one still works.
+fn assert_system1_resume_rejected(model: &Model) {
+    let missing = tmp_path("s1_reject_missing");
+    let lines = session(
+        model,
+        &[
+            serde_json::json!({"prompt": "Hello", "candidates": [" world"], "use_pinned": true}),
+            serde_json::json!({"prompt": "Hello", "candidates": [" world"],
+                               "import_kv": missing}),
+            serde_json::json!({"prompt": "Hello", "candidates": [" world", " there"]}),
+        ],
+    );
+    for l in &lines[..2] {
+        assert_eq!(l["error_kind"], "unsupported_architecture", "{l}");
+    }
+    assert_eq!(lines[2]["ok"], true, "{}", lines[2]);
+    assert!(lines[2]["chosen"].as_u64().is_some(), "{}", lines[2]);
+}
+
+#[test]
+#[ignore]
+fn ipc_system1_resumed_granite_fixture_rejects() {
+    assert_system1_resume_rejected(&load(GRANITE_FIXTURE, WeightsDtype::F32));
+}
+
+#[test]
+#[ignore]
+fn ipc_system1_resumed_gemma4_fixture_rejects() {
+    assert_system1_resume_rejected(&load(GEMMA4_FIXTURE, WeightsDtype::F32));
 }
