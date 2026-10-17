@@ -33,9 +33,11 @@ Targets:
                 the system prompt plus the previous note, and a warm
                 `reflex stdio` imports that file (`import_kv`) and decodes from
                 the role line
-  llama-cli     every hop is a fresh llama.cpp `llama-cli` process (the model
+  llama-cli     every hop is a fresh llama.cpp completion process (the model
                 reloads each hop); --llama-prompt-cache makes it reuse the system
-                prompt through llama.cpp's own `--prompt-cache` file
+                prompt through llama.cpp's own `--prompt-cache` file. Newer
+                llama.cpp builds moved raw completion from `llama-cli` (now a
+                chat UI) to `llama-completion`: pass that with --llama-cli
   selftest      runs the output parsers on canned lines; needs no GPU
 
 Cold hops report the process's wall time (spawn to exit), its first token
@@ -86,7 +88,7 @@ Usage:
   scripts/agent_relay_bench.py llama-server --url http://127.0.0.1:8080
   scripts/agent_relay_bench.py cold-chain --model m.gguf --kv-dir /dev/shm
   scripts/agent_relay_bench.py cold-warm --model m.gguf
-  scripts/agent_relay_bench.py llama-cli --llama-cli llama-cli --model m.gguf
+  scripts/agent_relay_bench.py llama-cli --llama-cli llama-completion --model m.gguf
   scripts/agent_relay_bench.py selftest
   common: [--hops 20] [--warmup 3] [--max-tokens 32] [--carry-chars 400]
           [--system-prompt-file f.txt] [--json-out results.json]
@@ -680,7 +682,11 @@ def main(argv=None):
         action="store_true",
         help="let llama-server reuse the shared prefix (default off)",
     )
-    ap.add_argument("--llama-cli", default="llama-cli", help="llama-cli binary (llama-cli target)")
+    ap.add_argument(
+        "--llama-cli",
+        default="llama-cli",
+        help="llama.cpp completion binary: llama-cli, or llama-completion on newer builds",
+    )
     ap.add_argument(
         "--llama-cli-args",
         default="-ngl 99 --no-warmup -no-cnv --simple-io -c 4096",
