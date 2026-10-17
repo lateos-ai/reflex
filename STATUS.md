@@ -1842,8 +1842,8 @@ batch 1, no socket in the core, one slot, and the envelope stays orchestrator-si
 Full plan: `docs/design/agent-relay-round2.md`. Each phase gets its own branch and
 public PR, T4-verified.
 
-- [x] **D: multi-process chains + energy** (done 2026-10-17, branch
-  `agent-relay-phase-d`, local only; no public PR yet, user decides). The bench gained
+- [x] **D: multi-process chains + energy** (done 2026-10-17; PUBLIC
+  #39 merged, github 2520554, private master synced 47be2af). The bench gained
   `cold`/`cold-chain`/`cold-warm`/`llama-cli` targets, `--energy` and a `selftest`
   target. `reflex generate` gained `kv_io_ms` (`--json` schema 1.2.0).
   - Shape: a resumed cold hop is one `--import-kv` + `--max-tokens N` process. The
