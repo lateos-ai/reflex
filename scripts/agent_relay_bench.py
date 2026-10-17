@@ -489,9 +489,9 @@ class ColdRunner:
         stdout, stderr, wall, first, energy = self.run(cmd, len(prompt.encode("utf-8")))
         perf = parse_llama_perf(stderr)
         sample = {"wall_ms": wall, "first_token_ms": first}
-        for key in ("load_ms", "prompt_eval_ms"):
-            if key in perf:
-                sample[key] = perf[key]
+        # Not its "load time": that is measured from context creation, not model load.
+        if "prompt_eval_ms" in perf:
+            sample["prompt_eval_ms"] = perf["prompt_eval_ms"]
         if perf.get("eval_runs"):
             sample["decode_ms_per_token"] = perf["eval_ms"] / perf["eval_runs"]
             sample["tokens"] = int(perf["eval_runs"]) + 1
@@ -516,6 +516,8 @@ def run_chain(do_hop, hops, warmup, max_tokens, carry_chars, on_measure_start=No
         sample, text = do_hop(hop_suffix(hop, previous, carry_chars), max_tokens)
         previous = text.strip()
         if hop >= warmup:
+            # Greedy and deterministic, so chains on different targets can be diffed.
+            sample["text"] = text
             samples.append(sample)
     return samples
 
