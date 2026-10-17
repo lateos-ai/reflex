@@ -612,11 +612,13 @@ impl Model {
     /// multi-token candidates here avoids that hazard entirely; this still
     /// covers System1's own headline use cases (Yes/No, A-D, a 1-10 scale).
     /// State-cloning to lift this restriction is a real follow-up, not
-    /// attempted here.
+    /// attempted here. The same holds after a cached prefix (`imported`, see
+    /// `Model::system1_evaluate_resumed`), which is copied, never written.
     pub(super) fn system1_evaluate_hybrid(
         &self,
         h: &HybridModel,
         prompt: &str,
+        imported: Option<HybridPrefix<'_>>,
         candidates: &[System1Candidate],
         temperature: f32,
     ) -> Result<System1Response, ReflexError> {
@@ -628,7 +630,7 @@ impl Model {
 
         let resolved: Vec<Vec<u32>> = candidates
             .iter()
-            .map(|c| self.resolve_candidate_token_ids(prompt, &c.text))
+            .map(|c| self.resolve_candidate_token_ids(prompt, &c.text, true))
             .collect::<Result<_, _>>()?;
         if resolved.iter().any(|ids| ids.len() > 1) {
             return Err(ReflexError::InvalidInput(
@@ -638,7 +640,7 @@ impl Model {
         }
 
         let (ids, hidden_batched, _states, _position) =
-            self.prefill_hybrid_batched(h, prompt, None, 0)?;
+            self.prefill_hybrid_batched(h, prompt, imported, 0)?;
         let hidden_size = h.attn_cfg.hidden_size;
         let eps = h.attn_cfg.rmsnorm_eps;
         let hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;

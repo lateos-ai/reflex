@@ -533,11 +533,13 @@ impl Model {
     /// but still **position-indexed**, not an unaddressed recurrence like
     /// hybrid's `GatedDeltaNet` state -- so the same shared-cache,
     /// score-to-completion-before-the-next-candidate reuse dense relies on
-    /// carries over unmodified.
+    /// carries over unmodified. `imported` resumes `prompt` after a cached
+    /// prefix (`Model::system1_evaluate_resumed`), which is copied, never written.
     pub(super) fn system1_evaluate_mla(
         &self,
         m: &MlaModel,
         prompt: &str,
+        imported: Option<MlaPrefix<'_>>,
         candidates: &[System1Candidate],
         temperature: f32,
     ) -> Result<System1Response, ReflexError> {
@@ -549,12 +551,12 @@ impl Model {
 
         let resolved: Vec<Vec<u32>> = candidates
             .iter()
-            .map(|c| self.resolve_candidate_token_ids(prompt, &c.text))
+            .map(|c| self.resolve_candidate_token_ids(prompt, &c.text, true))
             .collect::<Result<_, _>>()?;
         let max_len = resolved.iter().map(Vec::len).max().unwrap_or(1);
 
         let (ids, hidden_batched, mut kv_caches, base_position) =
-            self.prefill_mla_batched(m, prompt, None, max_len.saturating_sub(1))?;
+            self.prefill_mla_batched(m, prompt, imported, max_len.saturating_sub(1))?;
         let hidden_size = m.cfg.hidden_size;
         let eps = m.cfg.rmsnorm_eps;
         let hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;

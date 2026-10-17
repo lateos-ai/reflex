@@ -339,36 +339,8 @@ impl Model {
             });
         }
 
-        let model_format = if self.hybrid.is_some() {
-            "hybrid"
-        } else if self.mla.is_some() {
-            "MLA"
-        } else {
-            "dense/MoE"
-        };
-        let mismatch = || {
-            let what = match resume {
-                Resume::Pinned(_) => "pinned prefix",
-                _ => "imported KV cache file",
-            };
-            ReflexError::KvCache(format!(
-                "{what} is {} format, but this model uses the {model_format} format",
-                resume.format_name()
-            ))
-        };
-
         if let Some(h) = &self.hybrid {
-            let src: Option<HybridPrefix<'_>> = match resume {
-                Resume::Fresh => None,
-                Resume::File(ImportedKv::Hybrid(c)) => Some(PrefixSource::Host(c)),
-                Resume::Pinned(PinnedPrefix {
-                    state: DeviceState::Hybrid(d),
-                }) => Some(PrefixSource::Device {
-                    state: d,
-                    copy_ms: &copy_ms,
-                }),
-                _ => return Err(mismatch()),
-            };
+            let src = self.hybrid_prefix(resume, &copy_ms)?;
             let (token_ids, text, layers, seq_len) = self.generate_hybrid_impl(
                 h,
                 prompt,
@@ -386,17 +358,7 @@ impl Model {
             });
         }
         if let Some(m) = &self.mla {
-            let src: Option<MlaPrefix<'_>> = match resume {
-                Resume::Fresh => None,
-                Resume::File(ImportedKv::Mla(c)) => Some(PrefixSource::Host(c)),
-                Resume::Pinned(PinnedPrefix {
-                    state: DeviceState::Mla(d),
-                }) => Some(PrefixSource::Device {
-                    state: d,
-                    copy_ms: &copy_ms,
-                }),
-                _ => return Err(mismatch()),
-            };
+            let src = self.mla_prefix(resume, &copy_ms)?;
             let (token_ids, text, kv_caches, seq_len) = self.generate_mla_impl(
                 m,
                 prompt,
@@ -413,17 +375,7 @@ impl Model {
                 copy_ms: copy_ms.get(),
             });
         }
-        let src: Option<DensePrefix<'_>> = match resume {
-            Resume::Fresh => None,
-            Resume::File(ImportedKv::Dense(c)) => Some(PrefixSource::Host(c)),
-            Resume::Pinned(PinnedPrefix {
-                state: DeviceState::Dense(d),
-            }) => Some(PrefixSource::Device {
-                state: d,
-                copy_ms: &copy_ms,
-            }),
-            _ => return Err(mismatch()),
-        };
+        let src = self.dense_prefix(resume, &copy_ms)?;
         let space_prefix_next = self
             .tokenizer
             .ends_after_special(prompt, dense_after_special(src));
@@ -445,6 +397,113 @@ impl Model {
                 space_prefix_next,
             })),
             copy_ms: copy_ms.get(),
+        })
+    }
+
+    /// Like [`Model::system1_evaluate`], scoring the candidates after `prompt`
+    /// resumed from `resume` (`prompt` is then the continuation, with no BOS
+    /// added). Pinned prefixes and cache files share one path, as for
+    /// [`Model::generate_resumed`]. Also returns the time spent copying a pinned
+    /// prefix (`None` otherwise). A resumed `prompt` must still add at least one
+    /// token: the scores come from its last position. On the Qwen3.5 hybrid each
+    /// candidate must be a single token, as for a fresh prompt; Gemma 4 and
+    /// granitehybrid return `UnsupportedArchitecture` for anything but
+    /// [`Resume::Fresh`].
+    pub fn system1_evaluate_resumed(
+        &self,
+        prompt: &str,
+        resume: Resume<'_>,
+        candidates: &[System1Candidate],
+        temperature: f32,
+    ) -> Result<(System1Response, Option<f64>), ReflexError> {
+        let copy_ms = Cell::new(None);
+        let response = if let Some(h) = &self.hybrid {
+            let src = self.hybrid_prefix(resume, &copy_ms)?;
+            self.system1_evaluate_hybrid(h, prompt, src, candidates, temperature)?
+        } else if let Some(m) = &self.mla {
+            let src = self.mla_prefix(resume, &copy_ms)?;
+            self.system1_evaluate_mla(m, prompt, src, candidates, temperature)?
+        } else if self.gemma4.is_some() || self.granite.is_some() {
+            if !matches!(resume, Resume::Fresh) {
+                self.check_prefix_state_supported()?;
+            }
+            if let Some(g) = &self.gemma4 {
+                self.system1_evaluate_gemma4(g, prompt, candidates, temperature)?
+            } else {
+                let g = self.granite.as_ref().expect("checked above");
+                self.system1_evaluate_granite(g, prompt, candidates, temperature)?
+            }
+        } else {
+            let src = self.dense_prefix(resume, &copy_ms)?;
+            self.system1_evaluate_dense(prompt, src, candidates, temperature)?
+        };
+        Ok((response, copy_ms.get()))
+    }
+
+    /// The error for a `resume` whose state is another architecture's format.
+    fn prefix_format_mismatch(&self, resume: Resume<'_>) -> ReflexError {
+        let model_format = if self.hybrid.is_some() {
+            "hybrid"
+        } else if self.mla.is_some() {
+            "MLA"
+        } else {
+            "dense/MoE"
+        };
+        let what = match resume {
+            Resume::Pinned(_) => "pinned prefix",
+            _ => "imported KV cache file",
+        };
+        ReflexError::KvCache(format!(
+            "{what} is {} format, but this model uses the {model_format} format",
+            resume.format_name()
+        ))
+    }
+
+    /// `resume` as the dense/MoE path's [`PrefixSource`].
+    fn dense_prefix<'a>(
+        &self,
+        resume: Resume<'a>,
+        copy_ms: &'a Cell<Option<f64>>,
+    ) -> Result<Option<DensePrefix<'a>>, ReflexError> {
+        Ok(match resume {
+            Resume::Fresh => None,
+            Resume::File(ImportedKv::Dense(c)) => Some(PrefixSource::Host(c)),
+            Resume::Pinned(PinnedPrefix {
+                state: DeviceState::Dense(d),
+            }) => Some(PrefixSource::Device { state: d, copy_ms }),
+            _ => return Err(self.prefix_format_mismatch(resume)),
+        })
+    }
+
+    /// `resume` as the Qwen3.5 hybrid path's [`PrefixSource`].
+    fn hybrid_prefix<'a>(
+        &self,
+        resume: Resume<'a>,
+        copy_ms: &'a Cell<Option<f64>>,
+    ) -> Result<Option<HybridPrefix<'a>>, ReflexError> {
+        Ok(match resume {
+            Resume::Fresh => None,
+            Resume::File(ImportedKv::Hybrid(c)) => Some(PrefixSource::Host(c)),
+            Resume::Pinned(PinnedPrefix {
+                state: DeviceState::Hybrid(d),
+            }) => Some(PrefixSource::Device { state: d, copy_ms }),
+            _ => return Err(self.prefix_format_mismatch(resume)),
+        })
+    }
+
+    /// `resume` as the MLA path's [`PrefixSource`].
+    fn mla_prefix<'a>(
+        &self,
+        resume: Resume<'a>,
+        copy_ms: &'a Cell<Option<f64>>,
+    ) -> Result<Option<MlaPrefix<'a>>, ReflexError> {
+        Ok(match resume {
+            Resume::Fresh => None,
+            Resume::File(ImportedKv::Mla(c)) => Some(PrefixSource::Host(c)),
+            Resume::Pinned(PinnedPrefix {
+                state: DeviceState::Mla(d),
+            }) => Some(PrefixSource::Device { state: d, copy_ms }),
+            _ => return Err(self.prefix_format_mismatch(resume)),
         })
     }
 }

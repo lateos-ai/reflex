@@ -110,6 +110,22 @@ What has been built, in order. Measurements live in
     faults in reading the file into fresh memory.
 
   See [docs/design/agent-relay.md](docs/design/agent-relay.md#multi-process-chains-phase-d).
+- **System-1 scoring over a resumed prefix.** A `reflex stdio`/`uds` request with
+  `candidates` can now set `use_pinned` or `import_kv`. It scores the candidates after
+  the cached prefix plus `prompt`, and gives the token ids and `chosen` of one request
+  over the joined text, with scores equal up to float summation order. This works on
+  dense, MoE, MLA and the Qwen3.5 hybrid (single-token candidates); Gemma 4 and
+  Granite 4.0-H return `unsupported_architecture` with a prefix. `pin_prefix` and
+  `export_kv` stay generate-only.
+  - Every `candidates` response gains `chosen`, the index of the most probable
+    candidate.
+  - With `"timings": true`, every response reports the pinned slot after the request:
+    `pinned_seq_len` and `pinned_bytes`. Without it, responses are unchanged.
+  - `agent_relay_bench.py --system1 <labels>` adds a routing request to every turn.
+    On a T4 with Qwen3-0.6B and a ~1,490-token shared prompt, routing against the
+    pinned prefix takes 45 ms, against 285 ms over the whole prompt.
+
+  See [docs/design/agent-relay.md](docs/design/agent-relay.md#system-1-over-a-resumed-prefix-phase-e).
 
 ## 2026-10-15
 

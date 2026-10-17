@@ -50,6 +50,8 @@ The benchmark asks the engine for its own split, so overhead isn't guessed. When
 - `model_ms`: the whole model call. On a streaming request it includes writing each
   token line, because those writes happen inside the decode loop.
 
+Later phases added `kv_io_ms` (phases A and B), `mask_ms_total` (phase C), and
+`pinned_seq_len`/`pinned_bytes`, the pinned slot's size after the request (phase E).
 When the field is omitted (the default), responses are byte-identical to before.
 
 ### Example
@@ -109,8 +111,9 @@ A `generate` request on `reflex stdio`/`uds` can name two cache files:
 The files use the same formats as `reflex generate --export-kv/--import-kv`: dense/MoE
 (Qwen3, Qwen2, Llama, Mistral, Kolibri), the Qwen3.5 hybrid and MLA. Gemma 4 and
 Granite 4.0-H have no cache format yet and return `unsupported_architecture`. A file
-from a different architecture returns `kv_cache`. Both fields on a `candidates`
-request return `invalid_input`.
+from a different architecture returns `kv_cache`. `export_kv` on a `candidates`
+request returns `invalid_input`; `import_kv` there resumes System-1 scoring (phase E,
+below).
 
 An export captures exactly one generated token's worth of work: the state after the
 prompt. It can't come from a longer generation, because the Qwen3.5 hybrid's
@@ -258,7 +261,7 @@ Errors:
 | `use_pinned` with nothing pinned | `invalid_input` |
 | `pin_prefix` without `"max_tokens": 1` | `invalid_input` |
 | `pin_prefix`/`use_pinned` together with `import_kv`/`export_kv` | `invalid_input` |
-| `pin_prefix`/`use_pinned` on a `candidates` request | `invalid_input` |
+| `pin_prefix` on a `candidates` request (`use_pinned` is allowed since phase E) | `invalid_input` |
 | `pin_prefix`/`use_pinned` on Gemma 4 or Granite 4.0-H | `unsupported_architecture` |
 | a use whose own cache can't be allocated | `out_of_memory` |
 
@@ -757,11 +760,153 @@ cost nothing measurable. Two caveats belong with phase F:
 Raw data: `bench-results/agent-relay-t4-phase-d/` (not committed; `time-*` and
 `energy-*` JSON per target, `pf-*.time` for the page faults).
 
+## System-1 over a resumed prefix (phase E)
+
+System-1 scores a few candidate continuations of a prompt in one forward pass, with no
+decode loop (`Model::system1_evaluate`). In a relay it answers the small questions
+between hops: which agent should act next, whether a note is done, which of A to D
+applies. Each question is asked after the same long shared prompt the agents use. Phase
+E lets a `candidates` request resume from that prompt's cached state instead of
+prefilling it again.
+
+| field on a `candidates` request | effect |
+|---|---|
+| `"use_pinned": true` | scores after the session's pinned prefix; `prompt` is the continuation |
+| `"import_kv": "<path>"` | scores after that cache file's state; `prompt` is the continuation |
+
+```jsonl
+{"prompt": "<team rules>", "pin_prefix": true, "max_tokens": 1}
+{"prompt": "Previous note: ...\nThe agent who should act on this note next is the", "use_pinned": true,
+ "candidates": [" planner", " coder", " reviewer"], "timings": true}
+{"prompt": "Previous note: ...\nYou are the coder. Your note:", "use_pinned": true, "max_tokens": 64}
+```
+
+How it works:
+
+- **One prefix path for generating and scoring.** `Model::system1_evaluate_resumed`
+  maps a `Resume` onto each architecture's prefix source, the same mapping
+  `generate_resumed` uses. The dense/MoE, MLA and Qwen3.5 hybrid System-1 functions
+  then call the same batched prefill as generation, which seeds the request's own
+  cache from the file or the slot. `system1_evaluate` is the fresh case
+  (`Resume::Fresh`), so a request without a prefix runs exactly as before.
+- **The pinned state is never written.** Multi-token candidates are scored by teacher
+  forcing their own tokens after the prompt. Those positions go into the request's
+  copy of the cache, past the prefix, so one pin serves any number of scoring and
+  generating requests.
+- **Candidates are tokenized as continuations.** The prompt and each `prompt +
+  candidate` are encoded with the state the cached prefix ended on
+  (`Tokenizer::encode_continuation`). On a SentencePiece model, that decides whether
+  the continuation gets a dummy-prefix space, exactly as for a joined request.
+- **The prompt must add at least one token.** The scores come from the last position
+  of this request's own prefill. The final hidden state of the cached prefix isn't
+  kept, so an empty continuation returns `invalid_input`.
+- **The Qwen3.5 hybrid takes single-token candidates**, after a prefix as without one.
+  Scoring a multi-token candidate would need the recurrent state copied again for every
+  candidate, so it returns `invalid_input`.
+- **Gemma 4 and Granite 4.0-H** have no prefix-state format yet. They still score fresh
+  prompts and return `unsupported_architecture` with a prefix, before reading any file.
+
+The response:
+
+- **`chosen`** is the index of the highest-probability candidate (the first on a tie).
+  It is on every `candidates` response, with or without a prefix. Generate responses
+  don't have it.
+- **Slot facts.** With `"timings": true`, every response, generating or scoring, reports
+  the slot as it is after the request: `pinned_seq_len` (positions held, 0 when empty)
+  and `pinned_bytes` (VRAM held). With them an orchestrator can weigh keeping the pin
+  against recomputing the prefix or writing a cache file. Without `timings`, responses
+  are byte-identical to before.
+- **`kv_io_ms`** on a resumed `candidates` request is the device-to-device copy of the
+  pinned prefix, or the file read, as on the generate path.
+
+Errors on a `candidates` request:
+
+| request | `error_kind` |
+|---|---|
+| `pin_prefix` or `export_kv` | `invalid_input` (scoring writes past the prompt, so there's no state right after it to keep) |
+| `use_pinned` together with `import_kv` | `invalid_input` |
+| `use_pinned` with nothing pinned | `invalid_input` |
+| an empty continuation | `invalid_input` |
+| a multi-token candidate on the Qwen3.5 hybrid | `invalid_input` |
+| `use_pinned` or `import_kv` on Gemma 4 or Granite 4.0-H | `unsupported_architecture` |
+| `json_schema` | `invalid_input` |
+
+`scripts/agent_relay_bench.py --system1 <labels>` starts every turn with a System-1
+routing request: it scores the comma-separated labels after the previous note and
+"The agent who should act on this note next is the". With `--pin-prefix` the request
+resumes from the pinned system prompt, with `--reuse-prefix` from its cache file, and
+otherwise it sends the whole prompt. The generate hop follows, as before.
+
+### Results (Tesla T4, 2026-10-17)
+
+**Correctness.** `src/ipc/relay_tests.rs` scores the same candidates after a pinned
+prefix, after the same prefix's cache file, from the slot a second time, and over the
+joined text. The resumed requests give the joined request's token ids and `chosen`,
+and its scores up to float summation order. The resumed prefill runs fewer rows than
+the joined one, so a few kernels add in a different order, as in the
+batched-against-sequential prefill tests:
+
+| model | weights | largest score difference |
+|---|---|---:|
+| Qwen3-MoE fixture | f32 | 0 (bit-identical) |
+| MLA fixture | f32 | 5e-10 (1 ulp) |
+| Qwen3.5-MoE hybrid fixture, single-token candidates | f32 | 7e-8 (10 ulps) |
+| Qwen3-0.6B, candidates of 1 to 5 tokens | f16 | 4.9e-3, on scores up to 95 |
+| TinyLlama-1.1B-Chat (SentencePiece), after raw text and after `</s>` | f16 | 2.6e-3 |
+
+The f32 checks allow 1e-5 relative and the f16 ones 5e-3. The tests also cover the
+hybrid's multi-token rejection, Gemma 4 and Granite 4.0-H rejecting a prefix while still
+scoring fresh prompts, and the request errors, none of which changes the slot.
+
+**Unchanged without the new fields.** The same requests (generate, streaming,
+sampling, `json_schema`, fresh candidates, pin and use, errors) sent to `reflex stdio`
+built from this branch and from master give byte-identical lines on Qwen3-0.6B,
+TinyLlama and Qwen3.5-0.8B, apart from the new `chosen` on candidates lines. The phase 0
+bench gives the same 30 texts. Cold start is unchanged: interleaved
+`bench_cold_start_phases.sh` runs, 5 rounds of 2 runs per build, give a median
+first token of 630 ms on master and 635 ms here, with rounds spread over 624 to
+641 ms. The GPU nightly suite passes.
+
+**The routing hop.** `agent_relay_bench.py --system1
+planner,researcher,coder,reviewer,tester,summarizer`: Qwen3-0.6B Q4_K_M (f16 weights),
+30 turns after 3 warm-up turns, 6 labels of one token each, 32 greedy tokens per
+generate hop. p50 of the second of two identical rounds (the first agreed within
+1 ms):
+
+| prefix | System-1 hop from | routing round trip | prefix read/copy | generate round trip | turn |
+|---|---|---:|---:|---:|---:|
+| short (~40 tokens) | the whole prompt | 22.0 ms | | 230.7 ms | 252.6 ms |
+| short | the pinned prefix | 21.4 ms | 0.2 ms | 230.8 ms | 252.2 ms |
+| long (~1,490 tokens) | the whole prompt | 284.8 ms | | 509.3 ms | 793.6 ms |
+| long | its cache file | 228.9 ms | 107.0 ms | 478.9 ms | 707.7 ms |
+| long | the pinned prefix | 45.3 ms | 4.4 ms | 294.6 ms | 339.9 ms |
+
+What this shows:
+
+- **With a long shared prompt, routing against the pin costs 45 ms instead of 285.**
+  The copy is 4.4 ms. The rest is prefilling the note and the question over 1,490
+  cached positions, plus the LM-head gather for the 6 labels. A whole turn, routing plus
+  generating, drops from 794 to 340 ms.
+- **A file still pays its read.** 107 ms of the file route's 229 ms is the read; the
+  upload into the cache is most of the rest, as phase D found for generation.
+- **With a short prompt there's nothing to save.** Prefilling 40 tokens costs about
+  what copying them does, so both routes take ~22 ms, under a tenth of the generate
+  hop.
+- **The decisions match.** Within each prefix the pinned, file and fresh routes chose
+  the same label on all 30 turns, with probabilities within 2e-12, and the generate
+  hops gave the same 30 texts. (Qwen3-0.6B picks "summarizer" on every turn; the bench
+  measures the hop, not the router's quality.)
+
+Raw data: `bench-results/agent-relay-t4-phase-e/` (not committed). `run_e.log` and
+`phase-e-out/` hold the bench, byte-identity (`ident/`) and cold-start runs;
+`rerun_e.log` and `phase-e-out2/` hold the relay tests and the nightly run on the
+final test file.
+
 ## Planned next phases
 
-Round 2 is planned in [agent-relay-round2.md](agent-relay-round2.md): System-1
-scoring over a resumed prefix, smaller cache files (phase F, whose gate phase D
-passed), the sidecar's `response_format`, and composition examples.
+Round 2 is planned in [agent-relay-round2.md](agent-relay-round2.md): smaller cache
+files (phase F, whose gate phase D passed), the sidecar's `response_format`, and
+composition examples.
 
 ## Swarm pattern
 

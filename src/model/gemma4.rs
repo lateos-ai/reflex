@@ -838,7 +838,7 @@ impl Model {
         }
         let resolved: Vec<Vec<u32>> = candidates
             .iter()
-            .map(|c| self.resolve_candidate_token_ids(prompt, &c.text))
+            .map(|c| self.resolve_candidate_token_ids(prompt, &c.text, true))
             .collect::<Result<_, _>>()?;
         let max_len = resolved.iter().map(Vec::len).max().unwrap_or(1);
 
