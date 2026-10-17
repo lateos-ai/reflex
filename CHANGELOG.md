@@ -96,6 +96,20 @@ What has been built, in order. Measurements live in
 
   See [docs/design/agent-relay.md](docs/design/agent-relay.md) and
   [docs/reference.md](docs/reference.md#json-schema-output).
+- **Multi-process relay chains and energy.** `scripts/agent_relay_bench.py` gains
+  cold targets, where every hop is a fresh process: `cold`, `cold-chain` (resuming a
+  shared prefix through `--import-kv`), `cold-warm` (a cold export imported by a warm
+  `reflex stdio`) and `llama-cli` (llama.cpp's completion tool, optionally with its
+  `--prompt-cache`). With `--energy` it measures GPU joules per hop through
+  `reflex-energy`. `reflex generate`'s `REFLEX_GENERATE_OK` line gains `kv_io_ms`, the
+  cache file's read or write time; the `--json` schema is now 1.2.0.
+  - On a T4 with Qwen3-0.6B, a cold hop takes 1,048 ms, against 1,466 ms for
+    llama.cpp's, and 230 ms warm.
+  - With a ~1,490-token prefix, resuming a cold hop from its 342 MB cache file
+    (1,499 ms) is slower than recomputing the prefix (1,322 ms). That's mostly page
+    faults in reading the file into fresh memory.
+
+  See [docs/design/agent-relay.md](docs/design/agent-relay.md#multi-process-chains-phase-d).
 
 ## 2026-10-15
 

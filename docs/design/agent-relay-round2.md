@@ -69,6 +69,12 @@ Each phase gets its own branch and PR, verified on a T4.
 
 ### Phase D: measure multi-process chains and energy (first; decides F)
 
+**Done 2026-10-17.** Results are in [agent-relay.md](agent-relay.md), "Multi-process
+chains (phase D)". F's gate passes for the ~1,490-token prefix: file read plus upload
+is about 24% of a `cold-chain` hop and 27% of a `cold-warm` hop. But f16 files alone
+would only tie recomputing the prefix in a cold process, and most of the cold read is
+page faults on a freshly allocated buffer.
+
 `scripts/agent_relay_bench.py` gets two new targets:
 - **`cold-chain`.** Every hop is a fresh `reflex generate` process with
   `--import-kv`/`--export-kv`. An export needs `max_tokens` 1, so if the CLI can't
@@ -134,6 +140,10 @@ on every agent turn.
   read.
 - **Gate:** in phase D's cold chains, file read plus upload is more than about 20% of a
   hop. If it isn't, the numbers get recorded and this phase is skipped.
+- **Gate result (phase D):** passes (24% and 27%). Phase D also found that a cold
+  process reads the file 2.6× slower than a warm one (284 against 110 ms), from
+  faulting in the read buffer. Fixing that is format-independent, and is worth
+  weighing alongside f16 or before it.
 
 ### Phase G: sidecar surface
 
