@@ -913,7 +913,8 @@ def main(argv=None):
     )
     print_table(label, summary, len(samples))
     if setup is not None:
-        print("\nsetup (one cold process): " + ", ".join(f"{k}={v:.2f}" for k, v in setup.items()))
+        fields = (f"{k}={v:.2f}" for k, v in setup.items() if v is not None)
+        print("\nsetup (one cold process): " + ", ".join(fields))
     if energy_bracket is not None:
         print(
             f"\nenergy over the measured hops (one bracket): "
