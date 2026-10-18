@@ -1945,7 +1945,7 @@ public PR, T4-verified.
 - [x] **G: sidecar.** Map `response_format: json_schema` onto IPC `json_schema`,
   keeping property order. `/v1/classify` passes `chosen`/`entropy` through. No
   pin/slot/file fields over HTTP. **Done 2026-10-18, local branch
-  `agent-relay-phase-g` (from 452fc37), not pushed; public PR is the user's call.**
+  `agent-relay-phase-g` (from 452fc37); PUBLIC PR #42 opened 2026-10-18 (github branch `agent-relay-phase-g`, one commit a2702d4 on github/master fcb1d83, cherry-picked from dad31cb; worktree `../reflex-public-g`). User merges.**
     - Schema kept as `Box<RawValue>` (axum already enables `raw_value`; no
       `preserve_order` anywhere), whitespace stripped by `openai::compact_json`
       (a pretty-printed schema would otherwise break the one-line IPC framing).
