@@ -1,6 +1,7 @@
 # Agent relay, round 2: composable hops for inter-agent communication
 
-Status: planned (2026-10-16). Builds on agent relay phases 0 to C
+Status: done (planned 2026-10-16, phases D to H done by 2026-10-18). Builds on agent
+relay phases 0 to C
 ([agent-relay.md](agent-relay.md)).
 
 ## Why
@@ -175,6 +176,18 @@ G)". `{"type": "json_object"}` maps to the permissive schema `{"type": "object"}
   uses them.
 
 ### Phase H: composition docs and examples
+
+**Done (2026-10-18). This completes round 2.** See [agent-relay.md](agent-relay.md),
+"Composing agents (phase H)". Changes from this plan:
+- `reflex generate` can't import and export in one run, and `reflex system1` doesn't
+  resume. So `relay_chain.sh` exports the shared prefix once, and every later hop
+  imports it.
+- The worker's export is a second request over its role, the task and the handoff:
+  IPC rejects `json_schema` and `use_pinned` together with `export_kv`.
+- The cold sub-agent's envelope is built from `reflex generate --json`. The envelope
+  has optional `agent` and `hop` fields from the orchestrator.
+
+The plan as written:
 
 - A "Composing agents" section in [agent-relay.md](agent-relay.md), covering what
   belongs in Reflex and what belongs outside it. The out-of-scope list above is the

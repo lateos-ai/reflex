@@ -1212,10 +1212,50 @@ letter.
 - `examples/relay_chain.sh` (POSIX sh) is the cold version: every hop is a fresh
   process and hops hand off through files.
 
+### Results (Tesla T4, 2026-10-18)
+
+Setup as in phase D: Qwen3-0.6B Q4_K_M, `REFLEX_CUDA_ARCH=sm_75`, driver 595.91.07,
+cache files on `/dev/shm`, Python 3.10, greedy throughout, 64 tokens maximum per
+generating hop.
+
+**Correctness.** Both examples were run with f16 and with f32 weights, and the Python
+one also with an f16 cache file:
+- every envelope validated against the schema;
+- the router's `chosen` was the argmax of its candidates' probabilities;
+- the worker's handoff parsed as JSON (44 tokens, keys in schema order), and the shell
+  chain's decoded handoff file was byte-identical to the envelope's carry;
+- the cold sub-agent's 64 resumed token ids matched a fresh run over the joined text
+  without the file, with f32 weights and with f16 weights.
+
+**Wall time per hop**, p50 of 5 runs, f16 weights. A warm hop is the request's round
+trip; a cold hop is the process from spawn to exit, including its ~410 ms load.
+
+| example | hop | wall | first token | prefix read/copy | notes |
+|---|---|---:|---:|---:|---|
+| `relay_orchestrator.py` | router, System-1 over its pin (3 labels) | 12.5 ms | | 0.2 ms | 41 pinned positions, 9.6 MB |
+| `relay_orchestrator.py` | worker, JSON handoff over its pin, then export | 438.7 ms | 72.8 ms | | handoff 385 ms (44 tokens, masks 14.4 ms); export 53 ms, its write 11.4 ms |
+| `relay_orchestrator.py` | cold sub-agent, `--import-kv` the worker's file | 1,218 ms | 658 ms | 13.6 ms | 64 tokens |
+| `relay_chain.sh` | router, fresh `reflex system1` | 543 ms | | | |
+| `relay_chain.sh` | worker, `--import-kv` + `--json-schema` | 1,124 ms | 731 ms | 6.4 ms | |
+| `relay_chain.sh` | cold sub-agent, `--import-kv` | 1,231 ms | 672 ms | 6.4 ms | 64 tokens |
+
+- **The warm hops are the cheap ones.** Routing against the pin costs 12.5 ms, about
+  a fortieth of a cold `reflex system1` process (543 ms). Each warm process pays
+  about 250 ms once, on its first request (pinning the role), and nothing per hop
+  after that.
+- **A cold hop costs what phase D measured**, about 410 ms of load plus a first
+  forward pass of ~250 ms, then decode (the sub-agent's 64 tokens here against 32 in
+  phase D's 1,048 ms short cold hop). Resuming from a short file costs 6 to 14 ms.
+- **The worker's export is cheap with a short role.** Prefilling its role, the task and
+  the handoff again and writing the file takes 53 ms, against 385 ms for the handoff
+  itself.
+
+Raw data: `bench-results/agent-relay-t4-phase-h/` (not committed).
+
 ## Planned next phases
 
-Round 2 is planned in [agent-relay-round2.md](agent-relay-round2.md). Phases F, G and
-H are done (above).
+Round 2 ([agent-relay-round2.md](agent-relay-round2.md)) is complete: phases D to H
+are above. Decode speed is a separate track ([decode-speed.md](decode-speed.md)).
 
 ## Swarm pattern
 
