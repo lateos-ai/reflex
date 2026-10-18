@@ -38,6 +38,9 @@ rationale [below](#the-full-rationale):
   talks to the engine over local IPC. The engine itself may only grow sequential,
   non-network interfaces (`reflex stdio`, `reflex uds`) and in-process bindings (the C
   FFI, the PyO3 module). These always target GPU 0.
+- **Agents are composed outside the engine.** Routing, envelopes, carry text and
+  handoff files belong to the orchestrator; the engine only reports each request's
+  facts (see [design/agent-relay.md](design/agent-relay.md#composing-agents-phase-h)).
 
 ### The full rationale
 
