@@ -710,6 +710,7 @@ impl Model {
             attn_tiled: TiledAttnKernels::from_env()?,
             attn_decode: DecodeAttnKernels::from_env()?,
             decode_ops: DecodeOpKernels::from_env()?,
+            decode_ws: DecodeWorkspaceSlot::from_env()?,
             add_k,
             split_qg_k,
             sigmoid_gate_k,
@@ -1990,12 +1991,24 @@ impl Model {
             &picker.stream_text(&self.tokenizer, &mut pending_bytes, next_id),
         );
 
+        let use_ws = self.decode_ws_enabled();
+        let mut logits = Vec::new();
         while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
-            hidden =
-                self.forward_one_token_dense(next_id, position, &mut k_caches, &mut v_caches)?;
+            if use_ws {
+                self.decode_step_dense_ws(
+                    next_id,
+                    position,
+                    &mut k_caches,
+                    &mut v_caches,
+                    &mut logits,
+                )?;
+            } else {
+                hidden =
+                    self.forward_one_token_dense(next_id, position, &mut k_caches, &mut v_caches)?;
+                logits =
+                    self.lm_head_logits(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
+            }
             position += 1;
-            let mut logits =
-                self.lm_head_logits(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
             next_id = picker.pick(&mut logits)?;
             generated.push(next_id);
             on_token(

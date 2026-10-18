@@ -485,7 +485,7 @@ const ATTN_ONLINE_MAX_DIM: usize = 1024;
 /// A decode step splits its positions across blocks once there are more than this
 /// many per block, up to `ATTN_ONLINE_MAX_SPLITS` blocks per head.
 const ATTN_ONLINE_SPLIT_POSITIONS: usize = 256;
-const ATTN_ONLINE_MAX_SPLITS: usize = 64;
+pub(super) const ATTN_ONLINE_MAX_SPLITS: usize = 64;
 
 /// Loads a kernel and its f16-weight variant from one AOT module (one module
 /// load, two function lookups).
@@ -525,6 +525,7 @@ impl Model {
     /// heads. `s` must be a single row with `qk_dim == v_dim` and a kernel from
     /// [`attn_decode_kernel_index`]; the caller checks. Same output as
     /// [`Self::attention_online`]; only the f32 summation order differs.
+    #[cfg(test)]
     pub(super) fn attention_decode_gqa(
         &self,
         q: &CudaSlice<f32>,
@@ -533,6 +534,26 @@ impl Model {
         s: &OnlineAttnShape,
         kernel_index: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
+        let out = self.alloc_out(s.num_q_heads * s.v_dim, "attn_decode")?;
+        self.attention_decode_gqa_to(q, k, v, s, kernel_index, *out.device_ptr(), None)?;
+        Ok(out)
+    }
+
+    /// [`Self::attention_decode_gqa`] into the `num_q_heads * v_dim` floats at
+    /// `out`. A split decode writes its partials to `partial` when given (at least
+    /// `num_q_heads * ATTN_ONLINE_MAX_SPLITS * (v_dim + 2)` floats), else to a
+    /// buffer allocated here.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attention_decode_gqa_to(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaView<f32>,
+        v: &CudaView<f32>,
+        s: &OnlineAttnShape,
+        kernel_index: usize,
+        out: u64,
+        partial: Option<u64>,
+    ) -> Result<(), ReflexError> {
         let kernel = &self.attn_decode.kernels(&self.device)?[kernel_index];
         let heads_per_block = ATTN_DECODE_SHAPES[kernel_index].1;
         let seq_len = s.start_pos + 1;
@@ -551,26 +572,32 @@ impl Model {
             block_dim: (ATTN_DECODE_THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
-        let mut out = self.alloc_out(s.num_q_heads * s.v_dim, "attn_decode")?;
         if num_splits == 1 {
             unsafe {
                 kernel
                     .function
                     .clone()
-                    .launch(cfg, (q, k, v, &mut out, params))
+                    .launch(cfg, (q, k, v, out, params))
                     .map_err(|e| crate::gpu_err!(e, "attn_decode launch: {e}"))?;
             }
-            return Ok(out);
+            return Ok(());
         }
-        let mut partial = self.alloc_out(
-            s.num_q_heads * num_splits * (s.v_dim + 2),
-            "attn_decode partial",
-        )?;
+        let owned;
+        let partial = match partial {
+            Some(p) => p,
+            None => {
+                owned = self.alloc_out(
+                    s.num_q_heads * num_splits * (s.v_dim + 2),
+                    "attn_decode partial",
+                )?;
+                *owned.device_ptr()
+            }
+        };
         unsafe {
             kernel
                 .function
                 .clone()
-                .launch(cfg, (q, k, v, &mut partial, params))
+                .launch(cfg, (q, k, v, partial, params))
                 .map_err(|e| crate::gpu_err!(e, "attn_decode launch: {e}"))?;
             self.attn_online_combine_k
                 .function
@@ -582,8 +609,8 @@ impl Model {
                         shared_mem_bytes: 0,
                     },
                     (
-                        &partial,
-                        &mut out,
+                        partial,
+                        out,
                         s.num_q_heads as u32,
                         s.v_dim as u32,
                         num_splits as u32,
@@ -591,7 +618,7 @@ impl Model {
                 )
                 .map_err(|e| crate::gpu_err!(e, "attn_decode combine launch: {e}"))?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Runs `attention_online_kernel` (and, for a split decode, its combine kernel):
@@ -605,6 +632,23 @@ impl Model {
         v: &CudaView<f32>,
         s: OnlineAttnShape,
     ) -> Result<CudaSlice<f32>, ReflexError> {
+        let out = self.alloc_out(s.rows * s.num_q_heads * s.v_dim, "attn_online")?;
+        self.attention_online_to(q, k, v, s, *out.device_ptr(), None)?;
+        Ok(out)
+    }
+
+    /// [`Self::attention_online`] into the `rows * num_q_heads * v_dim` floats at
+    /// `out`; `partial` as in [`Self::attention_decode_gqa_to`] (`rows` times as
+    /// many floats).
+    pub(super) fn attention_online_to(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaView<f32>,
+        v: &CudaView<f32>,
+        s: OnlineAttnShape,
+        out: u64,
+        partial: Option<u64>,
+    ) -> Result<(), ReflexError> {
         if s.qk_dim > ATTN_ONLINE_MAX_DIM || s.v_dim > ATTN_ONLINE_MAX_DIM {
             return Err(crate::reflex_err!(
                 UnsupportedArchitecture,
@@ -642,26 +686,32 @@ impl Model {
             shared_mem_bytes: ((s.qk_dim + ATTN_ONLINE_WARPS * (s.v_dim + 2))
                 * std::mem::size_of::<f32>()) as u32,
         };
-        let mut out = self.alloc_out(s.rows * s.num_q_heads * s.v_dim, "attn_online")?;
         if num_splits == 1 {
             unsafe {
                 self.attn_online_k
                     .function
                     .clone()
-                    .launch(cfg, (q, k, v, &mut out, params))
+                    .launch(cfg, (q, k, v, out, params))
                     .map_err(|e| crate::gpu_err!(e, "attn_online launch: {e}"))?;
             }
-            return Ok(out);
+            return Ok(());
         }
-        let mut partial = self.alloc_out(
-            s.rows * s.num_q_heads * num_splits * (s.v_dim + 2),
-            "attn_online partial",
-        )?;
+        let owned;
+        let partial = match partial {
+            Some(p) => p,
+            None => {
+                owned = self.alloc_out(
+                    s.rows * s.num_q_heads * num_splits * (s.v_dim + 2),
+                    "attn_online partial",
+                )?;
+                *owned.device_ptr()
+            }
+        };
         unsafe {
             self.attn_online_k
                 .function
                 .clone()
-                .launch(cfg, (q, k, v, &mut partial, params))
+                .launch(cfg, (q, k, v, partial, params))
                 .map_err(|e| crate::gpu_err!(e, "attn_online launch: {e}"))?;
             self.attn_online_combine_k
                 .function
@@ -673,8 +723,8 @@ impl Model {
                         shared_mem_bytes: 0,
                     },
                     (
-                        &partial,
-                        &mut out,
+                        partial,
+                        out,
                         s.num_q_heads as u32,
                         s.v_dim as u32,
                         num_splits as u32,
@@ -682,7 +732,7 @@ impl Model {
                 )
                 .map_err(|e| crate::gpu_err!(e, "attn_online_combine launch: {e}"))?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// `x` is already device-resident (Phase 2 round 2) -- unlike the
@@ -696,8 +746,21 @@ impl Model {
         hidden_size: usize,
         eps: f32,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let mut dev_out = self.alloc_out(x.len(), "rmsnorm")?;
+        let dev_out = self.alloc_out(x.len(), "rmsnorm")?;
+        self.rmsnorm_to(x, weight, rows, hidden_size, eps, *dev_out.device_ptr())?;
+        Ok(dev_out)
+    }
 
+    /// [`Self::rmsnorm`] into the `rows * hidden_size` floats at `out`.
+    pub(super) fn rmsnorm_to(
+        &self,
+        x: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        rows: usize,
+        hidden_size: usize,
+        eps: f32,
+        out: u64,
+    ) -> Result<(), ReflexError> {
         // One block per row (see rmsnorm.cu), staging the row in shared memory
         // when it fits the default 48 KB (less the kernel's static shared float).
         let row_bytes = hidden_size * std::mem::size_of::<f32>();
@@ -716,18 +779,11 @@ impl Model {
                 .clone()
                 .launch(
                     launch_cfg,
-                    (
-                        x,
-                        weight,
-                        &mut dev_out,
-                        rows as u32,
-                        hidden_size as u32,
-                        eps,
-                    ),
+                    (x, weight, out, rows as u32, hidden_size as u32, eps),
                 )
                 .map_err(|e| crate::gpu_err!(e, "rmsnorm launch: {e}"))?;
         }
-        Ok(dev_out)
+        Ok(())
     }
 
     /// One row's residual add then RMSNorm: `hidden += delta`, returning
@@ -742,6 +798,28 @@ impl Model {
         hidden_size: usize,
         eps: f32,
     ) -> Result<CudaSlice<f32>, ReflexError> {
+        let dev_out = self.alloc_out(hidden_size, "add_rmsnorm")?;
+        self.residual_rmsnorm_to(
+            hidden,
+            delta,
+            weight,
+            hidden_size,
+            eps,
+            *dev_out.device_ptr(),
+        )?;
+        Ok(dev_out)
+    }
+
+    /// [`Self::residual_rmsnorm`] into the `hidden_size` floats at `out`.
+    pub(super) fn residual_rmsnorm_to(
+        &self,
+        hidden: &mut CudaSlice<f32>,
+        delta: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        hidden_size: usize,
+        eps: f32,
+        out: u64,
+    ) -> Result<(), ReflexError> {
         let fused = self
             .decode_ops
             .kernel(&self.device, DECODE_OP_ADD_RMSNORM, hidden_size)?;
@@ -749,9 +827,8 @@ impl Model {
             fused.filter(|_| hidden.len() == hidden_size && delta.len() == hidden_size)
         else {
             self.add_inplace(hidden, delta)?;
-            return self.rmsnorm(hidden, weight, 1, hidden_size, eps);
+            return self.rmsnorm_to(hidden, weight, 1, hidden_size, eps, out);
         };
-        let mut dev_out = self.alloc_out(hidden_size, "add_rmsnorm")?;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (rmsnorm_block_dim(hidden_size), 1, 1),
@@ -761,13 +838,10 @@ impl Model {
             kernel
                 .function
                 .clone()
-                .launch(
-                    cfg,
-                    (hidden, delta, weight, &mut dev_out, hidden_size as u32, eps),
-                )
+                .launch(cfg, (hidden, delta, weight, out, hidden_size as u32, eps))
                 .map_err(|e| crate::gpu_err!(e, "add_rmsnorm launch: {e}"))?;
         }
-        Ok(dev_out)
+        Ok(())
     }
 
     /// Two per-head RMSNorms with the same width (Qwen3's Q-Norm and K-Norm):
@@ -785,18 +859,45 @@ impl Model {
         width: usize,
         eps: f32,
     ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), ReflexError> {
+        let o1 = self.alloc_out(x1.len(), "rmsnorm_pair")?;
+        let o2 = self.alloc_out(x2.len(), "rmsnorm_pair")?;
+        self.rmsnorm_pair_to(
+            x1,
+            w1,
+            rows1,
+            x2,
+            w2,
+            rows2,
+            width,
+            eps,
+            (*o1.device_ptr(), *o2.device_ptr()),
+        )?;
+        Ok((o1, o2))
+    }
+
+    /// [`Self::rmsnorm_pair`] into the buffers at `out.0` (`rows1 * width`
+    /// floats) and `out.1` (`rows2 * width`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn rmsnorm_pair_to(
+        &self,
+        x1: &CudaSlice<f32>,
+        w1: &CudaSlice<f32>,
+        rows1: usize,
+        x2: &CudaSlice<f32>,
+        w2: &CudaSlice<f32>,
+        rows2: usize,
+        width: usize,
+        eps: f32,
+        out: (u64, u64),
+    ) -> Result<(), ReflexError> {
         let fused = self
             .decode_ops
             .kernel(&self.device, DECODE_OP_RMSNORM_PAIR, width)?;
         let Some(kernel) = fused.filter(|_| x1.len() == rows1 * width && x2.len() == rows2 * width)
         else {
-            return Ok((
-                self.rmsnorm(x1, w1, rows1, width, eps)?,
-                self.rmsnorm(x2, w2, rows2, width, eps)?,
-            ));
+            self.rmsnorm_to(x1, w1, rows1, width, eps, out.0)?;
+            return self.rmsnorm_to(x2, w2, rows2, width, eps, out.1);
         };
-        let mut o1 = self.alloc_out(x1.len(), "rmsnorm_pair")?;
-        let mut o2 = self.alloc_out(x2.len(), "rmsnorm_pair")?;
         let cfg = LaunchConfig {
             grid_dim: ((rows1 + rows2) as u32, 1, 1),
             block_dim: (rmsnorm_block_dim(width), 1, 1),
@@ -811,18 +912,18 @@ impl Model {
                     (
                         x1,
                         w1,
-                        &mut o1,
+                        out.0,
                         rows1 as u32,
                         x2,
                         w2,
-                        &mut o2,
+                        out.1,
                         width as u32,
                         eps,
                     ),
                 )
                 .map_err(|e| crate::gpu_err!(e, "rmsnorm_pair launch: {e}"))?;
         }
-        Ok((o1, o2))
+        Ok(())
     }
 
     /// `x` and `w_dev` are both already device-resident (Phase 2 round 2) --
@@ -843,13 +944,30 @@ impl Model {
             ));
         }
 
-        let mut dev_y = self.alloc_out(out_features, "gemv")?;
+        let dev_y = self.alloc_out(out_features, "gemv")?;
+        self.launch_gemv_dense(
+            &self.gemv_k,
+            x,
+            w_dev,
+            *dev_y.device_ptr(),
+            in_features,
+            out_features,
+        )?;
+        Ok(dev_y)
+    }
 
-        // One warp per output row (gemv_kernel's doc comment has the
-        // coalescing rationale) -- 256 threads/block = 8 warps/block, same
-        // total thread count per block as before this rewrite, just
-        // reinterpreted as 8 rows/block instead of 256 threads each doing
-        // one full row.
+    /// `gemv_kernel` / `gemv_f16_kernel` (whichever `kernel` is) into the
+    /// `out_features` floats at `y`. One warp per output row (gemv_kernel's doc
+    /// comment has the coalescing rationale) -- 256 threads/block = 8 rows/block.
+    fn launch_gemv_dense<X: DeviceRepr, W: DeviceRepr>(
+        &self,
+        kernel: &AotKernel,
+        x: X,
+        w: W,
+        y: u64,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<(), ReflexError> {
         let threads = 256u32;
         let warps_per_block = threads / WARP_SIZE;
         let blocks = (out_features as u32).div_ceil(warps_per_block).max(1);
@@ -859,22 +977,64 @@ impl Model {
             shared_mem_bytes: 0,
         };
         unsafe {
-            self.gemv_k
+            kernel
                 .function
                 .clone()
                 .launch(
                     launch_cfg,
-                    (
-                        x,
-                        w_dev,
-                        &mut dev_y,
-                        in_features as u32,
-                        out_features as u32,
-                    ),
+                    (x, w, y, in_features as u32, out_features as u32),
                 )
                 .map_err(|e| crate::gpu_err!(e, "gemv launch: {e}"))?;
         }
-        Ok(dev_y)
+        Ok(())
+    }
+
+    /// [`Self::gemv`] into the `w.shape[1]` floats at `y` instead of a new
+    /// buffer, for the decode workspace (`decode_step.rs`). Same kernels and
+    /// launch geometry as `gemv`, so the same bits. A weight type without a
+    /// pointer-output path here goes through `gemv` and a device copy.
+    pub(super) fn gemv_to(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+        y: u64,
+    ) -> Result<(), ReflexError> {
+        let in_features = w.shape[0] as usize;
+        let out_features = w.shape[1] as usize;
+        if x.len() != in_features {
+            return Err(crate::reflex_err!(
+                Other,
+                "gemv_to: x.len()={} != in_features={in_features}",
+                x.len()
+            ));
+        }
+        match &w.data {
+            WeightData::F32(data) => {
+                self.launch_gemv_dense(&self.gemv_k, x, data, y, in_features, out_features)
+            }
+            WeightData::F16(data) => self.launch_gemv_dense(
+                &self.gemv_f16_k,
+                x,
+                &data.slice(..),
+                y,
+                in_features,
+                out_features,
+            ),
+            WeightData::Quant {
+                ty: GgmlType::Q4K, ..
+            } if self.gemv_q4k_r1_k.is_some() => self.launch_gemv_q4k_r1(x, w, y),
+            WeightData::Quant {
+                ty: GgmlType::Q6K, ..
+            } => self.launch_gemv_q6k(x, w, y),
+            _ => {
+                let out = self.gemv(x, w)?;
+                // SAFETY: `y` holds `out_features` floats (the caller's buffer).
+                let mut dst = unsafe { self.device.upgrade_device_ptr::<f32>(y, out_features) };
+                let copied = self.device.dtod_copy(&out, &mut dst);
+                dst.leak();
+                copied.map_err(|e| crate::gpu_err!(e, "gemv_to copy: {e}"))
+            }
+        }
     }
 
     pub(super) fn gemv(
@@ -1025,6 +1185,14 @@ impl Model {
         x: &CudaSlice<f32>,
         w: &Weight,
     ) -> Result<CudaSlice<f32>, ReflexError> {
+        // Every output row is written (one warp per row).
+        let dev_y = self.alloc_out(w.shape[1] as usize, "gemv_q6k")?;
+        self.launch_gemv_q6k(x, w, *dev_y.device_ptr())?;
+        Ok(dev_y)
+    }
+
+    /// `gemv_q6k_kernel` into the `w.shape[1]` floats at `y`.
+    fn launch_gemv_q6k(&self, x: &CudaSlice<f32>, w: &Weight, y: u64) -> Result<(), ReflexError> {
         let in_features = w.shape[0] as usize;
         let out_features = w.shape[1] as usize;
         let kernel = self.gemv_q6k_k.as_ref().ok_or_else(|| {
@@ -1040,8 +1208,6 @@ impl Model {
                 x.len()
             ));
         }
-        // Every output row is written (one warp per row).
-        let mut dev_y = self.alloc_out(out_features, "gemv_q6k")?;
         let threads = 256u32;
         let warps_per_block = threads / WARP_SIZE;
         let launch_cfg = LaunchConfig {
@@ -1055,17 +1221,49 @@ impl Model {
                 .clone()
                 .launch(
                     launch_cfg,
-                    (
-                        x,
-                        w_ptr,
-                        &mut dev_y,
-                        in_features as u32,
-                        out_features as u32,
-                    ),
+                    (x, w_ptr, y, in_features as u32, out_features as u32),
                 )
                 .map_err(|e| crate::gpu_err!(e, "gemv_q6k launch: {e}"))?;
         }
-        Ok(dev_y)
+        Ok(())
+    }
+
+    /// `gemv_q4k_r1_kernel` (the one-row decode GEMV, 4 output rows per warp)
+    /// into the `w.shape[1]` floats at `y`. Requires `gemv_q4k_r1_k`.
+    fn launch_gemv_q4k_r1(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+        y: u64,
+    ) -> Result<(), ReflexError> {
+        let in_features = w.shape[0] as usize;
+        let out_features = w.shape[1] as usize;
+        let r1 = self.gemv_q4k_r1_k.as_ref().ok_or_else(|| {
+            ReflexError::Other("internal: gemv_q4k_r1_kernel not loaded".to_string())
+        })?;
+        let w_ptr = w
+            .quant_ptr()
+            .ok_or_else(|| ReflexError::Other("internal: gemv_q4k on an f32 weight".to_string()))?;
+        if x.len() != in_features || !in_features.is_multiple_of(QK_K) {
+            return Err(crate::reflex_err!(
+                Other,
+                "gemv_q4k: x.len()={} in_features={in_features} (must match, a multiple of {QK_K})",
+                x.len()
+            ));
+        }
+        let per_block = (GEMV_Q4K_R1_WARPS * GEMV_Q4K_R1_ROWS) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: ((out_features as u32).div_ceil(per_block).max(1), 1, 1),
+            block_dim: (GEMV_Q4K_R1_WARPS as u32 * WARP_SIZE, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            r1.function
+                .clone()
+                .launch(cfg, (x, w_ptr, y, in_features as u32, out_features as u32))
+                .map_err(|e| crate::gpu_err!(e, "gemv_q4k_r1 launch: {e}"))?;
+        }
+        Ok(())
     }
 
     /// `y[rows, out_features] = x[rows, in_features] @ w^T` straight from a
@@ -1095,32 +1293,10 @@ impl Model {
             ));
         }
         // Both kernels write every output element.
-        let mut dev_y = self.alloc_out(rows * out_features, "gemv_q4k")?;
-        if rows == 1 {
-            if let Some(r1) = &self.gemv_q4k_r1_k {
-                let per_block = (GEMV_Q4K_R1_WARPS * GEMV_Q4K_R1_ROWS) as u32;
-                let cfg = LaunchConfig {
-                    grid_dim: ((out_features as u32).div_ceil(per_block).max(1), 1, 1),
-                    block_dim: (GEMV_Q4K_R1_WARPS as u32 * WARP_SIZE, 1, 1),
-                    shared_mem_bytes: 0,
-                };
-                unsafe {
-                    r1.function
-                        .clone()
-                        .launch(
-                            cfg,
-                            (
-                                x,
-                                w_ptr,
-                                &mut dev_y,
-                                in_features as u32,
-                                out_features as u32,
-                            ),
-                        )
-                        .map_err(|e| crate::gpu_err!(e, "gemv_q4k_r1 launch: {e}"))?;
-                }
-                return Ok(dev_y);
-            }
+        let dev_y = self.alloc_out(rows * out_features, "gemv_q4k")?;
+        if rows == 1 && self.gemv_q4k_r1_k.is_some() {
+            self.launch_gemv_q4k_r1(x, w, *dev_y.device_ptr())?;
+            return Ok(dev_y);
         }
         let threads = 256u32;
         let warps_per_block = threads / WARP_SIZE;
@@ -1793,6 +1969,25 @@ impl Model {
         base: f32,
         rope_type: RopeType,
     ) -> Result<(), ReflexError> {
+        let t = *t.device_ptr();
+        self.rope_at(
+            t, num_heads, head_dim, rotary_dim, position, base, rope_type,
+        )
+    }
+
+    /// [`Self::rope`] on the `num_heads * head_dim` floats at `t` (a decode
+    /// workspace buffer or a K cache row).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn rope_at(
+        &self,
+        t: u64,
+        num_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        position: usize,
+        base: f32,
+        rope_type: RopeType,
+    ) -> Result<(), ReflexError> {
         let half_rotary = rotary_dim / 2;
         let total_pairs = (num_heads * half_rotary) as u32;
         let threads = 256u32;
@@ -2088,8 +2283,19 @@ impl Model {
         up: &CudaSlice<f32>,
         hidden_size: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let mut dev_out = self.alloc_out(hidden_size, "silu")?;
+        let dev_out = self.alloc_out(hidden_size, "silu")?;
+        self.silu_and_mul_to(gate, up, hidden_size, *dev_out.device_ptr())?;
+        Ok(dev_out)
+    }
 
+    /// [`Self::silu_and_mul`] into the `hidden_size` floats at `out`.
+    pub(super) fn silu_and_mul_to(
+        &self,
+        gate: &CudaSlice<f32>,
+        up: &CudaSlice<f32>,
+        hidden_size: usize,
+        out: u64,
+    ) -> Result<(), ReflexError> {
         let threads = 256u32;
         let blocks = (hidden_size as u32).div_ceil(threads).max(1);
         let launch_cfg = LaunchConfig {
@@ -2101,13 +2307,10 @@ impl Model {
             self.silu_k
                 .function
                 .clone()
-                .launch(
-                    launch_cfg,
-                    (gate, up, &mut dev_out, 1u32, hidden_size as u32),
-                )
+                .launch(launch_cfg, (gate, up, out, 1u32, hidden_size as u32))
                 .map_err(|e| crate::gpu_err!(e, "silu launch: {e}"))?;
         }
-        Ok(dev_out)
+        Ok(())
     }
 
     /// Causal single-new-query attention against the full K/V cache so far
@@ -2133,6 +2336,22 @@ impl Model {
         seq_len: usize,
         window: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
+        if self.attn_impl == AttnImpl::Online {
+            let out = self.alloc_out(num_q_heads * head_dim, "attention")?;
+            self.attention_to(
+                q,
+                k_cache,
+                v_cache,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                seq_len,
+                window,
+                *out.device_ptr(),
+                None,
+            )?;
+            return Ok(out);
+        }
         let first = if window > 0 {
             seq_len.saturating_sub(window)
         } else {
@@ -2142,28 +2361,6 @@ impl Model {
         let k_cache = &k_cache.slice(first * kv_stride..);
         let v_cache = &v_cache.slice(first * kv_stride..);
         let seq_len = seq_len - first;
-        if self.attn_impl == AttnImpl::Online {
-            let shape = OnlineAttnShape {
-                rows: 1,
-                start_pos: seq_len - 1,
-                num_q_heads,
-                group_size: num_q_heads / num_kv_heads,
-                qk_dim: head_dim,
-                v_dim: head_dim,
-                k_pos_stride: num_kv_heads * head_dim,
-                k_head_stride: head_dim,
-                v_pos_stride: num_kv_heads * head_dim,
-                v_head_stride: head_dim,
-                scale: 1.0f32 / (head_dim as f32).sqrt(),
-                window: 0,
-            };
-            if self.attn_decode.enabled() {
-                if let Some(i) = attn_decode_kernel_index(head_dim, shape.group_size) {
-                    return self.attention_decode_gqa(q, k_cache, v_cache, &shape, i);
-                }
-            }
-            return self.attention_online(q, k_cache, v_cache, shape);
-        }
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(num_q_heads * head_dim)
@@ -2196,6 +2393,61 @@ impl Model {
                 .map_err(|e| crate::gpu_err!(e, "attn launch: {e}"))?;
         }
         Ok(dev_out)
+    }
+
+    /// [`Self::attention`] into the `num_q_heads * head_dim` floats at `out`, with
+    /// split partials in `partial` when given (see
+    /// [`Self::attention_decode_gqa_to`]). Online attention only (the default
+    /// `AttnImpl`); the legacy kernels have no pointer-output form.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attention_to(
+        &self,
+        q: &CudaSlice<f32>,
+        k_cache: &CudaView<f32>,
+        v_cache: &CudaView<f32>,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        window: usize,
+        out: u64,
+        partial: Option<u64>,
+    ) -> Result<(), ReflexError> {
+        if self.attn_impl != AttnImpl::Online {
+            return Err(crate::reflex_err!(
+                Other,
+                "internal: attention_to needs the online attention kernels"
+            ));
+        }
+        let first = if window > 0 {
+            seq_len.saturating_sub(window)
+        } else {
+            0
+        };
+        let kv_stride = num_kv_heads * head_dim;
+        let k_cache = &k_cache.slice(first * kv_stride..);
+        let v_cache = &v_cache.slice(first * kv_stride..);
+        let seq_len = seq_len - first;
+        let shape = OnlineAttnShape {
+            rows: 1,
+            start_pos: seq_len - 1,
+            num_q_heads,
+            group_size: num_q_heads / num_kv_heads,
+            qk_dim: head_dim,
+            v_dim: head_dim,
+            k_pos_stride: num_kv_heads * head_dim,
+            k_head_stride: head_dim,
+            v_pos_stride: num_kv_heads * head_dim,
+            v_head_stride: head_dim,
+            scale: 1.0f32 / (head_dim as f32).sqrt(),
+            window: 0,
+        };
+        if self.attn_decode.enabled() {
+            if let Some(i) = attn_decode_kernel_index(head_dim, shape.group_size) {
+                return self.attention_decode_gqa_to(q, k_cache, v_cache, &shape, i, out, partial);
+            }
+        }
+        self.attention_online_to(q, k_cache, v_cache, shape, out, partial)
     }
 
     /// Batched-prefill variant of [`Self::attention`]: scores `rows` new
@@ -2329,7 +2581,20 @@ impl Model {
         b: &CudaSlice<f32>,
         m: usize,
     ) -> Result<(), ReflexError> {
-        let n = a.len() as u32;
+        let n = a.len();
+        self.add_at(*a.device_ptr(), n, b, m)
+    }
+
+    /// `add_kernel` on the `n` floats at `a`: `a[i] += b[i % m]` (a decode
+    /// workspace buffer or a K/V cache row, for Qwen2's Q/K/V biases).
+    pub(super) fn add_at(
+        &self,
+        a: u64,
+        n: usize,
+        b: &CudaSlice<f32>,
+        m: usize,
+    ) -> Result<(), ReflexError> {
+        let n = n as u32;
         let m = m as u32;
         let threads = 256u32;
         let blocks = n.div_ceil(threads).max(1);
@@ -2363,45 +2628,17 @@ impl Model {
         in_features: usize,
         out_features: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let mut dev_y = self.alloc_out(out_features, "gemv_view")?;
-        // One warp per output row -- see gemv_raw's identical comment. Same
-        // gemv_kernel, so this must stay in lockstep with gemv_raw's launch
-        // geometry.
-        let threads = 256u32;
-        let warps_per_block = threads / WARP_SIZE;
-        let blocks = (out_features as u32).div_ceil(warps_per_block).max(1);
-        let launch_cfg = LaunchConfig {
-            grid_dim: (blocks, 1, 1),
-            block_dim: (threads, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let launched = match &w {
-            WeightView::F32(w_dev) => unsafe {
-                self.gemv_k.function.clone().launch(
-                    launch_cfg,
-                    (
-                        x,
-                        w_dev,
-                        &mut dev_y,
-                        in_features as u32,
-                        out_features as u32,
-                    ),
-                )
-            },
-            WeightView::F16(w_dev) => unsafe {
-                self.gemv_f16_k.function.clone().launch(
-                    launch_cfg,
-                    (
-                        x,
-                        w_dev,
-                        &mut dev_y,
-                        in_features as u32,
-                        out_features as u32,
-                    ),
-                )
-            },
-        };
-        launched.map_err(|e| crate::gpu_err!(e, "gemv_view launch: {e}"))?;
+        let dev_y = self.alloc_out(out_features, "gemv_view")?;
+        // Same launch geometry as gemv_raw (Self::launch_gemv_dense).
+        let y = *dev_y.device_ptr();
+        match &w {
+            WeightView::F32(w_dev) => {
+                self.launch_gemv_dense(&self.gemv_k, x, w_dev, y, in_features, out_features)?
+            }
+            WeightView::F16(w_dev) => {
+                self.launch_gemv_dense(&self.gemv_f16_k, x, w_dev, y, in_features, out_features)?
+            }
+        }
         Ok(dev_y)
     }
 

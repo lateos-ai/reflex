@@ -76,6 +76,7 @@ use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
 
 mod config;
+mod decode_step;
 mod dense;
 mod gemma4;
 mod granite_hybrid;
@@ -88,6 +89,7 @@ mod prefix;
 
 use self::config::*;
 pub use self::config::{parse_model_config, LayerConfig, MoeMetaConfig, RopeType};
+use self::decode_step::*;
 use self::dense::*;
 use self::gemma4::*;
 use self::granite_hybrid::*;
@@ -109,6 +111,8 @@ mod attention_online_tests;
 mod attention_tiled_dense_tests;
 #[cfg(test)]
 mod attention_tiled_tests;
+#[cfg(test)]
+mod decode_step_tests;
 #[cfg(test)]
 mod f16_kernel_tests;
 #[cfg(test)]
@@ -256,6 +260,9 @@ pub struct Model {
     attn_decode: DecodeAttnKernels,
     /// Fused decode norms, loaded lazily; see [`DecodeOpKernels`].
     decode_ops: DecodeOpKernels,
+    /// Reused buffers for the dense decode step, allocated on the first one;
+    /// see `decode_step.rs`.
+    decode_ws: DecodeWorkspaceSlot,
     /// In-place residual add (`a[i] += b[i]`, see `kernels_cuda/elementwise.cu`)
     /// -- keeps residual-stream adds device-resident (Phase 2 round 2)
     /// instead of downloading both operands to host just to add two vectors.

@@ -150,6 +150,42 @@ greedy ids of all 257 tokens identical to the previous commit in every run):
 The fused norm still takes 7.8 µs per 1,024-wide row and 15 µs at 2,048. Most of that
 is the serial summation chain, which a bit-identical kernel has to keep.
 
+4. **A reused decode workspace** (`src/model/decode_step.rs`).
+   - **What changed.** `generate`'s dense decode step now keeps every intermediate
+     in a `DecodeWorkspace`, allocated on the first decode step and reused after that.
+     It writes K and V straight into their cache rows: the K/V GEMV outputs, the
+     bias adds, K-Norm and RoPE all target the row.
+   - **Unchanged.** The kernels, their launch geometry and their order are the same
+     as the allocating path's.
+   - **Effect per step.** About 390 allocations and frees and 56 device-to-device
+     copies go away on Qwen3-0.6B.
+   - **What it's for.** It leaves the step free of allocations, which CUDA graph
+     capture needs.
+   - **Scope.** Models whose layers are all dense (Qwen3, Qwen2, Llama, Mistral),
+     with the online attention kernels. MoE and Kolibri-1 (host-side routing) keep the
+     allocating path, as do system1 scoring and the sequential prefill.
+   - **`REFLEX_DECODE_WS=0`** turns it off.
+
+| model | context | before | after | change |
+|---|---|---:|---:|---:|
+| Qwen3-0.6B f16 | short | 6.62 | 6.42 | −2.9% |
+| | ~1,550 | 8.01 | 7.83 | −2.3% |
+| Qwen3-0.6B QR | short | 4.64 | 4.48 | −3.4% |
+| | ~1,550 | 6.13 | 5.97 | −2.6% |
+| TinyLlama f16 | short | 9.58 | 9.44 | −1.5% |
+| | ~1,550 | 10.07 | 9.93 | −1.4% |
+| TinyLlama QR | short | 5.80 | 5.70 | −1.7% |
+| | ~1,550 | 6.42 | 6.34 | −1.3% |
+
+TinyLlama gains less than 2%: it has fewer, larger layers, so its GPU work hides more
+of the host cost. The workspace stays regardless, because CUDA graphs need it.
+- **Bit-identity checks.**
+  - Logits of every decode step are bit-identical to the allocating path on
+    Qwen3-0.6B and TinyLlama, with f32 and f16 weights, for short and ~800-token
+    prompts (split attention).
+  - The qwen2 fixture (Q/K/V biases) gives the same result.
+  - Greedy ids are identical in every A/B run.
+
 ## What's left
 
 Ranked by the round 2 profile. Status as of 2026-10-18:
