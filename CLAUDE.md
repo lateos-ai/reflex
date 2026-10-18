@@ -155,7 +155,12 @@ pipeline (~0.9 s of a 2.3 s Mistral 7B load on a T4).
 its staging buffers per-tensor allocations: both were measured, and the reasons each
 alternative is wrong (a host/device race in one case, a cross-stream dependency that
 serializes the pipeline in the other) are written up in HISTORY.md's "Pipelined model
-load (item 5)" entry. `Model` keeps its `dequant_kernels`/`dequant_pipeline` alive past
+load (item 5)" entry. KV cache-file imports use the same pinned slots
+(`WeightLoadPipeline::upload_state`, 8 MB chunks, f16 files widened on the GPU):
+`kv_io::import_kv` reads only the header, and the payload is read straight into the
+slots. **Don't go back to reading the payload into host `Vec`s first**: that faulted in
+two fresh buffers per import (cold 342 MB read 284 ms vs 110 ms warm; with the fix the
+read plus upload is ~65 ms, docs/design/agent-relay.md phase F). `Model` keeps its `dequant_kernels`/`dequant_pipeline` alive past
 load specifically so `lm_head_resident` can reuse this same on-device path lazily.
 
 `forward_prompt` runs: embedding lookup (host-side gather, `batch_size` always 1) → each
