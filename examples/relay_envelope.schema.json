@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reflex relay envelope",
+  "description": "What an orchestrator passes from one agent hop to the next. Built from the engine's output (IPC responses, or reflex generate/system1 --json for cold hops) and the orchestrator's own state. The engine never reads or writes it.",
+  "type": "object",
+  "properties": {
+    "version": {
+      "description": "Envelope format version.",
+      "const": 1
+    },
+    "agent": {
+      "description": "Orchestrator state: the role that produced this hop.",
+      "type": "string"
+    },
+    "hop": {
+      "description": "Orchestrator state: the hop's position in the chain.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "decision": {
+      "description": "A System-1 decision: the chosen candidate.",
+      "type": "object",
+      "properties": {
+        "label": {
+          "description": "The chosen candidate: its text, or the orchestrator's name for it.",
+          "type": "string"
+        },
+        "chosen": {
+          "description": "IPC chosen (reflex system1 --json: best_idx).",
+          "type": "integer",
+          "minimum": 0
+        },
+        "probability": {
+          "description": "The chosen candidate's probability.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "entropy": {
+          "description": "Entropy of the candidates' distribution, in nats.",
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": ["label", "chosen", "probability", "entropy"],
+      "additionalProperties": false
+    },
+    "carry": {
+      "description": "Generated text handed to the next agent (IPC text; reflex generate --json: token_text).",
+      "type": "string"
+    },
+    "kv": {
+      "description": "Orchestrator state: a cache file the next agent can resume from (import_kv / --import-kv).",
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dtype": {
+          "description": "The export_kv_dtype the file was written with.",
+          "enum": ["f32", "f16"]
+        }
+      },
+      "required": ["path", "dtype"],
+      "additionalProperties": false
+    },
+    "timings": {
+      "description": "Milliseconds and slot facts. IPC timings for warm hops; the CLI's --json line for cold hops; wall_ms is measured by the orchestrator.",
+      "type": "object",
+      "properties": {
+        "wall_ms": {
+          "description": "Orchestrator: the request's round trip, or a cold process's spawn to exit.",
+          "type": "number",
+          "minimum": 0
+        },
+        "first_token_ms": {
+          "description": "IPC first_token_ms; reflex generate --json: process_start_to_first_token_ms.",
+          "type": "number",
+          "minimum": 0
+        },
+        "model_ms": {
+          "description": "IPC model_ms.",
+          "type": "number",
+          "minimum": 0
+        },
+        "kv_io_ms": {
+          "description": "Cache file read (with upload) and write, or the pinned prefix copy.",
+          "type": "number",
+          "minimum": 0
+        },
+        "mask_ms_total": {
+          "description": "IPC mask_ms_total (json_schema requests).",
+          "type": "number",
+          "minimum": 0
+        },
+        "pinned_seq_len": {
+          "description": "IPC pinned_seq_len: positions in the process's pinned slot after the request.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "pinned_bytes": {
+          "description": "IPC pinned_bytes: VRAM held by the pinned slot after the request.",
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": ["version"],
+  "anyOf": [
+    { "required": ["decision"] },
+    { "required": ["carry"] }
+  ],
+  "additionalProperties": false
+}
