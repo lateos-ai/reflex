@@ -186,12 +186,33 @@ of the host cost. The workspace stays regardless, because CUDA graphs need it.
   - The qwen2 fixture (Q/K/V biases) gives the same result.
   - Greedy ids are identical in every A/B run.
 
+**Tried and dropped: CUDA graphs.** The workspace step was captured and replayed as a
+graph with one `cuGraphLaunch`.
+- **How it worked.**
+  - Each step was captured again and applied with `cuGraphExecUpdate`, because RoPE's
+    position, the cache rows and the attention splits change every step.
+  - That capture ran while the previous step was on the GPU, with two executable
+    graphs alternating.
+  - Capture ran on a side stream: the device's work stream is the legacy default
+    stream, which can't be captured.
+- **Correctness.** Logits were bit-identical to the plain path.
+- **Speed.** It gained only 0.1-1.6% on the T4 (Qwen3-0.6B f16 −1.4%/−1.6%, QR
+  −0.5%/−1.0%, TinyLlama ≤0.4%), below the 2% bar.
+- **Why so little.** Launching a ~420-node graph costs about 0.6 ms of host time on
+  this driver. That launch sits between picking the token and the GPU starting, which
+  is about as long as the streamed launches took to get ahead of the GPU. GPU idle
+  stayed at ~0.6 ms per step (QR, short context).
+- **What might still help.** A step split into a few smaller graphs, or kernels that
+  read the position from device memory, so that a step could be submitted before its
+  token is known.
+
 ## What's left
 
 Ranked by the round 2 profile. Status as of 2026-10-18:
-- **Cut the remaining per-op host cost.** Reuse output buffers across steps instead of
-  allocating them, and write K/V straight into the cache. Then use CUDA graphs, which
-  would remove most of the 0.5-1.25 ms of GPU idle time per step.
+- **Cut the remaining per-op host cost.** *Partly done:* fused norms and the reused
+  workspace (fixes 3 and 4). A single CUDA graph per step didn't pay (above). What
+  remains of the GPU idle (~0.6-0.8 ms per step) is the step start: the logits copy,
+  the host argmax, the embedding upload and the first launches.
 - **f16 KV cache** (opt-in). Long contexts only: decode attention takes 1.5 ms per
   step on Qwen3-0.6B at ~1,550 positions. It changes outputs, so it can't be the
   default.
