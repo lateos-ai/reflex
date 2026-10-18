@@ -1942,9 +1942,28 @@ public PR, T4-verified.
     - Raw: `bench-results/agent-relay-t4-phase-f/` (step1, f1, f2, f3, f4 outs).
     - PUBLIC #41 (one commit a6fa472 on github 713a577) merged 2026-10-18 as fcb1d83;
       private master: ff to 47bc128 + merge github/master; branches and worktree removed.
-- [ ] **G: sidecar.** Map `response_format: json_schema` onto IPC `json_schema`,
+- [x] **G: sidecar.** Map `response_format: json_schema` onto IPC `json_schema`,
   keeping property order. `/v1/classify` passes `chosen`/`entropy` through. No
-  pin/slot/file fields over HTTP.
+  pin/slot/file fields over HTTP. **Done 2026-10-18, local branch
+  `agent-relay-phase-g` (from 452fc37), not pushed; public PR is the user's call.**
+    - Schema kept as `Box<RawValue>` (axum already enables `raw_value`; no
+      `preserve_order` anywhere), whitespace stripped by `openai::compact_json`
+      (a pretty-printed schema would otherwise break the one-line IPC framing).
+      IPC line now a `Serialize` struct (`IpcGenerateRequest`): keys
+      prompt/max_tokens/stream/sampling/json_schema (was sorted by `json!`).
+    - `json_object` -> `{"type":"object"}` (permissive in the subset); `text` /
+      absent -> none; other types or missing `schema` -> sidecar 400 `invalid_input`.
+    - `grammar_dead_end` -> 400 `invalid_request_error` (was 500). Behavior change
+      for all streams: a mid-stream `ok:false` final now sends an OpenAI-style
+      error event + `[DONE]` instead of a `finish_reason:"stop"` chunk.
+    - `/v1/classify` unchanged: label_index == engine `chosen` (same tie rule),
+      entropy, probability already exposed. HTTP drops per-label `token_ids`
+      (only the count `tokens`) and never requests `timings` -- listed to the user,
+      not added.
+    - Unit tests 31 (was 23), clippy -D warnings, fmt clean. T4 e2e (Qwen3-0.6B,
+      i-0701e892b03ff350a, started + stopped): keys in schema order, stream ==
+      non-stream text, json_object parses, `pattern` 400, dead end 400 / stream
+      error event, IPC-only fields ignored (no file written), classify unchanged.
 - [ ] **H: composition docs and examples.** A "Composing agents" boundary section,
   `examples/relay_envelope.schema.json`, `relay_orchestrator.py`, `relay_chain.sh`.
 - Out of scope:
