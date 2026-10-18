@@ -251,6 +251,20 @@ mod tests {
         assert!(v.get("stream").is_none() && v.get("max_tokens").is_none());
     }
 
+    /// HTTP has no pin, slot or cache-file fields; the IPC ones are ignored.
+    #[test]
+    fn ipc_only_fields_never_reach_the_engine() {
+        let r = req(serde_json::json!({
+            "prompt": "Q:", "labels": [" a"], "use_pinned": true, "pin_prefix": true,
+            "import_kv": "/tmp/a.kv", "export_kv": "/tmp/b.kv", "slot": 0, "file": "x",
+            "candidates": [" b"], "timings": true, "json_schema": {"type": "object"},
+        }));
+        assert_eq!(
+            serde_json::to_string(&ipc_request("Q:", &r)).unwrap(),
+            r#"{"candidates":[" a"],"prompt":"Q:","temperature":1.0}"#
+        );
+    }
+
     #[test]
     fn build_response_picks_the_most_probable_label_in_request_order() {
         let engine = serde_json::json!({

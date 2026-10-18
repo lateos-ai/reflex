@@ -30,9 +30,10 @@ use axum::{Json, Router};
 use chat_template::ChatTemplate;
 use futures::Stream;
 use openai::{
-    build_prompt, build_sampling, estimate_prompt_tokens, extract_text_messages, finish_reason,
-    now_unix, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessageOut,
-    Choice, ChunkChoice, Delta, ModelInfo, ModelPricing, ModelsResponse, RawMessage, Usage,
+    build_ipc_line, build_prompt, estimate_prompt_tokens, extract_text_messages, finish_reason,
+    ipc_json_schema, now_unix, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+    ChatMessageOut, Choice, ChunkChoice, Delta, ModelInfo, ModelPricing, ModelsResponse,
+    RawMessage, Usage,
 };
 use reflex_client::ReflexClient;
 use serde_json::Value;
@@ -578,7 +579,11 @@ struct EngineError<'a> {
 /// - `context_overflow` -> `400` `context_length_exceeded`, as OpenAI returns
 ///   (also recognized by message prefix, for engines without `error_kind`);
 /// - `invalid_input` -> `400` (the adapter already validates `max_tokens`, so this
-///   is a bad request parameter such as a sampling value);
+///   is a bad request parameter such as a sampling value, or a `response_format`
+///   schema outside the engine's subset);
+/// - `grammar_dead_end` -> `400`: a `response_format` request's `max_tokens` ran out
+///   before the JSON value was complete (the engine fails the request rather than
+///   return a value that doesn't parse);
 /// - `out_of_memory` -> `503`: the server is temporarily out of GPU memory;
 /// - anything else -> `500`, with the kind as `code` when the engine sent one.
 fn classify_engine_error(err: &EngineError) -> (StatusCode, &'static str, Option<String>) {
@@ -598,6 +603,11 @@ fn classify_engine_error(err: &EngineError) -> (StatusCode, &'static str, Option
             "invalid_request_error",
             Some("invalid_input".to_string()),
         ),
+        Some("grammar_dead_end") => (
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            Some("grammar_dead_end".to_string()),
+        ),
         Some("out_of_memory") => (
             StatusCode::SERVICE_UNAVAILABLE,
             "server_error",
@@ -614,6 +624,13 @@ fn classify_engine_error(err: &EngineError) -> (StatusCode, &'static str, Option
 fn engine_error_response(err: &EngineError) -> Response {
     let (status, error_type, code) = classify_engine_error(err);
     error_response_with(status, err.message, error_type, code.as_deref())
+}
+
+/// The SSE data for an engine failure after the stream has started: the body
+/// [`engine_error_response`] would have sent, without the status.
+fn stream_error_body(err: &EngineError) -> Value {
+    let (_, error_type, code) = classify_engine_error(err);
+    error_body(err.message, error_type, code.as_deref())
 }
 
 /// `Some` if `v` is the engine's terminal `final` event reporting failure.
@@ -647,20 +664,24 @@ async fn chat_completions(
     if let Some(response) = request_limit_violation(&state.limits, prompt.len(), max_tokens) {
         return response;
     }
-    let sampling = build_sampling(&req);
+    let json_schema = match ipc_json_schema(req.response_format.as_ref()) {
+        Ok(s) => s,
+        Err(e) => {
+            return error_response_with(
+                StatusCode::BAD_REQUEST,
+                e,
+                "invalid_request_error",
+                Some("invalid_input"),
+            )
+        }
+    };
     let stream = req.stream;
     let model_label = req
         .model
         .clone()
         .unwrap_or_else(|| state.model_label.clone());
 
-    let ipc_request = serde_json::json!({
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "stream": stream,
-        "sampling": sampling,
-    });
-    let line = match serde_json::to_string(&ipc_request) {
+    let line = match build_ipc_line(&req, &prompt, max_tokens, json_schema.as_deref()) {
         Ok(l) => l,
         Err(e) => {
             return error_response(
@@ -910,21 +931,21 @@ fn build_sse_stream(
                 };
                 yield Ok(Event::default().data(serde_json::to_string(&chunk).unwrap()));
             } else if event == "final" {
-                let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
-                if !ok {
-                    let msg = v.get("error").and_then(Value::as_str).unwrap_or("unknown reflex error");
-                    eprintln!("[adapter] reflex error mid-stream: {msg}");
+                if let Some(err) = engine_error(&v) {
+                    // Headers are already sent, so the failure goes out as an
+                    // OpenAI-style error event, as on a timeout, not as a finish
+                    // chunk: a `response_format` stream that hit `max_tokens`
+                    // (`grammar_dead_end`) must not look like a complete value.
+                    eprintln!("[adapter] reflex error mid-stream: {}", err.message);
+                    yield Ok(Event::default().data(stream_error_body(&err).to_string()));
+                    break;
                 }
                 let token_ids = v
                     .get("token_ids")
                     .and_then(Value::as_array)
                     .map(|a| a.len())
                     .unwrap_or(completion_tokens);
-                let reason = if ok {
-                    finish_reason(token_ids, requested_max_tokens)
-                } else {
-                    "stop"
-                };
+                let reason = finish_reason(token_ids, requested_max_tokens);
                 let final_chunk = ChatCompletionChunk {
                     id: chat_id.clone(),
                     object: "chat.completion.chunk",
@@ -1118,6 +1139,103 @@ mod tests {
                 None
             )
         );
+    }
+
+    #[test]
+    fn schema_errors_map_to_400_invalid_request_error() {
+        // What the engine sends for a schema outside its subset, and for a
+        // `response_format` request whose `max_tokens` ran out mid-value.
+        assert_eq!(
+            classify_engine_error(&engine(
+                "invalid input: json_schema: unsupported keyword \"pattern\" at #/properties/a",
+                Some("invalid_input")
+            )),
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("invalid_input".to_string())
+            )
+        );
+        assert_eq!(
+            classify_engine_error(&engine(
+                "json_schema: max_tokens ran out after 8 tokens, before the value was complete",
+                Some("grammar_dead_end")
+            )),
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("grammar_dead_end".to_string())
+            )
+        );
+    }
+
+    /// Runs `build_sse_stream` over canned engine events and returns its `data:`
+    /// payloads.
+    async fn sse_data(events: Vec<Value>, max_tokens: usize) -> Vec<String> {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let mut events = events.into_iter();
+        let first = events.next();
+        for v in events {
+            tx.send(v).await.unwrap();
+        }
+        drop(tx);
+        let stream = build_sse_stream(
+            first,
+            rx,
+            "c".into(),
+            0,
+            "m".into(),
+            max_tokens,
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        let bytes = axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: ").map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_failure_mid_stream_is_an_error_event_not_a_finish() {
+        let data = sse_data(
+            vec![
+                serde_json::json!({"event": "token", "text": "{\"a\":"}),
+                serde_json::json!({
+                    "event": "final", "ok": false, "error_kind": "grammar_dead_end",
+                    "error": "json_schema: max_tokens ran out after 1 tokens, before the value was complete",
+                    "text": "{\"a\":", "token_ids": [1],
+                }),
+            ],
+            1,
+        )
+        .await;
+        assert_eq!(data.len(), 4, "{data:?}"); // role, token, error, [DONE]
+        assert!(data[1].contains("{\\\"a\\\":"), "{}", data[1]);
+        let err: Value = serde_json::from_str(&data[2]).unwrap();
+        assert_eq!(err["error"]["type"], "invalid_request_error");
+        assert_eq!(err["error"]["code"], "grammar_dead_end");
+        assert!(!data.iter().any(|d| d.contains("finish_reason\":\"")));
+        assert_eq!(data[3], "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn a_successful_stream_still_ends_with_its_finish_reason() {
+        let data = sse_data(
+            vec![
+                serde_json::json!({"event": "token", "text": "{}"}),
+                serde_json::json!({"event": "token", "text": ""}),
+                serde_json::json!({"event": "final", "ok": true, "text": "{}", "token_ids": [1, 2]}),
+            ],
+            8,
+        )
+        .await;
+        let finish: Value = serde_json::from_str(&data[data.len() - 2]).unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
+        assert_eq!(data.last().unwrap(), "[DONE]");
     }
 
     #[test]
