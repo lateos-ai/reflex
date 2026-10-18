@@ -1010,7 +1010,7 @@ pub(super) fn f16_to_f32_on_device(
 }
 
 /// One thread per element, 256 per block, for the `convert.cu` kernels.
-fn elementwise_launch_cfg(n: usize) -> LaunchConfig {
+pub(super) fn elementwise_launch_cfg(n: usize) -> LaunchConfig {
     let threads = 256u32;
     let blocks = ((n as u64).div_ceil(threads as u64) as u32).max(1);
     LaunchConfig {
@@ -1482,6 +1482,9 @@ pub(super) struct WeightLoadPipeline {
     /// lazily (never shrunk) like their pinned host counterparts.
     pub(super) raw_dev: [Option<CudaSlice<u8>>; 2],
     pub(super) raw_cap: [usize; 2],
+    /// [`Self::upload_state`]'s device landing buffer for f16 values, which a
+    /// kernel then widens into the f32 cache; allocated on the first f16 upload.
+    state_f16: Option<CudaSlice<u8>>,
     /// Recorded on `compute_stream` right after the dequant kernel reading
     /// a slot is launched; `None` until that slot has been used once.
     pub(super) kernel_done: [Option<sys::CUevent>; 2],
@@ -1522,6 +1525,7 @@ impl WeightLoadPipeline {
             next_pinned: 0,
             raw_dev: [None, None],
             raw_cap: [0, 0],
+            state_f16: None,
             kernel_done: [None, None],
             next: 0,
             fill_threads: fill_thread_count(),
@@ -1965,10 +1969,22 @@ impl WeightLoadPipeline {
     /// prefill that reads it. Same per-slot host wait as [`Self::stage_h2d`]:
     /// chunk i+1 is read while chunk i is on the wire. Returns once every copy
     /// has landed, so the caller's timing covers the whole upload.
+    ///
+    /// f16 values (an f16 cache file) land in a device buffer first and
+    /// `widen` (`f16_to_f32_kernel`, exact) writes them into the f32 cache. The
+    /// landing buffer is reused chunk after chunk without a wait: its next H2D
+    /// is queued on the same stream as the kernel that reads it.
     pub(super) fn upload_state(
         &mut self,
         jobs: &[(sys::CUdeviceptr, &crate::kv_io::KvValues)],
+        widen: &AotKernel,
     ) -> Result<(), ReflexError> {
+        use crate::kv_io::KvDtype;
+        if self.state_f16.is_none() && jobs.iter().any(|(_, v)| v.dtype() == KvDtype::F16) {
+            let buf = unsafe { self.device.alloc::<u8>(STATE_CHUNK_BYTES) }
+                .map_err(|e| crate::gpu_err!(e, "alloc f16 state landing buffer: {e}"))?;
+            self.state_f16 = Some(buf);
+        }
         // (job, byte offset, len) pieces, packed into chunks in order.
         let mut pieces: Vec<(usize, usize, usize)> = Vec::new();
         for (j, (_, values)) in jobs.iter().enumerate() {
@@ -2008,8 +2024,31 @@ impl WeightLoadPipeline {
                 let staged =
                     unsafe { std::slice::from_raw_parts_mut(self.pinned[slot].ptr.add(at), len) };
                 values.read_bytes(off, staged)?;
-                unsafe { result::memcpy_htod_async(dst + off as u64, &*staged, stream) }
-                    .map_err(|e| crate::gpu_err!(e, "state upload: async H2D copy: {e}"))?;
+                match values.dtype() {
+                    KvDtype::F32 => {
+                        unsafe { result::memcpy_htod_async(dst + off as u64, &*staged, stream) }
+                            .map_err(|e| crate::gpu_err!(e, "state upload: async H2D copy: {e}"))?
+                    }
+                    KvDtype::F16 => {
+                        let landing = *self
+                            .state_f16
+                            .as_ref()
+                            .expect("allocated above for f16 jobs")
+                            .device_ptr()
+                            + at as u64;
+                        unsafe { result::memcpy_htod_async(landing, &*staged, stream) }
+                            .map_err(|e| crate::gpu_err!(e, "state upload: async H2D copy: {e}"))?;
+                        let n = len / 2;
+                        let out = dst + (off / 2 * 4) as u64;
+                        unsafe {
+                            widen
+                                .function
+                                .clone()
+                                .launch(elementwise_launch_cfg(n), (landing, out, n as u64))
+                        }
+                        .map_err(|e| crate::gpu_err!(e, "state upload: f16_to_f32 launch: {e}"))?;
+                    }
+                }
                 at += len;
             }
             unsafe { result::event::record(self.pinned_done[slot], stream) }

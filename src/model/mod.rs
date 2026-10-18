@@ -130,6 +130,8 @@ mod kolibri_config_tests;
 #[cfg(test)]
 mod kolibri_forward_tests;
 #[cfg(test)]
+mod kv_f16_tests;
+#[cfg(test)]
 #[path = "../../reference/mamba2_reference.rs"]
 mod mamba2_reference;
 #[cfg(test)]

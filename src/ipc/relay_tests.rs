@@ -900,3 +900,217 @@ fn ipc_system1_resumed_granite_fixture_rejects() {
 fn ipc_system1_resumed_gemma4_fixture_rejects() {
     assert_system1_resume_rejected(&load(GEMMA4_FIXTURE, WeightsDtype::F32));
 }
+
+/// The version field of a cache file.
+fn file_version(path: &str) -> u32 {
+    let bytes = std::fs::read(path).unwrap();
+    u32::from_le_bytes(bytes[4..8].try_into().unwrap())
+}
+
+/// First-token logits of `prompt` resumed from the cache file at `path` (or a
+/// fresh prompt), at the model API: the first token's full logit vector.
+fn first_logits(model: &Model, prompt: &str, path: Option<&str>) -> Vec<f32> {
+    let kv = path.map(|p| crate::kv_io::import_kv(p).expect("import"));
+    let resume = kv.as_ref().map_or(Resume::Fresh, Resume::File);
+    let mut logits = Vec::new();
+    model
+        .generate_resumed(
+            prompt,
+            1,
+            resume,
+            &crate::sampling::SamplingParams::default(),
+            |l| logits = l.to_vec(),
+            |_, _| {},
+        )
+        .expect("generate");
+    logits
+}
+
+/// `||a - b|| / ||b||` and `max |a - b|`.
+fn logit_diff(a: &[f32], b: &[f32]) -> (f64, f32) {
+    let (mut num, mut den, mut max) = (0f64, 0f64, 0f32);
+    for (&x, &y) in a.iter().zip(b) {
+        num += ((x - y) as f64).powi(2);
+        den += (y as f64).powi(2);
+        max = max.max((x - y).abs());
+    }
+    ((num / den).sqrt(), max)
+}
+
+/// How far an f16 cache file may move the first-token logits from the f32
+/// file's, as relative L2. f16 keeps 11 significant bits, so each cached value
+/// moves by at most ~2.4e-4 of itself; see docs/design/agent-relay.md, "Faster
+/// cache files (phase F)", for what that came to on a T4. The bound leaves
+/// room above it.
+const F16_FILE_REL_L2: f64 = 1e-2;
+
+/// Phase F's f16 files: exports `parts[0]` as an f32 file and as an f16 file
+/// (`export_kv_dtype`), resumes `parts[1]` from each over IPC, and compares
+/// with one request over the joined text: the same greedy ids from both files,
+/// an f16 file of the f16 version and smaller, and first-token logits from
+/// the f16 file within [`F16_FILE_REL_L2`] of the f32 file's.
+fn assert_f16_file_tracks_f32(model: &Model, parts: [&str; 2], tag: &str, version: u32) {
+    const N: usize = 12;
+    assert_split_tokenizes_alike(model, &parts);
+    let f32_file = tmp_path(&format!("{tag}_f32").replace(' ', "_"));
+    let f16_file = tmp_path(&format!("{tag}_f16").replace(' ', "_"));
+    let lines = session(
+        model,
+        &[
+            serde_json::json!({"prompt": parts[0], "export_kv": f32_file, "max_tokens": 1}),
+            serde_json::json!({"prompt": parts[0], "export_kv": f16_file,
+                               "export_kv_dtype": "f16", "max_tokens": 1, "timings": true}),
+            serde_json::json!({"prompt": parts[1], "import_kv": f32_file, "max_tokens": N,
+                               "timings": true}),
+            serde_json::json!({"prompt": parts[1], "import_kv": f16_file, "max_tokens": N,
+                               "timings": true}),
+            serde_json::json!({"prompt": parts.concat(), "max_tokens": N}),
+        ],
+    );
+    final_ok(&lines[0]);
+    final_ok(&lines[1]);
+    let (from_f32, from_f16, joined) = (
+        final_ok(&lines[2]),
+        final_ok(&lines[3]),
+        final_ok(&lines[4]),
+    );
+    let (s32, s16) = (
+        std::fs::metadata(&f32_file).unwrap().len(),
+        std::fs::metadata(&f16_file).unwrap().len(),
+    );
+    assert_eq!(file_version(&f16_file), version, "{tag}: f16 file version");
+    assert!(s16 < s32, "{tag}: f16 file {s16} bytes, f32 {s32}");
+    let l_joined = first_logits(model, &parts.concat(), None);
+    let l32 = first_logits(model, parts[1], Some(&f32_file));
+    let l16 = first_logits(model, parts[1], Some(&f16_file));
+    std::fs::remove_file(&f32_file).ok();
+    std::fs::remove_file(&f16_file).ok();
+    let (rel32, max32) = logit_diff(&l32, &l_joined);
+    let (rel16, max16) = logit_diff(&l16, &l32);
+    let (rel16j, max16j) = logit_diff(&l16, &l_joined);
+    eprintln!(
+        "F16_FILE {tag}: bytes f32 {s32} f16 {s16}; logits rel L2 / max |d|: f32 file vs joined {rel32:.2e}/{max32:.2e}, f16 file vs f32 file {rel16:.2e}/{max16:.2e}, f16 file vs joined {rel16j:.2e}/{max16j:.2e}; kv_io_ms f32 {} f16 {}",
+        lines[2]["timings"]["kv_io_ms"], lines[3]["timings"]["kv_io_ms"]
+    );
+    assert_eq!(from_f32, joined, "{tag}: f32 file differs from joined");
+    assert_eq!(from_f16, joined, "{tag}: f16 file differs from joined");
+    assert!(
+        rel16 < F16_FILE_REL_L2,
+        "{tag}: f16 file moved logits by rel L2 {rel16}"
+    );
+}
+
+/// Real dense Qwen3 (`REFLEX_TEST_GGUF`, `DENSE_GGUF`), default f16 weights.
+/// Also layers f16 files (import one, export another) through the three-part
+/// chain, and checks the request errors.
+#[test]
+#[ignore]
+fn ipc_kv_f16_file_dense_tracks_f32() {
+    let path = std::env::var("REFLEX_TEST_GGUF").expect("set REFLEX_TEST_GGUF to a dense GGUF");
+    let model = load(&path, WeightsDtype::DEFAULT);
+    assert_f16_file_tracks_f32(&model, [PARTS[0], PARTS[1]], "dense", 5);
+
+    let sys = tmp_path("dense_f16_sys");
+    let task = tmp_path("dense_f16_task");
+    let bad = tmp_path("dense_f16_bad");
+    let lines = session(
+        &model,
+        &[
+            serde_json::json!({"prompt": PARTS[0], "export_kv": sys,
+                               "export_kv_dtype": "f16", "max_tokens": 1}),
+            serde_json::json!({"prompt": PARTS[1], "import_kv": sys, "export_kv": task,
+                               "export_kv_dtype": "f16", "max_tokens": 1}),
+            serde_json::json!({"prompt": PARTS[2], "import_kv": task, "max_tokens": 12}),
+            serde_json::json!({"prompt": PARTS.concat(), "max_tokens": 12}),
+            serde_json::json!({"prompt": "p", "export_kv": bad, "export_kv_dtype": "bf16",
+                               "max_tokens": 1}),
+            serde_json::json!({"prompt": "p", "export_kv_dtype": "f16", "max_tokens": 1}),
+        ],
+    );
+    let layered = final_ok(&lines[2]);
+    assert_eq!(file_version(&task), 5);
+    std::fs::remove_file(&sys).ok();
+    std::fs::remove_file(&task).ok();
+    assert_eq!(layered, final_ok(&lines[3]), "layered f16 chain differs");
+    assert!(
+        !std::path::Path::new(&bad).exists(),
+        "rejected export wrote a file"
+    );
+    assert_eq!(lines[4]["error_kind"], "invalid_input", "{}", lines[4]);
+    assert_eq!(lines[5]["error_kind"], "invalid_input", "{}", lines[5]);
+}
+
+#[test]
+#[ignore]
+fn qwen3moe_fixture_ipc_kv_f16_file_tracks_f32() {
+    let model = load(QWEN3MOE_FIXTURE, WeightsDtype::F32);
+    assert_f16_file_tracks_f32(&model, [PARTS[0], PARTS[1]], "qwen3moe", 5);
+}
+
+/// The hybrid's version 6: f16 attention K/V, f32 GatedDeltaNet state.
+#[test]
+#[ignore]
+fn qwen35moe_fixture_ipc_kv_f16_file_tracks_f32() {
+    let model = load(QWEN35MOE_FIXTURE, WeightsDtype::F32);
+    assert_f16_file_tracks_f32(&model, [PARTS[0], PARTS[1]], "qwen35moe", 6);
+}
+
+/// A real Qwen3.5 hybrid (`REFLEX_TEST_GGUF`, the nightly's `HYBRID_GGUF`).
+#[test]
+#[ignore]
+fn ipc_kv_f16_file_hybrid_model_tracks_f32() {
+    let path = std::env::var("REFLEX_TEST_GGUF").expect("set REFLEX_TEST_GGUF to a hybrid GGUF");
+    let model = load(&path, WeightsDtype::DEFAULT);
+    assert_f16_file_tracks_f32(&model, [PARTS[0], PARTS[1]], "hybrid", 6);
+}
+
+#[test]
+#[ignore]
+fn ipc_kv_f16_file_mla_fixture_tracks_f32() {
+    let model = load(MLA_FIXTURE, WeightsDtype::F32);
+    assert_f16_file_tracks_f32(&model, [PARTS[0], PARTS[1]], "mla", 7);
+}
+
+/// SentencePiece (`REFLEX_TEST_GGUF`, the nightly's `SPM_GGUF`): the version-5
+/// header keeps `space_prefix_next`, so a continuation after `</s>` still gets
+/// its dummy-prefix space.
+#[test]
+#[ignore]
+fn ipc_kv_f16_file_spm_model_tracks_f32() {
+    let path = std::env::var("REFLEX_TEST_GGUF")
+        .expect("set REFLEX_TEST_GGUF to a SentencePiece GGUF (the nightly's SPM_GGUF)");
+    let model = load(&path, WeightsDtype::DEFAULT);
+    assert_f16_file_tracks_f32(&model, [PARTS[0], PARTS[1]], "spm", 5);
+    let user = "\n<|user|>\nWhat is the capital of France?</s>\n<|assistant|>\n";
+    assert_f16_file_tracks_f32(
+        &model,
+        ["<|system|>\nYou are a careful assistant.</s>", user],
+        "spm after a special token",
+        5,
+    );
+}
+
+/// Granite 4.0-H and Gemma 4 have no cache format in either dtype.
+#[test]
+#[ignore]
+fn ipc_kv_f16_file_granite_and_gemma4_fixtures_reject() {
+    for fixture in [GRANITE_FIXTURE, GEMMA4_FIXTURE] {
+        let model = load(fixture, WeightsDtype::F32);
+        let out = tmp_path("f16_reject");
+        let lines = session(
+            &model,
+            &[
+                serde_json::json!({"prompt": "Hello", "export_kv": out,
+                                   "export_kv_dtype": "f16", "max_tokens": 1}),
+                serde_json::json!({"prompt": "Hello", "max_tokens": 2}),
+            ],
+        );
+        assert!(!std::path::Path::new(&out).exists(), "{fixture}");
+        assert_eq!(
+            lines[0]["error_kind"], "unsupported_architecture",
+            "{fixture}: {}",
+            lines[0]
+        );
+        final_ok(&lines[1]);
+    }
+}

@@ -6,7 +6,7 @@
 //! never written by a request; each use gets its own copy.
 
 use super::*;
-use crate::kv_io::{DenseKvCache, HybridKvCache, ImportedKv, MlaKvCache};
+use crate::kv_io::{DenseKvCache, HybridKvCache, ImportedKv, KvDtype, KvValues, MlaKvCache};
 use std::cell::Cell;
 
 /// What a generate call resumes from. Anything but `Fresh` makes `prompt` the
@@ -176,6 +176,92 @@ pub(super) fn dense_after_special(src: Option<DensePrefix<'_>>) -> bool {
     src.is_none_or(|s| s.space_prefix_next())
 }
 
+/// Copies a device state's buffers to the host for a cache file. f32 values
+/// are copied as they are. f16 values are rounded on the device first
+/// (`cast_act_f16_kernel`: round to nearest even, saturating at +-65504 and
+/// counting what saturated) and downloaded as f16 bits, half the bytes, with no
+/// host conversion loop. [`Self::finish`] fails the export if anything
+/// saturated: K/V values that large would not survive f16 storage.
+pub(super) struct StateDownload<'m> {
+    model: &'m Model,
+    /// `cast_act_f16_kernel`'s `[max |x| bits, saturated count]`, f16 only.
+    stats: Option<CudaSlice<u32>>,
+}
+
+impl<'m> StateDownload<'m> {
+    pub(super) fn new(model: &'m Model, dtype: KvDtype) -> Result<Self, ReflexError> {
+        let stats = match dtype {
+            KvDtype::F32 => None,
+            KvDtype::F16 => Some(
+                model
+                    .device
+                    .alloc_zeros::<u32>(2)
+                    .map_err(|e| crate::gpu_err!(e, "alloc f16 export stats: {e}"))?,
+            ),
+        };
+        Ok(Self { model, stats })
+    }
+
+    /// `src[..n]` as `dtype` (f32 for a buffer that always stays f32, such as
+    /// the GatedDeltaNet state).
+    pub(super) fn get(
+        &mut self,
+        src: &CudaSlice<f32>,
+        n: usize,
+        dtype: KvDtype,
+        what: &str,
+    ) -> Result<KvValues, ReflexError> {
+        let device = &self.model.device;
+        match (dtype, self.stats.as_mut()) {
+            (KvDtype::F16, Some(stats)) => {
+                let mut out = unsafe { device.alloc::<u16>(n) }
+                    .map_err(|e| crate::gpu_err!(e, "{what}: alloc f16 export buffer: {e}"))?;
+                unsafe {
+                    self.model
+                        .dequant_kernels
+                        .cast_act_f16
+                        .function
+                        .clone()
+                        .launch(
+                            elementwise_launch_cfg(n),
+                            (&src.slice(0..n), &mut out, n as u64, &mut *stats),
+                        )
+                }
+                .map_err(|e| crate::gpu_err!(e, "{what}: f16 export cast: {e}"))?;
+                device
+                    .dtoh_sync_copy(&out)
+                    .map(KvValues::HostF16)
+                    .map_err(|e| crate::gpu_err!(e, "{what} dtoh: {e}"))
+            }
+            _ => device
+                .dtoh_sync_copy(&src.slice(0..n))
+                .map(KvValues::Host)
+                .map_err(|e| crate::gpu_err!(e, "{what} dtoh: {e}")),
+        }
+    }
+
+    /// Errors if any value rounded to f16 was outside its range.
+    pub(super) fn finish(self) -> Result<(), ReflexError> {
+        let Some(stats) = &self.stats else {
+            return Ok(());
+        };
+        let s = self
+            .model
+            .device
+            .dtoh_sync_copy(stats)
+            .map_err(|e| crate::gpu_err!(e, "f16 export stats dtoh: {e}"))?;
+        if s[1] > 0 {
+            return Err(crate::reflex_err!(
+                KvCache,
+                "an f16 cache file can't hold this state: {} values exceed f16's range (largest |x| = {}); export it as f32",
+                s[1],
+                f32::from_bits(s[0])
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Errors unless an imported buffer holds exactly the `expected` values the
 /// working cache's prefix region does.
 pub(super) fn check_state_len(
@@ -297,19 +383,30 @@ impl Model {
     /// Downloads a pinned prefix into the host form `crate::kv_io::export_kv`
     /// writes. This is how [`Model::generate_capture_kv`] builds its result.
     pub fn download_prefix(&self, prefix: &PinnedPrefix) -> Result<ImportedKv, ReflexError> {
+        self.download_prefix_as(prefix, KvDtype::F32)
+    }
+
+    /// [`Self::download_prefix`] for a cache file of element type `dtype`: with
+    /// f16 the values are rounded on the device (see [`StateDownload`]), and
+    /// `export_kv` then writes the f16 format version.
+    pub fn download_prefix_as(
+        &self,
+        prefix: &PinnedPrefix,
+        dtype: KvDtype,
+    ) -> Result<ImportedKv, ReflexError> {
         Ok(match &prefix.state {
-            DeviceState::Dense(d) => ImportedKv::Dense(self.download_dense_kv(d)?),
+            DeviceState::Dense(d) => ImportedKv::Dense(self.download_dense_kv(d, dtype)?),
             DeviceState::Hybrid(d) => {
                 let h = self.hybrid.as_ref().ok_or_else(|| {
                     ReflexError::Other("hybrid prefix on a non-hybrid model".to_string())
                 })?;
-                ImportedKv::Hybrid(self.download_hybrid_state(h, d)?)
+                ImportedKv::Hybrid(self.download_hybrid_state(h, d, dtype)?)
             }
             DeviceState::Mla(d) => {
                 let m = self.mla.as_ref().ok_or_else(|| {
                     ReflexError::Other("MLA prefix on a non-MLA model".to_string())
                 })?;
-                ImportedKv::Mla(self.download_mla_kv(m, d)?)
+                ImportedKv::Mla(self.download_mla_kv(m, d, dtype)?)
             }
         })
     }
