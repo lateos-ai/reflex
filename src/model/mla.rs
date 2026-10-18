@@ -1290,7 +1290,7 @@ impl Model {
         let imported_len = start_pos * qk_dim;
         match imported {
             None => {}
-            Some(PrefixSource::Host(cache)) => {
+            Some(PrefixSource::Host { cache, copy_ms }) => {
                 if cache.qk_dim != qk_dim {
                     return Err(crate::reflex_err!(
                         Other,
@@ -1307,14 +1307,16 @@ impl Model {
                         m.layers.len()
                     ));
                 }
+                let mut jobs = Vec::with_capacity(kv_caches.len());
                 for (layer_idx, kv_host) in cache.kv_caches.iter().enumerate() {
-                    let mut dst = kv_caches[layer_idx].slice_mut(0..imported_len);
-                    self.device
-                        .htod_sync_copy_into(kv_host, &mut dst)
-                        .map_err(|e| {
-                            crate::gpu_err!(e, "import mla kv_cache htod layer {layer_idx}: {e}")
-                        })?;
+                    check_state_len(kv_host, imported_len, "kv_cache", layer_idx)?;
+                    jobs.push((*kv_caches[layer_idx].device_ptr(), kv_host));
                 }
+                self.timed_prefix_copy(copy_ms, || {
+                    self.dequant_pipeline
+                        .borrow_mut()
+                        .upload_state(&jobs, &self.dequant_kernels.f16_to_f32_runs)
+                })?;
             }
             Some(PrefixSource::Device { state, copy_ms }) => {
                 if state.kv_caches.len() != m.layers.len() {
@@ -1605,37 +1607,44 @@ impl Model {
         on_first_token: impl FnMut(&[f32]),
         on_token: impl FnMut(u32, &str),
     ) -> Result<(Vec<u32>, String, crate::kv_io::MlaKvCache), ReflexError> {
+        let copy_ms = Cell::new(None);
         let (generated, text, kv_caches, seq_len) = self.generate_mla_impl(
             m,
             prompt,
-            imported.map(PrefixSource::Host),
+            imported.map(|cache| PrefixSource::Host {
+                cache,
+                copy_ms: &copy_ms,
+            }),
             1,
             sampling,
             on_first_token,
             on_token,
         )?;
-        let cache = self.download_mla_kv(m, &MlaDeviceKv { seq_len, kv_caches })?;
+        let cache = self.download_mla_kv(
+            m,
+            &MlaDeviceKv { seq_len, kv_caches },
+            crate::kv_io::KvDtype::F32,
+        )?;
         Ok((generated, text, cache))
     }
 
     /// Downloads a device-resident MLA latent cache's first `seq_len` positions
-    /// for export.
+    /// for export, as `dtype`.
     pub(super) fn download_mla_kv(
         &self,
         m: &MlaModel,
         d: &MlaDeviceKv,
+        dtype: crate::kv_io::KvDtype,
     ) -> Result<crate::kv_io::MlaKvCache, ReflexError> {
         let qk_dim = m.cfg.kv_lora_rank + m.cfg.qk_rope_head_dim;
         let per_layer_len = d.seq_len * qk_dim;
+        let mut dl = StateDownload::new(self, dtype)?;
         let kv_caches = d
             .kv_caches
             .iter()
-            .map(|c| {
-                self.device
-                    .dtoh_sync_copy(&c.slice(0..per_layer_len))
-                    .map_err(|e| crate::gpu_err!(e, "mla kv_cache dtoh: {e}"))
-            })
+            .map(|c| dl.get(c, per_layer_len, dtype, "mla kv_cache"))
             .collect::<Result<Vec<_>, _>>()?;
+        dl.finish()?;
         Ok(crate::kv_io::MlaKvCache {
             seq_len: d.seq_len,
             qk_dim,

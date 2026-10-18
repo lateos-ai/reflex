@@ -1775,7 +1775,7 @@ impl Model {
         let imported_len = start_pos * kv_stride;
         match imported {
             None => {}
-            Some(PrefixSource::Host(cache)) => {
+            Some(PrefixSource::Host { cache, copy_ms }) => {
                 if cache.num_kv_heads != self.cfg.num_kv_heads
                     || cache.head_dim != self.cfg.head_dim
                 {
@@ -1792,22 +1792,20 @@ impl Model {
                         self.layers.len()
                     ));
                 }
+                let mut jobs = Vec::with_capacity(2 * k_caches.len());
                 for (layer_idx, (k_host, v_host)) in
                     cache.k_caches.iter().zip(&cache.v_caches).enumerate()
                 {
-                    let mut k_dst = k_caches[layer_idx].slice_mut(0..imported_len);
-                    self.device
-                        .htod_sync_copy_into(k_host, &mut k_dst)
-                        .map_err(|e| {
-                            crate::gpu_err!(e, "import k_cache htod layer {layer_idx}: {e}")
-                        })?;
-                    let mut v_dst = v_caches[layer_idx].slice_mut(0..imported_len);
-                    self.device
-                        .htod_sync_copy_into(v_host, &mut v_dst)
-                        .map_err(|e| {
-                            crate::gpu_err!(e, "import v_cache htod layer {layer_idx}: {e}")
-                        })?;
+                    check_state_len(k_host, imported_len, "k_cache", layer_idx)?;
+                    check_state_len(v_host, imported_len, "v_cache", layer_idx)?;
+                    jobs.push((*k_caches[layer_idx].device_ptr(), k_host));
+                    jobs.push((*v_caches[layer_idx].device_ptr(), v_host));
                 }
+                self.timed_prefix_copy(copy_ms, || {
+                    self.dequant_pipeline
+                        .borrow_mut()
+                        .upload_state(&jobs, &self.dequant_kernels.f16_to_f32_runs)
+                })?;
             }
             Some(PrefixSource::Device { state, copy_ms }) => {
                 if state.k_caches.len() != self.layers.len() {
@@ -2127,44 +2125,53 @@ impl Model {
         on_first_token: impl FnMut(&[f32]),
         on_token: impl FnMut(u32, &str),
     ) -> Result<(Vec<u32>, String, crate::kv_io::DenseKvCache), ReflexError> {
-        let src = imported.map(PrefixSource::Host);
+        let copy_ms = Cell::new(None);
+        let src = imported.map(|cache| PrefixSource::Host {
+            cache,
+            copy_ms: &copy_ms,
+        });
         let space_prefix_next = self
             .tokenizer
             .ends_after_special(prompt, dense_after_special(src));
         let (generated, text, k_caches, v_caches, seq_len) =
             self.generate_dense_impl(prompt, src, 1, sampling, on_first_token, on_token)?;
-        let cache = self.download_dense_kv(&DenseDeviceKv {
-            seq_len,
-            k_caches,
-            v_caches,
-            space_prefix_next,
-        })?;
+        let cache = self.download_dense_kv(
+            &DenseDeviceKv {
+                seq_len,
+                k_caches,
+                v_caches,
+                space_prefix_next,
+            },
+            crate::kv_io::KvDtype::F32,
+        )?;
         Ok((generated, text, cache))
     }
 
     /// Downloads a device-resident dense/MoE state's first `seq_len` positions
-    /// (its buffers may carry generation headroom past that) for export.
+    /// (its buffers may carry generation headroom past that) for export, as
+    /// `dtype` (see [`StateDownload`]).
     pub(super) fn download_dense_kv(
         &self,
         d: &DenseDeviceKv,
+        dtype: crate::kv_io::KvDtype,
     ) -> Result<crate::kv_io::DenseKvCache, ReflexError> {
         let per_layer_len = d.seq_len * self.cfg.num_kv_heads * self.cfg.head_dim;
-        let download = |caches: &[CudaSlice<f32>], what: &str| {
+        let mut dl = StateDownload::new(self, dtype)?;
+        let mut download = |caches: &[CudaSlice<f32>], what: &str| {
             caches
                 .iter()
-                .map(|c| {
-                    self.device
-                        .dtoh_sync_copy(&c.slice(0..per_layer_len))
-                        .map_err(|e| crate::gpu_err!(e, "{what} dtoh: {e}"))
-                })
+                .map(|c| dl.get(c, per_layer_len, dtype, what))
                 .collect::<Result<Vec<_>, _>>()
         };
+        let k_caches = download(&d.k_caches, "k_cache")?;
+        let v_caches = download(&d.v_caches, "v_cache")?;
+        dl.finish()?;
         Ok(crate::kv_io::DenseKvCache {
             seq_len: d.seq_len,
             num_kv_heads: self.cfg.num_kv_heads,
             head_dim: self.cfg.head_dim,
-            k_caches: download(&d.k_caches, "k_cache")?,
-            v_caches: download(&d.v_caches, "v_cache")?,
+            k_caches,
+            v_caches,
             space_prefix_next: Some(d.space_prefix_next),
         })
     }

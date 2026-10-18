@@ -65,6 +65,13 @@ rest of its prompt with `import_kv` pointing at that file. This is Reflex's
 counterpart to llama-server's `--llama-cache-prompt`. --system-prompt-file
 swaps in a longer shared prefix, since the saving grows with its size.
 
+--kv-dtype f16 (cold-chain, cold-warm, --reuse-prefix): every cache file is
+written as f16 (`reflex generate --export-kv-dtype f16`, IPC `export_kv_dtype`),
+half the size; resuming from one is no longer exact. The default, f32, sends the
+same commands and requests as before the option existed. Cold hops and
+`cold-warm` report each file's size and read time (`kv_file_mb`,
+`kv_read_ms`); --reuse-prefix reports the prefix file's size once.
+
 --pin-prefix (stdio/uds): the same, but the system prompt's state stays in
 VRAM (`pin_prefix`) and every hop resumes from it (`use_pinned`), copying it
 device-to-device instead of reading a file.
@@ -104,6 +111,7 @@ Usage:
           [--energy [--reflex-energy target/release/reflex-energy]
                     [--energy-idle-ms 2000]]
   stdio/uds: [--reuse-prefix [--kv-dir /dev/shm] | --pin-prefix]
+  cold-chain/cold-warm/--reuse-prefix: [--kv-dtype f32|f16]
              [--system1 planner,coder,reviewer,tester]
   stdio/uds/llama-server: [--json-schema scripts/relay_handoff_schema.json]
   any target: [--json-prompt]
@@ -455,6 +463,20 @@ def llama_hop(url, prompt, max_tokens, cache_prompt, schema):
     }, msg.get("content", "")
 
 
+def kv_export_cli(kv_dtype):
+    """`reflex generate` arguments for writing a cache file of `kv_dtype`: none
+    for f32, so a default run sends the same command as before."""
+    return [] if kv_dtype == "f32" else ["--export-kv-dtype", kv_dtype]
+
+
+def kv_export_request(path, kv_dtype):
+    """IPC fields for writing a cache file of `kv_dtype` to `path`."""
+    fields = {"export_kv": path}
+    if kv_dtype != "f32":
+        fields["export_kv_dtype"] = kv_dtype
+    return fields
+
+
 class ColdRunner:
     """Spawns one process per hop, under reflex-energy when `wrap_energy`."""
 
@@ -489,7 +511,7 @@ class ColdRunner:
         if import_kv:
             cmd += ["--import-kv", import_kv]
         if export_kv:
-            cmd += ["--export-kv", export_kv]
+            cmd += ["--export-kv", export_kv] + kv_export_cli(a.kv_dtype)
         else:
             cmd += ["--max-tokens", str(max_tokens)]
         stdout, _, wall, _, energy = self.run(cmd + a.engine_arg)
@@ -723,6 +745,12 @@ def selftest():
     assert "use_pinned" not in c.sent[1] and c.sent[1]["prompt"].startswith("SYS\nn\n")
     summary = summarize([{"s1_chosen": "coder", "s1_rtt_ms": 1.0}, {"s1_chosen": "coder"}])
     assert summary["s1_chosen"] == {"coder": 2} and summary["s1_rtt_ms"]["p50"] == 1.0, summary
+
+    assert kv_export_cli("f32") == [] and kv_export_cli("f16") == ["--export-kv-dtype", "f16"]
+    assert list(kv_export_request("p", "f32")) == ["export_kv"]
+    assert kv_export_request("p", "f16") == {"export_kv": "p", "export_kv_dtype": "f16"}
+    req = {"prompt": "s", **kv_export_request("p", "f32"), "max_tokens": 1}
+    assert json.dumps(req) == '{"prompt": "s", "export_kv": "p", "max_tokens": 1}', req
     print("selftest ok")
     return 0
 
@@ -781,6 +809,12 @@ def main(argv=None):
         "--kv-dir",
         help="where cache files go (default: /dev/shm if present, else a temp dir; tmpfs is best)",
     )
+    ap.add_argument(
+        "--kv-dtype",
+        choices=("f32", "f16"),
+        default="f32",
+        help="cold-chain/cold-warm/--reuse-prefix: element type of the cache files written",
+    )
     ap.add_argument("--system-prompt-file", help="shared prefix to use instead of the built-in one")
     ap.add_argument("--json-schema", help="constrain every hop's output to the JSON Schema in this file")
     ap.add_argument(
@@ -810,6 +844,10 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.target == "selftest":
         return selftest()
+    if args.kv_dtype != "f32" and not (
+        args.target in ("cold-chain", "cold-warm") or args.reuse_prefix
+    ):
+        ap.error("--kv-dtype applies to cold-chain, cold-warm and --reuse-prefix")
     if (args.reuse_prefix or args.pin_prefix) and args.target not in ("stdio", "uds"):
         ap.error("--reuse-prefix/--pin-prefix are for stdio/uds; use --llama-cache-prompt")
     if args.reuse_prefix and args.pin_prefix:
@@ -849,6 +887,7 @@ def main(argv=None):
     on_measure_start = start_bracket if args.energy and args.target not in COLD_TARGETS else None
     proc = None
     setup = None
+    prefix_file_mb = None
     files = []
     try:
         if args.target == "llama-server":
@@ -920,8 +959,10 @@ def main(argv=None):
                 )
                 files.append(prefix_kv)
                 msg, _ = reflex_request(
-                    client, {"prompt": system, "export_kv": prefix_kv, "max_tokens": 1}
+                    client,
+                    {"prompt": system, **kv_export_request(prefix_kv, args.kv_dtype), "max_tokens": 1},
                 )
+                prefix_file_mb = os.path.getsize(prefix_kv) / 1e6
                 print(
                     f"exported prefix KV ({os.path.getsize(prefix_kv)} bytes) in "
                     f"{msg['timings']['model_ms']:.1f} ms -> {prefix_kv}",
@@ -1001,6 +1042,8 @@ def main(argv=None):
     if setup is not None:
         fields = (f"{k}={v:.2f}" for k, v in setup.items() if v is not None)
         print("\nsetup (one cold process): " + ", ".join(fields))
+    if prefix_file_mb is not None:
+        print(f"\nprefix cache file: {prefix_file_mb:.2f} MB ({args.kv_dtype})")
     if energy_bracket is not None:
         print(
             f"\nenergy over the measured hops (one bracket): "
@@ -1023,6 +1066,8 @@ def main(argv=None):
                     "llama_prompt_cache": args.llama_prompt_cache,
                     "reuse_prefix": args.reuse_prefix,
                     "pin_prefix": args.pin_prefix,
+                    "kv_dtype": args.kv_dtype,
+                    "prefix_kv_file_mb": prefix_file_mb,
                     "kv_dir": cold.kv_dir if cold is not None else args.kv_dir,
                     "json_schema": args.json_schema,
                     "json_prompt": args.json_prompt,

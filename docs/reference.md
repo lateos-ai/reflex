@@ -7,7 +7,7 @@ measurements; [DEVELOPMENT.md](DEVELOPMENT.md) is for contributors.
 Contents: [Subcommands](#subcommands) · [Build features](#build-features) ·
 [Kernel build modes](#kernel-build-modes) · [Weight storage](#weight-storage) · [Examples](#examples) ·
 [Context-length limit](#context-length-limit) · [`--json` output contract](#--json-output-contract) ·
-[JSON Schema output](#json-schema-output) ·
+[JSON Schema output](#json-schema-output) · [KV cache files](#kv-cache-files) ·
 [Error categories](#error-categories) · [Host-side building blocks](#host-side-building-blocks) ·
 [Docker](#docker) · [Runpod](#runpod) · [Kubernetes](#kubernetes)
 
@@ -233,7 +233,8 @@ objects also carry a **`schema_version`** field so a consumer can detect a shape
   `weights_dtype` to the `generate`, `system1`, `bench` and `check` result objects.
   1.2.0 added `kv_io_ms` to `generate`'s result: the time spent reading the
   `--import-kv` file or writing the `--export-kv` file, present only with one of them
-  (the plain-text line gains the same `kv_io_ms=` field).
+  (the plain-text line gains the same `kv_io_ms=` field). The read includes uploading
+  the file into the model's cache (see [KV cache files](#kv-cache-files)).
 - The four versioned objects are `generate`'s `REFLEX_GENERATE_OK` result, `system1`'s
   `REFLEX_SYSTEM1_OK` result, `smoke`'s `REFLEX_SMOKE_OK` result, and each additive
   `REFLEX_PHASE_OK` phase object. Per-item lines (`REFLEX_SYSTEM1_CANDIDATE_OK`,
@@ -286,6 +287,46 @@ sampling. It works for every architecture.
 
 Design, format rationale and measurements:
 [design/agent-relay.md](design/agent-relay.md), "JSON Schema constrained decoding".
+
+## KV cache files
+
+`reflex generate --export-kv <file>` (IPC `export_kv`) writes the model's state after
+the prompt; `--import-kv <file>` (IPC `import_kv`) resumes from it. The format is a
+small header (`CSKV` magic, a version, the shape) followed by the values, little
+endian. It's home-grown and versioned, not a stable public spec. Every version below
+still imports.
+
+| version | layout | values |
+|---:|---|---|
+| 1 | dense/MoE (Qwen3, Qwen2, Llama, Mistral, Kolibri) | f32 |
+| 2 | Qwen3.5 hybrid: attention K/V, GatedDeltaNet conv and recurrent state | f32 |
+| 3 | MLA (DeepSeek-V2/V3): one latent cache per layer | f32 |
+| 4 | dense/MoE, version 1 plus one byte for SentencePiece continuations | f32 |
+| 5 | version 4 | f16 |
+| 6 | version 2 | attention K/V f16, GatedDeltaNet state f32 |
+| 7 | version 3 | f16 |
+
+- **Exports write f32 (versions 4, 2, 3) unless asked for f16.** The CLI flag is
+  `--export-kv-dtype f16`, the IPC field `"export_kv_dtype": "f16"`. An f16 file is about
+  half the size (Qwen3-0.6B, 1,489 positions: 171 MB against 342 MB) and reads faster,
+  but resuming from it is no longer exact: the cached values are rounded to f16. On a
+  T4 that moved the next token's logits by about 7e-4 (relative L2) and left the greedy
+  tokens unchanged on every test prompt. The working cache stays f32 either way.
+- **The rounding happens on the GPU**, and so does widening back to f32 on import. A
+  value outside f16's range (|x| > 65504) fails the export with `kv_cache` instead of
+  becoming infinite.
+- **The hybrid keeps its recurrent state f32** (version 6). It's a fixed size per model,
+  so a short hybrid prefix's f16 file is barely smaller than its f32 one.
+- **Import reads the header first** and rejects a file whose length doesn't match it
+  (`kv_cache`), before any model work. The values are then read straight into the
+  engine's pinned staging buffers on their way to the GPU. Don't change a file while a
+  request resumes from it: a file that shrinks in between fails that request.
+- **`kv_io_ms`** reports the export's write, or the import's read, which includes the
+  upload into the model's cache, since the two overlap.
+
+Gemma 4 and Granite 4.0-H have no cache format and return `unsupported_architecture`.
+Design and measurements: [design/agent-relay.md](design/agent-relay.md), "Faster cache
+files (phase F)".
 
 ## Error categories
 
