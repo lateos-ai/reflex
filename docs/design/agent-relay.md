@@ -1081,11 +1081,61 @@ Raw data: `bench-results/agent-relay-t4-phase-f/` (not committed): `phase-f-step
 nightly, byte identity, CLI checks and cold start), `phase-f3-out/` and
 `phase-f4-out/` (the `kv_io_ms` and f16-upload follow-ups).
 
+## Sidecar surface (phase G)
+
+The OpenAI sidecar (`sidecar/openai-adapter/`) is the only HTTP surface. Phase G maps
+`response_format` on `/v1/chat/completions` onto IPC `json_schema`:
+
+| `response_format` | IPC `json_schema` |
+|---|---|
+| omitted, or `{"type": "text"}` | none |
+| `{"type": "json_schema", "json_schema": {"schema": S}}` | `S`, as written |
+| `{"type": "json_object"}` | `{"type": "object"}` (any object) |
+| any other `type`, or `json_schema` without `schema` | none: the sidecar returns `400` |
+
+The schema is kept as raw text (`serde_json::value::RawValue`) from the HTTP body to
+the IPC line, with only the whitespace between tokens removed, since an IPC request is
+one line. A `serde_json::Value` would sort the keys, and the properties would then come
+out in alphabetical order rather than schema order. `name`, `description` and `strict`
+are accepted and not used: the engine always enforces the schema.
+
+The engine's errors map to OpenAI-style errors:
+- a schema outside the subset is `400` `invalid_request_error`, code `invalid_input`;
+- `grammar_dead_end` (`max_tokens` ran out before the value was complete) is `400`
+  `invalid_request_error`, code `grammar_dead_end`.
+
+Both reach a streaming client as a real status when they come before the first token,
+as a schema error always does. A failure after the stream has started is one
+`{"error": ...}` event followed by `data: [DONE]`, with no `finish_reason` chunk, so a
+truncated value never looks complete. A completed value ends at EOS, so its
+`finish_reason` is `"stop"`.
+
+`/v1/classify` already returned what an orchestrator needs from a System-1 response:
+`label`/`label_index` (the engine's `chosen`, with the same first-on-a-tie rule),
+`entropy`, and each label's `probability`, `score` and token count. It is unchanged.
+
+HTTP requests still can't reach the pinned slot or cache files: `pin_prefix`,
+`use_pinned`, `import_kv` and `export_kv` are ignored, like any field the sidecar
+doesn't know, and the sidecar writes only the IPC fields it names. Unit tests check
+both endpoints' IPC lines byte for byte.
+
+End to end on a Tesla T4 (2026-10-18), `reflex stdio` with Qwen3-0.6B-Q4_K_M behind
+the sidecar, greedy:
+- a `json_schema` request listing `name`, `age`, `city` returned
+  `{"name": "Lila", "age": 25, "city": "New York"}`, keys in schema order, with
+  `finish_reason: "stop"`. Streaming gave the same text in 25 events. `json_object`
+  gave a parsing object. Without a schema the model starts with `<think>`;
+- `pattern` came back `400` `invalid_input` naming the keyword, and so did a
+  `required` name missing from `properties` on a streaming request, before any event;
+- `max_tokens: 4` gave `400` `grammar_dead_end`, and streaming gave four content
+  chunks, the error event and `[DONE]`;
+- a request with `pin_prefix`, `use_pinned`, `import_kv` and `export_kv` ran as a plain
+  request and wrote no file; `/v1/classify` gave the same probabilities as before.
+
 ## Planned next phases
 
-Round 2 is planned in [agent-relay-round2.md](agent-relay-round2.md). Phase F is done
-(above); next are the sidecar's `response_format` (phase G) and composition examples
-(phase H).
+Round 2 is planned in [agent-relay-round2.md](agent-relay-round2.md). Phases F and G
+are done (above); next are composition examples (phase H).
 
 ## Swarm pattern
 

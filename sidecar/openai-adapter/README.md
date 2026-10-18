@@ -159,10 +159,74 @@ for a future OpenRouter provider-listing application, which requires a `/v1/mode
 endpoint with this kind of metadata).
 
 Request fields honored: `model`, `messages` (`role`/`content`, string content only),
-`temperature`, `top_p`, `max_tokens`, `stream`, `seed`. `top_k` is accepted too as a
-Reflex-specific extension (not part of the OpenAI schema) since `IpcSamplingParams`
-supports it. `temperature` omitted or `<= 0` selects greedy argmax, mirroring
-`IpcRequest::sampling_params`'s own rule.
+`temperature`, `top_p`, `max_tokens`, `stream`, `seed`, `response_format` (below).
+`top_k` is accepted too as a Reflex-specific extension (not part of the OpenAI schema)
+since `IpcSamplingParams` supports it. `temperature` omitted or `<= 0` selects greedy
+argmax, mirroring `IpcRequest::sampling_params`'s own rule. Other fields are ignored,
+including the IPC-only `pin_prefix`, `use_pinned`, `import_kv` and `export_kv`: the
+pinned slot and cache files belong to whoever drives `reflex stdio`/`uds` directly
+(an orchestrator), not to HTTP callers, and the sidecar never forwards them.
+
+### `response_format`: JSON Schema output
+
+`response_format` constrains the reply to one JSON value that validates against a
+schema, using the engine's constrained decoding (see
+[docs/design/agent-relay.md](../../docs/design/agent-relay.md), "JSON Schema
+constrained decoding (phase C)"):
+
+```
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Invent a fictional person. Reply with their name, age and city as JSON."}],
+    "max_tokens": 96,
+    "response_format": {"type": "json_schema", "json_schema": {"name": "person", "strict": true,
+      "schema": {"type": "object",
+                 "properties": {"name": {"type": "string"}, "age": {"type": "integer"}, "city": {"type": "string"}},
+                 "required": ["name", "age", "city"]}}}
+  }'
+```
+
+Real response (Tesla T4, `Qwen3-0.6B-Q4_K_M`, greedy; the properties come out in
+schema order, not alphabetically):
+
+```json
+{"id":"chatcmpl-reflex-0","object":"chat.completion","created":1792337380,"model":"Qwen3-0.6B-Q4_K_M",
+ "choices":[{"index":0,"message":{"role":"assistant","content":"{\"name\": \"Lila\", \"age\": 25, \"city\": \"New York\"}"},"finish_reason":"stop"}],
+ "usage":{"prompt_tokens":15,"completion_tokens":22,"total_tokens":37}}
+```
+
+Without the schema, the same request opens with Qwen3's `<think>` block. With
+`"stream": true` the deltas join to the same text.
+
+- `{"type": "json_schema", "json_schema": {"schema": {...}}}`: the schema goes to the
+  engine as written, so properties come out in the order the schema lists them (the
+  sidecar passes it through as raw JSON text; it only removes the whitespace between
+  tokens, since an IPC request is one line). `name`, `description` and `strict` are
+  accepted and not used: the schema is always enforced, as if `strict` were `true`.
+  `schema` is required.
+- `{"type": "json_object"}`: any JSON object (the schema `{"type": "object"}`). Unlike
+  OpenAI, the prompt doesn't need to mention JSON.
+- `{"type": "text"}`, or no `response_format`: unconstrained, as before.
+- Any other `type` is a `400`.
+
+The supported schema subset is the engine's: `type`, `properties`, `required`,
+`additionalProperties` (`false` or omitted), `items`, `enum`, `const`, `anyOf`, and a
+local `$ref` into the root's `$defs`, plus annotation keywords such as `description`.
+Any other keyword (`pattern`, `minLength`, `format`, `oneOf`, ...) is rejected rather
+than silently ignored: the response is `400` `invalid_request_error` with code
+`invalid_input` and a message naming the keyword, in streaming mode too. When
+`properties` is given, the object has no other properties. The output is compact JSON,
+with at most one space after each `:` and `,`. See phase C in
+[agent-relay.md](../../docs/design/agent-relay.md) for the full rules.
+
+`max_tokens` has to cover the whole value. If it runs out first, the engine fails the
+request rather than return JSON that doesn't parse: non-streaming, that's a `400`
+`invalid_request_error` with code `grammar_dead_end`; streaming, the tokens already
+sent are followed by an `{"error": {..., "code": "grammar_dead_end"}}` event and
+`data: [DONE]`, with no `finish_reason` chunk. A completed value ends at EOS, so its
+`finish_reason` is `"stop"`; the usual heuristic (below) applies, so a value whose EOS
+lands exactly on the `max_tokens`-th token reports `"length"`.
 
 ### `POST /v1/classify`
 
@@ -287,10 +351,15 @@ limits work as for chat.
   HTTP status instead of an empty `200` stream.
 - **Other engine errors are mapped by the engine's `error_kind`** (see the root
   docs/reference.md's "Error categories"): `invalid_input` (a bad request parameter, such as a
-  sampling value) is `400` with code `invalid_input`; `out_of_memory` is `503` with type
+  sampling value or an unsupported schema keyword) is `400` with code `invalid_input`;
+  `grammar_dead_end` (`max_tokens` ran out inside a `response_format` value) is `400`
+  with code `grammar_dead_end`; `out_of_memory` is `503` with type
   `server_error`; anything else is `500` with the category as `code`. With an older
   engine binary that sends no `error_kind`, only the context-length case is recognized
-  (by its message prefix) and everything else is `500`.
+  (by its message prefix) and everything else is `500`. An error after a stream has
+  started (headers already sent) arrives as one OpenAI-style `{"error": {...}}` data
+  event with the same `type` and `code`, followed by `data: [DONE]`, and no
+  `finish_reason` chunk.
 - **No function/tool calling, no `logprobs`, no `n > 1`, no multimodal content
   parts.** A `messages[i].content` that isn't a plain string (e.g. an image/text
   content-parts array) is rejected with a `400`.

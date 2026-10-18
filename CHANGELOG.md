@@ -149,6 +149,21 @@ What has been built, in order. Measurements live in
 
   See [docs/design/agent-relay.md](docs/design/agent-relay.md#faster-cache-files-phase-f)
   and [docs/reference.md](docs/reference.md#kv-cache-files).
+- **`response_format` in the OpenAI sidecar.** `/v1/chat/completions` accepts
+  `{"type": "json_schema", "json_schema": {"schema": ...}}` and maps it onto the
+  engine's JSON Schema constrained decoding, streaming or not. The schema passes
+  through as raw JSON, so properties come out in schema order. `{"type":
+  "json_object"}` allows any JSON object, and `{"type": "text"}` is unchanged.
+  - A schema outside the engine's subset is a `400` `invalid_request_error`
+    (`invalid_input`, naming the keyword). `max_tokens` running out before the value
+    is complete is a `400` with code `grammar_dead_end`.
+  - An engine error after a stream has started now arrives as an OpenAI-style
+    `{"error": ...}` event before `data: [DONE]`, as a timeout already did, instead of
+    a `finish_reason: "stop"` chunk.
+  - HTTP requests still can't reach the pinned slot or cache files: `pin_prefix`,
+    `use_pinned`, `import_kv` and `export_kv` are ignored, like any unknown field.
+
+  See [sidecar/openai-adapter/README.md](sidecar/openai-adapter/README.md#response_format-json-schema-output).
 
 ## 2026-10-15
 
