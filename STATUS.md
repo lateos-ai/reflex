@@ -1990,6 +1990,9 @@ public PR, T4-verified.
       github/master 13d7518, no upstream). Tree identical to `agent-relay-phase-h`
       minus private files; LF blobs; no private-doc refs; host checks rerun there.
       PR text in the session scratchpad (`pr-relay-phase-h.md`).
+    - **PUBLIC PR #43 opened 2026-10-18** (github branch `agent-relay-phase-h`,
+      9671576). CI green (7 checks), mergeable, 8 files. After merge: sync private
+      master, delete worktree `../reflex-pub-h` and branches, diff CHANGELOG.
 - Out of scope:
   - an engine-side envelope, carry text or blob references;
   - zero-copy pinned use;
