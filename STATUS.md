@@ -1985,6 +1985,11 @@ public PR, T4-verified.
       p50 hops: py router 12.5 ms, worker 439 (handoff 385 + export 53), cold
       sub-agent 1,218; sh router 543, worker 1,124, sub-agent 1,231. Raw:
       `bench-results/agent-relay-t4-phase-h/`.
+    - **Public PR branch prepared 2026-10-18 (not pushed):** worktree
+      `../reflex-pub-h`, branch `pub/agent-relay-phase-h` 9671576 (one commit on
+      github/master 13d7518, no upstream). Tree identical to `agent-relay-phase-h`
+      minus private files; LF blobs; no private-doc refs; host checks rerun there.
+      PR text in the session scratchpad (`pr-relay-phase-h.md`).
 - Out of scope:
   - an engine-side envelope, carry text or blob references;
   - zero-copy pinned use;
