@@ -40,8 +40,10 @@
 //! (`crate::kv_io`). A request that sets `import_kv` treats `prompt` as the
 //! continuation after the file's positions. An `export_kv` request must set
 //! `max_tokens` to 1, since the state after a later generated token is no longer
-//! the prompt's (see `Model::generate_capture_kv`). The caller owns the files:
-//! the engine keeps nothing between requests.
+//! the prompt's (see `Model::generate_capture_kv`). `export_kv_dtype: "f16"`
+//! writes the file in f16, half the size, at the cost of an exact resume; the
+//! default `"f32"` is unchanged, and `import_kv` reads either. The caller owns
+//! the files: the engine keeps nothing between requests.
 //!
 //! **Pinned prefix**: a request with `pin_prefix` keeps the
 //! model's state after its prompt in VRAM, in the session's one [`PrefixSlot`],

@@ -297,12 +297,17 @@ struct Resumed {
 
 impl Model {
     /// Runs `copies` (copies into the working cache on the default stream),
-    /// waits for them, and records how long that took in `copy_ms`.
+    /// waits for them, and records how long that took in `copy_ms`. Work
+    /// already queued is waited for first, outside the timing: in a cold
+    /// process the weight load's last kernels can still be running.
     pub(super) fn timed_prefix_copy(
         &self,
         copy_ms: &Cell<Option<f64>>,
         copies: impl FnOnce() -> Result<(), ReflexError>,
     ) -> Result<(), ReflexError> {
+        self.device
+            .synchronize()
+            .map_err(|e| crate::gpu_err!(e, "sync before prefix copy: {e}"))?;
         let start = std::time::Instant::now();
         copies()?;
         self.device

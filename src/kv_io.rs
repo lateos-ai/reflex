@@ -66,10 +66,12 @@
 //! and the element type changed:
 //! - version 5: version 4 (dense/MoE), every K/V value f16 LE;
 //! - version 6: version 2 (hybrid), attention K/V f16 LE, while the
-//!   GatedDeltaNet `conv_state`/`recurrent` stay f32 LE (a fixed few MB per
-//!   model, and the recurrent state is carried forward through every later
-//!   token, so its rounding compounds instead of being read once; measured in
-//!   docs/design/agent-relay.md, "Faster cache files (phase F)");
+//!   GatedDeltaNet `conv_state`/`recurrent` stay f32 LE, as llama.cpp keeps
+//!   recurrent state f32 next to an f16 KV cache. Rounding that state too
+//!   measured ~15% more logit error than rounding the K/V alone (Qwen3.5-0.8B,
+//!   docs/design/agent-relay.md, "Faster cache files (phase F)"), small either
+//!   way, but it is a fixed size per model (~20 MB there), so keeping it f32
+//!   is what makes a short hybrid prefix's f16 file barely smaller;
 //! - version 7: version 3 (MLA), the latent f16 LE.
 //!
 //! The values are rounded to f16 on the device when exported (round to

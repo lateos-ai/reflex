@@ -161,3 +161,128 @@ fn dense_f16_state_rounding_errors() {
     let model = load_f32(&path);
     report(&model, "dense", &[Round::Attention]);
 }
+
+/// `WeightLoadPipeline::upload_state` widens f16 values exactly and lands
+/// every value where it belongs: more than one launch's worth of runs in one
+/// chunk, a buffer spanning several chunks, f32 and f16 jobs interleaved, and
+/// the same values read from an f16 cache file's ranges.
+#[test]
+#[ignore]
+fn upload_state_widens_f16_runs_exactly() {
+    use crate::kv_io::{KvDtype, KvValues};
+    let model = load_f32(QWEN35MOE_FIXTURE);
+    let value = |i: usize, salt: usize| ((i * 7 + salt * 131) % 4093) as f32 / 97.0 - 21.0;
+    // 150 small buffers (3 launches in one chunk), one of 5M values (10 MB in
+    // f16, two chunks), and f32 buffers between them.
+    let mut lens: Vec<usize> = (0..150).map(|k| 1 + (k * 37) % 900).collect();
+    lens.insert(75, 5_000_000);
+    let host: Vec<KvValues> = lens
+        .iter()
+        .enumerate()
+        .map(|(k, &n)| {
+            let xs: Vec<f32> = (0..n).map(|i| value(i, k)).collect();
+            if k % 5 == 4 {
+                KvValues::Host(xs)
+            } else {
+                KvValues::HostF16(
+                    xs.iter()
+                        .map(|&x| half::f16::from_f32(x).to_bits())
+                        .collect(),
+                )
+            }
+        })
+        .collect();
+    let expect: Vec<Vec<f32>> = host.iter().map(|v| v.to_f32().unwrap()).collect();
+    let check = |values: &[KvValues], what: &str| {
+        let bufs: Vec<CudaSlice<f32>> = values
+            .iter()
+            .map(|v| model.device.alloc_zeros::<f32>(v.len() + 3).unwrap())
+            .collect();
+        let jobs: Vec<_> = bufs.iter().map(|b| *b.device_ptr()).zip(values).collect();
+        model
+            .dequant_pipeline
+            .borrow_mut()
+            .upload_state(&jobs, &model.dequant_kernels.f16_to_f32_runs)
+            .expect("upload_state");
+        for (k, (b, want)) in bufs.iter().zip(&expect).enumerate() {
+            let got = model.device.dtoh_sync_copy(b).unwrap();
+            assert_eq!(&got[..want.len()], &want[..], "{what}: buffer {k} values");
+            assert_eq!(
+                &got[want.len()..],
+                &[0.0; 3],
+                "{what}: buffer {k} wrote past its end"
+            );
+        }
+    };
+    check(&host, "host values");
+
+    // The same values through a version-5 file: one dense layer per pair.
+    let n_pairs = host.len() / 2;
+    let path = std::env::temp_dir().join(format!("reflex_upload_runs_{}.cskv", std::process::id()));
+    let p = path.to_str().unwrap();
+    let f16_only: Vec<KvValues> = host
+        .iter()
+        .take(n_pairs * 2)
+        .map(|v| match v {
+            KvValues::Host(xs) => KvValues::HostF16(
+                xs.iter()
+                    .map(|&x| half::f16::from_f32(x).to_bits())
+                    .collect(),
+            ),
+            other => other.clone(),
+        })
+        .collect();
+    // Dense files need equal K/V lengths per layer: pad every buffer to one length.
+    let len = 1024;
+    let padded: Vec<KvValues> = f16_only
+        .iter()
+        .map(|v| {
+            let mut xs = v.to_f32().unwrap();
+            xs.resize(len, 0.5);
+            KvValues::HostF16(
+                xs.iter()
+                    .map(|&x| half::f16::from_f32(x).to_bits())
+                    .collect(),
+            )
+        })
+        .collect();
+    let cache = crate::kv_io::DenseKvCache {
+        seq_len: 1,
+        num_kv_heads: 1,
+        head_dim: len,
+        k_caches: padded.iter().step_by(2).cloned().collect(),
+        v_caches: padded.iter().skip(1).step_by(2).cloned().collect(),
+        space_prefix_next: Some(true),
+    };
+    crate::kv_io::export_dense_kv(p, &cache).unwrap();
+    let back = crate::kv_io::import_dense_kv(p).unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(back.k_caches.iter().all(|v| v.dtype() == KvDtype::F16));
+    let from_file: Vec<KvValues> = back
+        .k_caches
+        .iter()
+        .zip(&back.v_caches)
+        .flat_map(|(k, v)| [k.clone(), v.clone()])
+        .collect();
+    let bufs: Vec<CudaSlice<f32>> = from_file
+        .iter()
+        .map(|_| model.device.alloc_zeros::<f32>(len).unwrap())
+        .collect();
+    let jobs: Vec<_> = bufs
+        .iter()
+        .map(|b| *b.device_ptr())
+        .zip(&from_file)
+        .collect();
+    model
+        .dequant_pipeline
+        .borrow_mut()
+        .upload_state(&jobs, &model.dequant_kernels.f16_to_f32_runs)
+        .expect("upload_state from a file");
+    for (k, (b, v)) in bufs.iter().zip(&padded).enumerate() {
+        assert_eq!(
+            model.device.dtoh_sync_copy(b).unwrap(),
+            v.to_f32().unwrap(),
+            "file buffer {k}"
+        );
+    }
+}

@@ -126,6 +126,29 @@ What has been built, in order. Measurements live in
     pinned prefix takes 45 ms, against 285 ms over the whole prompt.
 
   See [docs/design/agent-relay.md](docs/design/agent-relay.md#system-1-over-a-resumed-prefix-phase-e).
+- **Faster cache-file imports, and opt-in f16 cache files.**
+  - `--import-kv`/`import_kv` reads only the file's header up front, and checks the
+    file's length against it. The values are then read straight into the engine's
+    pinned staging buffers on their way to the GPU. Before, they went through two
+    fresh host buffers, and faulting those in made a cold process's read of a 342 MB
+    file take 284 ms.
+  - On a T4 with Qwen3-0.6B and a ~1,490-token prefix, a cold hop resumed from the
+    file takes 1,203 ms instead of 1,530 ms, now faster than recomputing the prefix
+    (1,336 ms). A warm `reflex stdio` request reusing the file reaches its first
+    token in 91 ms instead of 223 ms. File formats, existing files and imported state
+    are unchanged.
+  - `kv_io_ms` now includes the upload into the cache, since the read and the upload
+    overlap.
+  - `--export-kv-dtype f16` (CLI) and `"export_kv_dtype": "f16"` (IPC) write the file
+    in f16, half the size: format versions 5, 6 and 7. The Qwen3.5 hybrid keeps its
+    recurrent state f32. Resuming from an f16 file isn't exact. On the test prompts it
+    moved the next token's logits by at most 7e-4 (relative L2) and gave the same
+    tokens. Exports stay f32 unless asked, and every format still imports.
+  - With f16 files the cold hop above takes 1,182 ms. `agent_relay_bench.py` gains
+    `--kv-dtype`.
+
+  See [docs/design/agent-relay.md](docs/design/agent-relay.md#faster-cache-files-phase-f)
+  and [docs/reference.md](docs/reference.md#kv-cache-files).
 
 ## 2026-10-15
 

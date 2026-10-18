@@ -1804,7 +1804,7 @@ impl Model {
                 self.timed_prefix_copy(copy_ms, || {
                     self.dequant_pipeline
                         .borrow_mut()
-                        .upload_state(&jobs, &self.dequant_kernels.f16_to_f32)
+                        .upload_state(&jobs, &self.dequant_kernels.f16_to_f32_runs)
                 })?;
             }
             Some(PrefixSource::Device { state, copy_ms }) => {

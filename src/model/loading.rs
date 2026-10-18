@@ -823,6 +823,9 @@ pub(super) struct DequantKernels {
     /// `cast_act_f16_kernel`: prefill activations into an f16 GEMM operand
     /// (`Model::gemm_view`'s f16 path).
     pub(super) cast_act_f16: AotKernel,
+    /// `f16_to_f32_runs_kernel`: an f16 cache file's values into the f32 cache
+    /// (`WeightLoadPipeline::upload_state`), one launch per chunk.
+    pub(super) f16_to_f32_runs: AotKernel,
 }
 
 /// Loads every on-device dequant and conversion kernel, one module load per
@@ -866,6 +869,7 @@ pub(super) fn load_dequant_kernels(
             "f32_to_f16_kernel",
             "f16_to_f32_kernel",
             "cast_act_f16_kernel",
+            "f16_to_f32_runs_kernel",
         ],
     )?
     .into_iter();
@@ -881,6 +885,7 @@ pub(super) fn load_dequant_kernels(
         f32_to_f16: next()?,
         f16_to_f32: next()?,
         cast_act_f16: next()?,
+        f16_to_f32_runs: next()?,
     })
 }
 
@@ -1101,6 +1106,24 @@ const STAGE_CHUNK_BYTES: usize = 64 << 20;
 /// import would cost ~59 ms, about what the whole 342 MB upload takes through
 /// 8 MB chunks (~56 ms, bound by the H2D copy, not the read).
 const STATE_CHUNK_BYTES: usize = 8 << 20;
+
+/// Runs one `f16_to_f32_runs_kernel` launch widens; `F16_RUNS_MAX` in
+/// kernels_cuda/convert.cu.
+const F16_RUNS_MAX: usize = 64;
+
+/// `f16_to_f32_runs_kernel`'s run list, passed by value (`struct F16Runs` in
+/// kernels_cuda/convert.cu, same layout): run `r` widens `n[r]` values from
+/// element `src[r]` of the landing buffer into the f32 buffer at `dst[r]`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct F16Runs {
+    dst: [u64; F16_RUNS_MAX],
+    src: [u32; F16_RUNS_MAX],
+    n: [u32; F16_RUNS_MAX],
+}
+
+// SAFETY: plain old data with the C layout the kernel declares.
+unsafe impl cudarc::driver::DeviceRepr for F16Runs {}
 
 /// Chunks smaller than this are filled on the loading thread alone: small
 /// models (Qwen3-0.6B's matrix weights are all under ~2 MB) never wake the
@@ -1970,10 +1993,14 @@ impl WeightLoadPipeline {
     /// chunk i+1 is read while chunk i is on the wire. Returns once every copy
     /// has landed, so the caller's timing covers the whole upload.
     ///
-    /// f16 values (an f16 cache file) land in a device buffer first and
-    /// `widen` (`f16_to_f32_kernel`, exact) writes them into the f32 cache. The
-    /// landing buffer is reused chunk after chunk without a wait: its next H2D
-    /// is queued on the same stream as the kernel that reads it.
+    /// A chunk with f16 values (an f16 cache file) is copied whole into a device
+    /// landing buffer, and `widen` (`f16_to_f32_runs_kernel`, exact) writes its
+    /// f16 pieces into the f32 cache, up to [`F16_RUNS_MAX`] pieces per launch.
+    /// One copy and one launch per chunk instead of one of each per piece: a
+    /// warm process that had idled between requests spent ~9 ms more on 56
+    /// alternating small copies and launches (T4). The landing buffer is reused
+    /// chunk after chunk without a wait: its next H2D is queued on the same
+    /// stream as the kernel that reads it.
     pub(super) fn upload_state(
         &mut self,
         jobs: &[(sys::CUdeviceptr, &crate::kv_io::KvValues)],
@@ -2017,6 +2044,7 @@ impl WeightLoadPipeline {
             }
             unsafe { self.pinned[slot].ensure_capacity(total)? };
             let mut at = 0;
+            let mut runs = Vec::new();
             for &(j, off, len) in &pieces[i..end] {
                 let (dst, values) = jobs[j];
                 // SAFETY: the slot holds `total` bytes and no copy reads it
@@ -2029,27 +2057,50 @@ impl WeightLoadPipeline {
                         unsafe { result::memcpy_htod_async(dst + off as u64, &*staged, stream) }
                             .map_err(|e| crate::gpu_err!(e, "state upload: async H2D copy: {e}"))?
                     }
-                    KvDtype::F16 => {
-                        let landing = *self
-                            .state_f16
-                            .as_ref()
-                            .expect("allocated above for f16 jobs")
-                            .device_ptr()
-                            + at as u64;
-                        unsafe { result::memcpy_htod_async(landing, &*staged, stream) }
-                            .map_err(|e| crate::gpu_err!(e, "state upload: async H2D copy: {e}"))?;
-                        let n = len / 2;
-                        let out = dst + (off / 2 * 4) as u64;
-                        unsafe {
-                            widen
-                                .function
-                                .clone()
-                                .launch(elementwise_launch_cfg(n), (landing, out, n as u64))
-                        }
-                        .map_err(|e| crate::gpu_err!(e, "state upload: f16_to_f32 launch: {e}"))?;
-                    }
+                    // (f32 destination, element offset in the chunk, elements)
+                    KvDtype::F16 => runs.push((dst + (off / 2 * 4) as u64, at / 2, len / 2)),
                 }
                 at += len;
+            }
+            if !runs.is_empty() {
+                let landing = *self
+                    .state_f16
+                    .as_ref()
+                    .expect("allocated above for f16 jobs")
+                    .device_ptr();
+                // SAFETY: as above; the whole chunk was just filled.
+                let chunk = unsafe { std::slice::from_raw_parts(self.pinned[slot].ptr, total) };
+                unsafe { result::memcpy_htod_async(landing, chunk, stream) }
+                    .map_err(|e| crate::gpu_err!(e, "state upload: async H2D copy: {e}"))?;
+                for batch in runs.chunks(F16_RUNS_MAX) {
+                    let mut list = F16Runs {
+                        dst: [0; F16_RUNS_MAX],
+                        src: [0; F16_RUNS_MAX],
+                        n: [0; F16_RUNS_MAX],
+                    };
+                    for (r, &(dst, src, n)) in batch.iter().enumerate() {
+                        list.dst[r] = dst;
+                        list.src[r] = src as u32;
+                        list.n[r] = n as u32;
+                    }
+                    let longest = batch.iter().map(|r| r.2).max().unwrap_or(1);
+                    let cfg = LaunchConfig {
+                        grid_dim: (
+                            (longest as u32).div_ceil(256).clamp(1, 512),
+                            batch.len() as u32,
+                            1,
+                        ),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        widen
+                            .function
+                            .clone()
+                            .launch(cfg, (landing, list, batch.len() as u32))
+                    }
+                    .map_err(|e| crate::gpu_err!(e, "state upload: f16_to_f32_runs launch: {e}"))?;
+                }
             }
             unsafe { result::event::record(self.pinned_done[slot], stream) }
                 .map_err(|e| crate::gpu_err!(e, "state upload: record pinned_done: {e}"))?;

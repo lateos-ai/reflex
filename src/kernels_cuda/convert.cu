@@ -45,6 +45,37 @@ extern "C" __global__ void f16_to_f32_kernel(
     }
 }
 
+// Up to F16_RUNS_MAX runs of f16 values, laid out back to back in one landing
+// buffer, each widened (exactly) into its own f32 buffer: `runs.dst[r][i] =
+// (f32)landing[runs.src[r] + i]` for i < runs.n[r]. An f16 cache file's chunk
+// (`WeightLoadPipeline::upload_state`) holds one run per cached buffer, so one
+// launch covers what used to be one launch per buffer. Block row `blockIdx.y`
+// is the run; each row strides over its run's values. Must match `F16Runs` in
+// src/model/loading.rs.
+#define F16_RUNS_MAX 64
+struct F16Runs {
+    unsigned long long dst[F16_RUNS_MAX];
+    unsigned int src[F16_RUNS_MAX];
+    unsigned int n[F16_RUNS_MAX];
+};
+
+extern "C" __global__ void f16_to_f32_runs_kernel(
+    const __half* __restrict__ landing,
+    F16Runs runs,
+    unsigned int count
+) {
+    const unsigned int r = blockIdx.y;
+    if (r >= count) {
+        return;
+    }
+    float* __restrict__ out = reinterpret_cast<float*>(runs.dst[r]);
+    const __half* __restrict__ in = landing + runs.src[r];
+    const unsigned int n = runs.n[r];
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        out[i] = __half2float(in[i]);
+    }
+}
+
 // Largest finite f16.
 #define F16_MAX 65504.0f
 

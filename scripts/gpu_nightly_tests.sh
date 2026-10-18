@@ -57,7 +57,7 @@ requirement() {
     model::mla_widening_tests::*) echo "|test-data/tiny-mla-v3.gguf|fixture missing" ;;
     lora::moe_expert_lora_fixture_tests::*) echo "|test-data/tiny-qwen3moe-lora.gguf|fixture missing" ;;
     *::qwen3moe_fixture_*) echo "|test-data/tiny-qwen3moe.gguf|fixture missing" ;;
-    *::qwen35moe_fixture_*) echo "|test-data/tiny-qwen35moe.gguf|fixture missing" ;;
+    *::qwen35moe_fixture_*|model::kv_f16_tests::upload_state_*) echo "|test-data/tiny-qwen35moe.gguf|fixture missing" ;;
     # ipc_kv_f16_file_granite_and_gemma4_fixtures_reject opens tiny-gemma4.gguf as well.
     *::ipc_kv_relay_granite_fixture_*|*::ipc_kv_f16_file_granite_and_gemma4_*|*::ipc_pinned_prefix_granite_fixture_*|*::ipc_json_schema_granite_fixture_*|*::ipc_system1_resumed_granite_fixture_*) echo "|test-data/tiny-granitehybrid.gguf|fixture missing" ;;
     *::ipc_pinned_prefix_gemma4_fixture_*|*::ipc_json_schema_gemma4_fixture_*|*::ipc_system1_resumed_gemma4_fixture_*) echo "|test-data/tiny-gemma4.gguf|fixture missing" ;;
