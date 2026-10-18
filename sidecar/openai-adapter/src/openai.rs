@@ -7,6 +7,7 @@
 //! list of known limitations.
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,6 +33,127 @@ pub struct ChatCompletionRequest {
     /// `IpcRequest::sampling_params` applies).
     #[serde(default)]
     pub top_k: Option<usize>,
+    /// `{"type": "text"}` (the default), `{"type": "json_schema", ...}` or
+    /// `{"type": "json_object"}` -- see [`ipc_json_schema`].
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
+    // Every other field (including the IPC-only `pin_prefix`, `use_pinned`,
+    // `import_kv`, `export_kv`) is ignored: serde drops unknown fields, and
+    // `build_ipc_line` writes only the fields named in `IpcGenerateRequest`.
+}
+
+/// OpenAI's `response_format`. A plain struct rather than an enum tagged on `type`:
+/// serde buffers an internally tagged enum's content, which a [`RawValue`] can't go
+/// through.
+#[derive(Debug, Deserialize)]
+pub struct ResponseFormat {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub json_schema: Option<JsonSchemaFormat>,
+}
+
+/// `response_format.json_schema`. `name`, `description` and `strict` are accepted
+/// and not used: the engine always enforces the schema strictly.
+#[derive(Debug, Deserialize)]
+pub struct JsonSchemaFormat {
+    /// Kept as the request's own text, so its properties reach the engine in the
+    /// order they're written (a `Value` without `preserve_order` sorts keys).
+    #[serde(default)]
+    pub schema: Option<Box<RawValue>>,
+}
+
+/// The schema `{"type": "json_object"}` maps to: any JSON object. In the engine's
+/// subset, an object schema without `properties` and without
+/// `additionalProperties: false` allows any object.
+pub const JSON_OBJECT_SCHEMA: &str = r#"{"type":"object"}"#;
+
+/// The IPC `json_schema` for `response_format`, compacted to one line, or `None`
+/// for no constraint (`text`, or no `response_format`). Errs with a message for a
+/// `400` on an unknown `type` or a `json_schema` without a `schema`. The schema's
+/// contents are the engine's to check: an unsupported keyword comes back as an
+/// `invalid_input` error.
+pub fn ipc_json_schema(format: Option<&ResponseFormat>) -> Result<Option<Box<RawValue>>, String> {
+    let Some(format) = format else {
+        return Ok(None);
+    };
+    let raw = match format.kind.as_str() {
+        "text" => return Ok(None),
+        "json_object" => JSON_OBJECT_SCHEMA,
+        "json_schema" => format
+            .json_schema
+            .as_ref()
+            .and_then(|f| f.schema.as_deref())
+            .ok_or("response_format.json_schema.schema is required with type \"json_schema\"")?
+            .get(),
+        other => {
+            return Err(format!(
+                "unsupported response_format type {other:?}: expected \"text\", \
+                 \"json_schema\" or \"json_object\""
+            ))
+        }
+    };
+    RawValue::from_string(compact_json(raw))
+        .map(Some)
+        .map_err(|e| format!("response_format schema: {e}"))
+}
+
+/// `raw` (valid JSON) without the whitespace between tokens. A schema sent
+/// pretty-printed would otherwise put newlines into the IPC request, which is one
+/// JSON value per line. Strings, and so key order and every value, are untouched.
+fn compact_json(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in raw.chars() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if !matches!(c, ' ' | '\t' | '\n' | '\r') {
+            if c == '"' {
+                in_string = true;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A `generate` IPC request, as `src/ipc.rs`'s `IpcRequest` reads it. A struct, not
+/// a `json!` value, so the line's keys come out in this order and `json_schema` is
+/// written as raw text.
+#[derive(Serialize)]
+struct IpcGenerateRequest<'a> {
+    prompt: &'a str,
+    max_tokens: usize,
+    stream: bool,
+    sampling: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    json_schema: Option<&'a RawValue>,
+}
+
+/// The IPC request line for a chat completion: the rendered `prompt`, the
+/// already-checked `max_tokens`, the request's `stream` and sampling fields, and
+/// `json_schema` from [`ipc_json_schema`].
+pub fn build_ipc_line(
+    req: &ChatCompletionRequest,
+    prompt: &str,
+    max_tokens: usize,
+    json_schema: Option<&RawValue>,
+) -> serde_json::Result<String> {
+    serde_json::to_string(&IpcGenerateRequest {
+        prompt,
+        max_tokens,
+        stream: req.stream,
+        sampling: build_sampling(req),
+        json_schema,
+    })
 }
 
 /// `content` is accepted as a plain JSON `Value` at parse time (not `String`
@@ -226,5 +348,132 @@ pub fn finish_reason(completion_tokens: usize, requested_max_tokens: usize) -> &
         "length"
     } else {
         "stop"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parses an HTTP body the way axum's `Json` extractor does (`from_slice` on
+    /// the raw bytes) and builds its IPC line.
+    fn ipc_line(body: &str) -> Result<String, String> {
+        let req: ChatCompletionRequest = serde_json::from_slice(body.as_bytes()).unwrap();
+        let schema = ipc_json_schema(req.response_format.as_ref())?;
+        Ok(build_ipc_line(&req, "P", 5, schema.as_deref()).unwrap())
+    }
+
+    const MESSAGES: &str = r#""messages": [{"role": "user", "content": "hi"}]"#;
+
+    #[test]
+    fn json_schema_passes_through_in_schema_order_compacted_to_one_line() {
+        // Properties deliberately not in alphabetical order, pretty-printed, with
+        // whitespace, an escaped quote and a backslash inside strings.
+        let body = format!(
+            r#"{{{MESSAGES}, "response_format": {{
+                "type": "json_schema",
+                "json_schema": {{
+                    "name": "handoff",
+                    "strict": true,
+                    "schema": {{
+                        "type": "object",
+                        "properties": {{
+                            "zeta": {{"type": "string", "description": "a \"quoted\" note"}},
+                            "alpha": {{"enum": ["x y", "back\\slash"]}},
+                            "mid": {{"type": "integer"}}
+                        }},
+                        "required": ["zeta", "alpha"]
+                    }}
+                }}
+            }}}}"#
+        );
+        let line = ipc_line(&body).unwrap();
+        assert_eq!(
+            line,
+            r#"{"prompt":"P","max_tokens":5,"stream":false,"sampling":null,"json_schema":{"type":"object","properties":{"zeta":{"type":"string","description":"a \"quoted\" note"},"alpha":{"enum":["x y","back\\slash"]},"mid":{"type":"integer"}},"required":["zeta","alpha"]}}"#
+        );
+        assert!(!line.contains('\n'));
+        // A `Value` round trip would have sorted the properties.
+        let sorted = serde_json::to_string(&serde_json::from_str::<Value>(&line).unwrap()).unwrap();
+        assert!(
+            sorted.find("\"alpha\"") < sorted.find("\"zeta\""),
+            "{sorted}"
+        );
+        assert!(line.find("\"zeta\"") < line.find("\"alpha\""), "{line}");
+    }
+
+    #[test]
+    fn text_or_no_response_format_sends_no_schema() {
+        let expected = r#"{"prompt":"P","max_tokens":5,"stream":false,"sampling":null}"#;
+        assert_eq!(ipc_line(&format!("{{{MESSAGES}}}")).unwrap(), expected);
+        let text = format!(r#"{{{MESSAGES}, "response_format": {{"type": "text"}}}}"#);
+        assert_eq!(ipc_line(&text).unwrap(), expected);
+    }
+
+    #[test]
+    fn json_object_maps_to_any_object() {
+        let body = format!(r#"{{{MESSAGES}, "response_format": {{"type": "json_object"}}}}"#);
+        assert_eq!(
+            ipc_line(&body).unwrap(),
+            r#"{"prompt":"P","max_tokens":5,"stream":false,"sampling":null,"json_schema":{"type":"object"}}"#
+        );
+    }
+
+    #[test]
+    fn bad_response_formats_are_rejected_before_the_engine() {
+        for (format, needle) in [
+            (r#"{"type": "json_schema"}"#, "schema is required"),
+            (
+                r#"{"type": "json_schema", "json_schema": {"name": "x"}}"#,
+                "schema is required",
+            ),
+            (
+                r#"{"type": "json_schema", "json_schema": {"schema": null}}"#,
+                "schema is required",
+            ),
+            (r#"{"type": "regex"}"#, "unsupported response_format type"),
+        ] {
+            let body = format!(r#"{{{MESSAGES}, "response_format": {format}}}"#);
+            let err = ipc_line(&body).unwrap_err();
+            assert!(err.contains(needle), "{format}: {err}");
+        }
+    }
+
+    #[test]
+    fn sampling_and_stream_sit_next_to_the_schema() {
+        let body = format!(
+            r#"{{{MESSAGES}, "stream": true, "temperature": 0.5, "seed": 7,
+                "response_format": {{"type": "json_schema", "json_schema": {{"schema": {{"type": "boolean"}}}}}}}}"#
+        );
+        assert_eq!(
+            ipc_line(&body).unwrap(),
+            r#"{"prompt":"P","max_tokens":5,"stream":true,"sampling":{"seed":7,"temperature":0.5,"top_k":null,"top_p":null},"json_schema":{"type":"boolean"}}"#
+        );
+    }
+
+    /// HTTP has no pin, slot or cache-file fields: a request carrying the IPC ones
+    /// is accepted (unknown fields are ignored, as for any other) and none of them
+    /// reaches the engine.
+    #[test]
+    fn ipc_only_fields_never_reach_the_engine() {
+        let body = format!(
+            r#"{{{MESSAGES}, "pin_prefix": true, "use_pinned": true,
+                "import_kv": "/tmp/a.kv", "export_kv": "/tmp/b.kv", "export_kv_dtype": "f16",
+                "slot": 0, "file": "/etc/passwd", "candidates": [" a"], "timings": true,
+                "json_schema": {{"type": "object"}}, "id": "x"}}"#
+        );
+        assert_eq!(
+            ipc_line(&body).unwrap(),
+            r#"{"prompt":"P","max_tokens":5,"stream":false,"sampling":null}"#
+        );
+    }
+
+    #[test]
+    fn compact_json_keeps_strings_byte_for_byte() {
+        assert_eq!(
+            compact_json("{ \"a b\" : [ 1 ,\n\t\"\\\\\" , \"\\\" x\" ] }"),
+            r#"{"a b":[1,"\\","\" x"]}"#
+        );
+        assert_eq!(compact_json("\"é \\u00e9\""), "\"é \\u00e9\"");
     }
 }

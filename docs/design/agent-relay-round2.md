@@ -159,7 +159,11 @@ on every agent turn.
   `--export-kv-dtype`), as format versions 5 to 7; the hybrid's recurrent state stays
   f32. See [agent-relay.md](agent-relay.md), "Faster cache files (phase F)".
 
-### Phase G: sidecar surface
+### Phase G: sidecar surface (done)
+
+**Done (2026-10-18).** See [agent-relay.md](agent-relay.md), "Sidecar surface (phase
+G)". `{"type": "json_object"}` maps to the permissive schema `{"type": "object"}`.
+`/v1/classify` already exposed everything listed below, so it is unchanged.
 
 `sidecar/openai-adapter/`:
 - `/v1/chat/completions` maps `response_format: {"type": "json_schema", "json_schema":
