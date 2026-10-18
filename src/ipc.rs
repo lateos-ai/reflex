@@ -440,27 +440,37 @@ fn run_generate_with(
         }
         None => None,
     };
+    // The file's payload is read while it is uploaded (`kv_io::import_kv`
+    // reads only the header), so the upload counts as part of the read.
+    let resume = imported.as_ref().map_or(Resume::Fresh, Resume::File);
     let Some(export_path) = &req.export_kv else {
-        return model.generate(
+        let (token_ids, text, upload_ms) = model.generate_resumed(
             &req.prompt,
             req.max_tokens.max(1),
-            imported.as_ref(),
+            resume,
             sampling,
             on_first_token,
             on_token,
-        );
+        )?;
+        add_ms(kv_io_ms, upload_ms);
+        return Ok((token_ids, text));
     };
-    let (token_ids, text, cache) = model.generate_capture_kv(
-        &req.prompt,
-        imported.as_ref(),
-        sampling,
-        on_first_token,
-        on_token,
-    )?;
+    // `Model::generate_capture_kv`, keeping the upload time.
+    let (token_ids, text, state, upload_ms) =
+        model.generate_pin_prefix(&req.prompt, resume, sampling, on_first_token, on_token)?;
+    add_ms(kv_io_ms, upload_ms);
+    let cache = model.download_prefix(&state)?;
     let start = std::time::Instant::now();
     crate::kv_io::export_kv(export_path, &cache)?;
-    *kv_io_ms = Some(kv_io_ms.unwrap_or(0.0) + elapsed_ms(start));
+    add_ms(kv_io_ms, Some(elapsed_ms(start)));
     Ok((token_ids, text))
+}
+
+/// Adds `ms` (if any) to the request's `kv_io_ms`.
+fn add_ms(kv_io_ms: &mut Option<f64>, ms: Option<f64>) {
+    if let Some(ms) = ms {
+        *kv_io_ms = Some(kv_io_ms.unwrap_or(0.0) + ms);
+    }
 }
 
 /// The error for a field that keeps a prefix (`export_kv`/`pin_prefix`) on a
@@ -530,11 +540,11 @@ fn run_system1(
                     .to_string(),
             )),
         };
+    // The pinned prefix's copy, or the file's upload (its read, see
+    // `run_generate`), on top of the header read above.
     let (response, copy_ms) =
         model.system1_evaluate_resumed(&req.prompt, resume, &candidates, req.temperature)?;
-    if copy_ms.is_some() {
-        *kv_io_ms = copy_ms;
-    }
+    add_ms(kv_io_ms, copy_ms);
     Ok(response)
 }
 

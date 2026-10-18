@@ -1095,6 +1095,13 @@ impl Drop for PinnedHostBuffer {
 /// pinned memory stays at 2 x this instead of 2 x the largest tensor.
 const STAGE_CHUNK_BYTES: usize = 64 << 20;
 
+/// Largest chunk [`WeightLoadPipeline::upload_state`] stages at once. A cold
+/// process pays ~0.46 ms per MB to allocate pinned memory (`cuMemHostAlloc`,
+/// T4 host), so growing both slots to [`STAGE_CHUNK_BYTES`] for a cache
+/// import would cost ~59 ms, about what the whole 342 MB upload takes through
+/// 8 MB chunks (~56 ms, bound by the H2D copy, not the read).
+const STATE_CHUNK_BYTES: usize = 8 << 20;
+
 /// Chunks smaller than this are filled on the loading thread alone: small
 /// models (Qwen3-0.6B's matrix weights are all under ~2 MB) never wake the
 /// fill workers, so their load is unchanged.
@@ -1946,6 +1953,77 @@ impl WeightLoadPipeline {
             )
         }
         .map_err(|e| crate::gpu_err!(e, "lazy upload: wait for copy: {e}"))
+    }
+
+    /// Uploads cached model state (an imported cache file's ranges, or values
+    /// already in host memory) into device buffers: each `(dst, values)` copies
+    /// `values` to the f32 buffer at `dst`. The bytes go through the pinned
+    /// slots in chunks of at most [`STATE_CHUNK_BYTES`], read straight into
+    /// them (`KvValues::read_bytes`, one positioned read per piece for a file),
+    /// and each chunk's copies are queued on the compute stream, so they're
+    /// ordered after the zeroing of the freshly allocated cache and before the
+    /// prefill that reads it. Same per-slot host wait as [`Self::stage_h2d`]:
+    /// chunk i+1 is read while chunk i is on the wire. Returns once every copy
+    /// has landed, so the caller's timing covers the whole upload.
+    pub(super) fn upload_state(
+        &mut self,
+        jobs: &[(sys::CUdeviceptr, &crate::kv_io::KvValues)],
+    ) -> Result<(), ReflexError> {
+        // (job, byte offset, len) pieces, packed into chunks in order.
+        let mut pieces: Vec<(usize, usize, usize)> = Vec::new();
+        for (j, (_, values)) in jobs.iter().enumerate() {
+            let total = values.byte_len();
+            let mut off = 0;
+            while off < total {
+                let len = (total - off).min(STATE_CHUNK_BYTES);
+                pieces.push((j, off, len));
+                off += len;
+            }
+        }
+        let stream = *self.device.cu_stream();
+        let mut last_slot = None;
+        let mut i = 0;
+        while i < pieces.len() {
+            let mut total = pieces[i].2;
+            let mut end = i + 1;
+            while end < pieces.len() && total + pieces[end].2 <= STATE_CHUNK_BYTES {
+                total += pieces[end].2;
+                end += 1;
+            }
+            let slot = self.next_pinned % 2;
+            self.next_pinned += 1;
+            if self.pinned_used[slot] {
+                unsafe { sys::lib().cuEventSynchronize(self.pinned_done[slot]) }
+                    .result()
+                    .map_err(|e| {
+                        crate::gpu_err!(e, "state upload: await slot {slot}'s prior H2D copy: {e}")
+                    })?;
+            }
+            unsafe { self.pinned[slot].ensure_capacity(total)? };
+            let mut at = 0;
+            for &(j, off, len) in &pieces[i..end] {
+                let (dst, values) = jobs[j];
+                // SAFETY: the slot holds `total` bytes and no copy reads it
+                // (waited above); pieces are disjoint ranges of it.
+                let staged =
+                    unsafe { std::slice::from_raw_parts_mut(self.pinned[slot].ptr.add(at), len) };
+                values.read_bytes(off, staged)?;
+                unsafe { result::memcpy_htod_async(dst + off as u64, &*staged, stream) }
+                    .map_err(|e| crate::gpu_err!(e, "state upload: async H2D copy: {e}"))?;
+                at += len;
+            }
+            unsafe { result::event::record(self.pinned_done[slot], stream) }
+                .map_err(|e| crate::gpu_err!(e, "state upload: record pinned_done: {e}"))?;
+            self.pinned_used[slot] = true;
+            last_slot = Some(slot);
+            i = end;
+        }
+        if let Some(slot) = last_slot {
+            unsafe { sys::lib().cuEventSynchronize(self.pinned_done[slot]) }
+                .result()
+                .map_err(|e| crate::gpu_err!(e, "state upload: await last copy: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Runs `jobs` (disjoint copies into one pinned buffer) on the fill

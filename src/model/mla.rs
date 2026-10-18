@@ -1290,7 +1290,7 @@ impl Model {
         let imported_len = start_pos * qk_dim;
         match imported {
             None => {}
-            Some(PrefixSource::Host(cache)) => {
+            Some(PrefixSource::Host { cache, copy_ms }) => {
                 if cache.qk_dim != qk_dim {
                     return Err(crate::reflex_err!(
                         Other,
@@ -1307,14 +1307,14 @@ impl Model {
                         m.layers.len()
                     ));
                 }
+                let mut jobs = Vec::with_capacity(kv_caches.len());
                 for (layer_idx, kv_host) in cache.kv_caches.iter().enumerate() {
-                    let mut dst = kv_caches[layer_idx].slice_mut(0..imported_len);
-                    self.device
-                        .htod_sync_copy_into(kv_host, &mut dst)
-                        .map_err(|e| {
-                            crate::gpu_err!(e, "import mla kv_cache htod layer {layer_idx}: {e}")
-                        })?;
+                    check_state_len(kv_host, imported_len, "kv_cache", layer_idx)?;
+                    jobs.push((*kv_caches[layer_idx].device_ptr(), kv_host));
                 }
+                self.timed_prefix_copy(copy_ms, || {
+                    self.dequant_pipeline.borrow_mut().upload_state(&jobs)
+                })?;
             }
             Some(PrefixSource::Device { state, copy_ms }) => {
                 if state.kv_caches.len() != m.layers.len() {
@@ -1605,10 +1605,14 @@ impl Model {
         on_first_token: impl FnMut(&[f32]),
         on_token: impl FnMut(u32, &str),
     ) -> Result<(Vec<u32>, String, crate::kv_io::MlaKvCache), ReflexError> {
+        let copy_ms = Cell::new(None);
         let (generated, text, kv_caches, seq_len) = self.generate_mla_impl(
             m,
             prompt,
-            imported.map(PrefixSource::Host),
+            imported.map(|cache| PrefixSource::Host {
+                cache,
+                copy_ms: &copy_ms,
+            }),
             1,
             sampling,
             on_first_token,
@@ -1633,6 +1637,7 @@ impl Model {
             .map(|c| {
                 self.device
                     .dtoh_sync_copy(&c.slice(0..per_layer_len))
+                    .map(crate::kv_io::KvValues::Host)
                     .map_err(|e| crate::gpu_err!(e, "mla kv_cache dtoh: {e}"))
             })
             .collect::<Result<Vec<_>, _>>()?;

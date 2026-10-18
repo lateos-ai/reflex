@@ -70,7 +70,7 @@ use cudarc::driver::{
     result, sys, CudaDevice, CudaSlice, CudaView, DevicePtr, DeviceRepr, DeviceSlice, LaunchAsync,
     LaunchConfig,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread::ScopedJoinHandle;

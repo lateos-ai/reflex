@@ -1775,7 +1775,7 @@ impl Model {
         let imported_len = start_pos * kv_stride;
         match imported {
             None => {}
-            Some(PrefixSource::Host(cache)) => {
+            Some(PrefixSource::Host { cache, copy_ms }) => {
                 if cache.num_kv_heads != self.cfg.num_kv_heads
                     || cache.head_dim != self.cfg.head_dim
                 {
@@ -1792,22 +1792,18 @@ impl Model {
                         self.layers.len()
                     ));
                 }
+                let mut jobs = Vec::with_capacity(2 * k_caches.len());
                 for (layer_idx, (k_host, v_host)) in
                     cache.k_caches.iter().zip(&cache.v_caches).enumerate()
                 {
-                    let mut k_dst = k_caches[layer_idx].slice_mut(0..imported_len);
-                    self.device
-                        .htod_sync_copy_into(k_host, &mut k_dst)
-                        .map_err(|e| {
-                            crate::gpu_err!(e, "import k_cache htod layer {layer_idx}: {e}")
-                        })?;
-                    let mut v_dst = v_caches[layer_idx].slice_mut(0..imported_len);
-                    self.device
-                        .htod_sync_copy_into(v_host, &mut v_dst)
-                        .map_err(|e| {
-                            crate::gpu_err!(e, "import v_cache htod layer {layer_idx}: {e}")
-                        })?;
+                    check_state_len(k_host, imported_len, "k_cache", layer_idx)?;
+                    check_state_len(v_host, imported_len, "v_cache", layer_idx)?;
+                    jobs.push((*k_caches[layer_idx].device_ptr(), k_host));
+                    jobs.push((*v_caches[layer_idx].device_ptr(), v_host));
                 }
+                self.timed_prefix_copy(copy_ms, || {
+                    self.dequant_pipeline.borrow_mut().upload_state(&jobs)
+                })?;
             }
             Some(PrefixSource::Device { state, copy_ms }) => {
                 if state.k_caches.len() != self.layers.len() {
@@ -2127,7 +2123,11 @@ impl Model {
         on_first_token: impl FnMut(&[f32]),
         on_token: impl FnMut(u32, &str),
     ) -> Result<(Vec<u32>, String, crate::kv_io::DenseKvCache), ReflexError> {
-        let src = imported.map(PrefixSource::Host);
+        let copy_ms = Cell::new(None);
+        let src = imported.map(|cache| PrefixSource::Host {
+            cache,
+            copy_ms: &copy_ms,
+        });
         let space_prefix_next = self
             .tokenizer
             .ends_after_special(prompt, dense_after_special(src));
@@ -2155,6 +2155,7 @@ impl Model {
                 .map(|c| {
                     self.device
                         .dtoh_sync_copy(&c.slice(0..per_layer_len))
+                        .map(crate::kv_io::KvValues::Host)
                         .map_err(|e| crate::gpu_err!(e, "{what} dtoh: {e}"))
                 })
                 .collect::<Result<Vec<_>, _>>()

@@ -109,10 +109,14 @@ impl PinnedPrefix {
 }
 
 /// One architecture's view of a [`Resume`]: where the working cache's first
-/// `seq_len` positions come from. `copy_ms` receives the device-to-device copy
-/// time of a pinned prefix.
+/// `seq_len` positions come from. `copy_ms` receives the time it took to fill
+/// them: the device-to-device copy of a pinned prefix, or a cache file's read
+/// and upload (`WeightLoadPipeline::upload_state`).
 pub(super) enum PrefixSource<'a, H, D> {
-    Host(&'a H),
+    Host {
+        cache: &'a H,
+        copy_ms: &'a Cell<Option<f64>>,
+    },
     Device {
         state: &'a D,
         copy_ms: &'a Cell<Option<f64>>,
@@ -148,7 +152,7 @@ impl_seq_len!(
 impl<H: SeqLen, D: SeqLen> PrefixSource<'_, H, D> {
     pub(super) fn seq_len(&self) -> usize {
         match self {
-            PrefixSource::Host(h) => h.seq_len(),
+            PrefixSource::Host { cache, .. } => cache.seq_len(),
             PrefixSource::Device { state, .. } => state.seq_len(),
         }
     }
@@ -160,7 +164,7 @@ impl DensePrefix<'_> {
     /// SentencePiece space, as before version 4.
     pub(super) fn space_prefix_next(&self) -> bool {
         match self {
-            PrefixSource::Host(c) => c.space_prefix_next.unwrap_or(true),
+            PrefixSource::Host { cache, .. } => cache.space_prefix_next.unwrap_or(true),
             PrefixSource::Device { state, .. } => state.space_prefix_next,
         }
     }
@@ -170,6 +174,24 @@ impl DensePrefix<'_> {
 /// is encoded with.
 pub(super) fn dense_after_special(src: Option<DensePrefix<'_>>) -> bool {
     src.is_none_or(|s| s.space_prefix_next())
+}
+
+/// Errors unless an imported buffer holds exactly the `expected` values the
+/// working cache's prefix region does.
+pub(super) fn check_state_len(
+    values: &crate::kv_io::KvValues,
+    expected: usize,
+    what: &str,
+    layer_idx: usize,
+) -> Result<(), ReflexError> {
+    if values.len() != expected {
+        return Err(crate::reflex_err!(
+            KvCache,
+            "imported {what} for layer {layer_idx} has {} values, expected {expected}",
+            values.len()
+        ));
+    }
+    Ok(())
 }
 
 /// `Option<PrefixSource>`'s start position: 0 for a fresh prompt.
@@ -188,8 +210,8 @@ struct Resumed {
 }
 
 impl Model {
-    /// Runs `copies` (device-to-device copies on the default stream), waits for
-    /// them, and records how long that took in `copy_ms`.
+    /// Runs `copies` (copies into the working cache on the default stream),
+    /// waits for them, and records how long that took in `copy_ms`.
     pub(super) fn timed_prefix_copy(
         &self,
         copy_ms: &Cell<Option<f64>>,
@@ -199,7 +221,7 @@ impl Model {
         copies()?;
         self.device
             .synchronize()
-            .map_err(|e| crate::gpu_err!(e, "pinned prefix copy sync: {e}"))?;
+            .map_err(|e| crate::gpu_err!(e, "prefix copy sync: {e}"))?;
         copy_ms.set(Some(start.elapsed().as_secs_f64() * 1000.0));
         Ok(())
     }
@@ -467,7 +489,7 @@ impl Model {
     ) -> Result<Option<DensePrefix<'a>>, ReflexError> {
         Ok(match resume {
             Resume::Fresh => None,
-            Resume::File(ImportedKv::Dense(c)) => Some(PrefixSource::Host(c)),
+            Resume::File(ImportedKv::Dense(cache)) => Some(PrefixSource::Host { cache, copy_ms }),
             Resume::Pinned(PinnedPrefix {
                 state: DeviceState::Dense(d),
             }) => Some(PrefixSource::Device { state: d, copy_ms }),
@@ -483,7 +505,7 @@ impl Model {
     ) -> Result<Option<HybridPrefix<'a>>, ReflexError> {
         Ok(match resume {
             Resume::Fresh => None,
-            Resume::File(ImportedKv::Hybrid(c)) => Some(PrefixSource::Host(c)),
+            Resume::File(ImportedKv::Hybrid(cache)) => Some(PrefixSource::Host { cache, copy_ms }),
             Resume::Pinned(PinnedPrefix {
                 state: DeviceState::Hybrid(d),
             }) => Some(PrefixSource::Device { state: d, copy_ms }),
@@ -499,7 +521,7 @@ impl Model {
     ) -> Result<Option<MlaPrefix<'a>>, ReflexError> {
         Ok(match resume {
             Resume::Fresh => None,
-            Resume::File(ImportedKv::Mla(c)) => Some(PrefixSource::Host(c)),
+            Resume::File(ImportedKv::Mla(cache)) => Some(PrefixSource::Host { cache, copy_ms }),
             Resume::Pinned(PinnedPrefix {
                 state: DeviceState::Mla(d),
             }) => Some(PrefixSource::Device { state: d, copy_ms }),

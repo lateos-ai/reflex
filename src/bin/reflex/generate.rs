@@ -434,11 +434,17 @@ pub fn run(args: Vec<String>) {
 
     let mut first_token_ms: Option<f64> = None;
     let mut first_token_energy: Option<energy::EnergyMeasurement> = None;
-    let (tokens, text) = model
-        .generate(
+    // `import_kv` reads only the header; the payload is read as it is
+    // uploaded, so `kv_io_ms` adds the upload (`upload_ms`).
+    let resume = imported.as_ref().map_or(
+        reflex_engine::model::Resume::Fresh,
+        reflex_engine::model::Resume::File,
+    );
+    let (tokens, text, upload_ms) = model
+        .generate_resumed(
             &prompt,
             max_tokens,
-            imported.as_ref(),
+            resume,
             &sampling,
             |_logits| {
                 first_token_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
@@ -455,6 +461,7 @@ pub fn run(args: Vec<String>) {
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let energy_measurement = sampler.measure();
     let prompt_eval_ms = first_token_ms.unwrap_or(total_ms) - model_ready_ms;
+    let read_ms = read_ms.map(|ms| ms + upload_ms.unwrap_or(0.0));
 
     print_phase_report(
         json,
