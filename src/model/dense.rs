@@ -709,6 +709,7 @@ impl Model {
             attn_impl,
             attn_tiled: TiledAttnKernels::from_env()?,
             attn_decode: DecodeAttnKernels::from_env()?,
+            decode_ops: DecodeOpKernels::from_env()?,
             add_k,
             split_qg_k,
             sigmoid_gate_k,
@@ -742,6 +743,11 @@ impl Model {
     /// round 2), no host round-trip. `mode` turns RoPE off and/or sets a
     /// sliding window (Kolibri-1); `post_norm`, when given, is applied to the
     /// O-proj output before the residual add (Kolibri-1's sandwich norm).
+    ///
+    /// `residual_in` is the previous layer's FFN output, not yet added to
+    /// `hidden`: the add happens here, fused with `attn_norm`
+    /// ([`Self::residual_rmsnorm`]). The O-proj residual add is fused the same
+    /// way with `ffn_norm`, whose output is returned next to `hidden`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_attn_block(
         &self,
@@ -755,19 +761,30 @@ impl Model {
         attn_bias: Option<&QkvBias>,
         mode: AttnMode,
         post_norm: Option<&Weight>,
+        ffn_norm: &Weight,
         mut hidden: CudaSlice<f32>,
+        residual_in: Option<CudaSlice<f32>>,
         position: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, ReflexError> {
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), ReflexError> {
         let cfg = &self.cfg;
-        let normed = self.rmsnorm(
-            &hidden,
-            attn_norm.f32()?,
-            1,
-            cfg.hidden_size,
-            cfg.rmsnorm_eps,
-        )?;
+        let normed = match residual_in {
+            Some(delta) => self.residual_rmsnorm(
+                &mut hidden,
+                &delta,
+                attn_norm.f32()?,
+                cfg.hidden_size,
+                cfg.rmsnorm_eps,
+            )?,
+            None => self.rmsnorm(
+                &hidden,
+                attn_norm.f32()?,
+                1,
+                cfg.hidden_size,
+                cfg.rmsnorm_eps,
+            )?,
+        };
 
         let mut q = self.gemv(&normed, attn_q)?;
         let mut k = self.gemv(&normed, attn_k)?;
@@ -778,23 +795,39 @@ impl Model {
             self.add_inplace(&mut v, b.v.f32()?)?;
         }
 
-        if let Some(qn) = attn_q_norm {
-            q = self.rmsnorm(
-                &q,
-                qn.f32()?,
-                cfg.num_q_heads,
-                cfg.head_dim,
-                cfg.rmsnorm_eps,
-            )?;
-        }
-        if let Some(kn) = attn_k_norm {
-            k = self.rmsnorm(
-                &k,
-                kn.f32()?,
-                cfg.num_kv_heads,
-                cfg.head_dim,
-                cfg.rmsnorm_eps,
-            )?;
+        match (attn_q_norm, attn_k_norm) {
+            (Some(qn), Some(kn)) => {
+                (q, k) = self.rmsnorm_pair(
+                    &q,
+                    qn.f32()?,
+                    cfg.num_q_heads,
+                    &k,
+                    kn.f32()?,
+                    cfg.num_kv_heads,
+                    cfg.head_dim,
+                    cfg.rmsnorm_eps,
+                )?;
+            }
+            (qn, kn) => {
+                if let Some(qn) = qn {
+                    q = self.rmsnorm(
+                        &q,
+                        qn.f32()?,
+                        cfg.num_q_heads,
+                        cfg.head_dim,
+                        cfg.rmsnorm_eps,
+                    )?;
+                }
+                if let Some(kn) = kn {
+                    k = self.rmsnorm(
+                        &k,
+                        kn.f32()?,
+                        cfg.num_kv_heads,
+                        cfg.head_dim,
+                        cfg.rmsnorm_eps,
+                    )?;
+                }
+            }
         }
 
         if mode.rope {
@@ -850,19 +883,26 @@ impl Model {
         if let Some(w) = post_norm {
             o_proj = self.rmsnorm(&o_proj, w.f32()?, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
         }
-        self.add_inplace(&mut hidden, &o_proj)?;
-        Ok(hidden)
+        let ffn_normed = self.residual_rmsnorm(
+            &mut hidden,
+            &o_proj,
+            ffn_norm.f32()?,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
+        Ok((hidden, ffn_normed))
     }
 
     pub(super) fn forward_layer_dense(
         &self,
         layer: &DenseLayerWeights,
         hidden: CudaSlice<f32>,
+        residual_in: Option<CudaSlice<f32>>,
         position: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, ReflexError> {
-        let mut post_attn = self.forward_attn_block(
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), ReflexError> {
+        let (post_attn, ffn_normed) = self.forward_attn_block(
             &layer.attn_norm,
             &layer.attn_q,
             &layer.attn_k,
@@ -873,27 +913,21 @@ impl Model {
             layer.attn_bias.as_ref(),
             AttnMode::STANDARD,
             None,
+            &layer.ffn_norm,
             hidden,
+            residual_in,
             position,
             k_cache,
             v_cache,
         )?;
 
         let cfg = &self.cfg;
-        let ffn_normed = self.rmsnorm(
-            &post_attn,
-            layer.ffn_norm.f32()?,
-            1,
-            cfg.hidden_size,
-            cfg.rmsnorm_eps,
-        )?;
         let gate = self.gemv(&ffn_normed, &layer.ffn_gate)?;
         let up = self.gemv(&ffn_normed, &layer.ffn_up)?;
         let activated = self.silu_and_mul(&gate, &up, cfg.ffn_hidden_size)?;
         let down = self.gemv(&activated, &layer.ffn_down)?;
 
-        self.add_inplace(&mut post_attn, &down)?;
-        Ok(post_attn)
+        Ok((post_attn, down))
     }
 
     /// Same attention block as [`Self::forward_layer_dense`], but the shared
@@ -912,11 +946,12 @@ impl Model {
         &self,
         layer: &MoeLayerWeights,
         hidden: CudaSlice<f32>,
+        residual_in: Option<CudaSlice<f32>>,
         position: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, ReflexError> {
-        let mut post_attn = self.forward_attn_block(
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), ReflexError> {
+        let (post_attn, ffn_normed) = self.forward_attn_block(
             &layer.attn_norm,
             &layer.attn_q,
             &layer.attn_k,
@@ -927,20 +962,15 @@ impl Model {
             layer.attn_bias.as_ref(),
             AttnMode::STANDARD,
             None,
+            &layer.ffn_norm,
             hidden,
+            residual_in,
             position,
             k_cache,
             v_cache,
         )?;
 
         let cfg = &self.cfg;
-        let ffn_normed = self.rmsnorm(
-            &post_attn,
-            layer.ffn_norm.f32()?,
-            1,
-            cfg.hidden_size,
-            cfg.rmsnorm_eps,
-        )?;
 
         let router_logits_dev = self.gemv(&ffn_normed, &layer.ffn_gate_inp)?;
         let router_logits = self
@@ -967,8 +997,7 @@ impl Model {
             &mut ffn_out_dev,
         )?;
 
-        self.add_inplace(&mut post_attn, &ffn_out_dev)?;
-        Ok(post_attn)
+        Ok((post_attn, ffn_out_dev))
     }
 
     /// Single-token routed-expert FFN: for each `(expert, weight)` in `routed`,
@@ -1139,11 +1168,12 @@ impl Model {
         &self,
         layer: &KolibriLayerWeights,
         hidden: CudaSlice<f32>,
+        residual_in: Option<CudaSlice<f32>>,
         position: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, ReflexError> {
-        let mut post_attn = self.forward_attn_block(
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), ReflexError> {
+        let (post_attn, ffn_normed) = self.forward_attn_block(
             &layer.attn_norm,
             &layer.attn_q,
             &layer.attn_k,
@@ -1154,20 +1184,15 @@ impl Model {
             None,
             layer.attn_mode,
             Some(&layer.post_attention_norm),
+            &layer.ffn_norm,
             hidden,
+            residual_in,
             position,
             k_cache,
             v_cache,
         )?;
 
         let cfg = &self.cfg;
-        let ffn_normed = self.rmsnorm(
-            &post_attn,
-            layer.ffn_norm.f32()?,
-            1,
-            cfg.hidden_size,
-            cfg.rmsnorm_eps,
-        )?;
 
         let shared_hidden_size = layer.ffn_gate_shexp.shape[1] as usize;
         let shared_gate = self.gemv(&ffn_normed, &layer.ffn_gate_shexp)?;
@@ -1207,25 +1232,31 @@ impl Model {
             cfg.hidden_size,
             cfg.rmsnorm_eps,
         )?;
-        self.add_inplace(&mut post_attn, &ffn_out)?;
-        Ok(post_attn)
+        Ok((post_attn, ffn_out))
     }
 
+    /// One decode layer. Returns `hidden` and the layer's FFN output *not yet
+    /// added* to it: pass that as the next layer's `residual_in`, which adds it
+    /// inside its attention norm (one launch instead of two), and add the last
+    /// layer's yourself.
     pub(super) fn forward_layer(
         &self,
         layer: &LayerWeights,
         hidden: CudaSlice<f32>,
+        residual_in: Option<CudaSlice<f32>>,
         position: usize,
         k_cache: &mut CudaSlice<f32>,
         v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, ReflexError> {
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), ReflexError> {
         match layer {
             LayerWeights::Dense(l) => {
-                self.forward_layer_dense(l, hidden, position, k_cache, v_cache)
+                self.forward_layer_dense(l, hidden, residual_in, position, k_cache, v_cache)
             }
-            LayerWeights::Moe(l) => self.forward_layer_moe(l, hidden, position, k_cache, v_cache),
+            LayerWeights::Moe(l) => {
+                self.forward_layer_moe(l, hidden, residual_in, position, k_cache, v_cache)
+            }
             LayerWeights::Kolibri(l) => {
-                self.forward_layer_kolibri(l, hidden, position, k_cache, v_cache)
+                self.forward_layer_kolibri(l, hidden, residual_in, position, k_cache, v_cache)
             }
         }
     }
@@ -2062,14 +2093,21 @@ impl Model {
             .device
             .htod_sync_copy(&self.token_embd.row(token_id)?)
             .map_err(|e| crate::gpu_err!(e, "embedding htod: {e}"))?;
+        let mut residual = None;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer(
+            let (h, ffn_out) = self.forward_layer(
                 layer,
                 hidden,
+                residual,
                 position,
                 &mut k_caches[layer_idx],
                 &mut v_caches[layer_idx],
             )?;
+            hidden = h;
+            residual = Some(ffn_out);
+        }
+        if let Some(ffn_out) = residual {
+            self.add_inplace(&mut hidden, &ffn_out)?;
         }
         Ok(hidden)
     }

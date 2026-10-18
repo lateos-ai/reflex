@@ -490,6 +490,7 @@ impl Model {
             attn_impl,
             attn_tiled: TiledAttnKernels::from_env()?,
             attn_decode: DecodeAttnKernels::from_env()?,
+            decode_ops: DecodeOpKernels::from_env()?,
             add_k,
             split_qg_k,
             sigmoid_gate_k,

@@ -405,6 +405,80 @@ impl DecodeAttnKernels {
     }
 }
 
+/// The fused decode ops behind [`Model::residual_rmsnorm`] and
+/// [`Model::rmsnorm_pair`] (`decode_ops.cu`): one module, loaded on the first
+/// decode step like [`DecodeAttnKernels`]. `REFLEX_DECODE_FUSE=0` runs the unfused
+/// kernels instead, for A/B runs and the bit-identity tests.
+pub(super) struct DecodeOpKernels {
+    enabled: std::cell::Cell<bool>,
+    kernels: std::sync::OnceLock<Vec<AotKernel>>,
+}
+
+const DECODE_OP_NAMES: [&str; 2] = ["add_rmsnorm_kernel", "rmsnorm_pair_kernel"];
+const DECODE_OP_ADD_RMSNORM: usize = 0;
+const DECODE_OP_RMSNORM_PAIR: usize = 1;
+/// Widest row the fused norms stage in shared memory (rmsnorm's 47 KB limit).
+const DECODE_OP_MAX_ROW_BYTES: usize = 47 * 1024;
+
+impl DecodeOpKernels {
+    pub(super) fn from_env() -> Result<Self, ReflexError> {
+        let enabled = match std::env::var("REFLEX_DECODE_FUSE").as_deref() {
+            Err(_) | Ok("") | Ok("1") => true,
+            Ok("0") => false,
+            Ok(other) => {
+                return Err(crate::reflex_err!(
+                    InvalidInput,
+                    "REFLEX_DECODE_FUSE must be 1 (the default) or 0, got {other:?}"
+                ))
+            }
+        };
+        Ok(Self {
+            enabled: std::cell::Cell::new(enabled),
+            kernels: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// For tests that compare the two paths on one loaded model.
+    #[cfg(test)]
+    pub(super) fn set_enabled(&self, on: bool) {
+        self.enabled.set(on);
+    }
+
+    /// Whether the module has been loaded (tests).
+    #[cfg(test)]
+    pub(super) fn loaded(&self) -> bool {
+        self.kernels.get().is_some()
+    }
+
+    /// The fused kernel `index`, or `None` when fusion is off or a row of
+    /// `row_len` floats doesn't fit in shared memory.
+    fn kernel(
+        &self,
+        device: &Arc<CudaDevice>,
+        index: usize,
+        row_len: usize,
+    ) -> Result<Option<&AotKernel>, ReflexError> {
+        if !self.enabled.get() || row_len * std::mem::size_of::<f32>() > DECODE_OP_MAX_ROW_BYTES {
+            return Ok(None);
+        }
+        if let Some(k) = self.kernels.get() {
+            return Ok(Some(&k[index]));
+        }
+        let loaded = aot::load_kernel_module(
+            device,
+            include_bytes!(env!("REFLEX_KERNEL_DECODE_OPS")),
+            "decode_ops",
+            &DECODE_OP_NAMES,
+        )?;
+        Ok(Some(&self.kernels.get_or_init(|| loaded)[index]))
+    }
+}
+
+/// rmsnorm's block size for a row of `hidden_size` floats.
+fn rmsnorm_block_dim(hidden_size: usize) -> u32 {
+    hidden_size.next_multiple_of(32).clamp(32, 256) as u32
+}
+
 /// `attention_online.cu`'s block size, in warps, and widest supported head.
 const ATTN_ONLINE_WARPS: usize = 8;
 const ATTN_ONLINE_MAX_DIM: usize = 1024;
@@ -629,7 +703,7 @@ impl Model {
         let row_bytes = hidden_size * std::mem::size_of::<f32>();
         let launch_cfg = LaunchConfig {
             grid_dim: (rows.clamp(1, 1 << 20) as u32, 1, 1),
-            block_dim: (hidden_size.next_multiple_of(32).clamp(32, 256) as u32, 1, 1),
+            block_dim: (rmsnorm_block_dim(hidden_size), 1, 1),
             shared_mem_bytes: if row_bytes <= 47 * 1024 {
                 row_bytes as u32
             } else {
@@ -654,6 +728,101 @@ impl Model {
                 .map_err(|e| crate::gpu_err!(e, "rmsnorm launch: {e}"))?;
         }
         Ok(dev_out)
+    }
+
+    /// One row's residual add then RMSNorm: `hidden += delta`, returning
+    /// `rmsnorm(hidden) * weight`. One `add_rmsnorm_kernel` launch on the decode
+    /// path (see [`DecodeOpKernels`]), else [`Self::add_inplace`] then
+    /// [`Self::rmsnorm`]; the two give the same bits.
+    pub(super) fn residual_rmsnorm(
+        &self,
+        hidden: &mut CudaSlice<f32>,
+        delta: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        hidden_size: usize,
+        eps: f32,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let fused = self
+            .decode_ops
+            .kernel(&self.device, DECODE_OP_ADD_RMSNORM, hidden_size)?;
+        let Some(kernel) =
+            fused.filter(|_| hidden.len() == hidden_size && delta.len() == hidden_size)
+        else {
+            self.add_inplace(hidden, delta)?;
+            return self.rmsnorm(hidden, weight, 1, hidden_size, eps);
+        };
+        let mut dev_out = self.alloc_out(hidden_size, "add_rmsnorm")?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (rmsnorm_block_dim(hidden_size), 1, 1),
+            shared_mem_bytes: (hidden_size * std::mem::size_of::<f32>()) as u32,
+        };
+        unsafe {
+            kernel
+                .function
+                .clone()
+                .launch(
+                    cfg,
+                    (hidden, delta, weight, &mut dev_out, hidden_size as u32, eps),
+                )
+                .map_err(|e| crate::gpu_err!(e, "add_rmsnorm launch: {e}"))?;
+        }
+        Ok(dev_out)
+    }
+
+    /// Two per-head RMSNorms with the same width (Qwen3's Q-Norm and K-Norm):
+    /// one `rmsnorm_pair_kernel` launch on the decode path, else two
+    /// [`Self::rmsnorm`] calls; the two give the same bits.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn rmsnorm_pair(
+        &self,
+        x1: &CudaSlice<f32>,
+        w1: &CudaSlice<f32>,
+        rows1: usize,
+        x2: &CudaSlice<f32>,
+        w2: &CudaSlice<f32>,
+        rows2: usize,
+        width: usize,
+        eps: f32,
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), ReflexError> {
+        let fused = self
+            .decode_ops
+            .kernel(&self.device, DECODE_OP_RMSNORM_PAIR, width)?;
+        let Some(kernel) = fused.filter(|_| x1.len() == rows1 * width && x2.len() == rows2 * width)
+        else {
+            return Ok((
+                self.rmsnorm(x1, w1, rows1, width, eps)?,
+                self.rmsnorm(x2, w2, rows2, width, eps)?,
+            ));
+        };
+        let mut o1 = self.alloc_out(x1.len(), "rmsnorm_pair")?;
+        let mut o2 = self.alloc_out(x2.len(), "rmsnorm_pair")?;
+        let cfg = LaunchConfig {
+            grid_dim: ((rows1 + rows2) as u32, 1, 1),
+            block_dim: (rmsnorm_block_dim(width), 1, 1),
+            shared_mem_bytes: (width * std::mem::size_of::<f32>()) as u32,
+        };
+        unsafe {
+            kernel
+                .function
+                .clone()
+                .launch(
+                    cfg,
+                    (
+                        x1,
+                        w1,
+                        &mut o1,
+                        rows1 as u32,
+                        x2,
+                        w2,
+                        &mut o2,
+                        width as u32,
+                        eps,
+                    ),
+                )
+                .map_err(|e| crate::gpu_err!(e, "rmsnorm_pair launch: {e}"))?;
+        }
+        Ok((o1, o2))
     }
 
     /// `x` and `w_dev` are both already device-resident (Phase 2 round 2) --

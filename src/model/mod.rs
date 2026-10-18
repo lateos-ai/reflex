@@ -254,6 +254,8 @@ pub struct Model {
     attn_tiled: TiledAttnKernels,
     /// GQA decode attention, loaded lazily; see [`DecodeAttnKernels`].
     attn_decode: DecodeAttnKernels,
+    /// Fused decode norms, loaded lazily; see [`DecodeOpKernels`].
+    decode_ops: DecodeOpKernels,
     /// In-place residual add (`a[i] += b[i]`, see `kernels_cuda/elementwise.cu`)
     /// -- keeps residual-stream adds device-resident (Phase 2 round 2)
     /// instead of downloading both operands to host just to add two vectors.

@@ -90,18 +90,81 @@ breaks the per-token arithmetic.
 - The GPU nightly suite passes (69/69 that ran).
 - No kernel spills on sm_75/86/90.
 
+## Round 2 profile (Tesla T4, 2026-10-18)
+
+Same method, on the code after the GQA kernel and the faster Q4_K/Q6_K decode GEMVs,
+with Qwen3-0.6B and TinyLlama, each with f16 weights and `REFLEX_QUANT_RESIDENT=1`
+(QR). Per decode step:
+
+| | Qwen3 f16 short | Qwen3 QR short | Qwen3 QR ~1,550 | TinyLlama f16 short |
+|---|---:|---:|---:|---:|
+| wall | 7.15 ms | 5.40 ms | 6.64 ms | 10.02 ms |
+| GPU busy | 6.29 ms | 4.15 ms | 5.67 ms | 9.54 ms |
+| GPU idle | 0.86 ms | 1.25 ms | 0.97 ms | 0.48 ms |
+| host work between logits copies | 3.9 ms | 3.9 ms | 3.8 ms | 2.7 ms |
+| launches / allocations / memsets | 504 / 393 / 0 | 504 / 393 / 0 | 506 / 395 / 0 | 352 / 265 / 0 |
+| `rmsnorm_kernel` | 0.75 ms | 0.76 ms | 0.79 ms | 0.93 ms |
+
+- **RMSNorm was slow because of its serial sum, not its launch count.** One thread
+  sums each row's squares in index order (that order keeps every architecture's output
+  bit-identical), at ~10 ns per element: 6.7 µs per 1,024-wide row, 20.6 µs at 2,048.
+- **QR at short context is the most host-sensitive case.** Its GPU work (4.15 ms) is
+  close to the host's (3.9 ms), so it idles 1.25 ms per step. With f16 weights, the
+  host stays about 2.4 ms ahead, and the idle time is mostly the ramp at the start of
+  each step, after the logits copy.
+
+## Round 2 fixes
+
+3. **Faster, fused decode norms.** These are bit-identical.
+   - **`rmsnorm_kernel` sums the same way, but faster.** The single summing thread
+     reads the staged row four floats at a time, unrolled (`kernels_cuda/rmsnorm.cuh`).
+     The additions are the same, in the same order. This applies to every architecture,
+     in prefill and decode.
+   - **The residual add is fused into the next norm**
+     (`kernels_cuda/decode_ops.cu`, `add_rmsnorm_kernel`). Each layer returns its FFN
+     output unadded, and the next layer's attention norm adds it. The O-proj add is
+     fused the same way into the FFN norm.
+   - **Q-Norm and K-Norm run in one launch** (`rmsnorm_pair_kernel`).
+   - **Coverage.** Dense, MoE and Kolibri-1 decode use the fused ops. The module loads
+     lazily on the first decode step. `REFLEX_DECODE_FUSE=0` turns the fusion off for
+     A/B runs.
+   - **Effect per step.** On Qwen3-0.6B, launches drop from 504 to 416 and norm plus
+     add GPU time from 0.85 to 0.51 ms. On TinyLlama they drop from 352 to 304 and from
+     0.99 to 0.68 ms.
+
+Decode ms/token (as above; medians of 3 interleaved runs with prebuilt binaries;
+greedy ids of all 257 tokens identical to the previous commit in every run):
+
+| model | context | before | after | change |
+|---|---|---:|---:|---:|
+| Qwen3-0.6B f16 | short | 6.91 | 6.60 | −4.4% |
+| | ~1,550 | 8.33 | 8.00 | −4.0% |
+| Qwen3-0.6B QR | short | 4.92 | 4.62 | −6.1% |
+| | ~1,550 | 6.40 | 6.10 | −4.7% |
+| TinyLlama f16 | short | 9.87 | 9.57 | −3.0% |
+| | ~1,550 | 10.35 | 10.06 | −2.8% |
+| TinyLlama QR | short | 5.95 | 5.74 | −3.5% |
+| | ~1,550 | 6.56 | 6.32 | −3.6% |
+| Qwen3.5-0.8B f16 (faster sum only) | short | 9.47 | 9.35 | −1.2% |
+
+The fused norm still takes 7.8 µs per 1,024-wide row and 15 µs at 2,048. Most of that
+is the serial summation chain, which a bit-identical kernel has to keep.
+
 ## What's left
 
-At short context Qwen3-0.6B now decodes in 6.96 ms, of which 4.0 ms is f16 weight
-reads. Next candidates, roughly in order of payoff:
-- **Read fewer weight bytes.** Make the Q4_K-resident decode GEMV bandwidth-efficient;
-  at ~0.56 bytes per weight it would read about a third of today's bytes. *Partly done
-  (2026-10-15):* the decode Q4_K GEMV is 1.6-1.8x faster and Q6_K layer tensors stay
-  quantized, so with `REFLEX_QUANT_RESIDENT=1` Qwen3-0.6B decodes in 4.86 ms at short
-  context (6.09 before) and 6.37 ms at ~1,550 positions. See
+Ranked by the round 2 profile. Status as of 2026-10-18:
+- **Cut the remaining per-op host cost.** Reuse output buffers across steps instead of
+  allocating them, and write K/V straight into the cache. Then use CUDA graphs, which
+  would remove most of the 0.5-1.25 ms of GPU idle time per step.
+- **f16 KV cache** (opt-in). Long contexts only: decode attention takes 1.5 ms per
+  step on Qwen3-0.6B at ~1,550 positions. It changes outputs, so it can't be the
+  default.
+- **Not planned this round.** These are all bit-identical:
+  - a 4-rows-per-warp `gemv_q6k` (QR only, ~0.3 ms; the Q6_K LM head runs at about
+    61% of bandwidth);
+  - greedy argmax on the device (~0.2 ms on a 152K vocabulary);
+  - fused Q/K/V and gate/up GEMVs (~2-3%).
+- **Read fewer weight bytes.** *Partly done (2026-10-15):* the decode Q4_K GEMV is
+  1.6-1.8x faster, and Q6_K layer tensors stay quantized. See
   [quantized-resident-weights.md](quantized-resident-weights.md), "Faster Q4_K/Q6_K
   decode".
-- **Cut the remaining per-op host cost.** Reuse output buffers across steps instead of
-  allocating them, fuse the Q/K/V GEMVs, and eventually use CUDA graphs.
-- **Pick the greedy token on the device.** That would replace the 600 KB logits copy
-  and the host argmax at the end of each step.
