@@ -1132,10 +1132,130 @@ the sidecar, greedy:
 - a request with `pin_prefix`, `use_pinned`, `import_kv` and `export_kv` ran as a plain
   request and wrote no file; `/v1/classify` gave the same probabilities as before.
 
+## Composing agents (phase H)
+
+Reflex runs one agent's hop at a time. Everything that connects hops into a
+multi-agent system belongs to the orchestrator, the program that starts the
+processes, sends the requests and keeps the files.
+
+| belongs in Reflex | belongs in the orchestrator |
+|---|---|
+| one request at a time, `batch_size` 1 | which agent acts next, priority, fan-out, retries |
+| one pinned prefix per warm process (`pin_prefix`/`use_pinned`) | how many processes, which prefix each keeps, when to re-pin |
+| reading and writing a cache file it is told to (`import_kv`/`export_kv`) | where files live, their names, when to delete them, who may read them |
+| the facts of each request: `text`, `candidates`, `chosen`, `entropy`, `timings` (with `kv_io_ms` and the slot's `pinned_seq_len`/`pinned_bytes`) | the envelope that carries a decision, carry text and a file path to the next agent |
+| local IPC (`reflex stdio`/`uds`) and the CLI | transport between machines, discovery, registries, encryption, message queues |
+| JSON Schema constrained output | the schema each handoff uses, and what to do with it |
+
+The engine never knows other agents exist. It has no envelope, carry-text or
+"state summary" field: an envelope that holds carry text and file paths is a
+protocol between agents, and a state summary has no meaning beyond the cache file.
+The same goes for a second slot, named prefixes or eviction, zero-copy use of the pin,
+and anything whose value only shows under concurrent load. See
+[DEVELOPMENT.md](../DEVELOPMENT.md)'s Non-goals.
+
+### The envelope
+
+`examples/relay_envelope.schema.json` (JSON Schema draft 2020-12) is one way an
+orchestrator can pass a hop's result on. Each field comes from the engine's existing
+output or from the orchestrator's own state:
+
+| field | from |
+|---|---|
+| `version` | the orchestrator (`1`) |
+| `agent`, `hop` (optional) | the orchestrator: the role name and a counter |
+| `decision.chosen` | IPC `chosen`, or `best_idx` from `reflex system1 --json` |
+| `decision.label`, `decision.probability` | the chosen candidate's `text` and `probability` |
+| `decision.entropy` | `entropy` |
+| `carry` | IPC `text` on a generate request, or `token_text` from `reflex generate --json` |
+| `kv.path`, `kv.dtype` | the orchestrator: the `export_kv` path and `export_kv_dtype` it sent (`f32` by default) |
+| `timings.*` | IPC `timings` for warm hops (`first_token_ms`, `model_ms`, `kv_io_ms`, `mask_ms_total`, `pinned_seq_len`, `pinned_bytes`); the CLI's `--json` line for cold hops (`process_start_to_first_token_ms`, `kv_io_ms`); `wall_ms` is measured by the orchestrator |
+
+`version` is required, and so is at least one of `decision` and `carry`. A `kv` object
+needs both its path and dtype. Every timing is optional: a cold hop has no
+`model_ms` and no slot.
+
+### Hop shapes
+
+Over IPC one request can import and export at once (`import_kv` plus `export_kv`), but
+some combinations are rejected because they would keep the wrong state:
+- `json_schema` doesn't combine with `export_kv` or `pin_prefix`: the kept state is
+  the one after the prompt, before any value exists.
+- `use_pinned` doesn't combine with `export_kv` or `import_kv`.
+- `export_kv` and `pin_prefix` need `"max_tokens": 1`.
+
+So a warm agent that writes a constrained handoff and then exports its context sends
+two requests: the handoff over `use_pinned`, then a fresh `export_kv` request over its
+role prefix, the task and the handoff. That second request prefills the role prefix
+again, which is cheap for a short role. For a long one, layer files as in phase A:
+export the role once, then import it and export the longer state.
+
+`reflex generate` has three shapes: a fresh prompt decoding up to `--max-tokens`
+tokens, a fresh prompt exporting (`--export-kv`, one token), and an import decoding
+up to `--max-tokens` tokens. `--json-schema` works with the first and third. It can't
+import and export in one run, and `reflex system1` doesn't resume from a file. A cold
+chain therefore exports a shared prefix once, and every later hop imports that file
+and decodes; carry text travels in a file of its own.
+
+**Split on a token boundary.** A resumed request gives the joined request's tokens
+only if the split falls between tokens. With Qwen's pretokenizer `}\n` is one token,
+so the exported text should end with a newline and the continuation start with a
+letter.
+
+### Examples
+
+- `examples/relay_orchestrator.py` (Python 3.8+, stdlib only) runs three agents: a
+  router (a warm `reflex stdio` process with a pinned role prefix, making a System-1
+  decision over `use_pinned`), a worker (a second warm process with its own pin,
+  writing a JSON Schema handoff and exporting its context) and a cold sub-agent (a
+  fresh `reflex generate --import-kv`). It prints one envelope per hop as a JSON line.
+- `examples/relay_chain.sh` (POSIX sh) is the cold version: every hop is a fresh
+  process and hops hand off through files.
+
+### Results (Tesla T4, 2026-10-18)
+
+Setup as in phase D: Qwen3-0.6B Q4_K_M, `REFLEX_CUDA_ARCH=sm_75`, driver 595.91.07,
+cache files on `/dev/shm`, Python 3.10, greedy throughout, 64 tokens maximum per
+generating hop.
+
+**Correctness.** Both examples were run with f16 and with f32 weights, and the Python
+one also with an f16 cache file:
+- every envelope validated against the schema;
+- the router's `chosen` was the argmax of its candidates' probabilities;
+- the worker's handoff parsed as JSON (44 tokens, keys in schema order), and the shell
+  chain's decoded handoff file was byte-identical to the envelope's carry;
+- the cold sub-agent's 64 resumed token ids matched a fresh run over the joined text
+  without the file, with f32 weights and with f16 weights.
+
+**Wall time per hop**, p50 of 5 runs, f16 weights. A warm hop is the request's round
+trip; a cold hop is the process from spawn to exit, including its ~410 ms load.
+
+| example | hop | wall | first token | prefix read/copy | notes |
+|---|---|---:|---:|---:|---|
+| `relay_orchestrator.py` | router, System-1 over its pin (3 labels) | 12.5 ms | | 0.2 ms | 41 pinned positions, 9.6 MB |
+| `relay_orchestrator.py` | worker, JSON handoff over its pin, then export | 438.7 ms | 72.8 ms | | handoff 385 ms (44 tokens, masks 14.4 ms); export 53 ms, its write 11.4 ms |
+| `relay_orchestrator.py` | cold sub-agent, `--import-kv` the worker's file | 1,218 ms | 658 ms | 13.6 ms | 64 tokens |
+| `relay_chain.sh` | router, fresh `reflex system1` | 543 ms | | | |
+| `relay_chain.sh` | worker, `--import-kv` + `--json-schema` | 1,124 ms | 731 ms | 6.4 ms | |
+| `relay_chain.sh` | cold sub-agent, `--import-kv` | 1,231 ms | 672 ms | 6.4 ms | 64 tokens |
+
+- **The warm hops are the cheap ones.** Routing against the pin costs 12.5 ms, about
+  a fortieth of a cold `reflex system1` process (543 ms). Each warm process pays
+  about 250 ms once, on its first request (pinning the role), and nothing per hop
+  after that.
+- **A cold hop costs what phase D measured**, about 410 ms of load plus a first
+  forward pass of ~250 ms, then decode (the sub-agent's 64 tokens here against 32 in
+  phase D's 1,048 ms short cold hop). Resuming from a short file costs 6 to 14 ms.
+- **The worker's export is cheap with a short role.** Prefilling its role, the task and
+  the handoff again and writing the file takes 53 ms, against 385 ms for the handoff
+  itself.
+
+Raw data: `bench-results/agent-relay-t4-phase-h/` (not committed).
+
 ## Planned next phases
 
-Round 2 is planned in [agent-relay-round2.md](agent-relay-round2.md). Phases F and G
-are done (above); next are composition examples (phase H).
+Round 2 ([agent-relay-round2.md](agent-relay-round2.md)) is complete: phases D to H
+are above. Decode speed is a separate track ([decode-speed.md](decode-speed.md)).
 
 ## Swarm pattern
 

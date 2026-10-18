@@ -164,6 +164,18 @@ What has been built, in order. Measurements live in
     `use_pinned`, `import_kv` and `export_kv` are ignored, like any unknown field.
 
   See [sidecar/openai-adapter/README.md](sidecar/openai-adapter/README.md#response_format-json-schema-output).
+- **Composing agents: docs and examples.** No engine change. A "Composing agents"
+  section in [docs/design/agent-relay.md](docs/design/agent-relay.md#composing-agents-phase-h)
+  sets out what belongs in Reflex and what belongs in the orchestrator, and which hop
+  shapes IPC and the CLI support.
+  - `examples/relay_envelope.schema.json` (JSON Schema draft 2020-12): an
+    orchestrator-side envelope for a hop's decision, carry text, cache file and
+    timings, built from the engine's existing output.
+  - `examples/relay_orchestrator.py` (Python 3.8+, stdlib only): a router and a worker
+    as warm `reflex stdio` processes with pinned prefixes (a System-1 decision against
+    the pin, a JSON Schema handoff and a cache-file export), then a cold
+    `reflex generate --import-kv` sub-agent.
+  - `examples/relay_chain.sh` (POSIX sh): the same chain with a fresh process per hop.
 
 ## 2026-10-15
 
