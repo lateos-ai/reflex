@@ -218,6 +218,12 @@ fn prefill_mla_batched_matches_sequential_real_moe_checkpoint() {
 /// batched KV-cache write path, `Self::mla_write_kv_cache_batch`, must offset by
 /// `start_pos` correctly, not just `0`). Run with `cargo test --release --
 /// --ignored prefill_mla_batched_import_kv_resume_matches_sequential`.
+/// `cache` as a resume source, with a throwaway upload-time cell.
+fn host(cache: &crate::kv_io::MlaKvCache) -> super::prefix::MlaPrefix<'_> {
+    let copy_ms = Box::leak(Box::new(std::cell::Cell::new(None)));
+    PrefixSource::Host { cache, copy_ms }
+}
+
 #[test]
 #[ignore]
 fn prefill_mla_batched_import_kv_resume_matches_sequential() {
@@ -232,10 +238,10 @@ fn prefill_mla_batched_import_kv_resume_matches_sequential() {
 
     let continuation = " Paris";
     let (seq_ids, seq_hidden, _, seq_position) = model
-        .prefill_mla(m, continuation, Some(PrefixSource::Host(&cache)), 0)
+        .prefill_mla(m, continuation, Some(host(&cache)), 0)
         .expect("prefill_mla resume failed");
     let (batch_ids, batch_hidden, _, batch_position) = model
-        .prefill_mla_batched(m, continuation, Some(PrefixSource::Host(&cache)), 0)
+        .prefill_mla_batched(m, continuation, Some(host(&cache)), 0)
         .expect("prefill_mla_batched resume failed");
 
     assert_eq!(

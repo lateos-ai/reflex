@@ -129,9 +129,10 @@ another, so the prefixes can be layered:
 
 The caller owns the files: the engine keeps nothing between requests, and two warm
 processes can share one file. With `"timings": true`, `kv_io_ms` reports the time
-spent reading and writing them. It is included in `model_ms`, and the read is also
-included in `first_token_ms`. The files hold f32 values, so a long prefix makes a
-large file; tmpfs keeps the read cheap.
+spent reading and writing them; since phase F the read includes the upload into the
+request's cache. It is included in `model_ms`, and the read is also included in
+`first_token_ms`. The files hold f32 values, so a long prefix makes a large file;
+tmpfs keeps the read cheap, and `"export_kv_dtype": "f16"` halves it (phase F, below).
 
 **The continuation is tokenized as if it followed the prefix.** With the same cache
 reused, the prompt resumes exactly where the joined text would have, provided the
@@ -817,7 +818,7 @@ The response:
   against recomputing the prefix or writing a cache file. Without `timings`, responses
   are byte-identical to before.
 - **`kv_io_ms`** on a resumed `candidates` request is the device-to-device copy of the
-  pinned prefix, or the file read, as on the generate path.
+  pinned prefix, or the file read and upload, as on the generate path.
 
 Errors on a `candidates` request:
 
@@ -902,11 +903,189 @@ Raw data: `bench-results/agent-relay-t4-phase-e/` (not committed). `run_e.log` a
 `rerun_e.log` and `phase-e-out2/` hold the relay tests and the nightly run on the
 final test file.
 
+## Faster cache files (phase F)
+
+Phase D found a cold process reading the long prefix's 342 MB cache file in 284 ms,
+against 110 ms in a warm one, and file read plus upload at about a quarter of a cold
+hop. Phase F first fixed the read, which applies to every existing file, then added
+f16 files as an opt-in.
+
+### Where a cold import's time went
+
+Measured before any change, with a standalone probe on the T4: one fresh process per
+variant, CUDA initialized first as in `reflex generate`, the long prefix's file on
+`/dev/shm`, 5 runs each (all within ~2 ms):
+
+| import strategy | total | phases (ms / minor faults) |
+|---|---:|---|
+| the old code's shape: read into a fresh `Vec<u8>`, collect into a fresh `Vec<f32>`, pageable upload | 507 ms | read 180 / 83K, convert 232 / 83K, upload 80 |
+| read straight into the final `Vec<f32>` | 259 ms | read 179 / 83K, upload 80 |
+| the same with `MADV_HUGEPAGE` | 257 ms | faults unchanged (THP is `madvise`-only and didn't apply) |
+| an anonymous `MAP_POPULATE` buffer, then read | 275 ms | populate 114 / 83K, read 81, upload 80 |
+| mmap the file, pageable upload from its pages | 96 ms | 5.2K faults (64 KB fault-around) |
+| the same with `MAP_POPULATE` | 96 ms | populate 16, upload 80 |
+| `cuMemHostRegister` on the mapping | | `CUDA_ERROR_NOT_SUPPORTED` on tmpfs |
+| two 64 MB pinned buffers, `read()` into them, async upload | 152 ms | `cuMemHostAlloc` 59 / 33K, stream 92 |
+| two 8 MB pinned buffers, `read()` into them, async upload | **64 ms** | alloc 7.6, stream 56 |
+| the same with 2 or 4 `pread` threads per chunk | 63 ms | stream 55.5: the upload (~6.2 GB/s) is the bound, not the read |
+
+- **Every fresh page costs a fault.** The old import read the payload into one fresh
+  buffer and converted it into another. The real binary freed each slice's byte buffer
+  before reading the next, so it faulted about half as much as the probe's replica:
+  its `kv_io_ms` was 276 to 281 ms.
+- **Pinned memory is expensive to allocate in a cold process**: about 0.46 ms per MB.
+  Staging through the weight loader's 64 MB chunk size would cost as much as the
+  whole upload, so cache files use 8 MB chunks.
+- **The read itself is cheap.** With pinned staging the upload is the bound, so more
+  read threads don't help.
+
+### The read fix
+
+`kv_io::import_kv` now reads only the header. It checks that the file is exactly as
+long as the header says and returns file ranges. Each range is then read with
+positioned reads straight into the model's pinned staging buffers, 8 MB at a time
+(`WeightLoadPipeline::upload_state`, the same two slots the weight load uses). The
+next chunk is read while the previous one is on its way to the GPU. The copies run on
+the compute stream, so they follow the zeroing of the new cache and come before the
+prefill that reads it. Nothing else changes:
+- The file formats and every existing version are unchanged, and what an import puts
+  in the cache is bit-identical.
+- A truncated, overlong or otherwise inconsistent file is rejected at import, before
+  any model work (`kv_cache`).
+- The caller must not change a file while a request resumes from it. A file that
+  shrinks in between fails that request with `kv_cache`; it doesn't crash the
+  process, as a memory-mapped file would.
+- `kv_io_ms` now covers the read and the upload, since they overlap. Work already
+  queued on the GPU, such as the end of a cold weight load, is waited for before
+  the timing starts.
+- Exports write each buffer's values directly instead of copying them into a byte
+  buffer first.
+
+### f16 files
+
+An export can ask for f16 values: `"export_kv_dtype": "f16"` over IPC,
+`--export-kv-dtype f16` on the CLI. Versions 5, 6 and 7 are the dense, hybrid and MLA
+layouts with f16 values (see [reference.md](../reference.md#kv-cache-files)). Every
+format imports, whichever was written.
+- **Opt-in, not the default.** An f32 file resumes exactly, as before; an f16 file
+  doesn't. Making f16 the default would change every existing caller's outputs and
+  files. A caller that wants the smaller file asks for it. Without the field, requests,
+  responses and files are byte-identical to before.
+- **The conversions run on the GPU.** Export rounds each value to nearest even
+  (`cast_act_f16_kernel`) and downloads f16 bits. A value beyond f16's range fails the
+  export instead of becoming infinite. Import copies each chunk to the GPU once and
+  widens its f16 runs in one launch (`f16_to_f32_runs_kernel`, exact).
+- **The working cache stays f32.** Only the file's values are rounded.
+- **The hybrid's GatedDeltaNet state stays f32** (version 6). llama.cpp also keeps
+  recurrent state in f32 next to an f16 KV cache. The measured cost of rounding it
+  too was small: on Qwen3.5-0.8B with f32 weights and a ~600-token prefix, rounding
+  the attention K/V alone moved the next token's logits by 1.04e-4 (relative L2) and
+  rounding the recurrent state as well by 1.19e-4, with the same 32 greedy tokens. The
+  state is a fixed ~20 MB, so keeping it f32 makes a short hybrid prefix's f16 file
+  barely smaller (20.4 against 20.5 MB). Rounding it too is an option if smaller
+  hybrid files matter.
+
+### Accuracy
+
+f16 storage keeps 11 significant bits. `src/ipc/relay_tests.rs` exports each prefix
+twice, as f32 and as f16, resumes from both over IPC, and compares with one request
+over the joined text. `src/model/kv_f16_tests.rs` rounds a pinned prefix's buffers in
+place to isolate the effect.
+
+| model | weights | next-token logits, f16 file vs f32 file (rel L2 / max abs) | greedy tokens |
+|---|---|---|---|
+| Qwen3-0.6B | f16 | 7.0e-4 / 1.4e-2 | identical |
+| Qwen3-0.6B, buffers rounded in place | f32 | 6.1e-4 / 6.5e-3 | 32/32 identical |
+| TinyLlama-1.1B-Chat (SentencePiece), after raw text | f16 | 2.1e-4 / 4.6e-3 | identical |
+| TinyLlama-1.1B-Chat, after `</s>` | f16 | 6.0e-4 / 7.5e-3 | identical |
+| Qwen3.5-0.8B hybrid | f16 | 1.9e-4 / 4.1e-3 | identical |
+| Qwen3.5-MoE hybrid fixture | f32 | 1.8e-4 / 2.1e-4 | identical |
+| Qwen3-MoE fixture | f32 | 5.5e-7 / 7.5e-9 | identical |
+| MLA fixture | f32 | 2.7e-6 / 5.1e-8 | identical |
+
+- For comparison, the f32 file against the joined request (fewer prefill rows, so a
+  different summation order) is 8.5e-4 on Qwen3-0.6B with f16 weights. f16 weights
+  already round the activations about as much as an f16 file rounds the cache.
+- The tests allow 1e-2 relative L2 against the f32 file and require the joined
+  request's greedy ids. The CLI's 32-token resumes and all 30 hops of every bench chain
+  gave the same text from an f16 file as from master's f32 one.
+
+### Results (Tesla T4, 2026-10-17)
+
+Same setup as phase D: Qwen3-0.6B Q4_K_M (f16 weights), 30 hops after 3 warm-up
+hops, 32 greedy tokens per hop, files on `/dev/shm`, `REFLEX_CUDA_ARCH=sm_75`. Master
+is f79231d. p50 per hop:
+
+| prefix | target | master | read fix, f32 file | read fix, f16 file |
+|---|---|---:|---:|---:|
+| long | `cold` (recompute, no file) | 1,329 ms | 1,336 ms | |
+| long | `cold-chain` hop | 1,530 ms | **1,203 ms** | **1,182 ms** |
+| long | `cold-chain` first token | 1,108 ms | 792 ms | 777 ms |
+| long | `cold-chain` read (+ upload after the fix) | 296 ms (+~80) | 67 ms | 44 ms |
+| long | file size | 342 MB | 342 MB | 171 MB |
+| long | `cold-warm` hop | 2,233 ms | 1,851 ms | 1,589 ms |
+| long | `cold-warm` write / read | 230 / 291 ms | 153 / 76 ms | 77 / 44 ms |
+| long | `stdio` with file reuse, round trip | 479 ms | 348 ms | 321 ms |
+| long | `stdio` with file reuse, first token | 223 ms | 91 ms | 65 ms |
+| short | `cold` | 1,071 ms | 1,067 ms | |
+| short | `cold-chain` hop | 1,075 ms | 1,074 ms | 1,066 ms |
+| short | `cold-warm` hop | 1,071 ms | 1,064 ms | 1,052 ms* |
+| short | `stdio` with file reuse, round trip | 237 ms | 234 ms | 233 ms |
+
+\* From the final build, run after this table's runs. The first f16 import widened
+each cached buffer with its own copy and kernel launch; in a warm process that had
+idled between requests, those 56 launches added ~9 ms to a short file's read (16 against
+6.6 ms for f32). The final build copies each 8 MB chunk once and widens its buffers in
+one launch: 6.6 ms, the same as f32. Its long-prefix rerun was 1 to 2% slower across
+the board (box drift), with the same gaps: `cold-chain` 1,222 ms (f32 file) and
+1,195 ms (f16) against 1,344 ms for `cold`.
+
+GPU energy per hop, gross / net of idle (cold targets p50, warm ones the bracket's
+mean):
+
+| prefix | target | master | read fix, f32 file | read fix, f16 file |
+|---|---|---:|---:|---:|
+| long | `cold` | 73.4 / 25.9 J | 73.3 / 26.0 J | |
+| long | `cold-chain` | 71.8 / 18.7 J | 61.9 / 18.7 J | 61.8 / 19.8 J |
+| long | `cold-warm` | 103.8 / 27.8 J | 90.2 / 27.9 J | 80.8 / 27.6 J |
+| long | `stdio` with file reuse | 26.7 / 10.5 J | 22.2 / 10.2 J | 21.4 / 10.3 J |
+| short | `cold-chain` | 56.2 / 17.0 J | 56.2 / 17.5 J | 56.1 / 16.9 J |
+
+What this shows:
+- **A cold chain now beats recomputing the prefix.** With the long prefix, `cold-chain`
+  takes 1,203 ms against 1,336 ms for `cold`, 10% less. Before the fix it was 177 to
+  200 ms slower. The read fix alone does this; it also applies to f32 files written
+  before it.
+- **f16 adds a little on top.** It halves the file and the read (67 to 44 ms) and the
+  write (153 to 77 ms): 21 ms per `cold-chain` hop, 262 ms per `cold-warm` hop, which
+  writes a file every hop.
+- **Warm processes gain too.** Reusing the long prefix from a file inside `reflex stdio`
+  went from a 223 to a 91 ms first token, or 65 ms with an f16 file. A pinned prefix
+  is still faster (38.6 ms, phase B), since nothing leaves the GPU.
+- **Energy follows the GPU work.** Net energy per hop is unchanged: the fix removes
+  host work, not GPU work. Gross energy drops with the shorter hop, by 10 J per long
+  `cold-chain` hop, since the idle draw runs for less time.
+- **Short prefixes are unchanged.** Their files are 10 MB or less.
+- **Faults.** One cold long-prefix hop went from 193.8K minor faults to 112.5K, against
+  about 106K to 110K without any import.
+
+Unchanged elsewhere: the GPU nightly suite passes; requests without the new field give
+byte-identical IPC responses and cache files on Qwen3-0.6B, TinyLlama and
+Qwen3.5-0.8B, and the CLI's default export is byte-identical, including the 342 MB
+long prefix; the phase 0 bench gives the same 30 texts; cold start is unchanged
+(interleaved `bench_cold_start_phases.sh`, 5 rounds of 2 runs: per-round p50 first
+token 690 to 695 ms on master, 688 to 696 ms here).
+
+Raw data: `bench-results/agent-relay-t4-phase-f/` (not committed): `phase-f-step1/`
+(the probe), `phase-f1-out/` (the read fix alone), `phase-f2-out/` (both, with tests,
+nightly, byte identity, CLI checks and cold start), `phase-f3-out/` and
+`phase-f4-out/` (the `kv_io_ms` and f16-upload follow-ups).
+
 ## Planned next phases
 
-Round 2 is planned in [agent-relay-round2.md](agent-relay-round2.md): smaller cache
-files (phase F, whose gate phase D passed), the sidecar's `response_format`, and
-composition examples.
+Round 2 is planned in [agent-relay-round2.md](agent-relay-round2.md). Phase F is done
+(above); next are the sidecar's `response_format` (phase G) and composition examples
+(phase H).
 
 ## Swarm pattern
 

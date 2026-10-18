@@ -40,8 +40,10 @@
 //! (`crate::kv_io`). A request that sets `import_kv` treats `prompt` as the
 //! continuation after the file's positions. An `export_kv` request must set
 //! `max_tokens` to 1, since the state after a later generated token is no longer
-//! the prompt's (see `Model::generate_capture_kv`). The caller owns the files:
-//! the engine keeps nothing between requests.
+//! the prompt's (see `Model::generate_capture_kv`). `export_kv_dtype: "f16"`
+//! writes the file in f16, half the size, at the cost of an exact resume; the
+//! default `"f32"` is unchanged, and `import_kv` reads either. The caller owns
+//! the files: the engine keeps nothing between requests.
 //!
 //! **Pinned prefix**: a request with `pin_prefix` keeps the
 //! model's state after its prompt in VRAM, in the session's one [`PrefixSlot`],
@@ -153,6 +155,11 @@ pub struct IpcRequest {
     /// file. Requires `max_tokens: 1`.
     #[serde(default)]
     pub export_kv: Option<String>,
+    /// With `export_kv`: the file's element type, `"f32"` (the default) or
+    /// `"f16"` (half the size; resuming from it is no longer exact). See
+    /// `crate::kv_io`'s f16 files.
+    #[serde(default)]
+    pub export_kv_dtype: Option<String>,
     /// `generate` path only: keep the state after this request's prompt in the
     /// session's [`PrefixSlot`], replacing its contents. Requires `max_tokens: 1`.
     #[serde(default)]
@@ -244,8 +251,9 @@ pub struct IpcTimings {
     /// Parsing the request line's JSON.
     pub parse_ms: f64,
     /// From the start of the model call to its first generated token: tokenize,
-    /// prefill, LM head and the first sampling step, plus reading the
-    /// `import_kv` file or copying the pinned prefix, if any. `generate` path only.
+    /// prefill, LM head and the first sampling step, plus reading (and
+    /// uploading) the `import_kv` file or copying the pinned prefix, if any.
+    /// `generate` path only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_token_ms: Option<f64>,
     /// The whole model call (`Model::generate` or `Model::system1_evaluate`). On
@@ -253,7 +261,9 @@ pub struct IpcTimings {
     /// since those happen inside the decode loop. Includes `kv_io_ms`.
     pub model_ms: f64,
     /// Reading the `import_kv` file plus writing the `export_kv` file, when the
-    /// request named either (on a `candidates` request too). On a `use_pinned`
+    /// request named either (on a `candidates` request too). The file's payload
+    /// is read while it is uploaded into the request's cache, so the read
+    /// includes that upload (`crate::kv_io`). On a `use_pinned`
     /// request, generating or scoring, the device-to-device copy
     /// of the pinned prefix into the request's own cache instead. Pinning itself
     /// copies nothing, so a `pin_prefix` request alone reports none.
@@ -377,6 +387,7 @@ fn run_generate_with(
     on_first_token: impl FnMut(&[f32]),
     on_token: impl FnMut(u32, &str),
 ) -> Result<(Vec<u32>, String), ReflexError> {
+    let export_dtype = export_kv_dtype(req)?;
     let uses_slot = req.pin_prefix || req.use_pinned;
     if uses_slot && (req.import_kv.is_some() || req.export_kv.is_some()) {
         return Err(ReflexError::InvalidInput(
@@ -440,27 +451,49 @@ fn run_generate_with(
         }
         None => None,
     };
+    // The file's payload is read while it is uploaded (`kv_io::import_kv`
+    // reads only the header), so the upload counts as part of the read.
+    let resume = imported.as_ref().map_or(Resume::Fresh, Resume::File);
     let Some(export_path) = &req.export_kv else {
-        return model.generate(
+        let (token_ids, text, upload_ms) = model.generate_resumed(
             &req.prompt,
             req.max_tokens.max(1),
-            imported.as_ref(),
+            resume,
             sampling,
             on_first_token,
             on_token,
-        );
+        )?;
+        add_ms(kv_io_ms, upload_ms);
+        return Ok((token_ids, text));
     };
-    let (token_ids, text, cache) = model.generate_capture_kv(
-        &req.prompt,
-        imported.as_ref(),
-        sampling,
-        on_first_token,
-        on_token,
-    )?;
+    // `Model::generate_capture_kv`, keeping the upload time.
+    let (token_ids, text, state, upload_ms) =
+        model.generate_pin_prefix(&req.prompt, resume, sampling, on_first_token, on_token)?;
+    add_ms(kv_io_ms, upload_ms);
+    let cache = model.download_prefix_as(&state, export_dtype)?;
     let start = std::time::Instant::now();
     crate::kv_io::export_kv(export_path, &cache)?;
-    *kv_io_ms = Some(kv_io_ms.unwrap_or(0.0) + elapsed_ms(start));
+    add_ms(kv_io_ms, Some(elapsed_ms(start)));
     Ok((token_ids, text))
+}
+
+/// Adds `ms` (if any) to the request's `kv_io_ms`.
+fn add_ms(kv_io_ms: &mut Option<f64>, ms: Option<f64>) {
+    if let Some(ms) = ms {
+        *kv_io_ms = Some(kv_io_ms.unwrap_or(0.0) + ms);
+    }
+}
+
+/// A `generate` request's `export_kv_dtype`: f32 unless it asks for f16, and
+/// only together with `export_kv`.
+fn export_kv_dtype(req: &IpcRequest) -> Result<crate::kv_io::KvDtype, ReflexError> {
+    match &req.export_kv_dtype {
+        None => Ok(crate::kv_io::KvDtype::F32),
+        Some(_) if req.export_kv.is_none() => Err(ReflexError::InvalidInput(
+            "export_kv_dtype applies only with export_kv".to_string(),
+        )),
+        Some(d) => crate::kv_io::KvDtype::parse(d),
+    }
 }
 
 /// The error for a field that keeps a prefix (`export_kv`/`pin_prefix`) on a
@@ -476,7 +509,7 @@ fn kv_fields_on_candidates_err() -> ReflexError {
 /// resume from `use_pinned` or `import_kv` (not both), and can't keep a prefix
 /// or take a `json_schema`.
 fn check_candidates_fields(req: &IpcRequest) -> Result<(), ReflexError> {
-    if req.export_kv.is_some() || req.pin_prefix {
+    if req.export_kv.is_some() || req.export_kv_dtype.is_some() || req.pin_prefix {
         return Err(kv_fields_on_candidates_err());
     }
     if req.use_pinned && req.import_kv.is_some() {
@@ -530,11 +563,11 @@ fn run_system1(
                     .to_string(),
             )),
         };
+    // The pinned prefix's copy, or the file's upload (its read, see
+    // `run_generate`), on top of the header read above.
     let (response, copy_ms) =
         model.system1_evaluate_resumed(&req.prompt, resume, &candidates, req.temperature)?;
-    if copy_ms.is_some() {
-        *kv_io_ms = copy_ms;
-    }
+    add_ms(kv_io_ms, copy_ms);
     Ok(response)
 }
 
@@ -1076,6 +1109,35 @@ mod tests {
     }
 
     #[test]
+    fn test_export_kv_dtype_defaults_to_f32_and_needs_export_kv() {
+        use crate::kv_io::KvDtype;
+        let parse = |s: &str| serde_json::from_str::<IpcRequest>(s).unwrap();
+        let dtype = |s: &str| export_kv_dtype(&parse(s));
+        assert_eq!(
+            dtype(r#"{"prompt": "p", "export_kv": "o", "max_tokens": 1}"#).unwrap(),
+            KvDtype::F32
+        );
+        assert_eq!(dtype(r#"{"prompt": "p"}"#).unwrap(), KvDtype::F32);
+        for (d, want) in [("f32", KvDtype::F32), ("f16", KvDtype::F16)] {
+            let req = format!(r#"{{"prompt": "p", "export_kv": "o", "export_kv_dtype": "{d}"}}"#);
+            assert_eq!(dtype(&req).unwrap(), want);
+        }
+        for bad in [
+            r#"{"prompt": "p", "export_kv": "o", "export_kv_dtype": "bf16"}"#,
+            r#"{"prompt": "p", "export_kv": "o", "export_kv_dtype": "F16"}"#,
+            r#"{"prompt": "p", "export_kv_dtype": "f16"}"#,
+            r#"{"prompt": "p", "import_kv": "i", "export_kv_dtype": "f16"}"#,
+        ] {
+            let err = dtype(bad).unwrap_err();
+            assert_eq!(err.kind(), "invalid_input", "{bad}: {err}");
+        }
+        assert!(serde_json::from_str::<IpcRequest>(
+            r#"{"prompt": "p", "export_kv": "o", "export_kv_dtype": 16}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn test_ipc_request_pin_fields_default_off_and_parse() {
         let req: IpcRequest = serde_json::from_str(r#"{"prompt": "p"}"#).unwrap();
         assert!(!req.pin_prefix && !req.use_pinned);
@@ -1121,6 +1183,7 @@ mod tests {
             r#", "use_pinned": true, "import_kv": "sys.cskv""#,
             r#", "json_schema": {"type": "string"}"#,
             r#", "use_pinned": true, "json_schema": {"type": "string"}"#,
+            r#", "export_kv_dtype": "f16""#,
         ] {
             let err = check_candidates_fields(&candidates_req(extra)).unwrap_err();
             assert_eq!(err.kind(), "invalid_input", "{extra}: {err}");

@@ -41,11 +41,14 @@
 //! then the continuation text appended after the cached positions, not a
 //! fresh prompt. `--max-tokens N` (default 1) generates up to N tokens,
 //! feeding each one back in, stopping early on the tokenizer's EOS. With either
-//! flag, `REFLEX_GENERATE_OK` gains `kv_io_ms`: the file read (import) or write
-//! (export), not the upload into the model's cache. The two flags can't be
-//! combined in one run (IPC's `import_kv`+`export_kv` can).
+//! flag, `REFLEX_GENERATE_OK` gains `kv_io_ms`: the file write (export), or the
+//! file read (import), which includes the upload into the model's cache since
+//! the payload is read straight into the upload's staging buffers. The two
+//! flags can't be combined in one run (IPC's `import_kv`+`export_kv` can).
+//! `--export-kv-dtype f16` writes an f16 file, half the size (`f32`, the
+//! default, resumes exactly); `--import-kv` reads either.
 //!
-//! Usage: `reflex generate <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file>] [--json]`
+//! Usage: `reflex generate <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file> [--export-kv-dtype f32|f16]] [--json]`
 //!        `reflex generate <path-to-gguf> [continuation-prompt] [--max-tokens N] --import-kv <file>`
 //!
 //! `--json` (needs `cargo build --features json-output`) prints each result
@@ -160,6 +163,7 @@ pub fn run(args: Vec<String>) {
 
     let mut positional: Vec<String> = Vec::new();
     let mut export_kv: Option<String> = None;
+    let mut export_kv_dtype: Option<String> = None;
     let mut import_kv: Option<String> = None;
     let mut max_tokens: usize = 1;
     let mut lora_path: Option<String> = None;
@@ -179,6 +183,12 @@ pub fn run(args: Vec<String>) {
             "--json" => json = true,
             "--export-kv" => {
                 export_kv = Some(args.next().expect("--export-kv requires a file path"))
+            }
+            "--export-kv-dtype" => {
+                export_kv_dtype = Some(
+                    args.next()
+                        .expect("--export-kv-dtype requires `f32` or `f16`"),
+                )
             }
             "--import-kv" => {
                 import_kv = Some(args.next().expect("--import-kv requires a file path"))
@@ -299,64 +309,18 @@ pub fn run(args: Vec<String>) {
         print_lora_ok(json, lora_path, applied);
     }
 
+    let export_dtype = match (&export_kv_dtype, &export_kv) {
+        (None, _) => kv_io::KvDtype::F32,
+        (Some(_), None) => crate::fail("--export-kv-dtype", "applies only with --export-kv"),
+        (Some(d), Some(_)) => {
+            kv_io::KvDtype::parse(d).unwrap_or_else(|e| crate::fail("--export-kv-dtype", e))
+        }
+    };
     if let Some(export_path) = &export_kv {
-        let mut write_ms = 0.0;
-        let mut timed_write = |write: &mut dyn FnMut()| {
-            let start = Instant::now();
-            write();
-            write_ms = start.elapsed().as_secs_f64() * 1000.0;
-        };
-        let (token_id, text) = match model.architecture_kind() {
-            ArchitectureKind::Hybrid => {
-                let ((token_id, text), cache) = model
-                    .forward_prompt_capture_kv_hybrid(&prompt)
-                    .unwrap_or_else(|e| crate::fail("forward_prompt_capture_kv_hybrid failed", e));
-                timed_write(&mut || {
-                    kv_io::export_hybrid_kv(export_path, &cache)
-                        .expect("failed to export hybrid KV cache")
-                });
-                print_kv_export_ok(
-                    json,
-                    export_path,
-                    "hybrid",
-                    cache.seq_len,
-                    cache.layers.len(),
-                );
-                (token_id, text)
-            }
-            ArchitectureKind::Dense => {
-                let ((token_id, text), cache) = model
-                    .forward_prompt_capture_kv(&prompt)
-                    .unwrap_or_else(|e| crate::fail("forward_prompt_capture_kv failed", e));
-                print_kv_export_ok(
-                    json,
-                    export_path,
-                    "dense",
-                    cache.seq_len,
-                    cache.k_caches.len(),
-                );
-                timed_write(&mut || {
-                    kv_io::export_dense_kv(export_path, &cache).expect("failed to export KV cache")
-                });
-                (token_id, text)
-            }
-            ArchitectureKind::Mla => {
-                let ((token_id, text), cache) = model
-                    .forward_prompt_capture_kv_mla(&prompt)
-                    .unwrap_or_else(|e| crate::fail("forward_prompt_capture_kv_mla failed", e));
-                print_kv_export_ok(
-                    json,
-                    export_path,
-                    "mla",
-                    cache.seq_len,
-                    cache.kv_caches.len(),
-                );
-                timed_write(&mut || {
-                    kv_io::export_mla_kv(export_path, &cache)
-                        .expect("failed to export MLA KV cache")
-                });
-                (token_id, text)
-            }
+        let kind = match model.architecture_kind() {
+            ArchitectureKind::Hybrid => "hybrid",
+            ArchitectureKind::Dense => "dense",
+            ArchitectureKind::Mla => "mla",
             ArchitectureKind::Gemma4 => {
                 crate::fail("--export-kv failed", "not supported for Gemma 4 models yet")
             }
@@ -365,6 +329,28 @@ pub fn run(args: Vec<String>) {
                 "not supported for granitehybrid (Granite 4.0-H) models yet",
             ),
         };
+        // `Model::generate_capture_kv` with the file's dtype: one token after the
+        // prompt, then the state right after the prompt.
+        let (token_ids, text, state, _) = model
+            .generate_pin_prefix(
+                &prompt,
+                reflex_engine::model::Resume::Fresh,
+                &reflex_engine::sampling::SamplingParams::default(),
+                |_logits| {},
+                |_id, _text| {},
+            )
+            .unwrap_or_else(|e| crate::fail("--export-kv failed", e));
+        let cache = model
+            .download_prefix_as(&state, export_dtype)
+            .unwrap_or_else(|e| crate::fail("--export-kv failed", e));
+        drop(state);
+        let start = Instant::now();
+        kv_io::export_kv(export_path, &cache)
+            .unwrap_or_else(|e| crate::fail("failed to export KV cache", e));
+        let write_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let (seq_len, num_layers) = cache.shape();
+        print_kv_export_ok(json, export_path, kind, seq_len, num_layers);
+        let (token_id, text) = (token_ids[0], text);
         let elapsed = t0.elapsed();
         let energy_measurement = sampler.measure();
         let prompt_eval_ms = elapsed.as_secs_f64() * 1000.0 - model_ready_ms;
@@ -434,11 +420,17 @@ pub fn run(args: Vec<String>) {
 
     let mut first_token_ms: Option<f64> = None;
     let mut first_token_energy: Option<energy::EnergyMeasurement> = None;
-    let (tokens, text) = model
-        .generate(
+    // `import_kv` reads only the header; the payload is read as it is
+    // uploaded, so `kv_io_ms` adds the upload (`upload_ms`).
+    let resume = imported.as_ref().map_or(
+        reflex_engine::model::Resume::Fresh,
+        reflex_engine::model::Resume::File,
+    );
+    let (tokens, text, upload_ms) = model
+        .generate_resumed(
             &prompt,
             max_tokens,
-            imported.as_ref(),
+            resume,
             &sampling,
             |_logits| {
                 first_token_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
@@ -455,6 +447,7 @@ pub fn run(args: Vec<String>) {
     let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let energy_measurement = sampler.measure();
     let prompt_eval_ms = first_token_ms.unwrap_or(total_ms) - model_ready_ms;
+    let read_ms = read_ms.map(|ms| ms + upload_ms.unwrap_or(0.0));
 
     print_phase_report(
         json,

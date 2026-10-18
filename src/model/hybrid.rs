@@ -1701,7 +1701,7 @@ impl Model {
         let imported_len = start_pos * attn_stride;
         match imported {
             None => {}
-            Some(PrefixSource::Host(cache)) => {
+            Some(PrefixSource::Host { cache, copy_ms }) => {
                 if cache.attn_num_kv_heads != h.attn_cfg.num_kv_heads
                     || cache.attn_head_dim != h.attn_cfg.head_dim
                 {
@@ -1718,8 +1718,8 @@ impl Model {
                         h.layers.len()
                     ));
                 }
-                for (layer_idx, (state, layer)) in states.iter_mut().zip(&cache.layers).enumerate()
-                {
+                let mut jobs = Vec::with_capacity(2 * states.len());
+                for (layer_idx, (state, layer)) in states.iter().zip(&cache.layers).enumerate() {
                     use crate::kv_io::HybridLayerCacheData as Data;
                     match (state, layer) {
                         (
@@ -1729,24 +1729,10 @@ impl Model {
                                 v_cache: v_host,
                             },
                         ) => {
-                            let mut k_dst = k_cache.slice_mut(0..imported_len);
-                            self.device
-                                .htod_sync_copy_into(k_host, &mut k_dst)
-                                .map_err(|e| {
-                                    crate::gpu_err!(
-                                        e,
-                                        "import hybrid k_cache layer {layer_idx}: {e}"
-                                    )
-                                })?;
-                            let mut v_dst = v_cache.slice_mut(0..imported_len);
-                            self.device
-                                .htod_sync_copy_into(v_host, &mut v_dst)
-                                .map_err(|e| {
-                                    crate::gpu_err!(
-                                        e,
-                                        "import hybrid v_cache layer {layer_idx}: {e}"
-                                    )
-                                })?;
+                            check_state_len(k_host, imported_len, "k_cache", layer_idx)?;
+                            check_state_len(v_host, imported_len, "v_cache", layer_idx)?;
+                            jobs.push((*k_cache.device_ptr(), k_host));
+                            jobs.push((*v_cache.device_ptr(), v_host));
                         }
                         (
                             HybridLayerState::Gdn {
@@ -1761,22 +1747,8 @@ impl Model {
                             if c_host.len() != conv_state.len() || r_host.len() != recurrent.len() {
                                 return Err(crate::reflex_err!(KvCache, "imported hybrid KV cache layer {layer_idx} Gdn state size mismatch"));
                             }
-                            self.device
-                                .htod_sync_copy_into(c_host, conv_state)
-                                .map_err(|e| {
-                                    crate::gpu_err!(
-                                        e,
-                                        "import gdn conv_state layer {layer_idx}: {e}"
-                                    )
-                                })?;
-                            self.device
-                                .htod_sync_copy_into(r_host, recurrent)
-                                .map_err(|e| {
-                                    crate::gpu_err!(
-                                        e,
-                                        "import gdn recurrent layer {layer_idx}: {e}"
-                                    )
-                                })?;
+                            jobs.push((*conv_state.device_ptr(), c_host));
+                            jobs.push((*recurrent.device_ptr(), r_host));
                         }
                         (HybridLayerState::Attn { .. }, Data::Gdn { .. }) => {
                             return Err(crate::reflex_err!(KvCache, "imported hybrid KV cache layer {layer_idx} is Gdn-kind but model layer is GatedAttention"));
@@ -1786,6 +1758,11 @@ impl Model {
                         }
                     }
                 }
+                self.timed_prefix_copy(copy_ms, || {
+                    self.dequant_pipeline
+                        .borrow_mut()
+                        .upload_state(&jobs, &self.dequant_kernels.f16_to_f32_runs)
+                })?;
             }
             Some(PrefixSource::Device { state, copy_ms }) => {
                 if state.layers.len() != h.layers.len() {
@@ -2096,63 +2073,61 @@ impl Model {
         on_first_token: impl FnMut(&[f32]),
         on_token: impl FnMut(u32, &str),
     ) -> Result<(Vec<u32>, String, crate::kv_io::HybridKvCache), ReflexError> {
+        let copy_ms = Cell::new(None);
         let (generated, text, layers, seq_len) = self.generate_hybrid_impl(
             h,
             prompt,
-            imported.map(PrefixSource::Host),
+            imported.map(|cache| PrefixSource::Host {
+                cache,
+                copy_ms: &copy_ms,
+            }),
             1,
             sampling,
             on_first_token,
             on_token,
         )?;
-        let cache = self.download_hybrid_state(h, &HybridDeviceState { seq_len, layers })?;
+        let cache = self.download_hybrid_state(
+            h,
+            &HybridDeviceState { seq_len, layers },
+            crate::kv_io::KvDtype::F32,
+        )?;
         Ok((generated, text, cache))
     }
 
     /// Downloads a device-resident hybrid state for export: attention K/V
     /// sliced to the first `seq_len` positions, GDN state in full.
+    /// With `dtype` f16 only the attention K/V is rounded; the GatedDeltaNet
+    /// state stays f32 (`crate::kv_io`'s version 6).
     pub(super) fn download_hybrid_state(
         &self,
         h: &HybridModel,
         d: &HybridDeviceState,
+        dtype: crate::kv_io::KvDtype,
     ) -> Result<crate::kv_io::HybridKvCache, ReflexError> {
+        use crate::kv_io::KvDtype::F32;
         let attn_len = d.seq_len * h.attn_cfg.num_kv_heads * h.attn_cfg.head_dim;
+        let mut dl = StateDownload::new(self, dtype)?;
         let mut layers = Vec::with_capacity(d.layers.len());
         for state in &d.layers {
             match state {
                 HybridLayerState::Attn { k_cache, v_cache } => {
-                    let k_host = self
-                        .device
-                        .dtoh_sync_copy(&k_cache.slice(0..attn_len))
-                        .map_err(|e| crate::gpu_err!(e, "hybrid k_cache dtoh: {e}"))?;
-                    let v_host = self
-                        .device
-                        .dtoh_sync_copy(&v_cache.slice(0..attn_len))
-                        .map_err(|e| crate::gpu_err!(e, "hybrid v_cache dtoh: {e}"))?;
                     layers.push(crate::kv_io::HybridLayerCacheData::Attn {
-                        k_cache: k_host,
-                        v_cache: v_host,
+                        k_cache: dl.get(k_cache, attn_len, dtype, "hybrid k_cache")?,
+                        v_cache: dl.get(v_cache, attn_len, dtype, "hybrid v_cache")?,
                     });
                 }
                 HybridLayerState::Gdn {
                     conv_state,
                     recurrent,
                 } => {
-                    let conv_host = self
-                        .device
-                        .dtoh_sync_copy(conv_state)
-                        .map_err(|e| crate::gpu_err!(e, "gdn conv_state dtoh: {e}"))?;
-                    let rec_host = self
-                        .device
-                        .dtoh_sync_copy(recurrent)
-                        .map_err(|e| crate::gpu_err!(e, "gdn recurrent dtoh: {e}"))?;
                     layers.push(crate::kv_io::HybridLayerCacheData::Gdn {
-                        conv_state: conv_host,
-                        recurrent: rec_host,
+                        conv_state: dl.get(conv_state, conv_state.len(), F32, "gdn conv_state")?,
+                        recurrent: dl.get(recurrent, recurrent.len(), F32, "gdn recurrent")?,
                     });
                 }
             }
         }
+        dl.finish()?;
 
         Ok(crate::kv_io::HybridKvCache {
             seq_len: d.seq_len,

@@ -224,6 +224,13 @@ Rules that follow from measured regressions:
   or allocating the staging buffers per tensor, reintroduces a host/device race or
   serializes the pipeline. The f16 dequant kernels go through the same pipeline; only
   the output element type differs.
+- **Read cache files straight into the pinned slots.** `kv_io::import_kv` reads only
+  the header; `WeightLoadPipeline::upload_state` reads each value range into the
+  pinned slots in chunks of at most 8 MB and copies it to the cache (an f16 file is
+  widened on the GPU). Reading the payload into fresh host vectors first faulted in
+  every page of two new buffers: a cold process read a 342 MB file in 284 ms against
+  110 ms warm. The chunk stays small because pinned memory costs ~0.46 ms per MB to
+  allocate in a cold process.
 - **Numerics probes.** `REFLEX_F16_ROUNDTRIP=1` (with `--weights f32`) rounds every
   matrix weight to f16 and back, which isolates weight rounding from the f16 kernels.
   `REFLEX_TOP2_TRACE=1` prints each generated position's top-2 logits.

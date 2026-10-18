@@ -142,7 +142,7 @@ Tests (`src/ipc/relay_tests.rs`):
 The bench gets `--system1 <labels>`, which adds a scoring hop against the pinned prefix
 on every agent turn.
 
-### Phase F: smaller cache files (only if phase D's gate passes)
+### Phase F: faster and smaller cache files (done)
 
 - The cache file payload is written as f16, as a new KV format version for each
   architecture. The current f32 versions still import. This halves the file and the
@@ -153,6 +153,11 @@ on every agent turn.
   process reads the file 2.6× slower than a warm one (284 against 110 ms), from
   faulting in the read buffer. Fixing that is format-independent, and is worth
   weighing alongside f16 or before it.
+- **Done.** The read fix came first: the payload is now read straight into pinned
+  staging on its way to the GPU, which alone makes a cold chain faster than
+  recomputing the prefix. f16 files followed as an opt-in (`export_kv_dtype`,
+  `--export-kv-dtype`), as format versions 5 to 7; the hybrid's recurrent state stays
+  f32. See [agent-relay.md](agent-relay.md), "Faster cache files (phase F)".
 
 ### Phase G: sidecar surface
 

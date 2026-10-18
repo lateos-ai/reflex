@@ -70,7 +70,7 @@ use cudarc::driver::{
     result, sys, CudaDevice, CudaSlice, CudaView, DevicePtr, DeviceRepr, DeviceSlice, LaunchAsync,
     LaunchConfig,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
@@ -129,6 +129,8 @@ mod iq_dequant_host_vs_device_tests;
 mod kolibri_config_tests;
 #[cfg(test)]
 mod kolibri_forward_tests;
+#[cfg(test)]
+mod kv_f16_tests;
 #[cfg(test)]
 #[path = "../../reference/mamba2_reference.rs"]
 mod mamba2_reference;
