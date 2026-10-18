@@ -1875,8 +1875,37 @@ public PR, T4-verified.
   - `--system1` routing hop, long prefix: pinned 45 ms, file 229, fresh 285; turn
     340 vs 794 ms. Short: ~22 ms either way. Decisions identical 30/30.
   - Raw: `bench-results/agent-relay-t4-phase-e/`.
-- [ ] **F: f16 cache files**, only if D shows file read plus upload is more than about
-  20% of a cold hop.
+- [ ] **F: faster cache-file reads, then f16 cache files** (in progress 2026-10-17,
+  branch `agent-relay-phase-f` from master f79231d).
+  - **Step 1 measured (T4, before any code change).** Standalone probe, one fresh
+    process per variant, CUDA initialized first, same 342 MB long-prefix file on
+    `/dev/shm`; 5 runs each, all within ~2 ms:
+
+    | import strategy | total | phases (ms / minor faults) |
+    |---|---:|---|
+    | today's shape (`Vec<u8>` then `collect` into `Vec<f32>`, pageable sync upload) | 507 ms | read 180/83K, convert 232/83K, free 14, upload 80 |
+    | read straight into the final `Vec<f32>` | 259 ms | read 179/83K, upload 80 |
+    | same, `MADV_HUGEPAGE` | 257 ms | no change (THP is `madvise`, faults stay 83K) |
+    | `MAP_POPULATE` anonymous buffer, then read | 275 ms | populate 114/83K, read 81, upload 80 |
+    | mmap the file, pageable upload from its pages | 96 ms | 5.2K faults (64 KB fault-around) |
+    | mmap + `MAP_POPULATE`, pageable upload | 96 ms | populate 16/5.2K, upload 80 |
+    | `cuMemHostRegister` on the mapping | — | `CUDA_ERROR_NOT_SUPPORTED` on tmpfs |
+    | pinned staging 2×64 MB, `read()` into it, async H2D | 152 ms | `cuMemHostAlloc` 59/33K, stream 92 |
+    | pinned staging 2×8 MB, `read()` into it, async H2D | **64 ms** | alloc 7.6/4.1K, stream 56 |
+    | same, 2 or 4 `pread` threads per chunk | 63 ms | stream 55.5: bound by the H2D (~6.2 GB/s), not the read |
+
+    - The real binary on the same box: `kv_io_ms` 276-281 and 190K minor faults with
+      the import vs 106K without (perf stat: 153K). It frees each `Vec<u8>` before
+      the next, so glibc reuses it and faults half as much as the probe's `cur`.
+    - Pinned memory costs ~0.46 ms per MB to allocate (`cuMemHostAlloc`): staging must
+      be small, not the 64 MB load chunk.
+    - Same-box cold hops, 5 interleaved: recompute 1.24-1.26 s wall, `cold-chain`
+      1.41-1.44 s. Today's read + upload ≈ 280 + 80 = 360 ms; the 8 MB pinned stream
+      is ~64 ms, so `cold-chain` should drop by ~295 ms to ~1.13 s, about 120 ms
+      (~10%) **under** cold recompute without f16. f16 would save at most ~30 ms
+      more on this file (half the H2D).
+    - Raw: `bench-results/agent-relay-t4-phase-f/phase-f-step1/` (`probe*.txt`,
+      `tv-*.time`, `hop-ab.txt`, `reflex-chain.txt`).
 - [ ] **G: sidecar.** Map `response_format: json_schema` onto IPC `json_schema`,
   keeping property order. `/v1/classify` passes `chosen`/`entropy` through. No
   pin/slot/file fields over HTTP.
