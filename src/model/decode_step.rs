@@ -156,9 +156,19 @@ impl Model {
         let row = position * kv_stride;
         let seq_len = position + 1;
 
-        self.device
-            .htod_sync_copy_into(&self.token_embd.row(token_id)?, &mut ws.hidden)
-            .map_err(|e| crate::gpu_err!(e, "embedding htod: {e}"))?;
+        // Async embedding upload: copy to pinned buffer and launch H2D on
+        // a side stream, then wait for it before launching kernels. This
+        // overlaps the ~4 KB embedding upload with host-side work between
+        // tokens (argmax/picker).
+        let embd = self.token_embd.row(token_id)?;
+        {
+            let mut pipeline = self.dequant_pipeline.borrow_mut();
+            pipeline.htod_async_embedding(&embd, *ws.hidden.device_ptr())?;
+        }
+        {
+            let mut pipeline = self.dequant_pipeline.borrow_mut();
+            pipeline.wait_embedding_copy()?;
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             let LayerWeights::Dense(l) = layer else {
                 return Err(crate::reflex_err!(

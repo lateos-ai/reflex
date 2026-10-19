@@ -1551,6 +1551,56 @@ pub(super) struct WeightLoadPipeline {
 }
 
 impl WeightLoadPipeline {
+    /// Async host-to-device copy of a single embedding row (typically 4-64 KB).
+    /// Copies `src` into pinned slot 0, launches H2D on `copy_stream`, records
+    /// an event, and returns immediately -- the caller must make the compute
+    /// stream wait for the copy before reading the destination. This is used by
+    /// the decode step to overlap the embedding upload with host-side argmax
+    /// /picker work between tokens.
+    pub(super) fn htod_async_embedding(
+        &mut self,
+        src: &[f32],
+        dst: u64,
+    ) -> Result<(), ReflexError> {
+        let len = src.len() * std::mem::size_of::<f32>();
+        let slot = 0;
+        // Wait for prior use of this slot (non-blocking on GPU, blocks host only if needed).
+        if self.pinned_used[slot] {
+            unsafe { sys::lib().cuEventSynchronize(self.pinned_done[slot]) }
+                .result()
+                .map_err(|e| {
+                    crate::gpu_err!(e, "pipeline: await embedding slot {slot}'s prior copy: {e}")
+                })?;
+        }
+        unsafe { self.pinned[slot].ensure_capacity(len)? };
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, self.pinned[slot].ptr, len)
+        };
+        self.h2d_async(dst, slot, len)?;
+        Ok(())
+    }
+
+    /// Makes the compute stream wait for the last embedding copy on slot 0.
+    /// Call this after `htod_async_embedding` and before launching any kernel
+    /// that reads the destination buffer.
+    pub(super) fn wait_embedding_copy(&mut self) -> Result<(), ReflexError> {
+        let slot = 0;
+        if self.pinned_used[slot] {
+            unsafe {
+                result::stream::wait_event(
+                    *self.device.cu_stream(),
+                    self.pinned_done[slot],
+                    sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+                )
+            }
+            .map_err(|e| crate::gpu_err!(e, "pipeline: wait embedding copy: {e}"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl WeightLoadPipeline {
     pub(super) fn new(device: &Arc<CudaDevice>) -> Result<Self, ReflexError> {
         let copy_stream = result::stream::create(result::stream::StreamKind::NonBlocking)
             .map_err(|e| crate::gpu_err!(e, "create pipeline copy stream: {e}"))?;
