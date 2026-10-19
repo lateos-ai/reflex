@@ -1101,6 +1101,309 @@ impl Model {
         }
     }
 
+    /// Fused Q/K/V GEMV: one launch reads `x` once and writes q, k, v outputs
+    /// with separate weight pointers (`gemv_qkv_kernel`). One warp per output
+    /// row across all three projections; total warps = q_out + k_out + v_out.
+    pub(super) fn gemv_qkv(
+        &self,
+        x: &CudaSlice<f32>,
+        w_q: &Weight,
+        w_k: &Weight,
+        w_v: &Weight,
+        y_q: u64,
+        y_k: u64,
+        y_v: u64,
+    ) -> Result<(), ReflexError> {
+        let in_features = w_q.shape[0] as usize;
+        let q_out = w_q.shape[1] as usize;
+        let k_out = w_k.shape[1] as usize;
+        let v_out = w_v.shape[1] as usize;
+        if x.len() != in_features {
+            return Err(crate::reflex_err!(
+                Other,
+                "gemv_qkv: x.len()={} != in_features={in_features}",
+                x.len()
+            ));
+        }
+        self.launch_gemv_qkv(
+            &self.gemv_qkv_k,
+            x,
+            w_q.f32()?,
+            w_k.f32()?,
+            w_v.f32()?,
+            y_q,
+            y_k,
+            y_v,
+            in_features,
+            q_out,
+            k_out,
+            v_out,
+        )
+    }
+
+    /// Fused Q/K/V GEMV for an f16 weight matrix.
+    pub(super) fn gemv_qkv_f16(
+        &self,
+        x: &CudaSlice<f32>,
+        w_q: &Weight,
+        w_k: &Weight,
+        w_v: &Weight,
+        y_q: u64,
+        y_k: u64,
+        y_v: u64,
+    ) -> Result<(), ReflexError> {
+        let in_features = w_q.shape[0] as usize;
+        let q_out = w_q.shape[1] as usize;
+        let k_out = w_k.shape[1] as usize;
+        let v_out = w_v.shape[1] as usize;
+        if x.len() != in_features {
+            return Err(crate::reflex_err!(
+                Other,
+                "gemv_qkv_f16: x.len()={} != in_features={in_features}",
+                x.len()
+            ));
+        }
+        self.launch_gemv_qkv(
+            &self.gemv_qkv_f16_k,
+            x,
+            w_q.f16()?,
+            w_k.f16()?,
+            w_v.f16()?,
+            y_q,
+            y_k,
+            y_v,
+            in_features,
+            q_out,
+            k_out,
+            v_out,
+        )
+    }
+
+    fn launch_gemv_qkv<W: DeviceRepr>(
+        &self,
+        kernel: &AotKernel,
+        x: &CudaSlice<f32>,
+        w_q: W,
+        w_k: W,
+        w_v: W,
+        y_q: u64,
+        y_k: u64,
+        y_v: u64,
+        in_features: usize,
+        q_out: usize,
+        k_out: usize,
+        v_out: usize,
+    ) -> Result<(), ReflexError> {
+        let threads = 256u32;
+        let warps_per_block = threads / WARP_SIZE;
+        let total_out = q_out + k_out + v_out;
+        let blocks = (total_out as u32).div_ceil(warps_per_block).max(1);
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            kernel
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (
+                        x,
+                        w_q,
+                        w_k,
+                        w_v,
+                        y_q,
+                        y_k,
+                        y_v,
+                        in_features as u32,
+                        q_out as u32,
+                        k_out as u32,
+                        v_out as u32,
+                    ),
+                )
+                .map_err(|e| crate::gpu_err!(e, "gemv_qkv launch: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Fused gate + up GEMV: one launch reads `x` once and writes gate, up
+    /// outputs with separate weight pointers (`gemv_gate_up_kernel`).
+    pub(super) fn gemv_gate_up(
+        &self,
+        x: &CudaSlice<f32>,
+        w_gate: &Weight,
+        w_up: &Weight,
+        y_gate: u64,
+        y_up: u64,
+    ) -> Result<(), ReflexError> {
+        let in_features = w_gate.shape[0] as usize;
+        let gate_out = w_gate.shape[1] as usize;
+        let up_out = w_up.shape[1] as usize;
+        if x.len() != in_features {
+            return Err(crate::reflex_err!(
+                Other,
+                "gemv_gate_up: x.len()={} != in_features={in_features}",
+                x.len()
+            ));
+        }
+        self.launch_gemv_gate_up(
+            &self.gemv_gate_up_k,
+            x,
+            w_gate.f32()?,
+            w_up.f32()?,
+            y_gate,
+            y_up,
+            in_features,
+            gate_out,
+            up_out,
+        )
+    }
+
+    /// Fused gate + up GEMV for an f16 weight matrix.
+    pub(super) fn gemv_gate_up_f16(
+        &self,
+        x: &CudaSlice<f32>,
+        w_gate: &Weight,
+        w_up: &Weight,
+        y_gate: u64,
+        y_up: u64,
+    ) -> Result<(), ReflexError> {
+        let in_features = w_gate.shape[0] as usize;
+        let gate_out = w_gate.shape[1] as usize;
+        let up_out = w_up.shape[1] as usize;
+        if x.len() != in_features {
+            return Err(crate::reflex_err!(
+                Other,
+                "gemv_gate_up_f16: x.len()={} != in_features={in_features}",
+                x.len()
+            ));
+        }
+        self.launch_gemv_gate_up(
+            &self.gemv_gate_up_f16_k,
+            x,
+            w_gate.f16()?,
+            w_up.f16()?,
+            y_gate,
+            y_up,
+            in_features,
+            gate_out,
+            up_out,
+        )
+    }
+
+    fn launch_gemv_gate_up<W: DeviceRepr>(
+        &self,
+        kernel: &AotKernel,
+        x: &CudaSlice<f32>,
+        w_gate: W,
+        w_up: W,
+        y_gate: u64,
+        y_up: u64,
+        in_features: usize,
+        gate_out: usize,
+        up_out: usize,
+    ) -> Result<(), ReflexError> {
+        let threads = 256u32;
+        let warps_per_block = threads / WARP_SIZE;
+        let total_out = gate_out + up_out;
+        let blocks = (total_out as u32).div_ceil(warps_per_block).max(1);
+        let launch_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            kernel
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (
+                        x,
+                        w_gate,
+                        w_up,
+                        y_gate,
+                        y_up,
+                        in_features as u32,
+                        gate_out as u32,
+                        up_out as u32,
+                    ),
+                )
+                .map_err(|e| crate::gpu_err!(e, "gemv_gate_up launch: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Dispatches Q/K/V GEMVs: uses fused `gemv_qkv` when fusion is enabled
+    /// and all three weights are f32 or f16; falls back to separate `gemv_to`
+    /// calls otherwise (quantized weights, or fusion disabled).
+    pub(super) fn gemv_qkv_to(
+        &self,
+        x: &CudaSlice<f32>,
+        w_q: &Weight,
+        w_k: &Weight,
+        w_v: &Weight,
+        y_q: u64,
+        y_k: u64,
+        y_v: u64,
+    ) -> Result<(), ReflexError> {
+        if !self.decode_ops.enabled.get() {
+            self.gemv_to(x, w_q, y_q)?;
+            self.gemv_to(x, w_k, y_k)?;
+            self.gemv_to(x, w_v, y_v)?;
+            return Ok(());
+        }
+        // Check if all weights are f32 or f16 (not quantized).
+        let q_is_f32 = matches!(&w_q.data, WeightData::F32(_));
+        let k_is_f32 = matches!(&w_k.data, WeightData::F32(_));
+        let v_is_f32 = matches!(&w_v.data, WeightData::F32(_));
+        if q_is_f32 && k_is_f32 && v_is_f32 {
+            return self.gemv_qkv(x, w_q, w_k, w_v, y_q, y_k, y_v);
+        }
+        let q_is_f16 = matches!(&w_q.data, WeightData::F16(_));
+        let k_is_f16 = matches!(&w_k.data, WeightData::F16(_));
+        let v_is_f16 = matches!(&w_v.data, WeightData::F16(_));
+        if q_is_f16 && k_is_f16 && v_is_f16 {
+            return self.gemv_qkv_f16(x, w_q, w_k, w_v, y_q, y_k, y_v);
+        }
+        // Quantized weights: fall back to separate launches.
+        self.gemv_to(x, w_q, y_q)?;
+        self.gemv_to(x, w_k, y_k)?;
+        self.gemv_to(x, w_v, y_v)?;
+        Ok(())
+    }
+
+    /// Dispatches gate + up GEMVs: same pattern as `gemv_qkv_to`.
+    pub(super) fn gemv_gate_up_to(
+        &self,
+        x: &CudaSlice<f32>,
+        w_gate: &Weight,
+        w_up: &Weight,
+        y_gate: u64,
+        y_up: u64,
+    ) -> Result<(), ReflexError> {
+        if !self.decode_ops.enabled.get() {
+            self.gemv_to(x, w_gate, y_gate)?;
+            self.gemv_to(x, w_up, y_up)?;
+            return Ok(());
+        }
+        let gate_is_f32 = matches!(&w_gate.data, WeightData::F32(_));
+        let up_is_f32 = matches!(&w_up.data, WeightData::F32(_));
+        if gate_is_f32 && up_is_f32 {
+            return self.gemv_gate_up(x, w_gate, w_up, y_gate, y_up);
+        }
+        let gate_is_f16 = matches!(&w_gate.data, WeightData::F16(_));
+        let up_is_f16 = matches!(&w_up.data, WeightData::F16(_));
+        if gate_is_f16 && up_is_f16 {
+            return self.gemv_gate_up_f16(x, w_gate, w_up, y_gate, y_up);
+        }
+        self.gemv_to(x, w_gate, y_gate)?;
+        self.gemv_to(x, w_up, y_up)?;
+        Ok(())
+    }
+
     pub(super) fn gemv(
         &self,
         x: &CudaSlice<f32>,

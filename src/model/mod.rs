@@ -207,6 +207,18 @@ pub struct Model {
     gemv_gather_k: AotKernel,
     /// `gemv_gather_k` for an f16 weight matrix (`gemv_gather_f16_kernel`).
     gemv_gather_f16_k: AotKernel,
+    /// Fused Q/K/V projections (`gemv_qkv_kernel`, `kernels_cuda/gemv_fused.cu`):
+    /// one launch reads x once and writes q, k, v outputs with separate weight
+    /// pointers. `REFLEX_DECODE_FUSE=0` turns fusion off for A/B runs.
+    gemv_qkv_k: AotKernel,
+    /// `gemv_qkv_kernel` for an f16 weight matrix.
+    gemv_qkv_f16_k: AotKernel,
+    /// Fused gate + up FFN projections (`gemv_gate_up_kernel`, same module):
+    /// one launch reads x once and writes gate, up outputs with separate weight
+    /// pointers.
+    gemv_gate_up_k: AotKernel,
+    /// `gemv_gate_up_kernel` for an f16 weight matrix.
+    gemv_gate_up_f16_k: AotKernel,
     /// `gemv_q4k_kernel` (`kernels_cuda/gemv_q4k.cu`), loaded only when the
     /// dense path keeps weights quantized (`REFLEX_QUANT_RESIDENT=1`).
     gemv_q4k_k: Option<AotKernel>,

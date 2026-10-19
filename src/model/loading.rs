@@ -197,6 +197,25 @@ impl Weight {
         }
     }
 
+    /// The f16 buffer of a matrix weight stored as f16 (`--weights f16`).
+    /// Errors on an f32 or quantized-resident weight instead of handing an
+    /// f16 kernel the wrong element type.
+    pub(super) fn f16(&self) -> Result<&CudaSlice<half::f16>, ReflexError> {
+        match &self.data {
+            WeightData::F16(s) => Ok(s),
+            WeightData::F32(_) => Err(crate::reflex_err!(
+                Other,
+                "weight of shape {:?} is stored as f32, but this op reads it as f16",
+                self.shape
+            )),
+            WeightData::Quant { ty, .. } => Err(crate::reflex_err!(
+                Other,
+                "internal: an f16-only code path got a quantized-resident ({ty:?}) weight of shape {:?}",
+                self.shape
+            )),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn dtype(&self) -> WeightsDtype {
         match &self.data {

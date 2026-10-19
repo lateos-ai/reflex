@@ -259,6 +259,18 @@ impl Model {
             "gemv_gather",
             ["gemv_gather_kernel", "gemv_gather_f16_kernel"],
         )?;
+        let [gemv_qkv_k, gemv_qkv_f16_k] = load_kernel_pair(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+            "gemv_fused",
+            ["gemv_qkv_kernel", "gemv_qkv_f16_kernel"],
+        )?;
+        let [gemv_gate_up_k, gemv_gate_up_f16_k] = load_kernel_pair(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+            "gemv_fused",
+            ["gemv_gate_up_kernel", "gemv_gate_up_f16_kernel"],
+        )?;
         let attn_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ATTENTION")),
@@ -679,6 +691,10 @@ impl Model {
             gemv_f16_k,
             gemv_gather_k,
             gemv_gather_f16_k,
+            gemv_qkv_k,
+            gemv_qkv_f16_k,
+            gemv_gate_up_k,
+            gemv_gate_up_f16_k,
             gemv_q4k_k,
             gemv_q4k_r1_k,
             dequant_q4k_coalesced_k,
