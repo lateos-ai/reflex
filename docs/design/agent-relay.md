@@ -337,6 +337,15 @@ What this shows:
   161.7 ms, with a 12.3 ms first token.
 - **Decode is still the largest gap.** 31 decode steps take 256 ms of the 295 ms
   pinned hop: 8.3 ms per token against llama.cpp's 4.7 ms.
+- **Update, decode speed round 2 (T4, 2026-10-19).** Same bench: Qwen3-0.6B, 30 hops,
+  32 tokens. Round 2 is the fused norms and the reused decode workspace
+  ([decode-speed.md](decode-speed.md)):
+  - **Pinned long hop:** 296.0 ms → **280.3 ms**, 7.77 ms per token. With the opt-in
+    f16 KV cache (`REFLEX_KV_CACHE=f16`) it is **259.3 ms**, 7.19 ms per token, and the
+    prefix copy takes 1.66 ms instead of 2.99.
+  - **Recomputed long hop:** 505.7 → 487.8 ms, or 465.3 ms with the f16 cache.
+  - **Short stdio hop:** 231.3 → 215.7 ms.
+  - **Texts:** every chain gave master's 30 texts, and the f16 cache the same 30 as f32.
 
 ## JSON Schema constrained decoding (phase C)
 

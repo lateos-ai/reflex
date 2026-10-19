@@ -14,7 +14,9 @@ What has been built, in order. Measurements live in
     step reuses one workspace for all its intermediates and writes K/V straight into
     the cache, which removes ~390 allocations and frees per step.
     `REFLEX_DECODE_WS=0` turns it off.
-  - **Results.** On a T4, Qwen3-0.6B decodes 6-9% faster and TinyLlama 3-4%.
+  - **Results.** On a T4, Qwen3-0.6B decodes 6-9% faster and TinyLlama 3-4%. A
+    32-token agent hop with a pinned ~1,550-token prefix takes 280 ms instead of 296
+    ms, or 259 ms with the f16 KV cache below.
   - **Tried and dropped.** CUDA graphs per decode step gained under 2%, so they are
     not included.
   - See [docs/design/decode-speed.md](docs/design/decode-speed.md).

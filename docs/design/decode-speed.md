@@ -287,6 +287,31 @@ compute-bound rather than bandwidth-bound, so halving the bytes doesn't shorten 
 The gain grows with context: decode attention is the part an f16 cache shrinks, and
 it is the part that grows with context.
 
+## Verification (Tesla T4, 2026-10-19)
+
+The round 2 branch (fixes 3 and 4 and the f16 KV cache) against master:
+- **GPU nightly:** 126 passed, 0 failed. 4 skipped, needing real Granite, IQ,
+  DeepSeek-V2-Lite and Qwen2.5 files.
+- **`reflex check`:** the same output (token ids, logit checksum) on Qwen3-0.6B,
+  TinyLlama and Qwen3.5-0.8B, with f32 and f16 weights.
+- **IPC requests:** a fixed set sent to `reflex stdio` gave byte-identical response
+  lines and cache files on the same three models. It covers generate, streaming,
+  sampling, `json_schema`, candidates, pin and use, errors, cache-file export and
+  import, and a ~1,550-token prompt decoded directly and through a pinned prefix.
+- **Agent relay bench** (Qwen3-0.6B, 30 hops, 32 tokens, the same texts as master):
+
+| hop | master | round 2 | round 2 + f16 KV cache |
+|---|---:|---:|---:|
+| short prefix | 231.3 ms (6.95 ms/token) | 215.7 ms (6.44) | n/a |
+| ~1,550-token prefix, recomputed | 505.7 ms (8.36) | 487.8 ms (7.84) | 465.3 ms (7.26) |
+| ~1,550-token prefix, pinned | 296.0 ms (8.30) | 280.3 ms (7.77) | 259.3 ms (7.19) |
+
+- **Cold start is unchanged.** `bench_cold_start_phases.sh`, 5 interleaved rounds of 2
+  runs, gives a median first token of 647 ms on master and 649 ms on the branch, with
+  every phase within noise. Both binaries were built with `--features ipc`.
+- **Binary size.** The binary is 0.8 MB larger, from the embedded f16 kernel modules,
+  which only `REFLEX_KV_CACHE=f16` loads.
+
 ## What's left
 
 Ranked by the round 2 profile. Status as of 2026-10-18:
