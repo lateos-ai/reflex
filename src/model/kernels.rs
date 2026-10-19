@@ -164,8 +164,8 @@ pub(super) fn launch_attention_tiled(
     device: &Arc<CudaDevice>,
     kernel: &AotKernel,
     q: &CudaSlice<f32>,
-    k: &CudaView<f32>,
-    v: &CudaView<f32>,
+    k: &KvView,
+    v: &KvView,
     s: &OnlineAttnShape,
 ) -> Result<CudaSlice<f32>, ReflexError> {
     let m = attn_tiled_queries_per_block(s.qk_dim)
@@ -186,14 +186,47 @@ pub(super) fn launch_attention_tiled(
     let mut out = device
         .alloc_zeros::<f32>(s.rows * s.num_q_heads * s.v_dim)
         .map_err(|e| crate::gpu_err!(e, "attn_tiled alloc out: {e}"))?;
+    let params = s.unsplit_params();
+    let rows = s.rows as u32;
+    let f = kernel.function.clone();
     unsafe {
-        kernel
-            .function
-            .clone()
-            .launch(cfg, (q, k, v, &mut out, s.unsplit_params(), s.rows as u32))
-            .map_err(|e| crate::gpu_err!(e, "attn_tiled launch: {e}"))?;
+        match (k, v) {
+            (KvView::F32(k), KvView::F32(v)) => f.launch(cfg, (q, k, v, &mut out, params, rows)),
+            (KvView::F16(k), KvView::F16(v)) => f.launch(cfg, (q, k, v, &mut out, params, rows)),
+            _ => return Err(kv_mixed_err()),
+        }
+        .map_err(|e| crate::gpu_err!(e, "attn_tiled launch: {e}"))?;
     }
     Ok(out)
+}
+
+fn kv_mixed_err() -> ReflexError {
+    crate::reflex_err!(Other, "internal: attention got K and V of different types")
+}
+
+/// Launches an attention kernel built for the cache type of `k`/`v` (f32 or f16
+/// views; the caller picked `kernel` by that type), with the same arguments either
+/// way: `(q, k, v, out, params)`.
+#[allow(clippy::too_many_arguments)]
+fn launch_kv(
+    kernel: &AotKernel,
+    cfg: LaunchConfig,
+    q: &CudaSlice<f32>,
+    k: &KvView,
+    v: &KvView,
+    out: u64,
+    params: AttnParams,
+    what: &str,
+) -> Result<(), ReflexError> {
+    let f = kernel.function.clone();
+    unsafe {
+        match (k, v) {
+            (KvView::F32(k), KvView::F32(v)) => f.launch(cfg, (q, k, v, out, params)),
+            (KvView::F16(k), KvView::F16(v)) => f.launch(cfg, (q, k, v, out, params)),
+            _ => return Err(kv_mixed_err()),
+        }
+    }
+    .map_err(|e| crate::gpu_err!(e, "{what} launch: {e}"))
 }
 
 /// The tiled prefill attention kernels for [`Model::attention_prefill`], each
@@ -203,9 +236,8 @@ pub(super) fn launch_attention_tiled(
 /// (`Gemma4Kernels`) and ignores this switch.
 pub(super) struct TiledAttnKernels {
     enabled: std::cell::Cell<bool>,
-    d64: std::sync::OnceLock<AotKernel>,
-    d128: std::sync::OnceLock<AotKernel>,
-    d256: std::sync::OnceLock<AotKernel>,
+    /// `[f32, f16 cache][d64, d128, d256]`.
+    cells: [[std::sync::OnceLock<AotKernel>; 3]; 2],
 }
 
 impl TiledAttnKernels {
@@ -222,9 +254,7 @@ impl TiledAttnKernels {
         };
         Ok(Self {
             enabled: std::cell::Cell::new(enabled),
-            d64: std::sync::OnceLock::new(),
-            d128: std::sync::OnceLock::new(),
-            d256: std::sync::OnceLock::new(),
+            cells: Default::default(),
         })
     }
 
@@ -241,42 +271,65 @@ impl TiledAttnKernels {
     /// Whether the module for `head_dim` has been loaded (tests).
     #[cfg(test)]
     pub(super) fn loaded(&self, head_dim: usize) -> bool {
-        match head_dim {
-            64 => self.d64.get().is_some(),
-            128 => self.d128.get().is_some(),
-            256 => self.d256.get().is_some(),
-            _ => false,
-        }
+        let i = match head_dim {
+            64 => 0,
+            128 => 1,
+            256 => 2,
+            _ => return false,
+        };
+        self.cells.iter().any(|c| c[i].get().is_some())
     }
 
-    /// The kernel for `head_dim`, loading its module on first use; `None` when
-    /// there is no tiled kernel for that head dim.
+    /// The kernel for `head_dim` and the K/V cache type, loading its module on
+    /// first use; `None` when there is no tiled kernel for that head dim. The f16
+    /// cache's kernels are separate modules (`attention_tiled*_f16.cu`).
     pub(super) fn kernel(
         &self,
         device: &Arc<CudaDevice>,
         head_dim: usize,
+        dtype: crate::kv_io::KvDtype,
     ) -> Result<Option<&AotKernel>, ReflexError> {
-        let (cell, bytes, module, name): (_, &'static [u8], _, _) = match head_dim {
-            64 => (
-                &self.d64,
+        use crate::kv_io::KvDtype::{F16, F32};
+        let (i, bytes, module, name): (_, &'static [u8], _, _) = match (dtype, head_dim) {
+            (F32, 64) => (
+                0,
                 include_bytes!(env!("REFLEX_KERNEL_ATTENTION_TILED_D64")),
                 "attention_tiled_d64",
                 "attention_tiled_d64_kernel",
             ),
-            128 => (
-                &self.d128,
+            (F32, 128) => (
+                1,
                 include_bytes!(env!("REFLEX_KERNEL_ATTENTION_TILED_D128")),
                 "attention_tiled_d128",
                 "attention_tiled_d128_kernel",
             ),
-            256 => (
-                &self.d256,
+            (F32, 256) => (
+                2,
                 include_bytes!(env!("REFLEX_KERNEL_ATTENTION_TILED")),
                 "attention_tiled",
                 "attention_tiled_d256_kernel",
             ),
+            (F16, 64) => (
+                0,
+                include_bytes!(env!("REFLEX_KERNEL_ATTENTION_TILED_D64_F16")),
+                "attention_tiled_d64_f16",
+                "attention_tiled_d64_f16_kernel",
+            ),
+            (F16, 128) => (
+                1,
+                include_bytes!(env!("REFLEX_KERNEL_ATTENTION_TILED_D128_F16")),
+                "attention_tiled_d128_f16",
+                "attention_tiled_d128_f16_kernel",
+            ),
+            (F16, 256) => (
+                2,
+                include_bytes!(env!("REFLEX_KERNEL_ATTENTION_TILED_F16")),
+                "attention_tiled_f16",
+                "attention_tiled_d256_f16_kernel",
+            ),
             _ => return Ok(None),
         };
+        let cell = &self.cells[usize::from(dtype == F16)][i];
         if let Some(k) = cell.get() {
             return Ok(Some(k));
         }
@@ -320,6 +373,19 @@ const ATTN_DECODE_NAMES: [&str; 11] = [
     "attention_decode_d256_h2_kernel",
     "attention_decode_d256_h4_kernel",
 ];
+const ATTN_DECODE_F16_NAMES: [&str; 11] = [
+    "attention_decode_d64_h1_f16_kernel",
+    "attention_decode_d64_h2_f16_kernel",
+    "attention_decode_d64_h4_f16_kernel",
+    "attention_decode_d64_h8_f16_kernel",
+    "attention_decode_d128_h1_f16_kernel",
+    "attention_decode_d128_h2_f16_kernel",
+    "attention_decode_d128_h4_f16_kernel",
+    "attention_decode_d128_h8_f16_kernel",
+    "attention_decode_d256_h1_f16_kernel",
+    "attention_decode_d256_h2_f16_kernel",
+    "attention_decode_d256_h4_f16_kernel",
+];
 /// Fewest cached positions per decode split, so the combine step stays small
 /// next to the work it merges.
 const ATTN_DECODE_MIN_SPLIT: usize = 32;
@@ -343,6 +409,8 @@ pub(super) fn attn_decode_kernel_index(head_dim: usize, group_size: usize) -> Op
 pub(super) struct DecodeAttnKernels {
     enabled: std::cell::Cell<bool>,
     kernels: std::sync::OnceLock<Vec<AotKernel>>,
+    /// The same kernels for an f16 K/V cache (`attention_decode_f16.cu`).
+    kernels_f16: std::sync::OnceLock<Vec<AotKernel>>,
     /// Streaming multiprocessors, read once, for sizing the splits.
     sm_count: std::sync::OnceLock<usize>,
 }
@@ -362,6 +430,7 @@ impl DecodeAttnKernels {
         Ok(Self {
             enabled: std::cell::Cell::new(enabled),
             kernels: std::sync::OnceLock::new(),
+            kernels_f16: std::sync::OnceLock::new(),
             sm_count: std::sync::OnceLock::new(),
         })
     }
@@ -382,17 +451,30 @@ impl DecodeAttnKernels {
         self.kernels.get().is_some()
     }
 
-    fn kernels(&self, device: &Arc<CudaDevice>) -> Result<&[AotKernel], ReflexError> {
-        if let Some(k) = self.kernels.get() {
+    fn kernels(
+        &self,
+        device: &Arc<CudaDevice>,
+        dtype: crate::kv_io::KvDtype,
+    ) -> Result<&[AotKernel], ReflexError> {
+        let (cell, bytes, module, names): (_, &'static [u8], _, &[&str]) = match dtype {
+            crate::kv_io::KvDtype::F32 => (
+                &self.kernels,
+                include_bytes!(env!("REFLEX_KERNEL_ATTENTION_DECODE")),
+                "attention_decode",
+                &ATTN_DECODE_NAMES,
+            ),
+            crate::kv_io::KvDtype::F16 => (
+                &self.kernels_f16,
+                include_bytes!(env!("REFLEX_KERNEL_ATTENTION_DECODE_F16")),
+                "attention_decode_f16",
+                &ATTN_DECODE_F16_NAMES,
+            ),
+        };
+        if let Some(k) = cell.get() {
             return Ok(k);
         }
-        let loaded = aot::load_kernel_module(
-            device,
-            include_bytes!(env!("REFLEX_KERNEL_ATTENTION_DECODE")),
-            "attention_decode",
-            &ATTN_DECODE_NAMES,
-        )?;
-        Ok(self.kernels.get_or_init(|| loaded))
+        let loaded = aot::load_kernel_module(device, bytes, module, names)?;
+        Ok(cell.get_or_init(|| loaded))
     }
 
     fn sm_count(&self, device: &Arc<CudaDevice>) -> usize {
@@ -529,8 +611,8 @@ impl Model {
     pub(super) fn attention_decode_gqa(
         &self,
         q: &CudaSlice<f32>,
-        k: &CudaView<f32>,
-        v: &CudaView<f32>,
+        k: &KvView,
+        v: &KvView,
         s: &OnlineAttnShape,
         kernel_index: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
@@ -547,14 +629,14 @@ impl Model {
     pub(super) fn attention_decode_gqa_to(
         &self,
         q: &CudaSlice<f32>,
-        k: &CudaView<f32>,
-        v: &CudaView<f32>,
+        k: &KvView,
+        v: &KvView,
         s: &OnlineAttnShape,
         kernel_index: usize,
         out: u64,
         partial: Option<u64>,
     ) -> Result<(), ReflexError> {
-        let kernel = &self.attn_decode.kernels(&self.device)?[kernel_index];
+        let kernel = &self.attn_decode.kernels(&self.device, k.dtype())?[kernel_index];
         let heads_per_block = ATTN_DECODE_SHAPES[kernel_index].1;
         let seq_len = s.start_pos + 1;
         let head_blocks = s.num_q_heads / heads_per_block;
@@ -573,14 +655,7 @@ impl Model {
             shared_mem_bytes: 0,
         };
         if num_splits == 1 {
-            unsafe {
-                kernel
-                    .function
-                    .clone()
-                    .launch(cfg, (q, k, v, out, params))
-                    .map_err(|e| crate::gpu_err!(e, "attn_decode launch: {e}"))?;
-            }
-            return Ok(());
+            return launch_kv(kernel, cfg, q, k, v, out, params, "attn_decode");
         }
         let owned;
         let partial = match partial {
@@ -594,11 +669,7 @@ impl Model {
             }
         };
         unsafe {
-            kernel
-                .function
-                .clone()
-                .launch(cfg, (q, k, v, partial, params))
-                .map_err(|e| crate::gpu_err!(e, "attn_decode launch: {e}"))?;
+            launch_kv(kernel, cfg, q, k, v, partial, params, "attn_decode")?;
             self.attn_online_combine_k
                 .function
                 .clone()
@@ -628,8 +699,8 @@ impl Model {
     pub(super) fn attention_online(
         &self,
         q: &CudaSlice<f32>,
-        k: &CudaView<f32>,
-        v: &CudaView<f32>,
+        k: &KvView,
+        v: &KvView,
         s: OnlineAttnShape,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let out = self.alloc_out(s.rows * s.num_q_heads * s.v_dim, "attn_online")?;
@@ -643,12 +714,16 @@ impl Model {
     pub(super) fn attention_online_to(
         &self,
         q: &CudaSlice<f32>,
-        k: &CudaView<f32>,
-        v: &CudaView<f32>,
+        k: &KvView,
+        v: &KvView,
         s: OnlineAttnShape,
         out: u64,
         partial: Option<u64>,
     ) -> Result<(), ReflexError> {
+        let kernel = match k.dtype() {
+            crate::kv_io::KvDtype::F32 => &self.attn_online_k,
+            crate::kv_io::KvDtype::F16 => self.kv_f16.kernel(&self.device, KV_F16_ATTN_ONLINE)?,
+        };
         if s.qk_dim > ATTN_ONLINE_MAX_DIM || s.v_dim > ATTN_ONLINE_MAX_DIM {
             return Err(crate::reflex_err!(
                 UnsupportedArchitecture,
@@ -687,14 +762,7 @@ impl Model {
                 * std::mem::size_of::<f32>()) as u32,
         };
         if num_splits == 1 {
-            unsafe {
-                self.attn_online_k
-                    .function
-                    .clone()
-                    .launch(cfg, (q, k, v, out, params))
-                    .map_err(|e| crate::gpu_err!(e, "attn_online launch: {e}"))?;
-            }
-            return Ok(());
+            return launch_kv(kernel, cfg, q, k, v, out, params, "attn_online");
         }
         let owned;
         let partial = match partial {
@@ -708,11 +776,7 @@ impl Model {
             }
         };
         unsafe {
-            self.attn_online_k
-                .function
-                .clone()
-                .launch(cfg, (q, k, v, partial, params))
-                .map_err(|e| crate::gpu_err!(e, "attn_online launch: {e}"))?;
+            launch_kv(kernel, cfg, q, k, v, partial, params, "attn_online")?;
             self.attn_online_combine_k
                 .function
                 .clone()
@@ -2328,8 +2392,8 @@ impl Model {
     pub(super) fn attention(
         &self,
         q: &CudaSlice<f32>,
-        k_cache: &CudaView<f32>,
-        v_cache: &CudaView<f32>,
+        k_cache: &KvView,
+        v_cache: &KvView,
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
@@ -2358,9 +2422,10 @@ impl Model {
             0
         };
         let kv_stride = num_kv_heads * head_dim;
-        let k_cache = &k_cache.slice(first * kv_stride..);
-        let v_cache = &v_cache.slice(first * kv_stride..);
+        let k_cache = &k_cache.tail(first * kv_stride);
+        let v_cache = &v_cache.tail(first * kv_stride);
         let seq_len = seq_len - first;
+        let (k_cache, v_cache) = (k_cache.f32()?, v_cache.f32()?);
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(num_q_heads * head_dim)
@@ -2403,8 +2468,8 @@ impl Model {
     pub(super) fn attention_to(
         &self,
         q: &CudaSlice<f32>,
-        k_cache: &CudaView<f32>,
-        v_cache: &CudaView<f32>,
+        k_cache: &KvView,
+        v_cache: &KvView,
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
@@ -2425,8 +2490,8 @@ impl Model {
             0
         };
         let kv_stride = num_kv_heads * head_dim;
-        let k_cache = &k_cache.slice(first * kv_stride..);
-        let v_cache = &v_cache.slice(first * kv_stride..);
+        let k_cache = &k_cache.tail(first * kv_stride);
+        let v_cache = &v_cache.tail(first * kv_stride);
         let seq_len = seq_len - first;
         let shape = OnlineAttnShape {
             rows: 1,
@@ -2465,8 +2530,8 @@ impl Model {
     pub(super) fn attention_prefill(
         &self,
         q: &CudaSlice<f32>,
-        k_cache: &CudaView<f32>,
-        v_cache: &CudaView<f32>,
+        k_cache: &KvView,
+        v_cache: &KvView,
         num_q_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
@@ -2493,7 +2558,10 @@ impl Model {
                 && self.attn_tiled.enabled()
                 && attn_tiled_fits(&shape)
             {
-                if let Some(kernel) = self.attn_tiled.kernel(&self.device, head_dim)? {
+                if let Some(kernel) =
+                    self.attn_tiled
+                        .kernel(&self.device, head_dim, k_cache.dtype())?
+                {
                     return launch_attention_tiled(
                         &self.device,
                         kernel,
@@ -2506,6 +2574,7 @@ impl Model {
             }
             return self.attention_online(q, k_cache, v_cache, shape);
         }
+        let (k_cache, v_cache) = (k_cache.f32()?, v_cache.f32()?);
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(rows * num_q_heads * head_dim)
@@ -2794,7 +2863,7 @@ impl Model {
         &self,
         m: &MlaModel,
         q: &CudaSlice<f32>,
-        kv_cache: &CudaView<f32>,
+        kv_cache: &KvView,
         num_q_heads: usize,
         qk_dim: usize,
         v_dim: usize,
@@ -2824,6 +2893,7 @@ impl Model {
                 },
             );
         }
+        let kv_cache = kv_cache.f32()?;
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(num_q_heads * v_dim)
@@ -2870,7 +2940,7 @@ impl Model {
         &self,
         m: &MlaModel,
         q: &CudaSlice<f32>,
-        kv_cache: &CudaView<f32>,
+        kv_cache: &KvView,
         num_q_heads: usize,
         qk_dim: usize,
         v_dim: usize,
@@ -2899,6 +2969,7 @@ impl Model {
                 },
             );
         }
+        let kv_cache = kv_cache.f32()?;
         let mut dev_out = self
             .device
             .alloc_zeros::<f32>(rows * num_q_heads * v_dim)
@@ -3039,7 +3110,7 @@ impl Model {
     pub(super) fn mla_write_kv_cache_batch(
         &self,
         m: &MlaModel,
-        kv_cache: &mut CudaSlice<f32>,
+        kv_cache: &mut KvBuf,
         kv_cmpr: &CudaSlice<f32>,
         k_pe: &CudaSlice<f32>,
         start_pos: usize,
@@ -3056,8 +3127,13 @@ impl Model {
             block_dim: (threads, 1, 1),
             shared_mem_bytes: 0,
         };
+        let kernel = match kv_cache.dtype() {
+            crate::kv_io::KvDtype::F32 => &m.mla_write_kv_cache_batch_k,
+            crate::kv_io::KvDtype::F16 => self.kv_f16.kernel(&self.device, KV_F16_MLA_WRITE)?,
+        };
+        let kv_cache = kv_cache.ptr_at(0);
         unsafe {
-            m.mla_write_kv_cache_batch_k
+            kernel
                 .function
                 .clone()
                 .launch(

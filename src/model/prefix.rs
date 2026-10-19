@@ -50,8 +50,8 @@ pub(super) enum DeviceState {
 
 pub(super) struct DenseDeviceKv {
     pub(super) seq_len: usize,
-    pub(super) k_caches: Vec<CudaSlice<f32>>,
-    pub(super) v_caches: Vec<CudaSlice<f32>>,
+    pub(super) k_caches: Vec<KvBuf>,
+    pub(super) v_caches: Vec<KvBuf>,
     /// Whether the cached prompt's encoding ended on a special token: the
     /// `after_special` a continuation is encoded with
     /// (`Tokenizer::encode_continuation`). Only the SentencePiece scheme, which
@@ -66,7 +66,7 @@ pub(super) struct HybridDeviceState {
 
 pub(super) struct MlaDeviceKv {
     pub(super) seq_len: usize,
-    pub(super) kv_caches: Vec<CudaSlice<f32>>,
+    pub(super) kv_caches: Vec<KvBuf>,
 }
 
 impl PinnedPrefix {
@@ -81,22 +81,23 @@ impl PinnedPrefix {
 
     /// VRAM held, in bytes.
     pub fn device_bytes(&self) -> usize {
-        let elems: usize = match &self.state {
-            DeviceState::Dense(d) => d.k_caches.iter().chain(&d.v_caches).map(|c| c.len()).sum(),
+        let kv = |c: &KvBuf| c.len() * c.dtype().size();
+        let f32s = std::mem::size_of::<f32>();
+        match &self.state {
+            DeviceState::Dense(d) => d.k_caches.iter().chain(&d.v_caches).map(kv).sum(),
             DeviceState::Hybrid(d) => d
                 .layers
                 .iter()
                 .map(|l| match l {
-                    HybridLayerState::Attn { k_cache, v_cache } => k_cache.len() + v_cache.len(),
+                    HybridLayerState::Attn { k_cache, v_cache } => kv(k_cache) + kv(v_cache),
                     HybridLayerState::Gdn {
                         conv_state,
                         recurrent,
-                    } => conv_state.len() + recurrent.len(),
+                    } => (conv_state.len() + recurrent.len()) * f32s,
                 })
                 .sum(),
-            DeviceState::Mla(d) => d.kv_caches.iter().map(|c| c.len()).sum(),
-        };
-        elems * std::mem::size_of::<f32>()
+            DeviceState::Mla(d) => d.kv_caches.iter().map(kv).sum(),
+        }
     }
 
     fn format_name(&self) -> &'static str {
@@ -237,6 +238,49 @@ impl<'m> StateDownload<'m> {
                 .dtoh_sync_copy(&src.slice(0..n))
                 .map(KvValues::Host)
                 .map_err(|e| crate::gpu_err!(e, "{what} dtoh: {e}")),
+        }
+    }
+
+    /// [`Self::get`] for a K/V cache buffer, f32 or f16 (`REFLEX_KV_CACHE`): an f16
+    /// cache downloads its values as they are into an f16 file and widens them
+    /// exactly (`f16_to_f32_kernel`, on the device) into an f32 one.
+    pub(super) fn get_kv(
+        &mut self,
+        src: &KvBuf,
+        n: usize,
+        dtype: KvDtype,
+        what: &str,
+    ) -> Result<KvValues, ReflexError> {
+        let s = match src {
+            KvBuf::F32(s) => return self.get(s, n, dtype, what),
+            KvBuf::F16(s) => s,
+        };
+        let device = &self.model.device;
+        match dtype {
+            KvDtype::F16 => device
+                .dtoh_sync_copy(&s.slice(0..n))
+                .map(|v| KvValues::HostF16(v.into_iter().map(half::f16::to_bits).collect()))
+                .map_err(|e| crate::gpu_err!(e, "{what} dtoh: {e}")),
+            KvDtype::F32 => {
+                let mut out = unsafe { device.alloc::<f32>(n) }
+                    .map_err(|e| crate::gpu_err!(e, "{what}: alloc f32 export buffer: {e}"))?;
+                unsafe {
+                    self.model
+                        .dequant_kernels
+                        .f16_to_f32
+                        .function
+                        .clone()
+                        .launch(
+                            elementwise_launch_cfg(n),
+                            (&s.slice(0..n), &mut out, n as u64),
+                        )
+                }
+                .map_err(|e| crate::gpu_err!(e, "{what}: f16 widen: {e}"))?;
+                device
+                    .dtoh_sync_copy(&out)
+                    .map(KvValues::Host)
+                    .map_err(|e| crate::gpu_err!(e, "{what} dtoh: {e}"))
+            }
         }
     }
 
@@ -386,9 +430,11 @@ impl Model {
     }
 
     /// Downloads a pinned prefix into the host form `crate::kv_io::export_kv`
-    /// writes. This is how [`Model::generate_capture_kv`] builds its result.
+    /// writes, in the working cache's own type ([`Model::kv_cache_dtype`]: an f16
+    /// cache gives an f16 file, as is). This is how [`Model::generate_capture_kv`]
+    /// builds its result.
     pub fn download_prefix(&self, prefix: &PinnedPrefix) -> Result<ImportedKv, ReflexError> {
-        self.download_prefix_as(prefix, KvDtype::F32)
+        self.download_prefix_as(prefix, self.kv_cache_dtype())
     }
 
     /// [`Self::download_prefix`] for a cache file of element type `dtype`: with

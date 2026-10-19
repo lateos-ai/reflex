@@ -156,7 +156,7 @@ its staging buffers per-tensor allocations: both were measured, and the reasons 
 alternative is wrong (a host/device race in one case, a cross-stream dependency that
 serializes the pipeline in the other) are written up in HISTORY.md's "Pipelined model
 load (item 5)" entry. KV cache-file imports use the same pinned slots
-(`WeightLoadPipeline::upload_state`, 8 MB chunks, f16 files widened on the GPU):
+(`WeightLoadPipeline::upload_state`, 8 MB chunks, f16 files widened on the GPU for an f32 cache, f32 files rounded for an f16 one):
 `kv_io::import_kv` reads only the header, and the payload is read straight into the
 slots. **Don't go back to reading the payload into host `Vec`s first**: that faulted in
 two fresh buffers per import (cold 342 MB read 284 ms vs 110 ms warm; with the fix the
@@ -289,6 +289,33 @@ Granite 4.0-H and MLA still call `attention_online`. Op outputs a kernel fully w
 use `Model::alloc_out` (no memset) instead of `alloc_zeros`; only switch an op to it if
 its kernel really writes every element. Design and T4 numbers:
 `docs/design/decode-speed.md`.
+
+Decode round 2 (2026-10-18). All of these are bit-identical:
+- **RMSNorm.** It sums each row in one thread, in index order, which is what keeps every
+  architecture's output fixed; `rmsnorm.cuh` only makes that loop faster. **Never
+  parallelize that sum.**
+- **Fused norms.** The decode path fuses residual add + norm and Q/K-Norm
+  (`decode_ops.cu`, lazy; `REFLEX_DECODE_FUSE=0`). `forward_layer` returns the FFN
+  output *unadded* and the next layer's attention norm adds it.
+- **Workspace.** Dense `generate` decodes through `DecodeWorkspace` (`decode_step.rs`;
+  `REFLEX_DECODE_WS=0`), with pointer-output wrappers (`gemv_to`, `rmsnorm_to`, ...)
+  and no allocations per step.
+- **CUDA graphs were tried and dropped** (<2%; the code is on local branch
+  `decode-speed-2-graphs-experiment`). cudarc 0.11's `CudaDevice::new` works on the
+  legacy NULL stream, which can't be captured.
+
+**Opt-in `REFLEX_KV_CACHE=f16`** (`kv_cache.rs`: `KvBuf`/`KvView`, `alloc_kv`,
+`kv_store`/`kv_store_kv`). It applies per process, read at load.
+- **Kernels.** The attention kernels are templated on the element type
+  (`attention_decode.cuh`, `attention_online.cuh`, `attention_tiled.cuh` + `kv_load.cuh`).
+  **Keep `kv_ld(p, i)` in index form**: that is what keeps the f32 cubins
+  byte-identical to the untemplated kernels.
+- **Modules.** The f16 kernels are separate lazy modules (`attention_decode_f16.cu`,
+  `kv_f16.cu`, `attention_tiled*_f16.cu`).
+- **Pinned prefix and files.** The pinned prefix is in the cache's type. Export defaults
+  to the cache's type, and `upload_state` jobs carry the destination type: it rounds an
+  f32 file into an f16 cache with `kv_store_f16_kernel`.
+- **Refused.** Gemma 4, Granite and legacy attention refuse it.
 
 ### JSON Schema constrained decoding (`src/grammar.rs`)
 Agent relay phase C. `SamplingParams::json_schema` (IPC `json_schema`, CLI

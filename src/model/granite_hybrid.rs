@@ -358,6 +358,8 @@ impl Model {
             attn_decode: DecodeAttnKernels::from_env()?,
             decode_ops: DecodeOpKernels::from_env()?,
             decode_ws: DecodeWorkspaceSlot::from_env()?,
+            kv_dtype: Cell::new(kv_dtype_from_env()?),
+            kv_f16: KvF16Kernels::new(),
             add_k,
             split_qg_k,
             sigmoid_gate_k,
@@ -500,8 +502,9 @@ impl Model {
         let filled = 0..(start_pos + rows) * kv_stride;
         let attn = self.attention_online(
             &q,
-            &k_cache.slice(filled.clone()),
-            &v_cache.slice(filled),
+            // Granite always keeps an f32 cache (REFLEX_KV_CACHE=f16 is rejected).
+            &KvView::F32(k_cache.slice(filled.clone())),
+            &KvView::F32(v_cache.slice(filled)),
             OnlineAttnShape {
                 rows,
                 start_pos,

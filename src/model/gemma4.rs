@@ -419,6 +419,8 @@ impl Model {
             attn_decode: DecodeAttnKernels::from_env()?,
             decode_ops: DecodeOpKernels::from_env()?,
             decode_ws: DecodeWorkspaceSlot::from_env()?,
+            kv_dtype: Cell::new(kv_dtype_from_env()?),
+            kv_f16: KvF16Kernels::new(),
             add_k,
             split_qg_k,
             sigmoid_gate_k,
@@ -527,6 +529,8 @@ impl Model {
             scale: 1.0,
             window,
         };
+        // Gemma 4 always keeps an f32 cache (REFLEX_KV_CACHE=f16 is rejected).
+        let (k, v) = (KvView::F32(k), KvView::F32(v));
         if let Some(out) = m
             .kernels
             .attention_prefill_tiled(&self.device, q, &k, &v, &shape)?
@@ -935,8 +939,8 @@ impl Gemma4Kernels {
         &self,
         device: &Arc<CudaDevice>,
         q: &CudaSlice<f32>,
-        k: &CudaView<f32>,
-        v: &CudaView<f32>,
+        k: &KvView,
+        v: &KvView,
         s: &OnlineAttnShape,
     ) -> Result<Option<CudaSlice<f32>>, ReflexError> {
         let kernel = match s.qk_dim {

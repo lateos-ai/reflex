@@ -67,6 +67,10 @@ pub(super) struct DecodeWorkspace {
     q_normed: CudaSlice<f32>,
     /// K before K-Norm, for models with one (otherwise K goes straight into the cache).
     k: CudaSlice<f32>,
+    /// This position's final K and V rows with an f16 cache, stored into it by
+    /// `kv_store` (an f32 cache gets them written straight into its row).
+    k_row: CudaSlice<f32>,
+    v_row: CudaSlice<f32>,
     attn: CudaSlice<f32>,
     /// Split-decode partials for the attention kernels.
     attn_partial: CudaSlice<f32>,
@@ -94,6 +98,8 @@ impl DecodeWorkspace {
             q: buf(q_len)?,
             q_normed: buf(q_len)?,
             k: buf(kv_len)?,
+            k_row: buf(kv_len)?,
+            v_row: buf(kv_len)?,
             attn: buf(q_len)?,
             attn_partial: buf(cfg.num_q_heads * ATTN_ONLINE_MAX_SPLITS * (cfg.head_dim + 2))?,
             o_proj: buf(cfg.hidden_size)?,
@@ -127,13 +133,15 @@ impl Model {
     /// One decode step through every dense layer at `position`, then the final
     /// norm and LM head: the same ops as [`Self::forward_one_token_dense`] and
     /// [`Self::lm_head_logits`], on workspace buffers, with this position's K/V
-    /// written straight into `k_caches`/`v_caches`. The logits land in `logits`.
+    /// written straight into `k_caches`/`v_caches` (an f32 cache), or rounded into
+    /// them from two workspace rows (an f16 cache, `REFLEX_KV_CACHE=f16`). The
+    /// logits land in `logits`.
     pub(super) fn decode_step_dense_ws(
         &self,
         token_id: u32,
         position: usize,
-        k_caches: &mut [CudaSlice<f32>],
-        v_caches: &mut [CudaSlice<f32>],
+        k_caches: &mut [KvBuf],
+        v_caches: &mut [KvBuf],
         logits: &mut Vec<f32>,
     ) -> Result<(), ReflexError> {
         let mut slot = self.decode_ws.ws.borrow_mut();
@@ -145,7 +153,7 @@ impl Model {
         let (hs, eps) = (cfg.hidden_size, cfg.rmsnorm_eps);
         let (nq, nkv, hd) = (cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim);
         let kv_stride = nkv * hd;
-        let row_offset = (position * kv_stride * std::mem::size_of::<f32>()) as u64;
+        let row = position * kv_stride;
         let seq_len = position + 1;
 
         self.device
@@ -164,12 +172,18 @@ impl Model {
             {
                 return Err(crate::reflex_err!(
                     Other,
-                    "internal: KV cache of {} floats has no room for position {position}",
+                    "internal: KV cache of {} values has no room for position {position}",
                     cache.len()
                 ));
             }
-            let k_row = ptr(&k_caches[i]) + row_offset;
-            let v_row = ptr(&v_caches[i]) + row_offset;
+            // Where this position's final K and V go: the cache row itself, or the
+            // workspace rows that `kv_store` rounds into an f16 cache.
+            let direct = k_caches[i].dtype() == crate::kv_io::KvDtype::F32;
+            let (k_row, v_row) = if direct {
+                (k_caches[i].ptr_at(row), v_caches[i].ptr_at(row))
+            } else {
+                (ptr(&ws.k_row), ptr(&ws.v_row))
+            };
 
             // Attention norm, adding the previous layer's FFN output first.
             if i == 0 {
@@ -244,10 +258,13 @@ impl Model {
                 cfg.rope_type,
             )?;
 
+            if !direct {
+                self.kv_store_kv(k_row, v_row, &k_caches[i], &v_caches[i], row, kv_stride)?;
+            }
             self.attention_to(
                 q,
-                &k_caches[i].slice(0..seq_len * kv_stride),
-                &v_caches[i].slice(0..seq_len * kv_stride),
+                &k_caches[i].view(0..seq_len * kv_stride),
+                &v_caches[i].view(0..seq_len * kv_stride),
                 nq,
                 nkv,
                 hd,

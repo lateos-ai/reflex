@@ -66,7 +66,7 @@ fn attention_decode_gqa_matches_online_kernel() {
             window,
         };
         let index = attn_decode_kernel_index(head_dim, group_size).expect("a kernel");
-        let (k_v, v_v) = (k_d.slice(..), v_d.slice(..));
+        let (k_v, v_v) = (KvView::F32(k_d.slice(..)), KvView::F32(v_d.slice(..)));
         let gqa = model
             .attention_decode_gqa(&q_d, &k_v, &v_v, &shape(), index)
             .expect("decode launch");

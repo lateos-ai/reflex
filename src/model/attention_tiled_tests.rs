@@ -129,7 +129,7 @@ fn attention_tiled_matches_online_kernel() {
             scale: c.scale,
             window: c.window,
         };
-        let (k_v, v_v) = (k_d.slice(..), v_d.slice(..));
+        let (k_v, v_v) = (KvView::F32(k_d.slice(..)), KvView::F32(v_d.slice(..)));
         let tiled = kernels
             .attention_prefill_tiled(&model.device, &q_d, &k_v, &v_v, &shape())
             .expect("tiled launch")

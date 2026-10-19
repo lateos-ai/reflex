@@ -45,8 +45,9 @@
 //! file read (import), which includes the upload into the model's cache since
 //! the payload is read straight into the upload's staging buffers. The two
 //! flags can't be combined in one run (IPC's `import_kv`+`export_kv` can).
-//! `--export-kv-dtype f16` writes an f16 file, half the size (`f32`, the
-//! default, resumes exactly); `--import-kv` reads either.
+//! `--export-kv-dtype f16` writes an f16 file, half the size (`f32` resumes
+//! exactly); the default is the working cache's type, f32 unless
+//! `REFLEX_KV_CACHE=f16`. `--import-kv` reads either.
 //!
 //! Usage: `reflex generate <path-to-gguf> [prompt] [--max-tokens N] [--export-kv <file> [--export-kv-dtype f32|f16]] [--json]`
 //!        `reflex generate <path-to-gguf> [continuation-prompt] [--max-tokens N] --import-kv <file>`
@@ -310,7 +311,7 @@ pub fn run(args: Vec<String>) {
     }
 
     let export_dtype = match (&export_kv_dtype, &export_kv) {
-        (None, _) => kv_io::KvDtype::F32,
+        (None, _) => model.kv_cache_dtype(),
         (Some(_), None) => crate::fail("--export-kv-dtype", "applies only with --export-kv"),
         (Some(d), Some(_)) => {
             kv_io::KvDtype::parse(d).unwrap_or_else(|e| crate::fail("--export-kv-dtype", e))

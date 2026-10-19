@@ -157,7 +157,7 @@ device-resident buffer. Matrix weights (the operands of the matmul kernels:
 `f32` with `--weights f32` / `REFLEX_WEIGHTS=f32`. Everything else is always `f32`:
 norms, biases, the Gated DeltaNet `ssm_*` tensors, Mamba-2's `ssm_conv1d`, `ssm_a`,
 `ssm_d` and `ssm_norm` (2-D in the GGUF, but vectors to the kernels), the MoE routers,
-activations and the KV cache. `Weight.data` is a `WeightData` enum (`F32`, `F16`, `Quant`), and every matmul
+activations, and (unless `REFLEX_KV_CACHE=f16`, below) the KV cache. `Weight.data` is a `WeightData` enum (`F32`, `F16`, `Quant`), and every matmul
 wrapper in `src/model/kernels.rs` dispatches on it.
 
 - **The f16 path reads f16 weights and accumulates in f32.** Decode GEMVs
@@ -192,6 +192,22 @@ doesn't have yet, once each, through the same pinned pipeline, and they stay res
 That is still one host-to-device copy per weight for the process lifetime, not a copy
 per call. The prefetch readers are off in this mode. See
 [design/kolibri.md](design/kolibri.md) (Phase 4 step 2).
+
+**Opt-in: `REFLEX_KV_CACHE=f16`** stores the working K/V cache in f16.
+- **Coverage.** Every attention layer of dense, MoE, Kolibri-1 and Qwen3.5 models, and
+  MLA's latent; Qwen3.5's GatedDeltaNet state stays f32. Gemma 4, Granite 4.0-H and
+  `REFLEX_ATTN_KERNEL=legacy` refuse it at load.
+- **Per process.** It is read once at load (`src/model/kv_cache.rs`: `KvBuf`/`KvView`),
+  and the pinned prefix holds its state in the same type.
+- **Numerics.** The attention kernels are templated on the cache's element type and
+  widen each K/V element to f32 as they load it; every cache write rounds to nearest
+  even, saturating at ±65504.
+- **No cost when off.** The f32 instantiations compile to the same cubins as before.
+  The f16 kernels are separate modules that only an f16 process loads, the first time
+  it needs them.
+- **Cache files.** With an f16 cache, export defaults to f16 files, and f32 files import
+  with rounding.
+- See [design/decode-speed.md](design/decode-speed.md), "f16 KV cache".
 
 Rules that follow from measured regressions:
 
@@ -230,7 +246,7 @@ Rules that follow from measured regressions:
 - **Read cache files straight into the pinned slots.** `kv_io::import_kv` reads only
   the header; `WeightLoadPipeline::upload_state` reads each value range into the
   pinned slots in chunks of at most 8 MB and copies it to the cache (an f16 file is
-  widened on the GPU). Reading the payload into fresh host vectors first faulted in
+  widened on the GPU for an f32 cache, an f32 file rounded on the GPU for an f16 one). Reading the payload into fresh host vectors first faulted in
   every page of two new buffers: a cold process read a 342 MB file in 284 ms against
   110 ms warm. The chunk stays small because pinned memory costs ~0.46 ms per MB to
   allocate in a cold process.

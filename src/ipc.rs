@@ -42,7 +42,9 @@
 //! `max_tokens` to 1, since the state after a later generated token is no longer
 //! the prompt's (see `Model::generate_capture_kv`). `export_kv_dtype: "f16"`
 //! writes the file in f16, half the size, at the cost of an exact resume; the
-//! default `"f32"` is unchanged, and `import_kv` reads either. The caller owns
+//! default is the working cache's type (`"f32"` unless the engine runs with
+//! `REFLEX_KV_CACHE=f16`, whose cache is already f16), and `import_kv` reads
+//! either. The caller owns
 //! the files: the engine keeps nothing between requests.
 //!
 //! **Pinned prefix**: a request with `pin_prefix` keeps the
@@ -387,7 +389,7 @@ fn run_generate_with(
     on_first_token: impl FnMut(&[f32]),
     on_token: impl FnMut(u32, &str),
 ) -> Result<(Vec<u32>, String), ReflexError> {
-    let export_dtype = export_kv_dtype(req)?;
+    let export_dtype = export_kv_dtype(req, model.kv_cache_dtype())?;
     let uses_slot = req.pin_prefix || req.use_pinned;
     if uses_slot && (req.import_kv.is_some() || req.export_kv.is_some()) {
         return Err(ReflexError::InvalidInput(
@@ -484,11 +486,14 @@ fn add_ms(kv_io_ms: &mut Option<f64>, ms: Option<f64>) {
     }
 }
 
-/// A `generate` request's `export_kv_dtype`: f32 unless it asks for f16, and
-/// only together with `export_kv`.
-fn export_kv_dtype(req: &IpcRequest) -> Result<crate::kv_io::KvDtype, ReflexError> {
+/// A `generate` request's `export_kv_dtype`, only together with `export_kv`; by
+/// default the working cache's type (`cache`: f32 unless `REFLEX_KV_CACHE=f16`).
+fn export_kv_dtype(
+    req: &IpcRequest,
+    cache: crate::kv_io::KvDtype,
+) -> Result<crate::kv_io::KvDtype, ReflexError> {
     match &req.export_kv_dtype {
-        None => Ok(crate::kv_io::KvDtype::F32),
+        None => Ok(cache),
         Some(_) if req.export_kv.is_none() => Err(ReflexError::InvalidInput(
             "export_kv_dtype applies only with export_kv".to_string(),
         )),
@@ -1109,14 +1114,19 @@ mod tests {
     }
 
     #[test]
-    fn test_export_kv_dtype_defaults_to_f32_and_needs_export_kv() {
+    fn test_export_kv_dtype_defaults_to_the_cache_type_and_needs_export_kv() {
         use crate::kv_io::KvDtype;
         let parse = |s: &str| serde_json::from_str::<IpcRequest>(s).unwrap();
-        let dtype = |s: &str| export_kv_dtype(&parse(s));
+        let dtype = |s: &str| export_kv_dtype(&parse(s), KvDtype::F32);
         assert_eq!(
             dtype(r#"{"prompt": "p", "export_kv": "o", "max_tokens": 1}"#).unwrap(),
             KvDtype::F32
         );
+        // An f16 working cache exports f16 unless the request asks for f32.
+        let req = parse(r#"{"prompt": "p", "export_kv": "o", "max_tokens": 1}"#);
+        assert_eq!(export_kv_dtype(&req, KvDtype::F16).unwrap(), KvDtype::F16);
+        let req = parse(r#"{"prompt": "p", "export_kv": "o", "export_kv_dtype": "f32"}"#);
+        assert_eq!(export_kv_dtype(&req, KvDtype::F16).unwrap(), KvDtype::F32);
         assert_eq!(dtype(r#"{"prompt": "p"}"#).unwrap(), KvDtype::F32);
         for (d, want) in [("f32", KvDtype::F32), ("f16", KvDtype::F16)] {
             let req = format!(r#"{{"prompt": "p", "export_kv": "o", "export_kv_dtype": "{d}"}}"#);

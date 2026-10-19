@@ -1,5 +1,7 @@
 // Tiled causal attention for batched prefill (flash-attention style, f32 SIMT, no
-// tensor cores), templated on the head dim D and the query vectors per block M. Each
+// tensor cores), templated on the K/V cache's element type T (f32, or f16 with
+// REFLEX_KV_CACHE=f16: attention_tiled*_f16.cu), the head dim D and the query vectors per
+// block M. Each
 // .cu file that includes this header instantiates the head dims one model family needs,
 // so a model JIT-compiles (in a PTX build) only its own module:
 //   attention_tiled.cu       D 256 and 512 (Gemma 4; Qwen3.5's gated attention, D 256)
@@ -41,6 +43,7 @@
 // static shared memory under 48 KB.
 
 #pragma once
+#include "kv_load.cuh"
 
 // Must match `AttnParams` in src/model/kernels.rs (and attention_online.cu) field for
 // field. num_splits and split_len are unused here.
@@ -64,11 +67,11 @@ struct AttnParams {
 #define TA_BC 64  // K/V positions per tile
 #define TA_DC 32  // head-dim chunk for Q K^T
 
-template <int D, int M>
+template <typename T, int D, int M>
 __device__ __forceinline__ void attention_tiled(
     const float* __restrict__ q,
-    const float* __restrict__ k,
-    const float* __restrict__ v,
+    const T* __restrict__ k,
+    const T* __restrict__ v,
     float* __restrict__ dst,
     const AttnParams& p,
     unsigned int rows
@@ -133,8 +136,8 @@ __device__ __forceinline__ void attention_tiled(
         }
     }
 
-    const float* k_head = k + (unsigned long long)kvh * p.k_head_stride;
-    const float* v_head = v + (unsigned long long)kvh * p.v_head_stride;
+    const T* k_head = k + (unsigned long long)kvh * p.k_head_stride;
+    const T* v_head = v + (unsigned long long)kvh * p.v_head_stride;
 
     for (unsigned int tile = tile_lo; tile < tile_hi; tile++) {
         const unsigned int kbase = tile * TA_BC;
@@ -164,7 +167,7 @@ __device__ __forceinline__ void attention_tiled(
                 const unsigned int n = e / TA_DC, kk = e % TA_DC;
                 const unsigned int pos = kbase + n;
                 k_s[n * QS + kk] = pos < kv_len
-                    ? k_head[(unsigned long long)pos * p.k_pos_stride + dc + kk]
+                    ? kv_ld(k_head, (unsigned long long)pos * p.k_pos_stride + dc + kk)
                     : 0.0f;
             }
             __syncthreads();
@@ -248,7 +251,7 @@ __device__ __forceinline__ void attention_tiled(
             for (int e = tid; e < VC * D; e += TA_THREADS) {
                 const unsigned int kr = e / D, d = e % D;
                 const unsigned int pos = kbase + vc + kr;
-                v_s[e] = pos < kv_len ? v_head[(unsigned long long)pos * p.v_pos_stride + d] : 0.0f;
+                v_s[e] = pos < kv_len ? kv_ld(v_head, (unsigned long long)pos * p.v_pos_stride + d) : 0.0f;
             }
             __syncthreads();
 #pragma unroll

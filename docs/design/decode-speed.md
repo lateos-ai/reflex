@@ -206,6 +206,87 @@ graph with one `cuGraphLaunch`.
   read the position from device memory, so that a step could be submitted before its
   token is known.
 
+## f16 KV cache (opt-in, `REFLEX_KV_CACHE=f16`)
+
+At ~1,550 positions, decode attention reads ~355 MB of f32 K/V per Qwen3-0.6B step,
+1.5 ms of it. `REFLEX_KV_CACHE=f16` stores the working cache in f16 and halves that.
+It changes outputs, so it is opt-in. The default stays f32 and byte-identical.
+
+**What is f16.**
+- Every attention layer's K and V: dense, MoE, Kolibri-1, and Qwen3.5's gated
+  attention.
+- MLA's compressed latent.
+- Not Qwen3.5's GatedDeltaNet `conv_state`/`recurrent`, which stay f32 as in f16 cache
+  files.
+- Activations, scores, softmax and accumulators stay f32. The kernels widen each K/V
+  element as they load it.
+- Every cache write rounds to nearest even, saturating at ±65504, with the same
+  expression as f16 cache-file export. NaN stays NaN.
+
+**Per process.**
+- The setting is read once at load.
+- The one pinned prefix holds its state in the same type, at half the VRAM, and
+  every request in the process uses it as is.
+- Gemma 4, Granite 4.0-H and `REFLEX_ATTN_KERNEL=legacy` refuse the setting at load.
+
+**Cache files.** No new format is needed.
+- With an f16 cache, `export_kv` / `--export-kv` default to an f16 file (versions
+  5/6/7), written as it is.
+- `export_kv_dtype: "f32"` widens the values exactly instead.
+- Importing an f16 file into an f16 cache is a plain copy.
+- An f32 file is rounded on the device on the way in, the same rounding as every
+  cache write.
+- With the default f32 cache, nothing about files changes.
+
+**Kernels.**
+- The attention kernels are templated on the cache's element type
+  (`attention_decode.cuh`, `attention_online.cuh`, `attention_tiled.cuh`, with loads
+  from `kv_load.cuh`).
+- The f32 instantiations compile to byte-identical cubins on sm_75/86/90.
+- The f16 kernels are separate modules: `attention_decode_f16.cu`, `kv_f16.cu` (online
+  attention, the rounding stores, MLA's batch write) and `attention_tiled*_f16.cu`.
+  An f16 process loads them the first time it needs them, so an f32 process loads and
+  JIT-compiles exactly what it did before.
+- One `kv_store_kv_f16_kernel` launch writes a layer's K and V rows. With two
+  launches, short-context decode was 1% slower.
+
+**Accuracy.** Measured as for phase F's f16 cache files: f32 weights, a ~700-token
+prompt, next-token logits with an f16 cache against an f32 one, and 32 greedy tokens.
+
+| model | rel L2 | max abs | greedy ids |
+|---|---:|---:|---|
+| Qwen3-0.6B | 6.8e-4 | 8.3e-3 | 32/32 identical |
+| TinyLlama 1.1B | 1.3e-4 | 1.8e-3 | 32/32 identical |
+| Qwen3.5-0.8B (hybrid) | 3.0e-4 | 3.5e-3 | 32/32 identical |
+| Qwen3-MoE fixture | 1.1e-6 | 8.8e-9 | 32/32 identical |
+| MLA fixture | 9.8e-7 | 1.7e-8 | 32/32 identical |
+
+These are about the size of what phase F's f16 files cost a resumed prefix (6e-4 on
+Qwen3-0.6B), as expected: an f16 working cache rounds the same values, plus the ones
+it writes while decoding.
+- **f16 pinned prefix vs its own f16 file.** Resuming from the f16 file is
+  bit-identical to resuming from the pinned prefix.
+- **f32 file into an f16 cache vs the f16 pinned prefix.** rel L2 5.0e-4 on
+  Qwen3-0.6B and 2.1e-4 on Qwen3.5, with the same 32 tokens.
+
+**Speed.** Same binary with and without `REFLEX_KV_CACHE=f16`. Decode ms/token,
+medians of 3 interleaved runs, greedy ids identical in every run:
+
+| model | context | f32 cache | f16 cache | change |
+|---|---|---:|---:|---:|
+| Qwen3-0.6B f16 | short | 6.40 | 6.41 | +0.2% |
+| | ~1,550 | 7.80 | 7.18 | −8.0% |
+| Qwen3-0.6B QR | short | 4.43 | 4.43 | 0.0% |
+| | ~1,550 | 5.90 | 5.31 | −10.1% |
+| TinyLlama f16 | short / ~1,550 | 9.41 / 9.87 | 9.37 / 9.84 | −0.4% / −0.4% |
+| TinyLlama QR | short / ~1,550 | 5.52 / 6.14 | 5.51 / 6.08 | −0.2% / −0.9% |
+
+TinyLlama gains nothing. All 32 of its query heads share 4 KV heads, so each block of
+its decode kernel puts 8 query heads on every K/V row it loads. That makes the kernel
+compute-bound rather than bandwidth-bound, so halving the bytes doesn't shorten it.
+The gain grows with context: decode attention is the part an f16 cache shrinks, and
+it is the part that grows with context.
+
 ## What's left
 
 Ranked by the round 2 profile. Status as of 2026-10-18:
@@ -213,9 +294,10 @@ Ranked by the round 2 profile. Status as of 2026-10-18:
   workspace (fixes 3 and 4). A single CUDA graph per step didn't pay (above). What
   remains of the GPU idle (~0.6-0.8 ms per step) is the step start: the logits copy,
   the host argmax, the embedding upload and the first launches.
-- **f16 KV cache** (opt-in). Long contexts only: decode attention takes 1.5 ms per
-  step on Qwen3-0.6B at ~1,550 positions. It changes outputs, so it can't be the
-  default.
+- **f16 KV cache.** *Done (opt-in, above):* −8% to −10% per token on Qwen3-0.6B at
+  ~1,550 positions. Decode attention for GQA groups of 8 (TinyLlama) is compute-bound,
+  so f16 storage doesn't help it; making it faster would mean less arithmetic per
+  cached position.
 - **Not planned this round.** These are all bit-identical:
   - a 4-rows-per-warp `gemv_q6k` (QR only, ~0.3 ms; the Q6_K LM head runs at about
     61% of bandwidth);
