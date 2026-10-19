@@ -1089,6 +1089,16 @@ impl Model {
             } if self.gemv_q4k_r1_k.is_some() => self.launch_gemv_q4k_r1(x, w, y),
             WeightData::Quant {
                 ty: GgmlType::Q6K, ..
+            } if self.gemv_q6k_r1_k.is_some() => {
+                let out = self.launch_gemv_q6k_r1(x, w)?;
+                // SAFETY: `y` holds `out_features` floats (the caller's buffer).
+                let mut dst = unsafe { self.device.upgrade_device_ptr::<f32>(y, out_features) };
+                let copied = self.device.dtod_copy(&out, &mut dst);
+                out.leak();
+                copied.map_err(|e| crate::gpu_err!(e, "gemv_q6k_r1 copy: {e}"))
+            }
+            WeightData::Quant {
+                ty: GgmlType::Q6K, ..
             } => self.launch_gemv_q6k(x, w, y),
             _ => {
                 let out = self.gemv(x, w)?;
@@ -1595,6 +1605,40 @@ impl Model {
         Ok(())
     }
 
+    /// `gemv_q6k_r1_kernel` (4 output rows per warp, decode path for Q6_K):
+    /// into the `w.shape[1]` floats at `y`. Requires `gemv_q6k_r1_k`.
+    fn launch_gemv_q6k_r1(&self, x: &CudaSlice<f32>, w: &Weight) -> Result<CudaSlice<f32>, ReflexError> {
+        let in_features = w.shape[0] as usize;
+        let out_features = w.shape[1] as usize;
+        let r1 = self.gemv_q6k_r1_k.as_ref().ok_or_else(|| {
+            ReflexError::Other("internal: gemv_q6k_r1_kernel not loaded".to_string())
+        })?;
+        let w_ptr = w
+            .quant_ptr()
+            .ok_or_else(|| ReflexError::Other("internal: gemv_q6k on an f32 weight".to_string()))?;
+        if x.len() != in_features || !in_features.is_multiple_of(QK_K) {
+            return Err(crate::reflex_err!(
+                Other,
+                "gemv_q6k_r1: x.len()={} in_features={in_features} (must match, a multiple of {QK_K})",
+                x.len()
+            ));
+        }
+        let dev_y = self.alloc_out(out_features, "gemv_q6k_r1")?;
+        let per_block = (GEMV_Q6K_R1_WARPS * GEMV_Q6K_R1_ROWS) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: ((out_features as u32).div_ceil(per_block).max(1), 1, 1),
+            block_dim: (GEMV_Q6K_R1_WARPS as u32 * WARP_SIZE, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            r1.function
+                .clone()
+                .launch(cfg, (x, w_ptr, *dev_y.device_ptr(), in_features as u32, out_features as u32))
+                .map_err(|e| crate::gpu_err!(e, "gemv_q6k_r1 launch: {e}"))?;
+        }
+        Ok(dev_y)
+    }
+
     /// `gemv_q4k_r1_kernel` (the one-row decode GEMV, 4 output rows per warp)
     /// into the `w.shape[1]` floats at `y`. Requires `gemv_q4k_r1_k`.
     fn launch_gemv_q4k_r1(
@@ -1750,8 +1794,12 @@ impl Model {
                 // Same for Q8_0 (Gemma 4), 16 rows per pass.
                 GgmlType::Q8_0 if rows <= quant_fused_max_rows() => self.gemv_q8_0(x, w, rows),
                 // No multi-row Q6_K kernel yet: one row is the decode GEMV,
+                // which uses `gemv_q6k_r1_kernel` (4 output rows per warp);
                 // anything more goes through the scratch path.
-                GgmlType::Q6K if rows == 1 => self.gemv_q6k(x, w),
+                GgmlType::Q6K if rows == 1 => {
+                    let dev_y = self.launch_gemv_q6k_r1(x, w)?;
+                    Ok(dev_y)
+                }
                 GgmlType::Q4K | GgmlType::Q6K | GgmlType::Q8_0 => {
                     self.gemm_quant_scratch(x, w, *ty, *len, in_features, out_features, rows)
                 }
@@ -3514,6 +3562,11 @@ pub(super) const GEMV_Q4K_MAX_ROWS: usize = 8;
 /// `GEMV_Q4K_R1_ROWS`/`GEMV_Q4K_R1_WARPS` in `kernels_cuda/gemv_q4k.cu`.
 pub(super) const GEMV_Q4K_R1_ROWS: usize = 4;
 pub(super) const GEMV_Q4K_R1_WARPS: usize = 4;
+
+/// `gemv_q6k_r1_kernel`'s output rows per warp and warps per block -- must equal
+/// `GEMV_Q6K_R1_ROWS`/`GEMV_Q6K_R1_WARPS` in `kernels_cuda/gemv_q4k.cu`.
+pub(super) const GEMV_Q6K_R1_ROWS: usize = 4;
+pub(super) const GEMV_Q6K_R1_WARPS: usize = 4;
 
 /// Rows per `gemv_q8_0_kernel` launch -- must equal `GEMV_Q8_0_MAX_ROWS` in
 /// `kernels_cuda/gemv_q8_0.cu`.

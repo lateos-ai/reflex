@@ -394,6 +394,7 @@ impl Model {
             dequant_q6k_coalesced_k,
             dequant_q6k_coalesced_f16_k,
             gemv_q6k_k,
+            gemv_q6k_r1_k,
         ) = if quant_dense {
             let mut fns = aot::load_kernel_module(
                 &device,
@@ -407,14 +408,15 @@ impl Model {
                     "dequantize_q6k_coalesced_kernel",
                     "dequantize_q6k_coalesced_f16_kernel",
                     "gemv_q6k_kernel",
+                    "gemv_q6k_r1_kernel",
                 ],
             )?
             .into_iter()
             .map(Some);
-            let mut next = || fns.next().expect("seven kernels requested");
-            (next(), next(), next(), next(), next(), next(), next())
+            let mut next = || fns.next().expect("eight kernels requested");
+            (next(), next(), next(), next(), next(), next(), next(), next())
         } else {
-            (None, None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None)
         };
         let modules_ms = t_modules.elapsed().as_secs_f64() * 1000.0;
         let t_weights = std::time::Instant::now();
@@ -702,6 +704,7 @@ impl Model {
             dequant_q6k_coalesced_k,
             dequant_q6k_coalesced_f16_k,
             gemv_q6k_k,
+            gemv_q6k_r1_k,
             q8_0_k: None,
             quant_scratch: RefCell::new(None),
             moe_gather_k,

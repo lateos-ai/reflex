@@ -237,6 +237,9 @@ pub struct Model {
     dequant_q6k_coalesced_f16_k: Option<AotKernel>,
     /// `gemv_q6k_kernel` (same module), for a quantized-resident LM head.
     gemv_q6k_k: Option<AotKernel>,
+    /// `gemv_q6k_r1_kernel` (same module): 4 output rows per warp, faster
+    /// decode path for Q6_K layer tensors and LM head in QR mode.
+    gemv_q6k_r1_k: Option<AotKernel>,
     /// `kernels_cuda/gemv_q8_0.cu`, loaded only when the Gemma 4 path keeps
     /// Q8_0 weights quantized (`REFLEX_QUANT_RESIDENT=1`). `None` everywhere
     /// else, so no other architecture can reach a Q8_0 kernel.
