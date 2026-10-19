@@ -10,8 +10,11 @@
 //
 // With dynamic shared memory of hidden_size floats, the block first stages the row
 // there with coalesced loads, so the single summing thread reads shared memory rather
-// than walking global memory alone. Launched with no shared memory (a row wider than
-// the launcher's limit), it reads x directly; the values are the same either way.
+// than walking global memory alone (four floats per load, see rmsnorm.cuh). Launched
+// with no shared memory (a row wider than the launcher's limit), it reads x directly;
+// the values are the same either way.
+#include "rmsnorm.cuh"
+
 extern "C" __global__ void rmsnorm_kernel(
     const float* __restrict__ x,
     const float* __restrict__ weight,
@@ -20,7 +23,9 @@ extern "C" __global__ void rmsnorm_kernel(
     unsigned int hidden_size,
     float eps
 ) {
-    extern __shared__ float row_s[];
+    // float4 so the staged row is 16-byte aligned for rmsnorm_rms_inv's vector loads.
+    extern __shared__ float4 row_s4[];
+    float* row_s = reinterpret_cast<float*>(row_s4);
     __shared__ float rms_inv_s;
     unsigned int dyn_smem;
     asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dyn_smem));
@@ -37,12 +42,7 @@ extern "C" __global__ void rmsnorm_kernel(
             src = row_s;
         }
         if (threadIdx.x == 0) {
-            float sum_sq = 0.0f;
-            for (unsigned int i = 0; i < hidden_size; i++) {
-                float v = src[i];
-                sum_sq += v * v;
-            }
-            rms_inv_s = 1.0f / sqrtf(sum_sq / hidden_size + eps);
+            rms_inv_s = rmsnorm_rms_inv(src, hidden_size, eps, staged);
         }
         __syncthreads();
         const float rms_inv = rms_inv_s;

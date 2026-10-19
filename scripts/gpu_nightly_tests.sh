@@ -45,14 +45,14 @@ mkdir -p "$LOG_DIR"
 # to run, and what to set when it is missing.
 requirement() {
   case "$1" in
-    *::prefill_hybrid_batched_matches_sequential|*::ipc_kv_f16_file_hybrid_model_*|model::kv_f16_tests::hybrid_*) echo "$HYBRID_GGUF|$HYBRID_GGUF|set HYBRID_GGUF" ;;
+    *::prefill_hybrid_batched_matches_sequential|*::ipc_kv_f16_file_hybrid_model_*|model::kv_f16_tests::hybrid_*|model::kv_cache_f16_tests::hybrid_*) echo "$HYBRID_GGUF|$HYBRID_GGUF|set HYBRID_GGUF" ;;
     *::iq_dequant_kernel_matches_host_on_real_tensors) echo "$IQ_GGUF|$IQ_GGUF|set IQ_GGUF" ;;
     *::prefill_mla_batched_matches_sequential_real_moe_checkpoint) echo "$MLA_REAL_GGUF|$MLA_REAL_GGUF|set MLA_REAL_GGUF" ;;
     *::qwen2_real_model_*) echo "$QWEN2_GGUF|$QWEN2_GGUF|set QWEN2_GGUF" ;;
     *::qwen2_fixture_lora_*) echo "|test-data/tiny-qwen2-lora.gguf|fixture missing" ;;
     model::qwen2_tests::*) echo "|test-data/tiny-qwen2.gguf|fixture missing" ;;
     *::granite_real_model_*) echo "$GRANITE_GGUF|$GRANITE_GGUF|set GRANITE_GGUF" ;;
-    *::ipc_kv_relay_spm_model_*|*::ipc_json_schema_spm_model_*|*::ipc_system1_resumed_spm_model_*|*::ipc_kv_f16_file_spm_model_*) echo "$SPM_GGUF|$SPM_GGUF|set SPM_GGUF" ;;
+    *::ipc_kv_relay_spm_model_*|*::ipc_json_schema_spm_model_*|*::ipc_system1_resumed_spm_model_*|*::ipc_kv_f16_file_spm_model_*|*::f16_kv_cache_spm_model_*) echo "$SPM_GGUF|$SPM_GGUF|set SPM_GGUF" ;;
     model::granite_hybrid_tests::*) echo "|test-data/tiny-granitehybrid.gguf|fixture missing" ;;
     model::mla_widening_tests::*) echo "|test-data/tiny-mla-v3.gguf|fixture missing" ;;
     lora::moe_expert_lora_fixture_tests::*) echo "|test-data/tiny-qwen3moe-lora.gguf|fixture missing" ;;
@@ -63,9 +63,9 @@ requirement() {
     *::ipc_pinned_prefix_gemma4_fixture_*|*::ipc_json_schema_gemma4_fixture_*|*::ipc_system1_resumed_gemma4_fixture_*) echo "|test-data/tiny-gemma4.gguf|fixture missing" ;;
     *::ipc_pinned_prefix_qwen2_fixture_*) echo "|test-data/tiny-qwen2.gguf|fixture missing" ;;
     *::ipc_pinned_prefix_kolibri1_fixture_*) echo "|test-data/tiny-kolibri1-f32.gguf|fixture missing" ;;
-    model::mla_batching_tests::*|*::online_attention_matches_legacy_kernels_mla|*::ipc_kv_relay_mla_fixture_*|*::ipc_kv_f16_file_mla_fixture_*|*::ipc_pinned_prefix_mla_fixture_*|*::ipc_json_schema_mla_fixture_*|*::ipc_system1_resumed_mla_fixture_*) echo "|test-data/deepseek-tiny-mla.gguf|fixture missing" ;;
+    model::mla_batching_tests::*|*::mla_fixture_f16_kv_cache_*|*::online_attention_matches_legacy_kernels_mla|*::ipc_kv_relay_mla_fixture_*|*::ipc_kv_f16_file_mla_fixture_*|*::ipc_pinned_prefix_mla_fixture_*|*::ipc_json_schema_mla_fixture_*|*::ipc_system1_resumed_mla_fixture_*) echo "|test-data/deepseek-tiny-mla.gguf|fixture missing" ;;
     *::gemma4_quant_resident_matches_dequantized) echo "|test-data/tiny-gemma4-q8_0.gguf|fixture missing (llama-quantize tiny-gemma4.gguf to Q8_0)" ;;
-    model::gemma4_model_tests::*|*::quant_resident_q8_0_*|model::attention_tiled_tests::*) echo "|test-data/tiny-gemma4.gguf|fixture missing" ;;
+    model::gemma4_model_tests::*|*::quant_resident_q8_0_*|model::attention_tiled_tests::*|*::f16_kv_cache_is_rejected_where_unsupported) echo "|test-data/tiny-gemma4.gguf|fixture missing" ;;
     model::rmsnorm_tests::*) echo "|test-data/tiny-qwen3moe.gguf|fixture missing" ;;
     *::kolibri1_q4km_fixture_generates|model::kolibri_config_tests::kolibri1_*|model::quant_resident_tests::kolibri1_*) echo "|test-data/tiny-kolibri1.gguf|fixture missing" ;;
     # kolibri1_batched_prefill_matches_sequential opens tiny-kolibri1.gguf as well.

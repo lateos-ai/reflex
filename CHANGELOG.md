@@ -5,6 +5,33 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Decode speed, round 2.** These change no outputs: greedy ids and logits are
+  bit-identical, and the f32 attention kernels compile to the same cubins.
+  - **Norms.** RMSNorm's single summing thread reads four floats at a time. The
+    decode path fuses each residual add into the next norm and runs Q-Norm and K-Norm
+    in one launch. `REFLEX_DECODE_FUSE=0` turns the fusion off.
+  - **Workspace.** For dense models (Qwen3, Qwen2, Llama/Mistral), `generate`'s decode
+    step reuses one workspace for all its intermediates and writes K/V straight into
+    the cache, which removes ~390 allocations and frees per step.
+    `REFLEX_DECODE_WS=0` turns it off.
+  - **Results.** On a T4, Qwen3-0.6B decodes 6-9% faster and TinyLlama 3-4%. A
+    32-token agent hop with a pinned ~1,550-token prefix takes 280 ms instead of 296
+    ms, or 259 ms with the f16 KV cache below.
+  - **Tried and dropped.** CUDA graphs per decode step gained under 2%, so they are
+    not included.
+  - See [docs/design/decode-speed.md](docs/design/decode-speed.md).
+- **Opt-in f16 KV cache.** `REFLEX_KV_CACHE=f16` stores the working K/V cache in f16,
+  at half the bytes. It covers every attention layer of dense, MoE, Kolibri-1 and
+  Qwen3.5 models and MLA's latent; Qwen3.5's recurrent state stays f32.
+  - **Speed.** On a T4, Qwen3-0.6B decodes 8-10% faster at ~1,550 positions.
+  - **Accuracy.** It moves next-token logits by about 1e-4 to 7e-4 (relative L2)
+    against an f32 cache, with the same 32 greedy tokens on every model measured.
+  - **Per process.** The setting is read at load. The pinned prefix holds its state in
+    the same type.
+  - **Cache files.** With an f16 cache, export defaults to f16 files, and f32 files
+    import with rounding.
+  - **Unsupported.** Gemma 4, Granite 4.0-H and `REFLEX_ATTN_KERNEL=legacy` refuse it.
+  - **Default.** Unchanged: f32, byte-identical.
 - **Faster decode.** Decode attention for dense, MoE, Kolibri-1 and Qwen3.5 now runs a
   GQA-aware kernel (`attention_decode.cu`). It reads each cached K/V row once for every
   query head that shares it and keeps two loads in flight per warp; it loads on the

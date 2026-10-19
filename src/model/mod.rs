@@ -76,11 +76,13 @@ use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
 
 mod config;
+mod decode_step;
 mod dense;
 mod gemma4;
 mod granite_hybrid;
 mod hybrid;
 mod kernels;
+mod kv_cache;
 mod loading;
 mod mla;
 mod prefill_profile;
@@ -88,11 +90,13 @@ mod prefix;
 
 use self::config::*;
 pub use self::config::{parse_model_config, LayerConfig, MoeMetaConfig, RopeType};
+use self::decode_step::*;
 use self::dense::*;
 use self::gemma4::*;
 use self::granite_hybrid::*;
 use self::hybrid::*;
 use self::kernels::*;
+use self::kv_cache::*;
 use self::loading::*;
 pub use self::loading::{F16ActivationStats, LoadOptions, WeightsDtype};
 use self::mla::*;
@@ -109,6 +113,8 @@ mod attention_online_tests;
 mod attention_tiled_dense_tests;
 #[cfg(test)]
 mod attention_tiled_tests;
+#[cfg(test)]
+mod decode_step_tests;
 #[cfg(test)]
 mod f16_kernel_tests;
 #[cfg(test)]
@@ -129,6 +135,8 @@ mod iq_dequant_host_vs_device_tests;
 mod kolibri_config_tests;
 #[cfg(test)]
 mod kolibri_forward_tests;
+#[cfg(test)]
+mod kv_cache_f16_tests;
 #[cfg(test)]
 mod kv_f16_tests;
 #[cfg(test)]
@@ -254,6 +262,16 @@ pub struct Model {
     attn_tiled: TiledAttnKernels,
     /// GQA decode attention, loaded lazily; see [`DecodeAttnKernels`].
     attn_decode: DecodeAttnKernels,
+    /// Fused decode norms, loaded lazily; see [`DecodeOpKernels`].
+    decode_ops: DecodeOpKernels,
+    /// Reused buffers for the dense decode step, allocated on the first one;
+    /// see `decode_step.rs`.
+    decode_ws: DecodeWorkspaceSlot,
+    /// The working K/V cache's element type (`REFLEX_KV_CACHE`, read at load);
+    /// see `kv_cache.rs`. A `Cell` only so tests can compare both on one model.
+    kv_dtype: Cell<crate::kv_io::KvDtype>,
+    /// The f16 cache's own kernels, loaded the first time it needs them.
+    kv_f16: KvF16Kernels,
     /// In-place residual add (`a[i] += b[i]`, see `kernels_cuda/elementwise.cu`)
     /// -- keeps residual-stream adds device-resident (Phase 2 round 2)
     /// instead of downloading both operands to host just to add two vectors.
@@ -731,21 +749,30 @@ impl Model {
             .get("general.architecture")
             .and_then(GgufValue::as_str)
             .unwrap_or("");
-        if architecture == "qwen35" || architecture == "qwen35moe" {
-            return Self::load_hybrid(device, file, &policy);
+        // Reject an unsupported f16 KV cache before loading any weights.
+        if kv_dtype_from_env()? == crate::kv_io::KvDtype::F16
+            && matches!(architecture, "gemma4" | "granitehybrid")
+        {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "REFLEX_KV_CACHE=f16 is not supported for {architecture}; use the default f32 cache"
+            ));
         }
-        if architecture == "deepseek2" {
-            return Self::load_mla(device, file, &policy);
-        }
-        if architecture == "gemma4" {
-            return Self::load_gemma4(device, file, &policy);
-        }
-        if architecture == "granitehybrid" {
-            return Self::load_granite_hybrid(device, file, &policy);
-        }
-        // `kolibri1` also goes through the dense/MoE path, as its own layer
-        // variant (`LayerWeights::Kolibri`).
-        Self::load_dense(device, file, &policy)
+        let model = if architecture == "qwen35" || architecture == "qwen35moe" {
+            Self::load_hybrid(device, file, &policy)?
+        } else if architecture == "deepseek2" {
+            Self::load_mla(device, file, &policy)?
+        } else if architecture == "gemma4" {
+            Self::load_gemma4(device, file, &policy)?
+        } else if architecture == "granitehybrid" {
+            Self::load_granite_hybrid(device, file, &policy)?
+        } else {
+            // `kolibri1` also goes through the dense/MoE path, as its own layer
+            // variant (`LayerWeights::Kolibri`).
+            Self::load_dense(device, file, &policy)?
+        };
+        model.check_kv_dtype_supported()?;
+        Ok(model)
     }
 
     /// The element type this model's matrix weights are stored in.

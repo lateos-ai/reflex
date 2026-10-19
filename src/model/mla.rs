@@ -7,12 +7,12 @@ use crate::error::ReflexError;
 /// state, the filled per-layer compressed-latent K/V caches, and the next
 /// absolute position. Shared by `prefill_mla_batched` and its non-batched
 /// counterpart.
-pub(super) type MlaPrefillResult = (Vec<u32>, CudaSlice<f32>, Vec<CudaSlice<f32>>, usize);
+pub(super) type MlaPrefillResult = (Vec<u32>, CudaSlice<f32>, Vec<KvBuf>, usize);
 
 /// MLA generate result: generated token ids, their concatenated decoded
 /// text, the final per-layer compressed-latent K/V caches, and the total
 /// sequence length reached. Returned by `generate_mla_impl`.
-pub(super) type MlaGenerateResult = (Vec<u32>, String, Vec<CudaSlice<f32>>, usize);
+pub(super) type MlaGenerateResult = (Vec<u32>, String, Vec<KvBuf>, usize);
 
 /// One MLA layer's FFN: dense SwiGLU for the `leading_dense_block_count` lead
 /// layers (identical in shape/meaning to `DenseLayerWeights`'s), or routed MoE +
@@ -490,6 +490,10 @@ impl Model {
             attn_impl,
             attn_tiled: TiledAttnKernels::from_env()?,
             attn_decode: DecodeAttnKernels::from_env()?,
+            decode_ops: DecodeOpKernels::from_env()?,
+            decode_ws: DecodeWorkspaceSlot::from_env()?,
+            kv_dtype: Cell::new(kv_dtype_from_env()?),
+            kv_f16: KvF16Kernels::new(),
             add_k,
             split_qg_k,
             sigmoid_gate_k,
@@ -635,7 +639,7 @@ impl Model {
         w: &MlaLayerWeights,
         mut hidden: CudaSlice<f32>,
         position: usize,
-        kv_cache: &mut CudaSlice<f32>,
+        kv_cache: &mut KvBuf,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &m.cfg;
         let n_head = cfg.num_heads;
@@ -769,21 +773,11 @@ impl Model {
         // preallocated per-layer cache -- device-resident from the start (Phase 2
         // round 2 convention), no host round-trip, ever, for this cache.
         let offset = position * qk_dim;
-        {
-            let mut dst = kv_cache.slice_mut(offset..offset + kv_lora);
-            self.device
-                .dtod_copy(&kv_cmpr_normed, &mut dst)
-                .map_err(|e| crate::gpu_err!(e, "mla kv_cache dtod cmpr: {e}"))?;
-        }
-        {
-            let mut dst = kv_cache.slice_mut(offset + kv_lora..offset + qk_dim);
-            self.device
-                .dtod_copy(&k_pe, &mut dst)
-                .map_err(|e| crate::gpu_err!(e, "mla kv_cache dtod k_pe: {e}"))?;
-        }
+        self.kv_store(*kv_cmpr_normed.device_ptr(), kv_cache, offset, kv_lora)?;
+        self.kv_store(*k_pe.device_ptr(), kv_cache, offset + kv_lora, qk_rope)?;
         let seq_len = position + 1;
 
-        let kv_view = kv_cache.slice(0..seq_len * qk_dim);
+        let kv_view = kv_cache.view(0..seq_len * qk_dim);
         // Scale uses the *uncompressed* per-head dim (n_embd_head_k_mla), not
         // qk_dim -- see `Self::mla_attention`'s doc comment. YaRN adjusts this via
         // its own precomputed mscale^2/sqrt(...) (see `MlaYarnConfig`).
@@ -824,7 +818,7 @@ impl Model {
         mut hidden: CudaSlice<f32>,
         start_pos: usize,
         rows: usize,
-        kv_cache: &mut CudaSlice<f32>,
+        kv_cache: &mut KvBuf,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &m.cfg;
         let n_head = cfg.num_heads;
@@ -983,7 +977,7 @@ impl Model {
         prof_mark(PrefillPhase::KvCopy, LayerKind::Layer)?;
         let seq_len = start_pos + rows;
 
-        let kv_view = kv_cache.slice(0..seq_len * qk_dim);
+        let kv_view = kv_cache.view(0..seq_len * qk_dim);
         let scale = match &cfg.yarn {
             Some(yarn) => yarn.attention_scale,
             None => 1.0 / (n_embd_head_k_mla as f32).sqrt(),
@@ -1037,7 +1031,7 @@ impl Model {
         hidden: CudaSlice<f32>,
         start_pos: usize,
         rows: usize,
-        kv_cache: &mut CudaSlice<f32>,
+        kv_cache: &mut KvBuf,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let post_attn =
             self.forward_mla_attn_block_batched(m, layer, hidden, start_pos, rows, kv_cache)?;
@@ -1273,7 +1267,7 @@ impl Model {
         start_pos: usize,
         rows: usize,
         extra_headroom: usize,
-    ) -> Result<Vec<CudaSlice<f32>>, ReflexError> {
+    ) -> Result<Vec<KvBuf>, ReflexError> {
         crate::limits::check_positions_up_to(
             start_pos,
             rows,
@@ -1282,10 +1276,9 @@ impl Model {
         )?;
         let qk_dim = m.cfg.kv_lora_rank + m.cfg.qk_rope_head_dim;
         let total_len = start_pos + rows + extra_headroom;
-        let mut kv_caches: Vec<CudaSlice<f32>> = (0..m.layers.len())
-            .map(|_| self.device.alloc_zeros::<f32>(total_len * qk_dim))
-            .collect::<Result<_, _>>()
-            .map_err(|e| crate::gpu_err!(e, "alloc mla kv_cache: {e}"))?;
+        let mut kv_caches: Vec<KvBuf> = (0..m.layers.len())
+            .map(|_| self.alloc_kv(total_len * qk_dim, "mla kv_cache"))
+            .collect::<Result<_, _>>()?;
 
         let imported_len = start_pos * qk_dim;
         match imported {
@@ -1310,12 +1303,16 @@ impl Model {
                 let mut jobs = Vec::with_capacity(kv_caches.len());
                 for (layer_idx, kv_host) in cache.kv_caches.iter().enumerate() {
                     check_state_len(kv_host, imported_len, "kv_cache", layer_idx)?;
-                    jobs.push((*kv_caches[layer_idx].device_ptr(), kv_host));
+                    let kv = &kv_caches[layer_idx];
+                    jobs.push((kv.ptr_at(0), kv.dtype(), kv_host));
                 }
+                let narrow = self.kv_narrow_kernel()?;
                 self.timed_prefix_copy(copy_ms, || {
-                    self.dequant_pipeline
-                        .borrow_mut()
-                        .upload_state(&jobs, &self.dequant_kernels.f16_to_f32_runs)
+                    self.dequant_pipeline.borrow_mut().upload_state(
+                        &jobs,
+                        &self.dequant_kernels.f16_to_f32_runs,
+                        narrow,
+                    )
                 })?;
             }
             Some(PrefixSource::Device { state, copy_ms }) => {
@@ -1329,14 +1326,12 @@ impl Model {
                 }
                 self.timed_prefix_copy(copy_ms, || {
                     for (layer_idx, src) in state.kv_caches.iter().enumerate() {
-                        self.device
-                            .dtod_copy(
-                                &src.slice(0..imported_len),
-                                &mut kv_caches[layer_idx].slice_mut(0..imported_len),
-                            )
-                            .map_err(|e| {
-                                crate::gpu_err!(e, "fork mla kv_cache layer {layer_idx}: {e}")
-                            })?;
+                        self.kv_copy_prefix(
+                            src,
+                            &mut kv_caches[layer_idx],
+                            imported_len,
+                            &format!("fork mla kv_cache layer {layer_idx}"),
+                        )?;
                     }
                     Ok(())
                 })?;
@@ -1528,7 +1523,7 @@ impl Model {
         m: &MlaModel,
         token_id: u32,
         position: usize,
-        kv_caches: &mut [CudaSlice<f32>],
+        kv_caches: &mut [KvBuf],
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &m.cfg;
         let hidden_size = cfg.hidden_size;
@@ -1623,7 +1618,7 @@ impl Model {
         let cache = self.download_mla_kv(
             m,
             &MlaDeviceKv { seq_len, kv_caches },
-            crate::kv_io::KvDtype::F32,
+            self.kv_cache_dtype(),
         )?;
         Ok((generated, text, cache))
     }
@@ -1642,7 +1637,7 @@ impl Model {
         let kv_caches = d
             .kv_caches
             .iter()
-            .map(|c| dl.get(c, per_layer_len, dtype, "mla kv_cache"))
+            .map(|c| dl.get_kv(c, per_layer_len, dtype, "mla kv_cache"))
             .collect::<Result<Vec<_>, _>>()?;
         dl.finish()?;
         Ok(crate::kv_io::MlaKvCache {

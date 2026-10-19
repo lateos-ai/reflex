@@ -8,27 +8,15 @@ use crate::error::ReflexError;
 /// the filled per-layer K/V caches (separate K and V buffers), and the next
 /// absolute position a caller may write into. Shared by `prefill_dense` and
 /// `prefill_dense_batched`.
-pub(super) type DensePrefillResult = (
-    Vec<u32>,
-    CudaSlice<f32>,
-    Vec<CudaSlice<f32>>,
-    Vec<CudaSlice<f32>>,
-    usize,
-);
+pub(super) type DensePrefillResult = (Vec<u32>, CudaSlice<f32>, Vec<KvBuf>, Vec<KvBuf>, usize);
 
 /// Generate result: generated token ids, their concatenated decoded text,
 /// the final per-layer K/V caches, and the total sequence length reached.
 /// Returned by `generate_dense_impl`.
-pub(super) type DenseGenerateResult = (
-    Vec<u32>,
-    String,
-    Vec<CudaSlice<f32>>,
-    Vec<CudaSlice<f32>>,
-    usize,
-);
+pub(super) type DenseGenerateResult = (Vec<u32>, String, Vec<KvBuf>, Vec<KvBuf>, usize);
 
 /// Per-layer K and V cache buffers, from `alloc_dense_kv_caches`.
-pub(super) type DenseKvBuffers = (Vec<CudaSlice<f32>>, Vec<CudaSlice<f32>>);
+pub(super) type DenseKvBuffers = (Vec<KvBuf>, Vec<KvBuf>);
 
 pub(super) struct DenseLayerWeights {
     pub(super) attn_norm: Weight,
@@ -709,6 +697,10 @@ impl Model {
             attn_impl,
             attn_tiled: TiledAttnKernels::from_env()?,
             attn_decode: DecodeAttnKernels::from_env()?,
+            decode_ops: DecodeOpKernels::from_env()?,
+            decode_ws: DecodeWorkspaceSlot::from_env()?,
+            kv_dtype: Cell::new(kv_dtype_from_env()?),
+            kv_f16: KvF16Kernels::new(),
             add_k,
             split_qg_k,
             sigmoid_gate_k,
@@ -742,6 +734,11 @@ impl Model {
     /// round 2), no host round-trip. `mode` turns RoPE off and/or sets a
     /// sliding window (Kolibri-1); `post_norm`, when given, is applied to the
     /// O-proj output before the residual add (Kolibri-1's sandwich norm).
+    ///
+    /// `residual_in` is the previous layer's FFN output, not yet added to
+    /// `hidden`: the add happens here, fused with `attn_norm`
+    /// ([`Self::residual_rmsnorm`]). The O-proj residual add is fused the same
+    /// way with `ffn_norm`, whose output is returned next to `hidden`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_attn_block(
         &self,
@@ -755,19 +752,30 @@ impl Model {
         attn_bias: Option<&QkvBias>,
         mode: AttnMode,
         post_norm: Option<&Weight>,
+        ffn_norm: &Weight,
         mut hidden: CudaSlice<f32>,
+        residual_in: Option<CudaSlice<f32>>,
         position: usize,
-        k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, ReflexError> {
+        k_cache: &mut KvBuf,
+        v_cache: &mut KvBuf,
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), ReflexError> {
         let cfg = &self.cfg;
-        let normed = self.rmsnorm(
-            &hidden,
-            attn_norm.f32()?,
-            1,
-            cfg.hidden_size,
-            cfg.rmsnorm_eps,
-        )?;
+        let normed = match residual_in {
+            Some(delta) => self.residual_rmsnorm(
+                &mut hidden,
+                &delta,
+                attn_norm.f32()?,
+                cfg.hidden_size,
+                cfg.rmsnorm_eps,
+            )?,
+            None => self.rmsnorm(
+                &hidden,
+                attn_norm.f32()?,
+                1,
+                cfg.hidden_size,
+                cfg.rmsnorm_eps,
+            )?,
+        };
 
         let mut q = self.gemv(&normed, attn_q)?;
         let mut k = self.gemv(&normed, attn_k)?;
@@ -778,23 +786,39 @@ impl Model {
             self.add_inplace(&mut v, b.v.f32()?)?;
         }
 
-        if let Some(qn) = attn_q_norm {
-            q = self.rmsnorm(
-                &q,
-                qn.f32()?,
-                cfg.num_q_heads,
-                cfg.head_dim,
-                cfg.rmsnorm_eps,
-            )?;
-        }
-        if let Some(kn) = attn_k_norm {
-            k = self.rmsnorm(
-                &k,
-                kn.f32()?,
-                cfg.num_kv_heads,
-                cfg.head_dim,
-                cfg.rmsnorm_eps,
-            )?;
+        match (attn_q_norm, attn_k_norm) {
+            (Some(qn), Some(kn)) => {
+                (q, k) = self.rmsnorm_pair(
+                    &q,
+                    qn.f32()?,
+                    cfg.num_q_heads,
+                    &k,
+                    kn.f32()?,
+                    cfg.num_kv_heads,
+                    cfg.head_dim,
+                    cfg.rmsnorm_eps,
+                )?;
+            }
+            (qn, kn) => {
+                if let Some(qn) = qn {
+                    q = self.rmsnorm(
+                        &q,
+                        qn.f32()?,
+                        cfg.num_q_heads,
+                        cfg.head_dim,
+                        cfg.rmsnorm_eps,
+                    )?;
+                }
+                if let Some(kn) = kn {
+                    k = self.rmsnorm(
+                        &k,
+                        kn.f32()?,
+                        cfg.num_kv_heads,
+                        cfg.head_dim,
+                        cfg.rmsnorm_eps,
+                    )?;
+                }
+            }
         }
 
         if mode.rope {
@@ -820,22 +844,18 @@ impl Model {
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
         let offset = position * kv_stride;
-        {
-            let mut dst = k_cache.slice_mut(offset..offset + kv_stride);
-            self.device
-                .dtod_copy(&k, &mut dst)
-                .map_err(|e| crate::gpu_err!(e, "attn kv-cache dtod k: {e}"))?;
-        }
-        {
-            let mut dst = v_cache.slice_mut(offset..offset + kv_stride);
-            self.device
-                .dtod_copy(&v, &mut dst)
-                .map_err(|e| crate::gpu_err!(e, "attn kv-cache dtod v: {e}"))?;
-        }
+        self.kv_store_kv(
+            *k.device_ptr(),
+            *v.device_ptr(),
+            k_cache,
+            v_cache,
+            offset,
+            kv_stride,
+        )?;
         let seq_len = position + 1;
 
-        let k_view = k_cache.slice(0..seq_len * kv_stride);
-        let v_view = v_cache.slice(0..seq_len * kv_stride);
+        let k_view = k_cache.view(0..seq_len * kv_stride);
+        let v_view = v_cache.view(0..seq_len * kv_stride);
         let attn_out = self.attention(
             &q,
             &k_view,
@@ -850,19 +870,26 @@ impl Model {
         if let Some(w) = post_norm {
             o_proj = self.rmsnorm(&o_proj, w.f32()?, 1, cfg.hidden_size, cfg.rmsnorm_eps)?;
         }
-        self.add_inplace(&mut hidden, &o_proj)?;
-        Ok(hidden)
+        let ffn_normed = self.residual_rmsnorm(
+            &mut hidden,
+            &o_proj,
+            ffn_norm.f32()?,
+            cfg.hidden_size,
+            cfg.rmsnorm_eps,
+        )?;
+        Ok((hidden, ffn_normed))
     }
 
     pub(super) fn forward_layer_dense(
         &self,
         layer: &DenseLayerWeights,
         hidden: CudaSlice<f32>,
+        residual_in: Option<CudaSlice<f32>>,
         position: usize,
-        k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, ReflexError> {
-        let mut post_attn = self.forward_attn_block(
+        k_cache: &mut KvBuf,
+        v_cache: &mut KvBuf,
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), ReflexError> {
+        let (post_attn, ffn_normed) = self.forward_attn_block(
             &layer.attn_norm,
             &layer.attn_q,
             &layer.attn_k,
@@ -873,27 +900,21 @@ impl Model {
             layer.attn_bias.as_ref(),
             AttnMode::STANDARD,
             None,
+            &layer.ffn_norm,
             hidden,
+            residual_in,
             position,
             k_cache,
             v_cache,
         )?;
 
         let cfg = &self.cfg;
-        let ffn_normed = self.rmsnorm(
-            &post_attn,
-            layer.ffn_norm.f32()?,
-            1,
-            cfg.hidden_size,
-            cfg.rmsnorm_eps,
-        )?;
         let gate = self.gemv(&ffn_normed, &layer.ffn_gate)?;
         let up = self.gemv(&ffn_normed, &layer.ffn_up)?;
         let activated = self.silu_and_mul(&gate, &up, cfg.ffn_hidden_size)?;
         let down = self.gemv(&activated, &layer.ffn_down)?;
 
-        self.add_inplace(&mut post_attn, &down)?;
-        Ok(post_attn)
+        Ok((post_attn, down))
     }
 
     /// Same attention block as [`Self::forward_layer_dense`], but the shared
@@ -912,11 +933,12 @@ impl Model {
         &self,
         layer: &MoeLayerWeights,
         hidden: CudaSlice<f32>,
+        residual_in: Option<CudaSlice<f32>>,
         position: usize,
-        k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, ReflexError> {
-        let mut post_attn = self.forward_attn_block(
+        k_cache: &mut KvBuf,
+        v_cache: &mut KvBuf,
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), ReflexError> {
+        let (post_attn, ffn_normed) = self.forward_attn_block(
             &layer.attn_norm,
             &layer.attn_q,
             &layer.attn_k,
@@ -927,20 +949,15 @@ impl Model {
             layer.attn_bias.as_ref(),
             AttnMode::STANDARD,
             None,
+            &layer.ffn_norm,
             hidden,
+            residual_in,
             position,
             k_cache,
             v_cache,
         )?;
 
         let cfg = &self.cfg;
-        let ffn_normed = self.rmsnorm(
-            &post_attn,
-            layer.ffn_norm.f32()?,
-            1,
-            cfg.hidden_size,
-            cfg.rmsnorm_eps,
-        )?;
 
         let router_logits_dev = self.gemv(&ffn_normed, &layer.ffn_gate_inp)?;
         let router_logits = self
@@ -967,8 +984,7 @@ impl Model {
             &mut ffn_out_dev,
         )?;
 
-        self.add_inplace(&mut post_attn, &ffn_out_dev)?;
-        Ok(post_attn)
+        Ok((post_attn, ffn_out_dev))
     }
 
     /// Single-token routed-expert FFN: for each `(expert, weight)` in `routed`,
@@ -1139,11 +1155,12 @@ impl Model {
         &self,
         layer: &KolibriLayerWeights,
         hidden: CudaSlice<f32>,
+        residual_in: Option<CudaSlice<f32>>,
         position: usize,
-        k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, ReflexError> {
-        let mut post_attn = self.forward_attn_block(
+        k_cache: &mut KvBuf,
+        v_cache: &mut KvBuf,
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), ReflexError> {
+        let (post_attn, ffn_normed) = self.forward_attn_block(
             &layer.attn_norm,
             &layer.attn_q,
             &layer.attn_k,
@@ -1154,20 +1171,15 @@ impl Model {
             None,
             layer.attn_mode,
             Some(&layer.post_attention_norm),
+            &layer.ffn_norm,
             hidden,
+            residual_in,
             position,
             k_cache,
             v_cache,
         )?;
 
         let cfg = &self.cfg;
-        let ffn_normed = self.rmsnorm(
-            &post_attn,
-            layer.ffn_norm.f32()?,
-            1,
-            cfg.hidden_size,
-            cfg.rmsnorm_eps,
-        )?;
 
         let shared_hidden_size = layer.ffn_gate_shexp.shape[1] as usize;
         let shared_gate = self.gemv(&ffn_normed, &layer.ffn_gate_shexp)?;
@@ -1207,25 +1219,31 @@ impl Model {
             cfg.hidden_size,
             cfg.rmsnorm_eps,
         )?;
-        self.add_inplace(&mut post_attn, &ffn_out)?;
-        Ok(post_attn)
+        Ok((post_attn, ffn_out))
     }
 
+    /// One decode layer. Returns `hidden` and the layer's FFN output *not yet
+    /// added* to it: pass that as the next layer's `residual_in`, which adds it
+    /// inside its attention norm (one launch instead of two), and add the last
+    /// layer's yourself.
     pub(super) fn forward_layer(
         &self,
         layer: &LayerWeights,
         hidden: CudaSlice<f32>,
+        residual_in: Option<CudaSlice<f32>>,
         position: usize,
-        k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>,
-    ) -> Result<CudaSlice<f32>, ReflexError> {
+        k_cache: &mut KvBuf,
+        v_cache: &mut KvBuf,
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), ReflexError> {
         match layer {
             LayerWeights::Dense(l) => {
-                self.forward_layer_dense(l, hidden, position, k_cache, v_cache)
+                self.forward_layer_dense(l, hidden, residual_in, position, k_cache, v_cache)
             }
-            LayerWeights::Moe(l) => self.forward_layer_moe(l, hidden, position, k_cache, v_cache),
+            LayerWeights::Moe(l) => {
+                self.forward_layer_moe(l, hidden, residual_in, position, k_cache, v_cache)
+            }
             LayerWeights::Kolibri(l) => {
-                self.forward_layer_kolibri(l, hidden, position, k_cache, v_cache)
+                self.forward_layer_kolibri(l, hidden, residual_in, position, k_cache, v_cache)
             }
         }
     }
@@ -1253,8 +1271,8 @@ impl Model {
         mut hidden: CudaSlice<f32>,
         start_pos: usize,
         rows: usize,
-        k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>,
+        k_cache: &mut KvBuf,
+        v_cache: &mut KvBuf,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &self.cfg;
         let kind = mode.profile_kind();
@@ -1322,23 +1340,19 @@ impl Model {
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
         let offset = start_pos * kv_stride;
         let write_len = rows * kv_stride;
-        {
-            let mut dst = k_cache.slice_mut(offset..offset + write_len);
-            self.device
-                .dtod_copy(&k, &mut dst)
-                .map_err(|e| crate::gpu_err!(e, "attn_batched kv-cache dtod k: {e}"))?;
-        }
-        {
-            let mut dst = v_cache.slice_mut(offset..offset + write_len);
-            self.device
-                .dtod_copy(&v, &mut dst)
-                .map_err(|e| crate::gpu_err!(e, "attn_batched kv-cache dtod v: {e}"))?;
-        }
+        self.kv_store_kv(
+            *k.device_ptr(),
+            *v.device_ptr(),
+            k_cache,
+            v_cache,
+            offset,
+            write_len,
+        )?;
         prof_mark(PrefillPhase::KvCopy, kind)?;
         let seq_len = start_pos + rows;
 
-        let k_view = k_cache.slice(0..seq_len * kv_stride);
-        let v_view = v_cache.slice(0..seq_len * kv_stride);
+        let k_view = k_cache.view(0..seq_len * kv_stride);
+        let v_view = v_cache.view(0..seq_len * kv_stride);
         let attn_out = self.attention_prefill(
             &q,
             &k_view,
@@ -1371,8 +1385,8 @@ impl Model {
         hidden: CudaSlice<f32>,
         start_pos: usize,
         rows: usize,
-        k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>,
+        k_cache: &mut KvBuf,
+        v_cache: &mut KvBuf,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut post_attn = self.forward_attn_block_batched(
             &layer.attn_norm,
@@ -1496,8 +1510,8 @@ impl Model {
         hidden: CudaSlice<f32>,
         start_pos: usize,
         rows: usize,
-        k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>,
+        k_cache: &mut KvBuf,
+        v_cache: &mut KvBuf,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut post_attn = self.forward_attn_block_batched(
             &layer.attn_norm,
@@ -1571,8 +1585,8 @@ impl Model {
         hidden: CudaSlice<f32>,
         start_pos: usize,
         rows: usize,
-        k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>,
+        k_cache: &mut KvBuf,
+        v_cache: &mut KvBuf,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut post_attn = self.forward_attn_block_batched(
             &layer.attn_norm,
@@ -1666,8 +1680,8 @@ impl Model {
         hidden: CudaSlice<f32>,
         start_pos: usize,
         rows: usize,
-        k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>,
+        k_cache: &mut KvBuf,
+        v_cache: &mut KvBuf,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         match layer {
             LayerWeights::Dense(l) => {
@@ -1763,14 +1777,12 @@ impl Model {
 
         let kv_stride = self.cfg.num_kv_heads * self.cfg.head_dim;
         let total_len = start_pos + rows + extra_headroom;
-        let mut k_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
-            .map(|_| self.device.alloc_zeros::<f32>(total_len * kv_stride))
-            .collect::<Result<_, _>>()
-            .map_err(|e| crate::gpu_err!(e, "alloc k_cache: {e}"))?;
-        let mut v_caches: Vec<CudaSlice<f32>> = (0..self.layers.len())
-            .map(|_| self.device.alloc_zeros::<f32>(total_len * kv_stride))
-            .collect::<Result<_, _>>()
-            .map_err(|e| crate::gpu_err!(e, "alloc v_cache: {e}"))?;
+        let mut k_caches: Vec<KvBuf> = (0..self.layers.len())
+            .map(|_| self.alloc_kv(total_len * kv_stride, "k_cache"))
+            .collect::<Result<_, _>>()?;
+        let mut v_caches: Vec<KvBuf> = (0..self.layers.len())
+            .map(|_| self.alloc_kv(total_len * kv_stride, "v_cache"))
+            .collect::<Result<_, _>>()?;
 
         let imported_len = start_pos * kv_stride;
         match imported {
@@ -1798,13 +1810,18 @@ impl Model {
                 {
                     check_state_len(k_host, imported_len, "k_cache", layer_idx)?;
                     check_state_len(v_host, imported_len, "v_cache", layer_idx)?;
-                    jobs.push((*k_caches[layer_idx].device_ptr(), k_host));
-                    jobs.push((*v_caches[layer_idx].device_ptr(), v_host));
+                    let k = &k_caches[layer_idx];
+                    let v = &v_caches[layer_idx];
+                    jobs.push((k.ptr_at(0), k.dtype(), k_host));
+                    jobs.push((v.ptr_at(0), v.dtype(), v_host));
                 }
+                let narrow = self.kv_narrow_kernel()?;
                 self.timed_prefix_copy(copy_ms, || {
-                    self.dequant_pipeline
-                        .borrow_mut()
-                        .upload_state(&jobs, &self.dequant_kernels.f16_to_f32_runs)
+                    self.dequant_pipeline.borrow_mut().upload_state(
+                        &jobs,
+                        &self.dequant_kernels.f16_to_f32_runs,
+                        narrow,
+                    )
                 })?;
             }
             Some(PrefixSource::Device { state, copy_ms }) => {
@@ -1820,22 +1837,18 @@ impl Model {
                     for (layer_idx, (k_src, v_src)) in
                         state.k_caches.iter().zip(&state.v_caches).enumerate()
                     {
-                        self.device
-                            .dtod_copy(
-                                &k_src.slice(0..imported_len),
-                                &mut k_caches[layer_idx].slice_mut(0..imported_len),
-                            )
-                            .map_err(|e| {
-                                crate::gpu_err!(e, "fork k_cache layer {layer_idx}: {e}")
-                            })?;
-                        self.device
-                            .dtod_copy(
-                                &v_src.slice(0..imported_len),
-                                &mut v_caches[layer_idx].slice_mut(0..imported_len),
-                            )
-                            .map_err(|e| {
-                                crate::gpu_err!(e, "fork v_cache layer {layer_idx}: {e}")
-                            })?;
+                        self.kv_copy_prefix(
+                            k_src,
+                            &mut k_caches[layer_idx],
+                            imported_len,
+                            &format!("fork k_cache layer {layer_idx}"),
+                        )?;
+                        self.kv_copy_prefix(
+                            v_src,
+                            &mut v_caches[layer_idx],
+                            imported_len,
+                            &format!("fork v_cache layer {layer_idx}"),
+                        )?;
                     }
                     Ok(())
                 })?;
@@ -1959,12 +1972,24 @@ impl Model {
             &picker.stream_text(&self.tokenizer, &mut pending_bytes, next_id),
         );
 
+        let use_ws = self.decode_ws_enabled();
+        let mut logits = Vec::new();
         while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
-            hidden =
-                self.forward_one_token_dense(next_id, position, &mut k_caches, &mut v_caches)?;
+            if use_ws {
+                self.decode_step_dense_ws(
+                    next_id,
+                    position,
+                    &mut k_caches,
+                    &mut v_caches,
+                    &mut logits,
+                )?;
+            } else {
+                hidden =
+                    self.forward_one_token_dense(next_id, position, &mut k_caches, &mut v_caches)?;
+                logits =
+                    self.lm_head_logits(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
+            }
             position += 1;
-            let mut logits =
-                self.lm_head_logits(&hidden, self.cfg.hidden_size, self.cfg.rmsnorm_eps)?;
             next_id = picker.pick(&mut logits)?;
             generated.push(next_id);
             on_token(
@@ -2055,21 +2080,28 @@ impl Model {
         &self,
         token_id: u32,
         position: usize,
-        k_caches: &mut [CudaSlice<f32>],
-        v_caches: &mut [CudaSlice<f32>],
+        k_caches: &mut [KvBuf],
+        v_caches: &mut [KvBuf],
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let mut hidden = self
             .device
             .htod_sync_copy(&self.token_embd.row(token_id)?)
             .map_err(|e| crate::gpu_err!(e, "embedding htod: {e}"))?;
+        let mut residual = None;
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            hidden = self.forward_layer(
+            let (h, ffn_out) = self.forward_layer(
                 layer,
                 hidden,
+                residual,
                 position,
                 &mut k_caches[layer_idx],
                 &mut v_caches[layer_idx],
             )?;
+            hidden = h;
+            residual = Some(ffn_out);
+        }
+        if let Some(ffn_out) = residual {
+            self.add_inplace(&mut hidden, &ffn_out)?;
         }
         Ok(hidden)
     }
@@ -2142,7 +2174,7 @@ impl Model {
                 v_caches,
                 space_prefix_next,
             },
-            crate::kv_io::KvDtype::F32,
+            self.kv_cache_dtype(),
         )?;
         Ok((generated, text, cache))
     }
@@ -2157,10 +2189,10 @@ impl Model {
     ) -> Result<crate::kv_io::DenseKvCache, ReflexError> {
         let per_layer_len = d.seq_len * self.cfg.num_kv_heads * self.cfg.head_dim;
         let mut dl = StateDownload::new(self, dtype)?;
-        let mut download = |caches: &[CudaSlice<f32>], what: &str| {
+        let mut download = |caches: &[KvBuf], what: &str| {
             caches
                 .iter()
-                .map(|c| dl.get(c, per_layer_len, dtype, what))
+                .map(|c| dl.get_kv(c, per_layer_len, dtype, what))
                 .collect::<Result<Vec<_>, _>>()
         };
         let k_caches = download(&d.k_caches, "k_cache")?;

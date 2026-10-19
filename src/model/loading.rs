@@ -2001,20 +2001,30 @@ impl WeightLoadPipeline {
     /// alternating small copies and launches (T4). The landing buffer is reused
     /// chunk after chunk without a wait: its next H2D is queued on the same
     /// stream as the kernel that reads it.
+    ///
+    /// Each job names its destination's element type: an f16 working cache
+    /// (`REFLEX_KV_CACHE=f16`) takes an f16 file's values as they are, and an f32
+    /// file's through the landing buffer and `narrow` (`kv_store_f16_kernel`,
+    /// the rounding every f16 cache write uses), which such a job requires.
     pub(super) fn upload_state(
         &mut self,
-        jobs: &[(sys::CUdeviceptr, &crate::kv_io::KvValues)],
+        jobs: &[(
+            sys::CUdeviceptr,
+            crate::kv_io::KvDtype,
+            &crate::kv_io::KvValues,
+        )],
         widen: &AotKernel,
+        narrow: Option<&AotKernel>,
     ) -> Result<(), ReflexError> {
         use crate::kv_io::KvDtype;
-        if self.state_f16.is_none() && jobs.iter().any(|(_, v)| v.dtype() == KvDtype::F16) {
+        if self.state_f16.is_none() && jobs.iter().any(|(_, d, v)| *d != v.dtype()) {
             let buf = unsafe { self.device.alloc::<u8>(STATE_CHUNK_BYTES) }
                 .map_err(|e| crate::gpu_err!(e, "alloc f16 state landing buffer: {e}"))?;
             self.state_f16 = Some(buf);
         }
         // (job, byte offset, len) pieces, packed into chunks in order.
         let mut pieces: Vec<(usize, usize, usize)> = Vec::new();
-        for (j, (_, values)) in jobs.iter().enumerate() {
+        for (j, (_, _, values)) in jobs.iter().enumerate() {
             let total = values.byte_len();
             let mut off = 0;
             while off < total {
@@ -2045,24 +2055,40 @@ impl WeightLoadPipeline {
             unsafe { self.pinned[slot].ensure_capacity(total)? };
             let mut at = 0;
             let mut runs = Vec::new();
+            // (f16 destination, byte offset in the chunk, f32 elements)
+            let mut narrows = Vec::new();
             for &(j, off, len) in &pieces[i..end] {
-                let (dst, values) = jobs[j];
+                let (dst, dst_dtype, values) = jobs[j];
                 // SAFETY: the slot holds `total` bytes and no copy reads it
                 // (waited above); pieces are disjoint ranges of it.
                 let staged =
                     unsafe { std::slice::from_raw_parts_mut(self.pinned[slot].ptr.add(at), len) };
                 values.read_bytes(off, staged)?;
-                match values.dtype() {
-                    KvDtype::F32 => {
+                match (dst_dtype, values.dtype()) {
+                    (KvDtype::F32, KvDtype::F32) | (KvDtype::F16, KvDtype::F16) => {
                         unsafe { result::memcpy_htod_async(dst + off as u64, &*staged, stream) }
                             .map_err(|e| crate::gpu_err!(e, "state upload: async H2D copy: {e}"))?
                     }
                     // (f32 destination, element offset in the chunk, elements)
-                    KvDtype::F16 => runs.push((dst + (off / 2 * 4) as u64, at / 2, len / 2)),
+                    (KvDtype::F32, KvDtype::F16) => {
+                        runs.push((dst + (off / 2 * 4) as u64, at / 2, len / 2))
+                    }
+                    (KvDtype::F16, KvDtype::F32) => {
+                        // f32 pieces only ever follow other f32 pieces here (a file
+                        // mixes types only as f16 K/V next to f32 recurrent state,
+                        // which stays f32), so the landing offset is f32-aligned.
+                        if at % 4 != 0 {
+                            return Err(crate::reflex_err!(
+                                Other,
+                                "internal: misaligned f32 state piece at byte {at}"
+                            ));
+                        }
+                        narrows.push((dst + (off / 4 * 2) as u64, at, len / 4))
+                    }
                 }
                 at += len;
             }
-            if !runs.is_empty() {
+            if !runs.is_empty() || !narrows.is_empty() {
                 let landing = *self
                     .state_f16
                     .as_ref()
@@ -2100,6 +2126,21 @@ impl WeightLoadPipeline {
                             .launch(cfg, (landing, list, batch.len() as u32))
                     }
                     .map_err(|e| crate::gpu_err!(e, "state upload: f16_to_f32_runs launch: {e}"))?;
+                }
+                for &(dst, at, n) in &narrows {
+                    let narrow = narrow.ok_or_else(|| {
+                        crate::reflex_err!(
+                            Other,
+                            "internal: f32 state into an f16 cache without kv_store_f16"
+                        )
+                    })?;
+                    unsafe {
+                        narrow.function.clone().launch(
+                            elementwise_launch_cfg(n),
+                            (landing + at as u64, dst, n as u64),
+                        )
+                    }
+                    .map_err(|e| crate::gpu_err!(e, "state upload: kv_store_f16 launch: {e}"))?;
                 }
             }
             unsafe { result::event::record(self.pinned_done[slot], stream) }

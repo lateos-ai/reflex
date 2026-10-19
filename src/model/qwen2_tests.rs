@@ -471,6 +471,23 @@ fn qwen2_fixture_generates_without_error() {
     assert!(!greedy(&model, "Once upon a time", 5).is_empty());
 }
 
+/// The workspace decode step (`decode_step.rs`, Q/K/V biases added in place in
+/// the workspace and the K/V cache rows) gives the allocating path's logits, bit
+/// for bit, with f32 and f16 weights.
+#[test]
+#[ignore]
+fn qwen2_fixture_decode_workspace_matches_allocating() {
+    let Some(file) = fixture() else { return };
+    for weights in [WeightsDtype::F32, WeightsDtype::F16] {
+        let model = load(&file, weights, None);
+        super::decode_step_tests::assert_workspace_step_matches_allocating(
+            &model,
+            "Once upon a time",
+            10,
+        );
+    }
+}
+
 /// Token-for-token greedy agreement with llama.cpp, f32 weights.
 #[test]
 #[ignore]

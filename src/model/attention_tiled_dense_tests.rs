@@ -102,10 +102,10 @@ fn attention_tiled_small_dims_match_online_kernel() {
         assert!(attn_tiled_fits(&shape()), "shape should be supported");
         let kernel = model
             .attn_tiled
-            .kernel(&model.device, c.head_dim)
+            .kernel(&model.device, c.head_dim, crate::kv_io::KvDtype::F32)
             .expect("load tiled module")
             .expect("a kernel for this head dim");
-        let (k_v, v_v) = (k_d.slice(..), v_d.slice(..));
+        let (k_v, v_v) = (KvView::F32(k_d.slice(..)), KvView::F32(v_d.slice(..)));
         let tiled = launch_attention_tiled(&model.device, kernel, &q_d, &k_v, &v_v, &shape())
             .expect("tiled launch");
         let online = model
@@ -226,8 +226,12 @@ fn attention_tiled_crossover_timings() {
                 scale: 0.1,
                 window: 0,
             };
-            let kernel = model.attn_tiled.kernel(dev, head_dim).unwrap().unwrap();
-            let (kv, vv) = (k.slice(..), v.slice(..));
+            let kernel = model
+                .attn_tiled
+                .kernel(dev, head_dim, crate::kv_io::KvDtype::F32)
+                .unwrap()
+                .unwrap();
+            let (kv, vv) = (KvView::F32(k.slice(..)), KvView::F32(v.slice(..)));
             let time = |f: &dyn Fn()| {
                 f();
                 dev.synchronize().unwrap();
@@ -263,7 +267,11 @@ fn attention_tiled_crossover_timings_resumed() {
     let model = load_test_model(WeightsDtype::DEFAULT);
     let dev = &model.device;
     for (num_q_heads, num_kv_heads, head_dim) in [(16, 8, 128), (32, 8, 128), (14, 2, 64)] {
-        let kernel = model.attn_tiled.kernel(dev, head_dim).unwrap().unwrap();
+        let kernel = model
+            .attn_tiled
+            .kernel(dev, head_dim, crate::kv_io::KvDtype::F32)
+            .unwrap()
+            .unwrap();
         for start_pos in [0, 16, 32, 64, 128, 256, 512, 1024, 2048] {
             for rows in [2, 4, 8, 16, 32, 48, 63] {
                 let kv_stride = num_kv_heads * head_dim;
@@ -290,7 +298,7 @@ fn attention_tiled_crossover_timings_resumed() {
                     scale: 0.1,
                     window: 0,
                 };
-                let (kv, vv) = (k.slice(..), v.slice(..));
+                let (kv, vv) = (KvView::F32(k.slice(..)), KvView::F32(v.slice(..)));
                 let time = |f: &dyn Fn()| {
                     f();
                     dev.synchronize().unwrap();
