@@ -10,5 +10,5 @@ extern "C" __global__ void __launch_bounds__(TA_THREADS, 2) attention_tiled_d128
     AttnParams p,
     unsigned int rows
 ) {
-    attention_tiled<128, 64>(q, k, v, dst, p, rows);
+    attention_tiled<float, 128, 64>(q, k, v, dst, p, rows);
 }

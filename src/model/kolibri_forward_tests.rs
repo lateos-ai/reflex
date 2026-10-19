@@ -303,8 +303,8 @@ fn kolibri1_sliding_window_attention_matches_host_reference() {
             let out = if rows == 1 {
                 model.attention(
                     &qd,
-                    &kd.slice(..),
-                    &vd.slice(..),
+                    &KvView::F32(kd.slice(..)),
+                    &KvView::F32(vd.slice(..)),
                     hq,
                     hkv,
                     d,
@@ -314,8 +314,8 @@ fn kolibri1_sliding_window_attention_matches_host_reference() {
             } else {
                 model.attention_prefill(
                     &qd,
-                    &kd.slice(..),
-                    &vd.slice(..),
+                    &KvView::F32(kd.slice(..)),
+                    &KvView::F32(vd.slice(..)),
                     hq,
                     hkv,
                     d,

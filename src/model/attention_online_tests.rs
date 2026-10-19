@@ -72,12 +72,21 @@ fn online_attention_matches_legacy_kernels_gqa() {
         let k = upload(model, &pseudo_random(positions * hkv * d, seed + 1));
         let v = upload(model, &pseudo_random(positions * hkv * d, seed + 2));
         let out = if rows == 1 {
-            model.attention(&q, &k.slice(..), &v.slice(..), hq, hkv, d, positions, 0)
+            model.attention(
+                &q,
+                &KvView::F32(k.slice(..)),
+                &KvView::F32(v.slice(..)),
+                hq,
+                hkv,
+                d,
+                positions,
+                0,
+            )
         } else {
             model.attention_prefill(
                 &q,
-                &k.slice(..),
-                &v.slice(..),
+                &KvView::F32(k.slice(..)),
+                &KvView::F32(v.slice(..)),
                 hq,
                 hkv,
                 d,
@@ -140,12 +149,21 @@ fn online_attention_matches_legacy_kernels_mla() {
         let kv = upload(model, &pseudo_random(positions * qk_dim, seed + 1));
         let m = model.mla.as_ref().unwrap();
         let out = if rows == 1 {
-            model.mla_attention(m, &q, &kv.slice(..), hq, qk_dim, v_dim, positions, scale)
+            model.mla_attention(
+                m,
+                &q,
+                &KvView::F32(kv.slice(..)),
+                hq,
+                qk_dim,
+                v_dim,
+                positions,
+                scale,
+            )
         } else {
             model.mla_attention_prefill(
                 m,
                 &q,
-                &kv.slice(..),
+                &KvView::F32(kv.slice(..)),
                 hq,
                 qk_dim,
                 v_dim,

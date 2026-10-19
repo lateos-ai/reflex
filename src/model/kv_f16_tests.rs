@@ -51,16 +51,21 @@ fn round_in_place(model: &Model, p: &mut PinnedPrefix, what: Round) {
     let round = |b: &mut CudaSlice<f32>| {
         f16_roundtrip_in_place(&model.dequant_kernels, b).expect("f16 roundtrip")
     };
+    let round_kv = |b: &mut KvBuf| round(b.f32_mut().expect("an f32 cache"));
     match (&mut p.state, what) {
         (_, Round::None) => {}
-        (DeviceState::Dense(d), _) => d.k_caches.iter_mut().chain(&mut d.v_caches).for_each(round),
-        (DeviceState::Mla(d), _) => d.kv_caches.iter_mut().for_each(round),
+        (DeviceState::Dense(d), _) => d
+            .k_caches
+            .iter_mut()
+            .chain(&mut d.v_caches)
+            .for_each(round_kv),
+        (DeviceState::Mla(d), _) => d.kv_caches.iter_mut().for_each(round_kv),
         (DeviceState::Hybrid(h), what) => {
             for layer in &mut h.layers {
                 match layer {
                     HybridLayerState::Attn { k_cache, v_cache } => {
-                        round(k_cache);
-                        round(v_cache);
+                        round_kv(k_cache);
+                        round_kv(v_cache);
                     }
                     HybridLayerState::Gdn {
                         conv_state,
@@ -198,11 +203,15 @@ fn upload_state_widens_f16_runs_exactly() {
             .iter()
             .map(|v| model.device.alloc_zeros::<f32>(v.len() + 3).unwrap())
             .collect();
-        let jobs: Vec<_> = bufs.iter().map(|b| *b.device_ptr()).zip(values).collect();
+        let jobs: Vec<_> = bufs
+            .iter()
+            .zip(values)
+            .map(|(b, v)| (*b.device_ptr(), KvDtype::F32, v))
+            .collect();
         model
             .dequant_pipeline
             .borrow_mut()
-            .upload_state(&jobs, &model.dequant_kernels.f16_to_f32_runs)
+            .upload_state(&jobs, &model.dequant_kernels.f16_to_f32_runs, None)
             .expect("upload_state");
         for (k, (b, want)) in bufs.iter().zip(&expect).enumerate() {
             let got = model.device.dtoh_sync_copy(b).unwrap();
@@ -270,13 +279,13 @@ fn upload_state_widens_f16_runs_exactly() {
         .collect();
     let jobs: Vec<_> = bufs
         .iter()
-        .map(|b| *b.device_ptr())
         .zip(&from_file)
+        .map(|(b, v)| (*b.device_ptr(), KvDtype::F32, v))
         .collect();
     model
         .dequant_pipeline
         .borrow_mut()
-        .upload_state(&jobs, &model.dequant_kernels.f16_to_f32_runs)
+        .upload_state(&jobs, &model.dequant_kernels.f16_to_f32_runs, None)
         .expect("upload_state from a file");
     for (k, (b, v)) in bufs.iter().zip(&padded).enumerate() {
         assert_eq!(

@@ -11,7 +11,7 @@ extern "C" __global__ void __launch_bounds__(TA_THREADS, 2) attention_tiled_d256
     AttnParams p,
     unsigned int rows
 ) {
-    attention_tiled<256, 64>(q, k, v, dst, p, rows);
+    attention_tiled<float, 256, 64>(q, k, v, dst, p, rows);
 }
 
 extern "C" __global__ void __launch_bounds__(TA_THREADS, 2) attention_tiled_d512_kernel(
@@ -22,5 +22,5 @@ extern "C" __global__ void __launch_bounds__(TA_THREADS, 2) attention_tiled_d512
     AttnParams p,
     unsigned int rows
 ) {
-    attention_tiled<512, 32>(q, k, v, dst, p, rows);
+    attention_tiled<float, 512, 32>(q, k, v, dst, p, rows);
 }

@@ -130,8 +130,8 @@ pub(super) enum HybridLayerWeights {
 /// place on-device by `Model::gdn_conv`/`Model::gdn_delta`.
 pub(super) enum HybridLayerState {
     Attn {
-        k_cache: CudaSlice<f32>,
-        v_cache: CudaSlice<f32>,
+        k_cache: KvBuf,
+        v_cache: KvBuf,
     },
     Gdn {
         conv_state: CudaSlice<f32>,
@@ -565,6 +565,10 @@ impl Model {
             attn_impl,
             attn_tiled: TiledAttnKernels::from_env()?,
             attn_decode: DecodeAttnKernels::from_env()?,
+            decode_ops: DecodeOpKernels::from_env()?,
+            decode_ws: DecodeWorkspaceSlot::from_env()?,
+            kv_dtype: Cell::new(kv_dtype_from_env()?),
+            kv_f16: KvF16Kernels::new(),
             add_k,
             split_qg_k,
             sigmoid_gate_k,
@@ -956,8 +960,8 @@ impl Model {
         w: &GatedAttnLayerWeights,
         mut hidden: CudaSlice<f32>,
         position: usize,
-        k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>,
+        k_cache: &mut KvBuf,
+        v_cache: &mut KvBuf,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &h.attn_cfg;
         let normed = self.rmsnorm(
@@ -1044,22 +1048,18 @@ impl Model {
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
         let offset = position * kv_stride;
-        {
-            let mut dst = k_cache.slice_mut(offset..offset + kv_stride);
-            self.device
-                .dtod_copy(&k, &mut dst)
-                .map_err(|e| crate::gpu_err!(e, "gated-attn kv-cache dtod k: {e}"))?;
-        }
-        {
-            let mut dst = v_cache.slice_mut(offset..offset + kv_stride);
-            self.device
-                .dtod_copy(&v, &mut dst)
-                .map_err(|e| crate::gpu_err!(e, "gated-attn kv-cache dtod v: {e}"))?;
-        }
+        self.kv_store_kv(
+            *k.device_ptr(),
+            *v.device_ptr(),
+            k_cache,
+            v_cache,
+            offset,
+            kv_stride,
+        )?;
         let seq_len = position + 1;
 
-        let k_view = k_cache.slice(0..seq_len * kv_stride);
-        let v_view = v_cache.slice(0..seq_len * kv_stride);
+        let k_view = k_cache.view(0..seq_len * kv_stride);
+        let v_view = v_cache.view(0..seq_len * kv_stride);
         let mut attn_out = self.attention(
             &q,
             &k_view,
@@ -1112,8 +1112,8 @@ impl Model {
         mut hidden: CudaSlice<f32>,
         start_pos: usize,
         rows: usize,
-        k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>,
+        k_cache: &mut KvBuf,
+        v_cache: &mut KvBuf,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &h.attn_cfg;
         let normed = self.rmsnorm(
@@ -1205,23 +1205,19 @@ impl Model {
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
         let offset = start_pos * kv_stride;
         let write_len = rows * kv_stride;
-        {
-            let mut dst = k_cache.slice_mut(offset..offset + write_len);
-            self.device
-                .dtod_copy(&k, &mut dst)
-                .map_err(|e| crate::gpu_err!(e, "gated-attn-batched kv-cache dtod k: {e}"))?;
-        }
-        {
-            let mut dst = v_cache.slice_mut(offset..offset + write_len);
-            self.device
-                .dtod_copy(&v, &mut dst)
-                .map_err(|e| crate::gpu_err!(e, "gated-attn-batched kv-cache dtod v: {e}"))?;
-        }
+        self.kv_store_kv(
+            *k.device_ptr(),
+            *v.device_ptr(),
+            k_cache,
+            v_cache,
+            offset,
+            write_len,
+        )?;
         prof_mark(PrefillPhase::KvCopy, LayerKind::Attn)?;
         let seq_len = start_pos + rows;
 
-        let k_view = k_cache.slice(0..seq_len * kv_stride);
-        let v_view = v_cache.slice(0..seq_len * kv_stride);
+        let k_view = k_cache.view(0..seq_len * kv_stride);
+        let v_view = v_cache.view(0..seq_len * kv_stride);
         let mut attn_out = self.attention_prefill(
             &q,
             &k_view,
@@ -1687,8 +1683,8 @@ impl Model {
             .map(|l| -> Result<HybridLayerState, ReflexError> {
                 Ok(match l {
                     HybridLayerWeights::GatedAttention(_) => HybridLayerState::Attn {
-                        k_cache: alloc(attn_kv_cache_len, "k_cache")?,
-                        v_cache: alloc(attn_kv_cache_len, "v_cache")?,
+                        k_cache: self.alloc_kv(attn_kv_cache_len, "k_cache")?,
+                        v_cache: self.alloc_kv(attn_kv_cache_len, "v_cache")?,
                     },
                     HybridLayerWeights::GatedDeltaNet(_) => HybridLayerState::Gdn {
                         conv_state: alloc(h.gdn_cfg.conv_state_len(), "conv_state")?,
@@ -1731,8 +1727,8 @@ impl Model {
                         ) => {
                             check_state_len(k_host, imported_len, "k_cache", layer_idx)?;
                             check_state_len(v_host, imported_len, "v_cache", layer_idx)?;
-                            jobs.push((*k_cache.device_ptr(), k_host));
-                            jobs.push((*v_cache.device_ptr(), v_host));
+                            jobs.push((k_cache.ptr_at(0), k_cache.dtype(), k_host));
+                            jobs.push((v_cache.ptr_at(0), v_cache.dtype(), v_host));
                         }
                         (
                             HybridLayerState::Gdn {
@@ -1747,8 +1743,17 @@ impl Model {
                             if c_host.len() != conv_state.len() || r_host.len() != recurrent.len() {
                                 return Err(crate::reflex_err!(KvCache, "imported hybrid KV cache layer {layer_idx} Gdn state size mismatch"));
                             }
-                            jobs.push((*conv_state.device_ptr(), c_host));
-                            jobs.push((*recurrent.device_ptr(), r_host));
+                            // GatedDeltaNet state stays f32 whatever the KV cache type.
+                            jobs.push((
+                                *conv_state.device_ptr(),
+                                crate::kv_io::KvDtype::F32,
+                                c_host,
+                            ));
+                            jobs.push((
+                                *recurrent.device_ptr(),
+                                crate::kv_io::KvDtype::F32,
+                                r_host,
+                            ));
                         }
                         (HybridLayerState::Attn { .. }, Data::Gdn { .. }) => {
                             return Err(crate::reflex_err!(KvCache, "imported hybrid KV cache layer {layer_idx} is Gdn-kind but model layer is GatedAttention"));
@@ -1758,10 +1763,13 @@ impl Model {
                         }
                     }
                 }
+                let narrow = self.kv_narrow_kernel()?;
                 self.timed_prefix_copy(copy_ms, || {
-                    self.dequant_pipeline
-                        .borrow_mut()
-                        .upload_state(&jobs, &self.dequant_kernels.f16_to_f32_runs)
+                    self.dequant_pipeline.borrow_mut().upload_state(
+                        &jobs,
+                        &self.dequant_kernels.f16_to_f32_runs,
+                        narrow,
+                    )
                 })?;
             }
             Some(PrefixSource::Device { state, copy_ms }) => {
@@ -1784,18 +1792,9 @@ impl Model {
                                     v_cache: v_src,
                                 },
                             ) => {
-                                self.device
-                                    .dtod_copy(
-                                        &k_src.slice(0..imported_len),
-                                        &mut k_cache.slice_mut(0..imported_len),
-                                    )
-                                    .map_err(fork_err)?;
-                                self.device
-                                    .dtod_copy(
-                                        &v_src.slice(0..imported_len),
-                                        &mut v_cache.slice_mut(0..imported_len),
-                                    )
-                                    .map_err(fork_err)?;
+                                let what = format!("fork hybrid state layer {layer_idx}");
+                                self.kv_copy_prefix(k_src, k_cache, imported_len, &what)?;
+                                self.kv_copy_prefix(v_src, v_cache, imported_len, &what)?;
                             }
                             (
                                 HybridLayerState::Gdn {
@@ -2089,7 +2088,7 @@ impl Model {
         let cache = self.download_hybrid_state(
             h,
             &HybridDeviceState { seq_len, layers },
-            crate::kv_io::KvDtype::F32,
+            self.kv_cache_dtype(),
         )?;
         Ok((generated, text, cache))
     }
@@ -2112,8 +2111,8 @@ impl Model {
             match state {
                 HybridLayerState::Attn { k_cache, v_cache } => {
                     layers.push(crate::kv_io::HybridLayerCacheData::Attn {
-                        k_cache: dl.get(k_cache, attn_len, dtype, "hybrid k_cache")?,
-                        v_cache: dl.get(v_cache, attn_len, dtype, "hybrid v_cache")?,
+                        k_cache: dl.get_kv(k_cache, attn_len, dtype, "hybrid k_cache")?,
+                        v_cache: dl.get_kv(v_cache, attn_len, dtype, "hybrid v_cache")?,
                     });
                 }
                 HybridLayerState::Gdn {
