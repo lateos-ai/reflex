@@ -358,6 +358,17 @@ in `test-data/` locally:
 - Tests that need a real model read its path from `REFLEX_TEST_GGUF`. The nightly
   passes `SPM_GGUF` (a SentencePiece chat model, e.g. TinyLlama-1.1B-Chat) to the
   tests that need one (`ipc_kv_relay_spm_model_*`, `ipc_json_schema_spm_model_*`).
+- A real Qwen3.5 GGUF for `HYBRID_GGUF` must not carry MTP/NextN heads. Every
+  `ggml-org/Qwen3.5-0.8B-GGUF` file (`Q8_0`, `BF16`, `Q4_0`) sets
+  `nextn_predict_layers=1`, so the hybrid tests fail to load with
+  `qwen35.nextn_predict_layers MTP/NextN blocks (nextn_predict_layers=1) are not
+  supported by this MVP (reconvert with convert_hf_to_gguf.py --no-mtp to drop them)`.
+  That is a fixture-selection trap, not an engine bug. Use a non-MTP community
+  conversion instead (e.g. `unsloth/Qwen3.5-0.8B-GGUF`'s `Qwen3.5-0.8B-Q4_K_M.gguf`),
+  or convert the HF checkpoint with `convert_hf_to_gguf.py --no-mtp`; with such a file
+  the GPU suite passes in both QR-default and `REFLEX_QUANT_RESIDENT=0` modes.
+  Switching to `Q8_0` is not a workaround: the official `Q8_0` file has the same MTP
+  block.
 
 [`scripts/gpu_nightly_tests.sh`](../scripts/gpu_nightly_tests.sh) maps each GPU test to
 the file it needs and reports the ones it can't run as skipped.

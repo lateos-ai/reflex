@@ -72,7 +72,7 @@ serverless endpoint in one click, no build required ([worker docs](.runpod/READM
 | Dense Qwen2 / Qwen2.5, incl. Math and Coder (`qwen2`) | Qwen2.5-0.5B-Instruct; a synthetic fixture. YaRN long-context scaling and `qwen2moe` are not supported |
 | Qwen3-MoE (`qwen3moe`) | synthetic fixtures (real `qwen3moe` tensor layout, top-k routing) |
 | Llama / Mistral (`llama`) | TinyLlama-1.1B |
-| Qwen3.5 hybrid Gated DeltaNet (`qwen35`, `qwen35moe`) | Qwen3.5-0.8B; Qwen3.8-27B `Q8_0` (f16 weights, 80 GB GPU); a random-weight `qwen35moe` checkpoint |
+| Qwen3.5 hybrid Gated DeltaNet (`qwen35`, `qwen35moe`) | Qwen3.5-0.8B; Qwen3.8-27B `Q8_0` (f16 weights, 80 GB GPU); a random-weight `qwen35moe` checkpoint. MTP/NextN heads are not supported, so use a `--no-mtp` conversion or a non-MTP `Q4_K_M` file (the official `Q8_0`/`BF16`/`Q4_0` are rejected) |
 | DeepSeek-V2/V3 MLA (`deepseek2`) | DeepSeek-V2-Lite, DeepSeek-Coder-V2-Lite-Instruct, GigaChat3.1-10B-A1.8B, GLM-4.7-Flash (f16 weights, 80 GB GPU); two synthetic fixtures. Group-limited routing (the 671B V3/R1), MTP heads, Moonlight (`kimi-k2` tokenizer) and Kanana-2 (`kanana2`) are not supported |
 | Granite 4.0-H Mamba-2 hybrid (`granitehybrid`) | Granite 4.0-H 350M and 1B `Q8_0`; a synthetic fixture. MoE variants (Tiny, Small), Falcon-H1, Nemotron-H, Jamba and pure Mamba-2 are not supported |
 | Kolibri-1 MoE (`kolibri1`) | Aleph Alpha's Kolibri-1 78B, `Q4_K_M`; a synthetic fixture |
