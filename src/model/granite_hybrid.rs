@@ -110,7 +110,7 @@ impl Model {
                 "REFLEX_ATTN_KERNEL=legacy is not supported for granitehybrid: the legacy kernels fix the attention scale at 1/sqrt(head_dim), and Granite 4.0-H uses its own attention.scale"
             ));
         }
-        if quant_resident_enabled() {
+        if quant_resident_explicit() && quant_resident_enabled() {
             eprintln!(
                 "note: quantized-resident weights are not supported for granitehybrid; using {} weights",
                 policy.matrix_dtype
@@ -361,7 +361,7 @@ impl Model {
                 include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
                 "gemv_fused",
                 "gemv_gate_up_f16_kernel",
-             )?,
+            )?,
             gemv_q4k_k: None,
             gemv_q4k_r1_k: None,
             dequant_q4k_coalesced_k: None,

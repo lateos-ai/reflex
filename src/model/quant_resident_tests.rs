@@ -21,11 +21,7 @@ fn policy(dtype: WeightsDtype) -> WeightPolicy {
 /// [`Model::load_with_options`] with `REFLEX_QUANT_RESIDENT` set to `quant`
 /// for the load only (so run these tests single-threaded).
 fn load_model(device: Arc<CudaDevice>, file: &GgufFile, dtype: WeightsDtype, quant: bool) -> Model {
-    if quant {
-        std::env::set_var("REFLEX_QUANT_RESIDENT", "1");
-    } else {
-        std::env::remove_var("REFLEX_QUANT_RESIDENT");
-    }
+    std::env::set_var("REFLEX_QUANT_RESIDENT", if quant { "1" } else { "0" });
     let opts = LoadOptions {
         weights: dtype,
         lora_adapter: None,

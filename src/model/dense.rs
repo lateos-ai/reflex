@@ -327,7 +327,7 @@ impl Model {
         let lazy_experts = lazy_experts_enabled() && quant_resident_enabled() && kolibri.is_some();
         if lazy_experts_enabled() && !lazy_experts {
             eprintln!(
-                "note: REFLEX_LAZY_EXPERTS=1 needs REFLEX_QUANT_RESIDENT=1 and a Kolibri-1 model; loading every weight up front"
+                "note: REFLEX_LAZY_EXPERTS=1 needs quantized-resident weights (REFLEX_QUANT_RESIDENT must not be 0) and a Kolibri-1 model; loading every weight up front"
             );
         }
         if lazy_experts {
@@ -345,7 +345,8 @@ impl Model {
         // dense layers and Kolibri-1's layers; other MoE models keep f32 and
         // say so.
         let quant_on = quant_resident_enabled();
-        if quant_on && expert_used_count.is_some() && kolibri.is_none() {
+        if quant_resident_explicit() && quant_on && expert_used_count.is_some() && kolibri.is_none()
+        {
             eprintln!("note: quantized-resident weights are not supported for this MoE model yet; using f32 weights");
         }
         // Layer matmuls stay quantized if Q4_K or Q6_K (a Q4_K_M file has Q6_K
@@ -414,7 +415,16 @@ impl Model {
             .into_iter()
             .map(Some);
             let mut next = || fns.next().expect("eight kernels requested");
-            (next(), next(), next(), next(), next(), next(), next(), next())
+            (
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+            )
         } else {
             (None, None, None, None, None, None, None, None)
         };

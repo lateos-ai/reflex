@@ -212,7 +212,7 @@ impl Model {
         let q8_0_k = if quant_on && (arena.is_some() || q8_0_embd) {
             Some(Q8_0Kernels::load(&device)?)
         } else {
-            if quant_on {
+            if quant_resident_explicit() && quant_on {
                 eprintln!(
                     "note: quantized-resident weights keep only Q8_0 on the Gemma 4 path, and this file has none; using {} weights",
                     policy.matrix_dtype
@@ -422,7 +422,7 @@ impl Model {
                 include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
                 "gemv_fused",
                 "gemv_gate_up_f16_kernel",
-             )?,
+            )?,
             gemv_q4k_k: None,
             gemv_q4k_r1_k: None,
             dequant_q4k_coalesced_k: None,

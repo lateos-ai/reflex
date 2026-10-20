@@ -336,6 +336,13 @@ pub(super) fn quant_resident_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Whether `REFLEX_QUANT_RESIDENT` was set at all. Notices about paths that do
+/// not implement QR only print when the user asked for it explicitly, so the
+/// default stays quiet on models that never supported it.
+pub(super) fn quant_resident_explicit() -> bool {
+    std::env::var("REFLEX_QUANT_RESIDENT").is_ok()
+}
+
 /// `REFLEX_LAZY_EXPERTS=1` (with `REFLEX_QUANT_RESIDENT=1`, Kolibri-1 only):
 /// a routed expert's weights are copied to the GPU the first time the router
 /// picks it, not at load (docs/design/kolibri.md, Phase 4 step 2). Read once
@@ -2373,7 +2380,7 @@ pub(super) fn load_weight_device(
 /// [`load_weight_device`], but a 2-D tensor (or a 3-D per-expert stack, read
 /// one expert at a time through `Model::quant_expert_weight`) whose type is in
 /// `allowed` is kept as raw blocks in `arena` instead of being dequantized
-/// (`REFLEX_QUANT_RESIDENT=1`: the dense path, and Kolibri-1's layers). Every
+/// (QR, the default: the dense path, and Kolibri-1's layers). Every
 /// other tensor, and a LoRA target (`policy.keep_f32`, merged in f32), takes
 /// [`load_weight_device`]'s path unchanged.
 pub(super) fn load_weight_device_quant(
