@@ -1095,6 +1095,7 @@ impl Model {
                 let mut dst = unsafe { self.device.upgrade_device_ptr::<f32>(y, out_features) };
                 let copied = self.device.dtod_copy(&out, &mut dst);
                 out.leak();
+                std::mem::forget(dst);
                 copied.map_err(|e| crate::gpu_err!(e, "gemv_q6k_r1 copy: {e}"))
             }
             WeightData::Quant {

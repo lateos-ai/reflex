@@ -296,15 +296,6 @@ extern "C" __global__ void gemv_q6k_r1_kernel(
         acc[r] = 0.0f;
     }
     for (unsigned int b = 0; b < nb; b++) {
-        // Load headers for all 4 rows: d (bytes 208..209) and scales (bytes 192..207).
-        uint4 hdr[R];
-        #pragma unroll
-        for (int r = 0; r < R; r++) {
-            if (row0 + r < out_features) {
-                const unsigned char* block = w + (row0 + r) * row_bytes + (unsigned long long)b * 210ull;
-                hdr[r] = *reinterpret_cast<const uint4*>(block + 200);
-            }
-        }
         const float* xb = x + (b << 8);
         #pragma unroll
         for (unsigned int n = 0; n < 2; n++) {
@@ -322,7 +313,7 @@ extern "C" __global__ void gemv_q6k_r1_kernel(
                     const int q2 = (int)((ql_l32 & 0xF) | (((qh >> 2) & 3) << 4)) - 32;
                     const int q3 = (int)((ql_l >> 4) | (((qh >> 4) & 3) << 4)) - 32;
                     const int q4 = (int)((ql_l32 >> 4) | (((qh >> 6) & 3) << 4)) - 32;
-                    const float d = q4k_le_f16(&hdr[r].x);
+                    const float d = q4k_le_f16(block + 208);
                     const float* xn = xb + 128u * n;
                     acc[r] += xn[l] * d * (float)sc[is] * (float)q1
                             + xn[l + 32] * d * (float)sc[is + 2] * (float)q2
