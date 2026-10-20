@@ -171,19 +171,7 @@ wrapper in `src/model/kernels.rs` dispatches on it.
 - **LoRA merges happen in f32.** `LoadOptions::lora_adapter` loads the adapter's target
   weights as `f32`; `apply_lora` adds the delta and then rounds to f16 once.
 
-**Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense Qwen3/Llama/Mistral path, and Kolibri-1,
-including its stacked experts; other MoE
-models, hybrid, MLA and Granite 4.0-H print a notice and keep their normal storage). Q4_K and Q6_K matmul weights are
-uploaded as their raw GGUF blocks into one device arena and dequantized inside the matmul
-kernels (`gemv_q4k`/`gemv_q6k` for decode, the fused multi-row Q4_K prefill kernel), or, for longer prompts, into
-a reused device scratch buffer that cuBLAS then reads. That scratch buffer has the
-`--weights` dtype: `f16` (read by `cublasGemmEx`) by default, `f32` (`Sgemm`) with
-`--weights f32`. A Q6_K or Q4_K LM head is kept as raw blocks too. Every other matrix
-weight follows `--weights`. On the Gemma 4 path the flag keeps Q8_0 weights instead (the layer
-matmuls and the tied LM head; `gemv_q8_0`, the same fused-then-scratch prefill split),
-which is what fits the 31B Q8_0 on a 48 GB card. The rules below still hold: the
-scratch path is device to device, so weights are never copied host-to-device per call. See
-[design/quantized-resident-weights.md](design/quantized-resident-weights.md).
+**Quantized-resident weights (default).** Q4_K and Q6_K matmul weights are uploaded as their raw GGUF blocks into one device arena and dequantized inside the matmul kernels (`gemv_q4k`/`gemv_q6k` for decode, the fused multi-row Q4_K prefill kernel), or, for longer prompts, into a reused device scratch buffer that cuBLAS then reads. That scratch buffer has the `--weights` dtype: `f16` (read by `cublasGemmEx`) by default, `f32` (`Sgemm`) with `--weights f32`. A Q6_K or Q4_K LM head is kept as raw blocks too. Every other matrix weight follows `--weights`. On the Gemma 4 path Q8_0 weights stay quantized instead (the layer matmuls and the tied LM head; `gemv_q8_0`, the same fused-then-scratch prefill split), which is what fits the 31B Q8_0 on a 48 GB card. The rules below still hold: the scratch path is device to device, so weights are never copied host-to-device per call. Set `REFLEX_QUANT_RESIDENT=0` to load matrix weights as `f16` instead. Other architectures (MoE models other than Kolibri-1, hybrid, MLA, Granite 4.0-H) ignore the flag and keep their normal storage. See [design/quantized-resident-weights.md](design/quantized-resident-weights.md).
 
 **Opt-in on top of that: `REFLEX_LAZY_EXPERTS=1`** (Kolibri-1 only; anything else
 prints a notice and loads eagerly). The load reserves each layer's stacked-expert space
@@ -370,6 +358,17 @@ in `test-data/` locally:
 - Tests that need a real model read its path from `REFLEX_TEST_GGUF`. The nightly
   passes `SPM_GGUF` (a SentencePiece chat model, e.g. TinyLlama-1.1B-Chat) to the
   tests that need one (`ipc_kv_relay_spm_model_*`, `ipc_json_schema_spm_model_*`).
+- A real Qwen3.5 GGUF for `HYBRID_GGUF` must not carry MTP/NextN heads. Every
+  `ggml-org/Qwen3.5-0.8B-GGUF` file (`Q8_0`, `BF16`, `Q4_0`) sets
+  `nextn_predict_layers=1`, so the hybrid tests fail to load with
+  `qwen35.nextn_predict_layers MTP/NextN blocks (nextn_predict_layers=1) are not
+  supported by this MVP (reconvert with convert_hf_to_gguf.py --no-mtp to drop them)`.
+  That is a fixture-selection trap, not an engine bug. Use a non-MTP community
+  conversion instead (e.g. `unsloth/Qwen3.5-0.8B-GGUF`'s `Qwen3.5-0.8B-Q4_K_M.gguf`),
+  or convert the HF checkpoint with `convert_hf_to_gguf.py --no-mtp`; with such a file
+  the GPU suite passes in both QR-default and `REFLEX_QUANT_RESIDENT=0` modes.
+  Switching to `Q8_0` is not a workaround: the official `Q8_0` file has the same MTP
+  block.
 
 [`scripts/gpu_nightly_tests.sh`](../scripts/gpu_nightly_tests.sh) maps each GPU test to
 the file it needs and reports the ones it can't run as skipped.

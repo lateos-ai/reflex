@@ -281,7 +281,12 @@ fn f16_gemm_ex_matches_rowwise_gemv_and_reports_saturation() {
         weights: WeightsDtype::F16,
         lora_adapter: None,
     };
+    // This test targets f16 *storage*, so opt out of quantized-resident
+    // weights (the default since `REFLEX_QUANT_RESIDENT` became on by
+    // default); a Q4_K `attn_q` would otherwise stay `WeightData::Quant`.
+    std::env::set_var("REFLEX_QUANT_RESIDENT", "0");
     let model = Model::load_with_options(device.clone(), &file, &opts).expect("load f16");
+    std::env::remove_var("REFLEX_QUANT_RESIDENT");
     assert!(
         model.hybrid.is_none() && model.mla.is_none(),
         "needs a dense/MoE model"

@@ -80,6 +80,7 @@ fn decode_workspace_step_matches_allocating_bit_for_bit() {
     let readme = std::fs::read_to_string("README.md").expect("read README.md");
     let long: String = readme.chars().take(3000).collect();
     for weights in [WeightsDtype::F32, WeightsDtype::F16] {
+        eprintln!("decode_workspace_step: weights={weights:?}");
         let model = load(weights);
         model
             .generate(
@@ -95,11 +96,13 @@ fn decode_workspace_step_matches_allocating_bit_for_bit() {
             !model.decode_ws.allocated(),
             "a one-token generate allocated the decode workspace"
         );
+        eprintln!("decode_workspace_step: short prompt");
         assert_workspace_step_matches_allocating(
             &model,
             "The lighthouse keeper climbed the stairs",
             12,
         );
+        eprintln!("decode_workspace_step: long prompt");
         assert_workspace_step_matches_allocating(&model, &long, 6);
         assert!(model.decode_ws.allocated());
     }

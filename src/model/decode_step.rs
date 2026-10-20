@@ -156,9 +156,19 @@ impl Model {
         let row = position * kv_stride;
         let seq_len = position + 1;
 
-        self.device
-            .htod_sync_copy_into(&self.token_embd.row(token_id)?, &mut ws.hidden)
-            .map_err(|e| crate::gpu_err!(e, "embedding htod: {e}"))?;
+        // Async embedding upload: copy to pinned buffer and launch H2D on
+        // a side stream, then wait for it before launching kernels. This
+        // overlaps the ~4 KB embedding upload with host-side work between
+        // tokens (argmax/picker).
+        let embd = self.token_embd.row(token_id)?;
+        {
+            let mut pipeline = self.dequant_pipeline.borrow_mut();
+            pipeline.htod_async_embedding(&embd, *ws.hidden.device_ptr())?;
+        }
+        {
+            let mut pipeline = self.dequant_pipeline.borrow_mut();
+            pipeline.wait_embedding_copy()?;
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             let LayerWeights::Dense(l) = layer else {
                 return Err(crate::reflex_err!(
@@ -205,9 +215,15 @@ impl Model {
             } else {
                 k_row
             };
-            self.gemv_to(&ws.normed, &l.attn_q, ptr(&ws.q))?;
-            self.gemv_to(&ws.normed, &l.attn_k, k_out)?;
-            self.gemv_to(&ws.normed, &l.attn_v, v_row)?;
+            self.gemv_qkv_to(
+                &ws.normed,
+                &l.attn_q,
+                &l.attn_k,
+                &l.attn_v,
+                ptr(&ws.q),
+                k_out,
+                v_row,
+            )?;
             if let Some(b) = &l.attn_bias {
                 self.add_at(ptr(&ws.q), nq * hd, b.q.f32()?, nq * hd)?;
                 self.add_at(k_out, kv_stride, b.k.f32()?, kv_stride)?;
@@ -283,8 +299,13 @@ impl Model {
                 ptr(&ws.ffn_normed),
             )?;
 
-            self.gemv_to(&ws.ffn_normed, &l.ffn_gate, ptr(&ws.gate))?;
-            self.gemv_to(&ws.ffn_normed, &l.ffn_up, ptr(&ws.up))?;
+            self.gemv_gate_up_to(
+                &ws.ffn_normed,
+                &l.ffn_gate,
+                &l.ffn_up,
+                ptr(&ws.gate),
+                ptr(&ws.up),
+            )?;
             self.silu_and_mul_to(&ws.gate, &ws.up, cfg.ffn_hidden_size, ptr(&ws.act))?;
             self.gemv_to(&ws.act, &l.ffn_down, ptr(&ws.down))?;
         }

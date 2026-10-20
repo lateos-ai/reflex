@@ -169,6 +169,29 @@ report p50/p95 per phase instead of one sample. "Process launch" (OS
 report about itself — it's derived as external wall clock minus the internal total,
 the same gap this page's other benchmark numbers already rely on.
 
+### Current default: QR on an A10G (2026-10-20)
+
+Quantized-resident weights became the default on 2026-10-20; `REFLEX_QUANT_RESIDENT=0`
+is the opt-out. Measured on a dedicated AWS EC2 `g5.xlarge` (**NVIDIA A10G** 24 GB,
+driver 595.91.07 / CUDA 13.2, `REFLEX_CUDA_ARCH=sm_86`), `n=10`, two interleaved
+rounds, `p50` (`scripts/bench_cold_start_phases_system1.sh` and
+`..._phases.sh`; model files in the page cache):
+
+| model | QR | `system1` total | `generate` first token | resident MiB | decode, 128 tokens |
+|---|---|---|---|---|---|
+| Qwen3-0.6B Q4_K_M | on (default) | **445–451 ms** | **458–461 ms** | **270** | **3.48 ms/token** |
+| Qwen3-0.6B Q4_K_M | off (`f16`) | 442–444 ms | 620 ms | 878 | 3.81 ms/token |
+| Mistral-7B-v0.1 Q4_K_M | on | **1,035–1,038 ms** | **976 ms** | **4,110** | **15.21 ms/token** |
+| Mistral-7B-v0.1 Q4_K_M | off (`f16`) | 2,928–2,931 ms | 2,928–2,936 ms | 13,806 | 30.19 ms/token |
+| Gemma 4 12B Q8_0 | on | **1,807–1,813 ms** | **1,994–1,999 ms** | **11,088** | **41.53 ms/token** |
+| Gemma 4 12B Q8_0 | off (`f16`) | 2,145–2,155 ms | OOM | 20,942 | OOM |
+
+The 128-token decode is `(last − first) / 128` over `reflex generate --max-tokens 129`
+(median of 3 interleaved runs). Qwen3-1.7B, TinyLlama, the per-phase split, warm
+prefill and the correctness/comparison details are in
+[design/quantized-resident-weights.md](design/quantized-resident-weights.md#qr-as-the-default-2026-10-20).
+The table below is the previous T4/f32 measurement, kept as history.
+
 Each of those phases also gets an **additive** `REFLEX_PHASE_OK phase=<name>
 duration_ms=<ms> energy_joules=<j> energy_method=<m>` line (one per phase, printed
 *before* the aggregate result line; the `energy_*` fields are present only when a
@@ -192,8 +215,9 @@ and no total joules — it runs no timed execution phase, only cheap boolean che
 reports the energy *method* a real run would use (`nvml_energy` check) instead of inventing
 a phase to measure.
 
-**Current numbers, real `Tesla T4` (dedicated AWS EC2 `g4dn.xlarge`), `Qwen3-0.6B-Q4_K_M.gguf`,
-`reflex system1`, `n=10`** (`REFLEX_CUDA_ARCH=sm_75`, driver 595.91.07 / CUDA 13.2;
+**Historical: real `Tesla T4` (dedicated AWS EC2 `g4dn.xlarge`), `f32` weights,
+`Qwen3-0.6B-Q4_K_M.gguf`, `reflex system1`, `n=10`, 2026-09-29**
+(`REFLEX_CUDA_ARCH=sm_75`, driver 595.91.07 / CUDA 13.2;
 `scripts/bench_cold_start_phases_system1.sh`, which now also aggregates the
 `REFLEX_PHASE_OK` `energy_joules` fields; raw per-run logs kept under `bench-results/`):
 
@@ -206,8 +230,9 @@ a phase to measure.
 | scoring pass (single forward pass) | 39.2 | 39.5 | 0.000 |
 | **total** (`process_start_to_result_ms`) | **485.4** | **494.0** | **20.324** |
 
-This table is `f32` weights. The `f16` default was measured on 2026-10-04 in a different
-build mode, so the two don't compare row by row. See [f16 weight storage](#f16-weight-storage)
+This historical table is `f32` weights, before `f16` and then QR became the default. The
+`f16` default was measured on 2026-10-04 in a different build mode, so the two don't
+compare row by row. See [f16 weight storage](#f16-weight-storage)
 (same-session `system1` total: 448.6 ms `f32` vs. 415–423 ms `f16` with its cuBLAS
 warm-up).
 
@@ -241,7 +266,7 @@ joules figure to put in a column.
 On this dedicated instance the spread was tight (p95 within ~1–4% of p50 per phase in the
 table above), unlike the shared-rented-instance variance discussed below.
 
-That ~485ms is down from **3502.8ms** in this table's previous revision — but that
+Historically, that ~485 ms is down from **3502.8ms** in this table's previous revision — but that
 older figure was a *different measurement* (`reflex generate`, `Q8_0`, rented `NVIDIA
 L40`), so it is not a like-for-like multiple and shouldn't be quoted as one. On this same
 T4/`Q4_K_M`/`system1` setup the starting point was **~1248.6ms** (mean of `n=5`, before
@@ -342,9 +367,10 @@ breakdown, not scoped here.
 ## f16 weight storage
 
 `f16` became the default weight storage on 2026-10-02 (see [reference](reference.md#weight-storage)).
-**Every other figure on this page was measured with `f32` weights** and stays as
-measured. Each will get a note pointing at its `f16` replacement once that's measured,
-rather than being overwritten.
+**Most other figures on this page were measured with `f32` or `f16` weights before QR
+became the default on 2026-10-20** and stay as measured. The current default is QR; its
+re-measurement is [above](#current-default-qr-on-an-a10g-2026-10-20) and in
+[design/quantized-resident-weights.md](design/quantized-resident-weights.md#qr-as-the-default-2026-10-20).
 
 [`scripts/verify_f16_weights.sh`](../scripts/verify_f16_weights.sh) produces every number
 in this section, on one GPU in one session:

@@ -535,7 +535,7 @@ impl Model {
             .map_err(|e| crate::gpu_err!(e, "alloc f16 activation stats: {e}"))?;
         pipeline.end_load();
         Ok(Model {
-            device,
+            device: device.clone(),
             cublas,
             rmsnorm_k,
             rope_k,
@@ -547,6 +547,30 @@ impl Model {
             gemv_f16_k,
             gemv_gather_k,
             gemv_gather_f16_k,
+            gemv_qkv_k: aot::load_kernel(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+                "gemv_fused",
+                "gemv_qkv_kernel",
+            )?,
+            gemv_qkv_f16_k: aot::load_kernel(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+                "gemv_fused",
+                "gemv_qkv_f16_kernel",
+            )?,
+            gemv_gate_up_k: aot::load_kernel(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+                "gemv_fused",
+                "gemv_gate_up_kernel",
+            )?,
+            gemv_gate_up_f16_k: aot::load_kernel(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+                "gemv_fused",
+                "gemv_gate_up_f16_kernel",
+            )?,
             gemv_q4k_k: None,
             gemv_q4k_r1_k: None,
             dequant_q4k_coalesced_k: None,
@@ -554,6 +578,7 @@ impl Model {
             dequant_q6k_coalesced_k: None,
             dequant_q6k_coalesced_f16_k: None,
             gemv_q6k_k: None,
+            gemv_q6k_r1_k: None,
             q8_0_k: None,
             quant_scratch: RefCell::new(None),
             moe_gather_k,

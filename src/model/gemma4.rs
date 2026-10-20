@@ -9,7 +9,7 @@ use super::*;
 use crate::error::ReflexError;
 
 /// Gemma 4's per-layer matmul tensors (`blk.{i}.<name>.weight`): the ones
-/// `REFLEX_QUANT_RESIDENT=1` keeps as raw Q8_0 blocks. Global layers have no
+/// kept as raw Q8_0 blocks (QR is the default). Global layers have no
 /// `attn_v`.
 pub(super) const GEMMA4_MATMUL_TENSORS: [&str; 7] = [
     "attn_q",
@@ -212,9 +212,9 @@ impl Model {
         let q8_0_k = if quant_on && (arena.is_some() || q8_0_embd) {
             Some(Q8_0Kernels::load(&device)?)
         } else {
-            if quant_on {
+            if quant_resident_explicit() && quant_on {
                 eprintln!(
-                    "note: REFLEX_QUANT_RESIDENT=1 keeps only Q8_0 weights on the Gemma 4 path, and this file has none; using {} weights",
+                    "note: quantized-resident weights keep only Q8_0 on the Gemma 4 path, and this file has none; using {} weights",
                     policy.matrix_dtype
                 );
             }
@@ -387,7 +387,7 @@ impl Model {
             rope_type: RopeType::Neox,
         };
         Ok(Model {
-            device,
+            device: device.clone(),
             cublas,
             rmsnorm_k,
             rope_k,
@@ -399,6 +399,30 @@ impl Model {
             gemv_f16_k,
             gemv_gather_k,
             gemv_gather_f16_k,
+            gemv_qkv_k: aot::load_kernel(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+                "gemv_fused",
+                "gemv_qkv_kernel",
+            )?,
+            gemv_qkv_f16_k: aot::load_kernel(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+                "gemv_fused",
+                "gemv_qkv_f16_kernel",
+            )?,
+            gemv_gate_up_k: aot::load_kernel(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+                "gemv_fused",
+                "gemv_gate_up_kernel",
+            )?,
+            gemv_gate_up_f16_k: aot::load_kernel(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+                "gemv_fused",
+                "gemv_gate_up_f16_kernel",
+            )?,
             gemv_q4k_k: None,
             gemv_q4k_r1_k: None,
             dequant_q4k_coalesced_k: None,
@@ -406,6 +430,7 @@ impl Model {
             dequant_q6k_coalesced_k: None,
             dequant_q6k_coalesced_f16_k: None,
             gemv_q6k_k: None,
+            gemv_q6k_r1_k: None,
             q8_0_k,
             quant_scratch: RefCell::new(None),
             moe_gather_k,

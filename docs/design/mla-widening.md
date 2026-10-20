@@ -49,7 +49,7 @@ Out, each rejected at load with a clear error naming the key or tensor:
   file has one dense lead layer.
 - Legacy pre-split files (unsplit `attn_kv_b`, no `key_length_mla`). Rejected as before.
 - `--lora` on MLA. Rejected as before.
-- `REFLEX_QUANT_RESIDENT=1` keeps printing its notice and loading MLA weights in the
+- `REFLEX_QUANT_RESIDENT=0` prints its notice and loads MLA weights in the
   `--weights` dtype, as before.
 
 ## Reference implementations

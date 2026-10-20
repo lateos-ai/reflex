@@ -1,13 +1,17 @@
 # Design: keep weights quantized on the GPU
 
-**Status: prototype built and measured on a T4 (2026-10-02), opt-in behind
-`REFLEX_QUANT_RESIDENT=1`. Results are in [Prototype results](#prototype-results); the
-sections before them are the original proposal, kept as written.**
+**Status: the default since 2026-10-20 (opt out with `REFLEX_QUANT_RESIDENT=0`).
+Prototype built and measured on a T4 (2026-10-02), originally opt-in behind
+`REFLEX_QUANT_RESIDENT=1`; the default's verification is in
+[QR as the default](#qr-as-the-default-2026-10-20). Results of the opt-in era are in
+[Prototype results](#prototype-results); the sections before them are the original
+proposal, kept as written.**
 
 **Rebuilt on `f16` weight storage (2026-10-06), not yet re-measured.** `f16` became the
 default weight storage after this prototype was measured, so every "f32" baseline below
-predates it. The two now combine under one rule: `REFLEX_QUANT_RESIDENT=1` decides which
-weights stay quantized (Q4_K layer weights and a Q6_K LM head, dense path only), and
+predates it. The two combine under one rule: QR (now the default; `REFLEX_QUANT_RESIDENT=0`
+opts out) decides which weights stay quantized (Q4_K/Q6_K layer weights and a Q6_K LM
+head, dense path; Q8_0 on Gemma 4), and
 `--weights` decides the element type of everything that is dequantized. That covers the
 other matrix weights, and the scratch buffer the prefill path above the row crossover
 dequantizes into: `f16` read by `cublasGemmEx` by default, `f32` read by `Sgemm` with
@@ -975,3 +979,158 @@ llama.cpp decodes at 4.7):
   one-row-per-warp layout the Q4_K kernel just dropped, so the same change should apply.
 - rmsnorm, 0.79 ms over 113 small launches.
 - About 0.9 ms of idle GPU between steps.
+
+## QR as the default (2026-10-20)
+
+`quant_resident_enabled()` now returns true unless `REFLEX_QUANT_RESIDENT=0`, so QR is
+the default for the dense path (Q4_K/Q6_K), Kolibri-1 and Gemma 4 (Q8_0). Every result
+above was measured with the flag opt-in; this section is the first verification of the
+default.
+
+**Environment.** AWS EC2 `g5.xlarge` (4 vCPU), NVIDIA A10G 24 GB (23,028 MiB usable),
+driver 595.91.07, CUDA 13.2, compute capability 8.6, `REFLEX_CUDA_ARCH=sm_86` (native
+cubin, `reflex doctor` confirms `compiled_arch=sm_86`). Branch `decode-speed-3`, based on
+`c8ce20f`, plus the test-helper/notice commit `0a3a21a` and the decode-path fixes in
+`b872da1` described below.
+"QR on" is the default (no environment variable); "QR off" is
+`REFLEX_QUANT_RESIDENT=0`. `--weights f16` in both modes unless stated. Cold-start runs
+use `scripts/bench_cold_start_phases_system1.sh` / `..._phases.sh`, `n=10`, two
+interleaved rounds, `p50`; each cell is `round 1 / round 2`. Model files are in the page
+cache, as in the earlier measurements on this page.
+
+The 31B Q8_0 was not run: this card is 24 GB. The 12B Q8_0 is the largest real model
+here.
+
+### Correctness
+
+- **Host tests:** `cargo test --release` 230 passed, 0 failed, 90 ignored.
+- **GPU suite, both modes:** `REFLEX_QUANT_RESIDENT` unset and `=0` each give **128
+  passed, 0 failed, 2 skipped**. The skips are the missing `IQ_GGUF` fixture and the real
+  DeepSeek-V2-Lite checkpoint (`MLA_REAL_GGUF`; ~17 GB at `q8_0`, not usable on 24 GB with
+  this project's `f32` MLA residency).
+- **Single-threaded env-var tests:** the `quant_resident*`, `gemma4_quant_resident*` and
+  `kolibri1_quant_resident*` tests run 14/14 in both modes with `--test-threads=1`.
+- **`reflex check`:** 17 models/fixtures, two prompts, `--max-tokens 32`, QR on and off,
+  `--weights f16` and (where it fits) `--weights f32`: **47 comparisons, 0 token-id
+  divergences**. The 4 non-comparisons are the expected OOMs below.
+- **Checksums.** With `--weights f32` the only difference is summation order: the largest
+  relative first-token checksum move is **2.1e-6** (the tiny Kolibri fixture). With
+  `--weights f16` the moves are larger (typically 3e-4 to 2.5e-3 on dense models, up to
+  2.1e-2 on the tiny Kolibri fixture) because QR uses the exact quantized weights while
+  the opt-out path rounds them to f16 at load. That is the documented f16 rounding, not
+  a token change.
+- **Unchanged paths.** Generic MoE (other than Kolibri), Qwen3.5 hybrid, MLA and Granite
+  4.0-H produce bit-identical `reflex check` output with the flag on and off; they load
+  in `--weights` dtype. A default run prints no "not supported" notice. An explicit
+  `REFLEX_QUANT_RESIDENT=1` does print it for generic MoE and Granite (the two paths with
+  such a notice).
+- **Expected OOMs on 24 GB:** Mistral 7B opt-out `--weights f32` (~29 GB) and Gemma 4 12B
+  opt-out `--weights f16`/`f32`. Gemma 12B opt-out still loads (20,942 MiB resident) and
+  cold `system1` completes, but `generate` and the warm benchmark run out of memory. QR
+  fits both models.
+- **Bugs found and fixed during the run.** The first full suite gave 120/8/2 (QR default)
+  and 116/12/2 (opt-out). Two were real WIP bugs, not QR numerics:
+  - `gemv_qkv_f16_kernel` / `gemv_gate_up_f16_kernel` reduced the warp sum twice
+    (`warp_dot_f16` already reduces), which corrupted the opt-out workspace decode path
+    and the JSON-schema tests. Removed the second reduction (`b872da1`).
+  - One-row `gemv()` used the older Q6_K kernel while `gemv_to()` used
+    `gemv_q6k_r1_kernel`, so the workspace and allocating decode paths differed with QR
+    on. `gemv()` now dispatches to the r1 kernel as Q4_K already did (`b872da1`).
+
+### Cold start (`p50`, `n=10`, two interleaved rounds; `r1 / r2`)
+
+`system1`, Qwen3-0.6B through Mistral 7B and Gemma 4 12B:
+
+| model | QR | `system1` total | model load | scoring pass |
+|---|---|---|---|---|
+| Qwen3-0.6B Q4_K_M | on | 451.4 / 445.4 ms | 251.1 / 246.1 ms | 23.1 / 23.0 ms |
+| Qwen3-0.6B Q4_K_M | off | 443.7 / 442.1 ms | 247.1 / 247.1 ms | 19.3 / 19.1 ms |
+| Qwen3-1.7B Q4_K_M | on | 586.6 / 585.7 ms | 368.0 / 368.2 ms | 39.7 / 39.7 ms |
+| Qwen3-1.7B Q4_K_M | off | 744.6 / 711.6 ms | 541.0 / 503.7 ms | 23.9 / 23.8 ms |
+| TinyLlama-1.1B Q4_K_M | on | 451.2 / 451.3 ms | 263.9 / 265.6 ms | 31.1 / 31.0 ms |
+| TinyLlama-1.1B Q4_K_M | off | 463.4 / 485.6 ms | 277.0 / 286.3 ms | 20.2 / 45.5 ms |
+| Mistral-7B-v0.1 Q4_K_M | on | 1,037.5 / 1,034.9 ms | 765.7 / 762.5 ms | 114.3 / 114.4 ms |
+| Mistral-7B-v0.1 Q4_K_M | off | 2,928.3 / 2,931.0 ms | 2,618.2 / 2,618.4 ms | 91.1 / 91.3 ms |
+| Gemma 4 12B Q8_0 | on | 1,813.2 / 1,806.7 ms | 1,433.4 / 1,428.5 ms | 99.9 / 99.8 ms |
+| Gemma 4 12B Q8_0 | off | 2,155.5 / 2,145.3 ms | 1,802.6 / 1,791.7 ms | 67.8 / 67.9 ms |
+
+`generate` to the first token:
+
+| model | QR | first token | model load | prompt eval |
+|---|---|---|---|---|
+| Qwen3-0.6B | on | 458.1 / 460.9 ms | 245.9 / 245.9 ms | 36.0 / 35.8 ms |
+| Qwen3-0.6B | off | 620.4 / 619.6 ms | 247.5 / 248.1 ms | 195.1 / 194.9 ms |
+| Qwen3-1.7B | on | 569.4 / 570.6 ms | 366.7 / 368.0 ms | 26.2 / 26.1 ms |
+| Qwen3-1.7B | off | 745.3 / 744.4 ms | 540.7 / 540.7 ms | 24.9 / 24.9 ms |
+| TinyLlama-1.1B | on | 443.1 / 435.1 ms | 266.5 / 262.2 ms | 21.4 / 21.5 ms |
+| TinyLlama-1.1B | off | 485.9 / 484.1 ms | 288.3 / 285.9 ms | 45.4 / 45.2 ms |
+| Mistral-7B-v0.1 | on | 976.8 / 976.3 ms | 763.0 / 762.0 ms | 56.8 / 56.8 ms |
+| Mistral-7B-v0.1 | off | 2,935.5 / 2,927.9 ms | 2,620.3 / 2,610.8 ms | 91.0 / 91.0 ms |
+| Gemma 4 12B | on | 1,999.1 / 1,994.1 ms | 1,426.7 / 1,425.9 ms | 284.0 / 283.7 ms |
+| Gemma 4 12B | off | OOM | — | OOM |
+
+The Gemma 12B opt-out `generate` run OOMs; its `system1` run does load (1,802.6 /
+1,791.7 ms model load) because the short scoring pass fits. The table above is
+`generate`, so its model-load/prompt-eval cells are left as `—`.
+
+### Decode and VRAM
+
+`reflex bench` (`--warmup 3 --iters 20`), resident MiB after load, and a separate
+128-token decode (`reflex generate --max-tokens 129`, `(last - first) / 128`, median of
+3 interleaved runs). Decode columns are `29 / 113 / 449` prompt tokens for the Qwen3
+models and Gemma, and `33 / 129 / 513` for TinyLlama and Mistral (their tokenizers
+produce different bucket lengths).
+
+| model | QR | resident MiB | decode 128-token ms/token | bench decode ms/token |
+|---|---|---|---|---|
+| Qwen3-0.6B | on | **270** | **3.48** | **3.45 / 3.50 / 3.71** |
+| Qwen3-0.6B | off | 878 | 3.81 | 3.79 / 3.83 / 4.01 |
+| Qwen3-1.7B | on | **1,070** | **6.17** | **6.10 / 6.15 / 6.35** |
+| Qwen3-1.7B | off | 3,598 | 8.53 | 8.50 / 8.54 / 8.72 |
+| TinyLlama-1.1B | on | **622** | **4.11** | **4.09 / 4.14 / 4.22** |
+| TinyLlama-1.1B | off | 2,062 | 5.40 | 5.37 / 5.42 / 5.48 |
+| Mistral-7B-v0.1 | on | **4,110** | **15.21** | **15.20 / 15.26 / 15.47** |
+| Mistral-7B-v0.1 | off | 13,806 | 30.19 | 30.19 / 30.27 / 30.45 |
+| Gemma 4 12B | on | **11,088** | **41.53** | **40.70 / 42.99 / 51.94** |
+| Gemma 4 12B | off | 20,942 | OOM | OOM |
+
+Warm prefill (same buckets) keeps the known short-prompt gap:
+
+| model | QR | warm prefill p50 |
+|---|---|---|
+| Qwen3-0.6B | on | 11.3 / 14.4 / 32.9 ms |
+| Qwen3-0.6B | off | **7.4 / 9.9 / 28.2 ms** |
+| Qwen3-1.7B | on | 26.4 / 31.6 / 68.8 ms |
+| Qwen3-1.7B | off | **13.2 / 18.4 / 55.6 ms** |
+| TinyLlama-1.1B | on | 18.3 / 26.6 / 49.5 ms |
+| TinyLlama-1.1B | off | **9.0 / 17.5 / 40.0 ms** |
+| Mistral-7B-v0.1 | on | 104.7 / 140.6 / 261.3 ms |
+| Mistral-7B-v0.1 | off | **39.7 / 75.2 / 195.5 ms** |
+| Gemma 4 12B | on | 142.9 / 164.4 / 352.5 ms |
+
+### What this says
+
+- **The design doc's expected signs hold on this GPU.** Qwen3-0.6B `system1` is the one
+  small regression (445-451 ms vs 442-444, ~1-2%), while `generate` is 26% faster
+  (458-461 vs 620 ms), decode is 8-10% faster (3.48 vs 3.81 ms/token), and VRAM falls
+  69% (270 vs 878 MiB). The earlier T4 expectation was ~441 vs ~421 ms for `system1`,
+  ~461 vs ~661 for `generate`, and ~4.9 vs ~8.2 ms/token; the absolutes are lower on the
+  A10G but every sign is the same.
+- **At 1.7B and above QR wins every headline metric**, including `system1`: 586 vs
+  712-745 ms (0.6B's load saving is too small to offset the fused-kernel prefill cost;
+  at 1.7B the load saving is larger than that cost).
+- **Mistral 7B is the clearest win:** `system1` 1.03 s vs 2.93 s (~2.8x), first token
+  0.98 s vs 2.93 s (~3.0x), decode 15.21 vs 30.19 ms/token (~2.0x), VRAM 4.1 vs 13.8 GB.
+  The old T4 measurement was 2.87 vs 3.87 s and 5.4 vs 13.8 GB; the A10G is simply
+  faster and the load saving dominates even more.
+- **Gemma 4 12B confirms the A40 results on a 24 GB card:** 11,088 MiB resident (A40:
+  11,086), 1,994 ms first token (A40: 1,990), 1,807 ms cold `system1` (A40: 1,807), and
+  41.5 ms/token decode at short context. The f16 opt-out loads 20,942 MiB but cannot run
+  `generate` or the warm decode loop on this card.
+- **The open gap is unchanged and still unresolved:** warm short prefill is slower with
+  QR at every model (1.5-2.6x at the shortest bucket), because the fused quantized
+  kernels lose to f16 cuBLAS tensor cores above a few rows. On models where the load
+  dominates (1.7B, TinyLlama, Mistral, Gemma) that does not move the cold totals; on
+  Qwen3-0.6B it is why `system1` is 1-2% slower. A fused dequantize-in-registers
+  tensor-core GEMM (Marlin-style, with its own numerics check) is the next step, not
+  something this change attempts.

@@ -289,11 +289,7 @@ const TINY_Q8_0_FIXTURE: &str = "test-data/tiny-gemma4-q8_0.gguf";
 /// Loads `file` in `dtype` with `REFLEX_QUANT_RESIDENT` set to `quant` for
 /// the load only (so run these tests single-threaded).
 fn load_with_flag(file: &GgufFile, dtype: WeightsDtype, quant: bool) -> Model {
-    if quant {
-        std::env::set_var("REFLEX_QUANT_RESIDENT", "1");
-    } else {
-        std::env::remove_var("REFLEX_QUANT_RESIDENT");
-    }
+    std::env::set_var("REFLEX_QUANT_RESIDENT", if quant { "1" } else { "0" });
     let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
     let opts = LoadOptions {
         weights: dtype,
