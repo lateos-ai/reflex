@@ -115,7 +115,7 @@ pub(super) struct KolibriLayerWeights {
 }
 
 /// Kolibri-1's per-layer matmul tensors (`blk.{i}.<name>.weight`): the ones
-/// `REFLEX_QUANT_RESIDENT=1` keeps as raw Q4_K/Q6_K blocks. `ffn_gate_inp`
+/// kept as raw Q4_K/Q6_K blocks (QR is the default). `ffn_gate_inp`
 /// (the router) is F32 in the file and stays dequantized.
 pub(super) const KOLIBRI_MATMUL_TENSORS: [&str; 10] = [
     "attn_q",
@@ -346,7 +346,7 @@ impl Model {
         // say so.
         let quant_on = quant_resident_enabled();
         if quant_on && expert_used_count.is_some() && kolibri.is_none() {
-            eprintln!("note: REFLEX_QUANT_RESIDENT=1 is not supported for this MoE model yet; using f32 weights");
+            eprintln!("note: quantized-resident weights are not supported for this MoE model yet; using f32 weights");
         }
         // Layer matmuls stay quantized if Q4_K or Q6_K (a Q4_K_M file has Q6_K
         // `attn_v`/`ffn_down` in half the layers; Kolibri-1 also has Q6_K

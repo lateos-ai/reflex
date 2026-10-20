@@ -106,7 +106,7 @@ individual rows are dequantized lazily and cached on first use (see HISTORY.md's
 mapped for its lifetime) — don't reintroduce a `to_vec()` copy: it was ~103 ms of ~231 ms
 `model_load_ms` on a T4 (`REFLEX_LOAD_PROFILE=1`), mostly page-faulting the new `Vec`.
 
-**Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense path, plus Kolibri-1 including its stacked
+**Quantized-resident weights (default)** (dense path, plus Kolibri-1 including its stacked
 experts and Q6_K tensors, one expert at a time via `Model::quant_expert_weight`; other
 MoE models, hybrid and MLA print a notice and keep their normal storage; Gemma 4 keeps
 Q8_0 instead -- layer matmuls and the tied LM head, `gemv_q8_0` in `kernels_cuda/gemv_q8_0.cu`,
@@ -117,7 +117,7 @@ warp, bit-identical to `gemv_q4k_kernel`) / `gemv_q6k_kernel`, in short prefills
 fused multi-row Q4_K kernel, or,
 above a row crossover, dequantized device-to-device into a reused scratch buffer in the
 `--weights` dtype (f16 scratch + `cublasGemmEx`, or f32 + `Sgemm`; Q6_K through
-`dequantize_q6k_coalesced*`); a Q6_K LM head stays quantized too (`gemv_q6k_kernel`). Every other matrix weight follows `--weights`. Design,
+`dequantize_q6k_coalesced*`); a Q6_K LM head stays quantized too (`gemv_q6k_kernel`). Every other matrix weight follows `--weights`. Set `REFLEX_QUANT_RESIDENT=0` to load matrix weights as `f16` instead. Design,
 results and open gaps: `docs/design/quantized-resident-weights.md` — read it before
 touching weight residency, the matmul kernels or `WeightLoadPipeline`. On top of it,
 **`REFLEX_LAZY_EXPERTS=1`** (Kolibri-1 only) reserves the stacked-expert arena space

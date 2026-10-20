@@ -171,19 +171,7 @@ wrapper in `src/model/kernels.rs` dispatches on it.
 - **LoRA merges happen in f32.** `LoadOptions::lora_adapter` loads the adapter's target
   weights as `f32`; `apply_lora` adds the delta and then rounds to f16 once.
 
-**Opt-in: `REFLEX_QUANT_RESIDENT=1`** (dense Qwen3/Llama/Mistral path, and Kolibri-1,
-including its stacked experts; other MoE
-models, hybrid, MLA and Granite 4.0-H print a notice and keep their normal storage). Q4_K and Q6_K matmul weights are
-uploaded as their raw GGUF blocks into one device arena and dequantized inside the matmul
-kernels (`gemv_q4k`/`gemv_q6k` for decode, the fused multi-row Q4_K prefill kernel), or, for longer prompts, into
-a reused device scratch buffer that cuBLAS then reads. That scratch buffer has the
-`--weights` dtype: `f16` (read by `cublasGemmEx`) by default, `f32` (`Sgemm`) with
-`--weights f32`. A Q6_K or Q4_K LM head is kept as raw blocks too. Every other matrix
-weight follows `--weights`. On the Gemma 4 path the flag keeps Q8_0 weights instead (the layer
-matmuls and the tied LM head; `gemv_q8_0`, the same fused-then-scratch prefill split),
-which is what fits the 31B Q8_0 on a 48 GB card. The rules below still hold: the
-scratch path is device to device, so weights are never copied host-to-device per call. See
-[design/quantized-resident-weights.md](design/quantized-resident-weights.md).
+**Quantized-resident weights (default).** Q4_K and Q6_K matmul weights are uploaded as their raw GGUF blocks into one device arena and dequantized inside the matmul kernels (`gemv_q4k`/`gemv_q6k` for decode, the fused multi-row Q4_K prefill kernel), or, for longer prompts, into a reused device scratch buffer that cuBLAS then reads. That scratch buffer has the `--weights` dtype: `f16` (read by `cublasGemmEx`) by default, `f32` (`Sgemm`) with `--weights f32`. A Q6_K or Q4_K LM head is kept as raw blocks too. Every other matrix weight follows `--weights`. On the Gemma 4 path Q8_0 weights stay quantized instead (the layer matmuls and the tied LM head; `gemv_q8_0`, the same fused-then-scratch prefill split), which is what fits the 31B Q8_0 on a 48 GB card. The rules below still hold: the scratch path is device to device, so weights are never copied host-to-device per call. Set `REFLEX_QUANT_RESIDENT=0` to load matrix weights as `f16` instead. Other architectures (MoE models other than Kolibri-1, hybrid, MLA, Granite 4.0-H) ignore the flag and keep their normal storage. See [design/quantized-resident-weights.md](design/quantized-resident-weights.md).
 
 **Opt-in on top of that: `REFLEX_LAZY_EXPERTS=1`** (Kolibri-1 only; anything else
 prints a notice and loads eagerly). The load reserves each layer's stacked-expert space

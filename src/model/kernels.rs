@@ -1557,7 +1557,7 @@ impl Model {
     }
 
     /// One-row GEMV straight from a quantized-resident Q6_K weight
-    /// (`gemv_q6k_kernel`) -- the LM head when `REFLEX_QUANT_RESIDENT=1`.
+    /// (`gemv_q6k_kernel`) -- the LM head in QR mode.
     pub(super) fn gemv_q6k(
         &self,
         x: &CudaSlice<f32>,
@@ -3583,7 +3583,7 @@ pub(super) const GEMV_Q8_0_ROWS_PER_WARP: u32 = 4;
 pub(super) const GEMV_Q8_0_TILE: usize = 512;
 
 /// The `kernels_cuda/gemv_q8_0.cu` kernels, loaded only when the Gemma 4 path
-/// keeps Q8_0 weights quantized (`REFLEX_QUANT_RESIDENT=1`).
+/// keeps Q8_0 weights quantized (QR is the default).
 pub(super) struct Q8_0Kernels {
     /// `gemv_q8_0_kernel`: the fused 2-16 row prefill path (`x` staged in
     /// shared memory, 4 output rows per warp).

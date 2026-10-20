@@ -220,7 +220,7 @@ pub struct Model {
     /// `gemv_gate_up_kernel` for an f16 weight matrix.
     gemv_gate_up_f16_k: AotKernel,
     /// `gemv_q4k_kernel` (`kernels_cuda/gemv_q4k.cu`), loaded only when the
-    /// dense path keeps weights quantized (`REFLEX_QUANT_RESIDENT=1`).
+    /// dense path keeps weights quantized (QR is the default).
     gemv_q4k_k: Option<AotKernel>,
     /// `gemv_q4k_r1_kernel` (same module): the one-row (decode) form of
     /// `gemv_q4k_k`, several output rows per warp.
@@ -241,7 +241,7 @@ pub struct Model {
     /// decode path for Q6_K layer tensors and LM head in QR mode.
     gemv_q6k_r1_k: Option<AotKernel>,
     /// `kernels_cuda/gemv_q8_0.cu`, loaded only when the Gemma 4 path keeps
-    /// Q8_0 weights quantized (`REFLEX_QUANT_RESIDENT=1`). `None` everywhere
+    /// Q8_0 weights quantized (QR is the default). `None` everywhere
     /// else, so no other architecture can reach a Q8_0 kernel.
     q8_0_k: Option<Q8_0Kernels>,
     /// Reused scratch for the quantized-resident prefill path above the fused

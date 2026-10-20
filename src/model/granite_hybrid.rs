@@ -112,7 +112,7 @@ impl Model {
         }
         if quant_resident_enabled() {
             eprintln!(
-                "note: REFLEX_QUANT_RESIDENT=1 is not supported for granitehybrid; using {} weights",
+                "note: quantized-resident weights are not supported for granitehybrid; using {} weights",
                 policy.matrix_dtype
             );
         }

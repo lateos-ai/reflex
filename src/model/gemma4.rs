@@ -9,7 +9,7 @@ use super::*;
 use crate::error::ReflexError;
 
 /// Gemma 4's per-layer matmul tensors (`blk.{i}.<name>.weight`): the ones
-/// `REFLEX_QUANT_RESIDENT=1` keeps as raw Q8_0 blocks. Global layers have no
+/// kept as raw Q8_0 blocks (QR is the default). Global layers have no
 /// `attn_v`.
 pub(super) const GEMMA4_MATMUL_TENSORS: [&str; 7] = [
     "attn_q",
@@ -214,7 +214,7 @@ impl Model {
         } else {
             if quant_on {
                 eprintln!(
-                    "note: REFLEX_QUANT_RESIDENT=1 keeps only Q8_0 weights on the Gemma 4 path, and this file has none; using {} weights",
+                    "note: quantized-resident weights keep only Q8_0 on the Gemma 4 path, and this file has none; using {} weights",
                     policy.matrix_dtype
                 );
             }

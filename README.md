@@ -73,30 +73,21 @@ serverless endpoint in one click, no build required ([worker docs](.runpod/READM
 | Qwen3.5 hybrid Gated DeltaNet (`qwen35`, `qwen35moe`) | Qwen3.5-0.8B; Qwen3.8-27B `Q8_0` (f16 weights, 80 GB GPU); a random-weight `qwen35moe` checkpoint |
 | DeepSeek-V2/V3 MLA (`deepseek2`) | DeepSeek-V2-Lite, DeepSeek-Coder-V2-Lite-Instruct, GigaChat3.1-10B-A1.8B, GLM-4.7-Flash (f16 weights, 80 GB GPU); two synthetic fixtures. Group-limited routing (the 671B V3/R1), MTP heads, Moonlight (`kimi-k2` tokenizer) and Kanana-2 (`kanana2`) are not supported |
 | Granite 4.0-H Mamba-2 hybrid (`granitehybrid`) | Granite 4.0-H 350M and 1B `Q8_0`; a synthetic fixture. MoE variants (Tiny, Small), Falcon-H1, Nemotron-H, Jamba and pure Mamba-2 are not supported |
-| Kolibri-1 MoE (`kolibri1`) | Aleph Alpha's Kolibri-1 78B, `Q4_K_M` (needs `REFLEX_QUANT_RESIDENT=1`); a synthetic fixture |
-| Gemma 4 dense, text only (`gemma4`) | Gemma 4 12B-it and 31B-it `Q8_0` (the 31B needs an 80 GB GPU, or 48 GB with `REFLEX_QUANT_RESIDENT=1`); a synthetic fixture. E2B/E4B and 26B-A4B are not supported |
+| Kolibri-1 MoE (`kolibri1`) | Aleph Alpha's Kolibri-1 78B, `Q4_K_M`; a synthetic fixture |
+| Gemma 4 dense, text only (`gemma4`) | Gemma 4 12B-it and 31B-it `Q8_0` (the 31B needs an 80 GB GPU with `REFLEX_QUANT_RESIDENT=0`; QR is default); a synthetic fixture. E2B/E4B and 26B-A4B are not supported |
 
 Each architecture counted as supported only after its generated tokens matched an
 independent implementation (llama.cpp, or a CPU reference) on real hardware.
 
 - **GGUF only.** Convert other checkpoints with llama.cpp's `convert_hf_to_gguf.py`.
-- **Weights are held as `f16` on the GPU by default**, dequantized once at load: VRAM is
-  about 2 bytes per parameter whatever the file's quantization. `--weights f32` (or
-  `REFLEX_WEIGHTS=f32`) keeps the exact `f32` reference mode, about 4 bytes per parameter.
-  Only matrix weights change type; norms, MoE routers, activations and the KV cache are
-  `f32` in both modes. `reflex check` defaults to `f32`.
+- **Weights are held quantized on the GPU by default** (Q4_K/Q6_K on the dense path, Q8_0 on Gemma 4): VRAM is about half what `f16` would use. `--weights f32` (or
+   `REFLEX_WEIGHTS=f32`) keeps the exact `f32` reference mode for everything that is dequantized; norms, MoE routers, activations and the KV cache are
+   `f32` in both modes. `reflex check` defaults to `f32`.
 - **Context**: up to 65,535 positions per sequence (prompt + generated tokens + any
   imported KV cache); longer requests fail with a clear `context_overflow` error.
 - **`system1`** works on every architecture; on the Qwen3.5 hybrid models each candidate
   must be a single token.
-- **Models too big for `f16`**: `REFLEX_QUANT_RESIDENT=1` keeps `Q4_K`/`Q6_K` matrix weights
-  quantized on the GPU instead (dense path and Kolibri-1), and `Q8_0` ones on Gemma 4.
-  Kolibri-1's 47.5 GB `Q4_K_M` then fits a 48 GB card, and so does Gemma 4 31B `Q8_0`
-  (37.9 GB peak at 2,641 tokens). On Gemma 4 it also speeds up cold start and decode,
-  but short warm prompts are slower than with `f16` weights. Adding `REFLEX_LAZY_EXPERTS=1` uploads each expert only when
-  the router first picks it: a short prompt's cold first token on an RTX A6000 goes from
-  8.6 s to 2.3 s. See [quantized-resident weights](docs/design/quantized-resident-weights.md)
-  and [Kolibri-1](docs/design/kolibri.md).
+- **QR off**: `REFLEX_QUANT_RESIDENT=0` loads matrix weights as `f16` (about 2 bytes per parameter). This makes short warm prompts and system1 faster than QR, at the cost of roughly double the VRAM and a ~15–40% decode regression.
 - DeepSeek's MTP heads and group-limited expert routing are not supported.
 
 ## How it compares

@@ -5,6 +5,14 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Quantized-resident weights are now the default.** `REFLEX_QUANT_RESIDENT` defaults to
+  on; set it to `0` to opt out and load matrix weights as `f16`. This halves VRAM usage
+  for quantized models (Q4_K/Q6_K on the dense path, Q8_0 on Gemma 4), speeds up cold
+  start by removing per-tensor allocations, and improves decode speed by reading half the
+  weight bytes per token. Short warm prompts and `system1` become slower (~15–40 ms extra)
+  because the fused quantized kernels lose to cuBLAS tensor cores above ~4 rows. See
+  [design/quantized-resident-weights.md](docs/design/quantized-resident-weights.md).
+
 - **Decode speed, round 2.** These change no outputs: greedy ids and logits are
   bit-identical, and the f32 attention kernels compile to the same cubins.
   - **Norms.** RMSNorm's single summing thread reads four floats at a time. The

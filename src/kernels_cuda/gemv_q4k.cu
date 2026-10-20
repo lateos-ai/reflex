@@ -1,8 +1,8 @@
 // Matrix-vector (and few-row matrix-matrix) product straight from Q4_K blocks:
 // y[r] = x[r] @ W^T for r in 0..rows (rows <= GEMV_Q4K_MAX_ROWS), where W is the
 // GGUF's raw Q4_K data, row-major (out_features, in_features), never expanded
-// to f32 in device memory. Used when weights are kept quantized on the GPU
-// (REFLEX_QUANT_RESIDENT=1, see docs/design/quantized-resident-weights.md).
+// to f32 in device memory. Used when QR is the default; set REFLEX_QUANT_RESIDENT=0
+// to load weights as f16 instead (see docs/design/quantized-resident-weights.md).
 //
 // Same launch geometry as `gemv_kernel` (gemv.cu): one warp per output row,
 // lanes reduce with a warp shuffle. A 144-byte Q4_K super-block is `d: f16`,
