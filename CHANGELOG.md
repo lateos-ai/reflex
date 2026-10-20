@@ -5,6 +5,23 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Quantized-resident weights are now the default.** `REFLEX_QUANT_RESIDENT` defaults to
+  on; set it to `0` to opt out and load matrix weights as `f16`. This halves VRAM usage
+  for quantized models (Q4_K/Q6_K on the dense path, Q8_0 on Gemma 4), speeds up cold
+  start by removing per-tensor allocations, and improves decode speed by reading half the
+  weight bytes per token. Short warm prompts and `system1` become slower (~15–40 ms extra)
+  because the fused quantized kernels lose to cuBLAS tensor cores above ~4 rows. See
+  [design/quantized-resident-weights.md](docs/design/quantized-resident-weights.md).
+  **Verified 2026-10-20** on an AWS EC2 `g5.xlarge` (NVIDIA A10G, driver 595.91.07,
+  CUDA 13.2, `sm_86`): GPU suite 128 passed / 0 failed / 2 skipped in both modes;
+  47 `reflex check` comparisons with zero token-id divergences. Qwen3-0.6B
+  `system1` 445–451 ms vs 442–444 (1–2% slower), `generate` 458–461 vs 620,
+  decode 3.48 vs 3.81 ms/token, 270 vs 878 MiB; Mistral 7B `system1` 1.03 vs
+  2.93 s and 4.1 vs 13.8 GB; Gemma 4 12B first token 1,994–1,999 ms at 11.1 GB
+  (the `f16` opt-out OOMs on 24 GB). Also fixed two decode-path bugs this exposed:
+  an f16 fused-GEMV double reduction and one-row Q6_K `gemv` not using the r1
+  kernel that `gemv_to` uses.
+
 - **Decode speed, round 2.** These change no outputs: greedy ids and logits are
   bit-identical, and the f32 attention kernels compile to the same cubins.
   - **Norms.** RMSNorm's single summing thread reads four floats at a time. The

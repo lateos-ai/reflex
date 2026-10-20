@@ -115,7 +115,7 @@ pub(super) struct KolibriLayerWeights {
 }
 
 /// Kolibri-1's per-layer matmul tensors (`blk.{i}.<name>.weight`): the ones
-/// `REFLEX_QUANT_RESIDENT=1` keeps as raw Q4_K/Q6_K blocks. `ffn_gate_inp`
+/// kept as raw Q4_K/Q6_K blocks (QR is the default). `ffn_gate_inp`
 /// (the router) is F32 in the file and stays dequantized.
 pub(super) const KOLIBRI_MATMUL_TENSORS: [&str; 10] = [
     "attn_q",
@@ -259,6 +259,18 @@ impl Model {
             "gemv_gather",
             ["gemv_gather_kernel", "gemv_gather_f16_kernel"],
         )?;
+        let [gemv_qkv_k, gemv_qkv_f16_k] = load_kernel_pair(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+            "gemv_fused",
+            ["gemv_qkv_kernel", "gemv_qkv_f16_kernel"],
+        )?;
+        let [gemv_gate_up_k, gemv_gate_up_f16_k] = load_kernel_pair(
+            &device,
+            include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+            "gemv_fused",
+            ["gemv_gate_up_kernel", "gemv_gate_up_f16_kernel"],
+        )?;
         let attn_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ATTENTION")),
@@ -315,7 +327,7 @@ impl Model {
         let lazy_experts = lazy_experts_enabled() && quant_resident_enabled() && kolibri.is_some();
         if lazy_experts_enabled() && !lazy_experts {
             eprintln!(
-                "note: REFLEX_LAZY_EXPERTS=1 needs REFLEX_QUANT_RESIDENT=1 and a Kolibri-1 model; loading every weight up front"
+                "note: REFLEX_LAZY_EXPERTS=1 needs quantized-resident weights (REFLEX_QUANT_RESIDENT must not be 0) and a Kolibri-1 model; loading every weight up front"
             );
         }
         if lazy_experts {
@@ -333,8 +345,9 @@ impl Model {
         // dense layers and Kolibri-1's layers; other MoE models keep f32 and
         // say so.
         let quant_on = quant_resident_enabled();
-        if quant_on && expert_used_count.is_some() && kolibri.is_none() {
-            eprintln!("note: REFLEX_QUANT_RESIDENT=1 is not supported for this MoE model yet; using f32 weights");
+        if quant_resident_explicit() && quant_on && expert_used_count.is_some() && kolibri.is_none()
+        {
+            eprintln!("note: quantized-resident weights are not supported for this MoE model yet; using f32 weights");
         }
         // Layer matmuls stay quantized if Q4_K or Q6_K (a Q4_K_M file has Q6_K
         // `attn_v`/`ffn_down` in half the layers; Kolibri-1 also has Q6_K
@@ -382,6 +395,7 @@ impl Model {
             dequant_q6k_coalesced_k,
             dequant_q6k_coalesced_f16_k,
             gemv_q6k_k,
+            gemv_q6k_r1_k,
         ) = if quant_dense {
             let mut fns = aot::load_kernel_module(
                 &device,
@@ -395,14 +409,24 @@ impl Model {
                     "dequantize_q6k_coalesced_kernel",
                     "dequantize_q6k_coalesced_f16_kernel",
                     "gemv_q6k_kernel",
+                    "gemv_q6k_r1_kernel",
                 ],
             )?
             .into_iter()
             .map(Some);
-            let mut next = || fns.next().expect("seven kernels requested");
-            (next(), next(), next(), next(), next(), next(), next())
+            let mut next = || fns.next().expect("eight kernels requested");
+            (
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+                next(),
+            )
         } else {
-            (None, None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None)
         };
         let modules_ms = t_modules.elapsed().as_secs_f64() * 1000.0;
         let t_weights = std::time::Instant::now();
@@ -679,6 +703,10 @@ impl Model {
             gemv_f16_k,
             gemv_gather_k,
             gemv_gather_f16_k,
+            gemv_qkv_k,
+            gemv_qkv_f16_k,
+            gemv_gate_up_k,
+            gemv_gate_up_f16_k,
             gemv_q4k_k,
             gemv_q4k_r1_k,
             dequant_q4k_coalesced_k,
@@ -686,6 +714,7 @@ impl Model {
             dequant_q6k_coalesced_k,
             dequant_q6k_coalesced_f16_k,
             gemv_q6k_k,
+            gemv_q6k_r1_k,
             q8_0_k: None,
             quant_scratch: RefCell::new(None),
             moe_gather_k,

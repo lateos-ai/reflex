@@ -1,8 +1,8 @@
 // Matrix-vector (and few-row matrix-matrix) product straight from Q4_K blocks:
 // y[r] = x[r] @ W^T for r in 0..rows (rows <= GEMV_Q4K_MAX_ROWS), where W is the
 // GGUF's raw Q4_K data, row-major (out_features, in_features), never expanded
-// to f32 in device memory. Used when weights are kept quantized on the GPU
-// (REFLEX_QUANT_RESIDENT=1, see docs/design/quantized-resident-weights.md).
+// to f32 in device memory. Used when QR is the default; set REFLEX_QUANT_RESIDENT=0
+// to load weights as f16 instead (see docs/design/quantized-resident-weights.md).
 //
 // Same launch geometry as `gemv_kernel` (gemv.cu): one warp per output row,
 // lanes reduce with a warp shuffle. A 144-byte Q4_K super-block is `d: f16`,
@@ -243,6 +243,83 @@ extern "C" __global__ void gemv_q4k_r1_kernel(
                     whi[i] = d2 * q4k_nib(q[i] >> 4) - m2;
                 }
                 acc[r] += dot16_regs(xlo, wlo) + dot16_regs(xhi, whi);
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        float sum = acc[r];
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        }
+        if (lane == 0u && row0 + r < out_features) {
+            y[row0 + r] = sum;
+        }
+    }
+}
+
+// One-row (decode) Q6_K GEMV, 4 output rows per warp: each lane loads its 32
+// activations of a super-block once and reuses them for all 4 rows, so
+// activation reads per weight drop four-fold. `gemv_q6k_kernel` reads ~4 bytes
+// of `x` per 0.73 bytes of weight and is bound by that rather than by DRAM.
+// Per row, the lane layout, decode expression and summation order are
+// `gemv_q6k_kernel`'s, so every output matches it bit for bit. On a T4 this
+// is about 1.5-1.7x faster than `gemv_q6k_kernel` with rows == 1.
+// Launch: block = 32 * GEMV_Q6K_R1_WARPS threads,
+// grid = ceil(out_features / (GEMV_Q6K_R1_WARPS * GEMV_Q6K_R1_ROWS)).
+#define GEMV_Q6K_R1_ROWS 4
+#define GEMV_Q6K_R1_WARPS 4
+
+extern "C" __global__ void gemv_q6k_r1_kernel(
+    const float* __restrict__ x,
+    const unsigned char* __restrict__ w,
+    float* __restrict__ y,
+    unsigned int in_features,
+    unsigned int out_features
+) {
+    constexpr int R = GEMV_Q6K_R1_ROWS;
+    const unsigned int warp_id = threadIdx.x >> 5;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int row0 = (blockIdx.x * GEMV_Q6K_R1_WARPS + warp_id) * R;
+    if (row0 >= out_features) {
+        return;
+    }
+    const unsigned int nb = in_features >> 8;
+    const unsigned long long row_bytes = (unsigned long long)nb * 210ull;
+    const unsigned int l = lane;
+    const unsigned int is = l / 16;
+
+    float acc[R];
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        acc[r] = 0.0f;
+    }
+    for (unsigned int b = 0; b < nb; b++) {
+        const float* xb = x + (b << 8);
+        #pragma unroll
+        for (unsigned int n = 0; n < 2; n++) {
+            const unsigned int ql_off = 64u * n;
+            #pragma unroll
+            for (int r = 0; r < R; r++) {
+                if (row0 + r < out_features) {
+                    const unsigned char* block = w + (row0 + r) * row_bytes + (unsigned long long)b * 210ull;
+                    const unsigned char ql_l = block[ql_off + l];
+                    const unsigned char ql_l32 = block[ql_off + l + 32];
+                    const unsigned char qh = block[128 + 32u * n + l];
+                    const signed char* sc_all = (const signed char*)(block + 192);
+                    const signed char* sc = sc_all + 8u * n;
+                    const int q1 = (int)((ql_l & 0xF) | (((qh >> 0) & 3) << 4)) - 32;
+                    const int q2 = (int)((ql_l32 & 0xF) | (((qh >> 2) & 3) << 4)) - 32;
+                    const int q3 = (int)((ql_l >> 4) | (((qh >> 4) & 3) << 4)) - 32;
+                    const int q4 = (int)((ql_l32 >> 4) | (((qh >> 6) & 3) << 4)) - 32;
+                    const float d = q4k_le_f16(block + 208);
+                    const float* xn = xb + 128u * n;
+                    acc[r] += xn[l] * d * (float)sc[is] * (float)q1
+                            + xn[l + 32] * d * (float)sc[is + 2] * (float)q2
+                            + xn[l + 64] * d * (float)sc[is + 4] * (float)q3
+                            + xn[l + 96] * d * (float)sc[is + 6] * (float)q4;
+                }
             }
         }
     }

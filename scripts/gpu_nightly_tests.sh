@@ -11,7 +11,8 @@
 # Usage: scripts/gpu_nightly_tests.sh           (from the repo root, on a CUDA machine)
 # Environment:
 #   DENSE_GGUF     required  dense Qwen3 GGUF, e.g. Qwen3-0.6B-Q4_K_M.gguf
-#   HYBRID_GGUF    optional  Qwen3.5 hybrid GGUF, e.g. Qwen3.5-0.8B-Q4_K_M.gguf
+#   HYBRID_GGUF    optional  a non-MTP Qwen3.5 hybrid GGUF, e.g. Qwen3.5-0.8B-Q4_K_M.gguf
+#                            (ggml-org's Q8_0/BF16/Q4_0 carry MTP heads and are rejected)
 #   IQ_GGUF        optional  a GGUF containing IQ-family tensors
 #   MLA_REAL_GGUF  optional  the real DeepSeek-V2-Lite GGUF (~17 GB; see docs/DEVELOPMENT.md)
 #   QWEN2_GGUF     optional  a real Qwen2.5 Q4_K_M GGUF with Q4_K matmuls, e.g.

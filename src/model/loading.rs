@@ -134,7 +134,7 @@ impl WeightPolicy {
 /// A weight tensor's device buffer. `F32` is every tensor in `--weights f32`
 /// mode and the non-matrix tensors in both modes; `F16` is a matrix weight in
 /// `--weights f16` mode; `Quant` is a matrix weight kept as its raw GGUF blocks
-/// (`REFLEX_QUANT_RESIDENT=1`: dense path, Kolibri-1, Gemma 4) and read by the quantized matmul
+/// (QR is the default: dense path, Kolibri-1, Gemma 4) and read by the quantized matmul
 /// kernels. Every matmul wrapper in `kernels.rs` dispatches on this enum.
 pub(super) enum WeightData {
     F32(CudaSlice<f32>),
@@ -164,13 +164,13 @@ pub(super) enum WeightView<'a> {
 /// (`[in_features, out_features]` for a 2-D `nn.Linear`-style weight,
 /// `[hidden_size]` for a norm weight).
 ///
-/// Matrix weights are dequantized at load to the `--weights` dtype. With
-/// `REFLEX_QUANT_RESIDENT=1`, the dense path keeps Q4_K matmul weights (and a
+/// Matrix weights are dequantized at load to the `--weights` dtype. With QR (the default),
+/// the dense path keeps Q4_K matmul weights (and a
 /// Q6_K LM head) as their raw GGUF blocks instead ([`WeightData::Quant`]), and
 /// the GEMV/GEMM wrappers dequantize as they compute -- see
 /// docs/design/quantized-resident-weights.md. Paths that only handle one
 /// element type go through [`Weight::f32`] or [`Weight::view`], which error
-/// (never panic) on anything else.
+/// (never panic) on anything else. Set `REFLEX_QUANT_RESIDENT=0` to load matrix weights as `f16` instead.
 pub(super) struct Weight {
     pub(super) data: WeightData,
     pub(super) shape: Vec<u64>,
@@ -192,6 +192,25 @@ impl Weight {
             WeightData::Quant { ty, .. } => Err(crate::reflex_err!(
                 Other,
                 "internal: an f32-only code path got a quantized-resident ({ty:?}) weight of shape {:?}",
+                self.shape
+            )),
+        }
+    }
+
+    /// The f16 buffer of a matrix weight stored as f16 (`--weights f16`).
+    /// Errors on an f32 or quantized-resident weight instead of handing an
+    /// f16 kernel the wrong element type.
+    pub(super) fn f16(&self) -> Result<&CudaSlice<half::f16>, ReflexError> {
+        match &self.data {
+            WeightData::F16(s) => Ok(s),
+            WeightData::F32(_) => Err(crate::reflex_err!(
+                Other,
+                "weight of shape {:?} is stored as f32, but this op reads it as f16",
+                self.shape
+            )),
+            WeightData::Quant { ty, .. } => Err(crate::reflex_err!(
+                Other,
+                "internal: an f16-only code path got a quantized-resident ({ty:?}) weight of shape {:?}",
                 self.shape
             )),
         }
@@ -241,7 +260,7 @@ impl Weight {
 }
 
 /// One device allocation holding every quantized-resident tensor's raw
-/// blocks (`REFLEX_QUANT_RESIDENT=1`), sized up front from the GGUF header so
+/// blocks (QR is the default), sized up front from the GGUF header so
 /// the load makes one `cuMemAlloc` instead of one per tensor. Offsets are
 /// 256-byte aligned.
 pub(super) struct QuantArena {
@@ -307,10 +326,21 @@ pub(super) fn expert_trace_enabled() -> bool {
     *V.get_or_init(|| std::env::var("REFLEX_EXPERT_TRACE").is_ok_and(|v| v == "1"))
 }
 
-/// `REFLEX_QUANT_RESIDENT=1` turns on quantized-resident weights for the
-/// dense path, Kolibri-1 (Q4_K/Q6_K) and Gemma 4 (Q8_0). Read once per load.
+/// Quantized-resident weights are the default for the dense path, Kolibri-1
+/// (Q4_K/Q6_K) and Gemma 4 (Q8_0). Set `REFLEX_QUANT_RESIDENT=0` to opt out
+/// and use dequantized f16/f32 weights instead. Read once per load.
 pub(super) fn quant_resident_enabled() -> bool {
-    std::env::var("REFLEX_QUANT_RESIDENT").is_ok_and(|v| v == "1")
+    std::env::var("REFLEX_QUANT_RESIDENT")
+        .ok()
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// Whether `REFLEX_QUANT_RESIDENT` was set at all. Notices about paths that do
+/// not implement QR only print when the user asked for it explicitly, so the
+/// default stays quiet on models that never supported it.
+pub(super) fn quant_resident_explicit() -> bool {
+    std::env::var("REFLEX_QUANT_RESIDENT").is_ok()
 }
 
 /// `REFLEX_LAZY_EXPERTS=1` (with `REFLEX_QUANT_RESIDENT=1`, Kolibri-1 only):
@@ -1532,6 +1562,56 @@ pub(super) struct WeightLoadPipeline {
 }
 
 impl WeightLoadPipeline {
+    /// Async host-to-device copy of a single embedding row (typically 4-64 KB).
+    /// Copies `src` into pinned slot 0, launches H2D on `copy_stream`, records
+    /// an event, and returns immediately -- the caller must make the compute
+    /// stream wait for the copy before reading the destination. This is used by
+    /// the decode step to overlap the embedding upload with host-side argmax
+    /// /picker work between tokens.
+    pub(super) fn htod_async_embedding(
+        &mut self,
+        src: &[f32],
+        dst: u64,
+    ) -> Result<(), ReflexError> {
+        let len = src.len() * std::mem::size_of::<f32>();
+        let slot = 0;
+        // Wait for prior use of this slot (non-blocking on GPU, blocks host only if needed).
+        if self.pinned_used[slot] {
+            unsafe { sys::lib().cuEventSynchronize(self.pinned_done[slot]) }
+                .result()
+                .map_err(|e| {
+                    crate::gpu_err!(e, "pipeline: await embedding slot {slot}'s prior copy: {e}")
+                })?;
+        }
+        unsafe { self.pinned[slot].ensure_capacity(len)? };
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, self.pinned[slot].ptr, len)
+        };
+        self.h2d_async(dst, slot, len)?;
+        Ok(())
+    }
+
+    /// Makes the compute stream wait for the last embedding copy on slot 0.
+    /// Call this after `htod_async_embedding` and before launching any kernel
+    /// that reads the destination buffer.
+    pub(super) fn wait_embedding_copy(&mut self) -> Result<(), ReflexError> {
+        let slot = 0;
+        if self.pinned_used[slot] {
+            unsafe {
+                result::stream::wait_event(
+                    *self.device.cu_stream(),
+                    self.pinned_done[slot],
+                    sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+                )
+            }
+            .map_err(|e| crate::gpu_err!(e, "pipeline: wait embedding copy: {e}"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl WeightLoadPipeline {
     pub(super) fn new(device: &Arc<CudaDevice>) -> Result<Self, ReflexError> {
         let copy_stream = result::stream::create(result::stream::StreamKind::NonBlocking)
             .map_err(|e| crate::gpu_err!(e, "create pipeline copy stream: {e}"))?;
@@ -2300,7 +2380,7 @@ pub(super) fn load_weight_device(
 /// [`load_weight_device`], but a 2-D tensor (or a 3-D per-expert stack, read
 /// one expert at a time through `Model::quant_expert_weight`) whose type is in
 /// `allowed` is kept as raw blocks in `arena` instead of being dequantized
-/// (`REFLEX_QUANT_RESIDENT=1`: the dense path, and Kolibri-1's layers). Every
+/// (QR, the default: the dense path, and Kolibri-1's layers). Every
 /// other tensor, and a LoRA target (`policy.keep_f32`, merged in f32), takes
 /// [`load_weight_device`]'s path unchanged.
 pub(super) fn load_weight_device_quant(

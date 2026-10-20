@@ -1,8 +1,8 @@
 // Matrix-vector (and few-row matrix-matrix) product straight from Q8_0 blocks:
 // y[r] = x[r] @ W^T for r in 0..rows (rows <= GEMV_Q8_0_MAX_ROWS), where W is
 // the GGUF's raw Q8_0 data, row-major (out_features, in_features), never
-// expanded in device memory. Used by the Gemma 4 path when weights are kept
-// quantized on the GPU (REFLEX_QUANT_RESIDENT=1, see
+// expanded in device memory. Used by the Gemma 4 path when QR is the default;
+// set REFLEX_QUANT_RESIDENT=0 to load weights as f16 instead (see
 // docs/design/quantized-resident-weights.md, "Q8_0 on the Gemma 4 path").
 //
 // A Q8_0 block is 34 bytes: `d: f16`, then `qs[32]` (int8). Blocks are 34

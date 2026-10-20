@@ -110,9 +110,9 @@ impl Model {
                 "REFLEX_ATTN_KERNEL=legacy is not supported for granitehybrid: the legacy kernels fix the attention scale at 1/sqrt(head_dim), and Granite 4.0-H uses its own attention.scale"
             ));
         }
-        if quant_resident_enabled() {
+        if quant_resident_explicit() && quant_resident_enabled() {
             eprintln!(
-                "note: REFLEX_QUANT_RESIDENT=1 is not supported for granitehybrid; using {} weights",
+                "note: quantized-resident weights are not supported for granitehybrid; using {} weights",
                 policy.matrix_dtype
             );
         }
@@ -326,7 +326,7 @@ impl Model {
             rope_type: RopeType::Neox,
         };
         Ok(Model {
-            device,
+            device: device.clone(),
             cublas,
             rmsnorm_k,
             rope_k,
@@ -338,6 +338,30 @@ impl Model {
             gemv_f16_k,
             gemv_gather_k,
             gemv_gather_f16_k,
+            gemv_qkv_k: aot::load_kernel(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+                "gemv_fused",
+                "gemv_qkv_kernel",
+            )?,
+            gemv_qkv_f16_k: aot::load_kernel(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+                "gemv_fused",
+                "gemv_qkv_f16_kernel",
+            )?,
+            gemv_gate_up_k: aot::load_kernel(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+                "gemv_fused",
+                "gemv_gate_up_kernel",
+            )?,
+            gemv_gate_up_f16_k: aot::load_kernel(
+                &device,
+                include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
+                "gemv_fused",
+                "gemv_gate_up_f16_kernel",
+            )?,
             gemv_q4k_k: None,
             gemv_q4k_r1_k: None,
             dequant_q4k_coalesced_k: None,
@@ -345,6 +369,7 @@ impl Model {
             dequant_q6k_coalesced_k: None,
             dequant_q6k_coalesced_f16_k: None,
             gemv_q6k_k: None,
+            gemv_q6k_r1_k: None,
             q8_0_k: None,
             quant_scratch: RefCell::new(None),
             moe_gather_k,
