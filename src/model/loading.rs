@@ -1573,7 +1573,7 @@ impl WeightLoadPipeline {
         src: &[f32],
         dst: u64,
     ) -> Result<(), ReflexError> {
-        let len = src.len() * std::mem::size_of::<f32>();
+        let len = std::mem::size_of_val(src);
         let slot = 0;
         // Wait for prior use of this slot (non-blocking on GPU, blocks host only if needed).
         if self.pinned_used[slot] {

@@ -1115,6 +1115,7 @@ impl Model {
     /// Fused Q/K/V GEMV: one launch reads `x` once and writes q, k, v outputs
     /// with separate weight pointers (`gemv_qkv_kernel`). One warp per output
     /// row across all three projections; total warps = q_out + k_out + v_out.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn gemv_qkv(
         &self,
         x: &CudaSlice<f32>,
@@ -1153,6 +1154,7 @@ impl Model {
     }
 
     /// Fused Q/K/V GEMV for an f16 weight matrix.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn gemv_qkv_f16(
         &self,
         x: &CudaSlice<f32>,
@@ -1190,6 +1192,7 @@ impl Model {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn launch_gemv_qkv<W: DeviceRepr>(
         &self,
         kernel: &AotKernel,
@@ -1304,6 +1307,7 @@ impl Model {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn launch_gemv_gate_up<W: DeviceRepr>(
         &self,
         kernel: &AotKernel,
@@ -1350,6 +1354,7 @@ impl Model {
     /// Dispatches Q/K/V GEMVs: uses fused `gemv_qkv` when fusion is enabled
     /// and all three weights are f32 or f16; falls back to separate `gemv_to`
     /// calls otherwise (quantized weights, or fusion disabled).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn gemv_qkv_to(
         &self,
         x: &CudaSlice<f32>,
