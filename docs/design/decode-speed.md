@@ -312,22 +312,73 @@ The round 2 branch (fixes 3 and 4 and the f16 KV cache) against master:
 - **Binary size.** The binary is 0.8 MB larger, from the embedded f16 kernel modules,
   which only `REFLEX_KV_CACHE=f16` loads.
 
+## Round 3 (2026-10-20): QR as the default
+
+Quantized-resident weights became the default (`REFLEX_QUANT_RESIDENT=0` opts out), so
+this round's four decode changes were verified through that change rather than as a
+standalone A/B. All four are bit-identical. The A10G cold-start, decode and VRAM table
+(QR default against `REFLEX_QUANT_RESIDENT=0`) is in
+[quantized-resident-weights.md](quantized-resident-weights.md#qr-as-the-default-2026-10-20);
+Qwen3-0.6B decodes at 3.48 vs 3.81 ms/token and uses 270 vs 878 MiB, Mistral 7B at
+15.21 vs 30.19 ms/token. The f16 opt-out path is unchanged.
+
+- **4 rows per warp in `gemv_q6k_r1_kernel`** (`kernels_cuda/gemv_q4k.cu`). Each warp
+  writes four output rows and loads each activation once per super-block for all four,
+  where `gemv_q6k_kernel` handles one row per warp, so activation reads per weight fall
+  4x. Q6_K layer tensors and the LM head use it in QR mode. The per-row dot product and
+  reduction order are the same as `gemv_q6k_kernel`, so the output is bit-identical.
+- **Async embedding upload from pinned memory** (`src/model/decode_step.rs`,
+  `src/model/loading.rs`). The decode step's embedding row goes into a reused pinned
+  staging slot and is sent on the load pipeline's copy stream; the compute stream waits
+  on an event before its first kernel. That overlaps the ~4 KB H2D with the host
+  argmax/picker work and removes the blocking `htod_sync_copy`, with no per-token
+  allocation.
+- **Fused Q/K/V and gate/up GEMVs** (`kernels_cuda/gemv_fused.cu`). One launch per
+  projection group instead of three and two: `gemv_qkv_kernel` over separate q/k/v
+  weight pointers, `gemv_gate_up_kernel` over the gate/up pair. Per-row dot products and
+  reductions are the same, so outputs are bit-identical. Dense, Gemma 4, Granite 4.0-H,
+  Qwen3.5 and MLA decode dispatch it by weight type (f32/f16/quantized);
+  `REFLEX_DECODE_FUSE=0` restores the separate launches.
+- **Streamed Q6_K block headers** (same kernel). The 4-row kernel no longer stages all
+  four rows' block headers in registers before walking a super-block; each row's `d`
+  and scales are read as the block is consumed. Bit-identical. This is commit `2bba001`,
+  which still carries a WIP label; only the label is stale.
+
+**Verification.** A10G 24 GB (`g5.xlarge`, sm_86): GPU suite 128 passed / 0 failed / 2
+skipped in both QR-default and opt-out modes, and `reflex check` gives 47 comparisons
+with 0 token-id divergences. That suite surfaced two decode-path bugs, both fixed here:
+the f16 fused QKV/gate-up kernels reduced the warp sum twice (`warp_dot_f16` already
+reduces), corrupting the opt-out workspace decode and JSON-schema tests; and one-row
+`gemv()` used the older one-row-per-warp Q6_K kernel while `gemv_to()` used
+`gemv_q6k_r1_kernel`, so the workspace and allocating paths differed with QR on. The f16
+opt-out still takes the same path and produces the same results as before the round.
+
 ## What's left
 
-Ranked by the round 2 profile. Status as of 2026-10-18:
+Ranked by the round 2 profile and the round 3 QR-default numbers. Status as of
+2026-10-20:
+- **Close the QR warm-prefill gap.** With QR, warm prefill is still 1.5-2.6x slower than
+  the f16 cuBLAS path at the 1-16-row buckets: Qwen3-0.6B 11.3 vs 7.4 ms, Mistral 7B
+  104.7 vs 39.7 ms, Gemma 4 12B 142.9 ms. That is why Qwen3-0.6B `system1` is 1-2%
+  slower; on larger models the load saving hides it. The next step is a fused
+  dequantize-in-registers tensor-core GEMM (Marlin-style) with its own numerics check,
+  not another change to the existing GEMVs. See
+  [quantized-resident-weights.md](quantized-resident-weights.md#qr-as-the-default-2026-10-20).
 - **Cut the remaining per-op host cost.** *Partly done:* fused norms and the reused
-  workspace (fixes 3 and 4). A single CUDA graph per step didn't pay (above). What
-  remains of the GPU idle (~0.6-0.8 ms per step) is the step start: the logits copy,
-  the host argmax, the embedding upload and the first launches.
+  workspace (round 2), and the embedding upload is now async from pinned memory
+  (round 3). A single CUDA graph per step didn't pay (above). What remains of the GPU
+  idle (~0.6-0.8 ms per step) is the step start: the logits copy, the host argmax and
+  the first launches.
 - **f16 KV cache.** *Done (opt-in, above):* −8% to −10% per token on Qwen3-0.6B at
   ~1,550 positions. Decode attention for GQA groups of 8 (TinyLlama) is compute-bound,
   so f16 storage doesn't help it; making it faster would mean less arithmetic per
   cached position.
-- **Not planned this round.** These are all bit-identical:
-  - a 4-rows-per-warp `gemv_q6k` (QR only, ~0.3 ms; the Q6_K LM head runs at about
-    61% of bandwidth);
-  - greedy argmax on the device (~0.2 ms on a 152K vocabulary);
+- **Done in round 3.** These are bit-identical:
+  - a 4-rows-per-warp `gemv_q6k` (QR only; the Q6_K LM head ran at about 61% of
+    bandwidth);
   - fused Q/K/V and gate/up GEMVs (~2-3%).
+- **Not planned.** Greedy argmax on the device (~0.2 ms on a 152K vocabulary) is still
+  open.
 - **Read fewer weight bytes.** *Partly done (2026-10-15):* the decode Q4_K GEMV is
   1.6-1.8x faster, and Q6_K layer tensors stay quantized. See
   [quantized-resident-weights.md](quantized-resident-weights.md), "Faster Q4_K/Q6_K
