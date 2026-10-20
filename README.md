@@ -5,13 +5,15 @@ launching a process to its first result, not sustained server throughput. Every 
 kernel is compiled ahead of time by `nvcc` and shipped inside the binary, so nothing is
 JIT-compiled when the process starts.
 
-**~483 ms cold start, p50**: `reflex system1` from process start to its scored result
-(the engine's own timer), Tesla T4, `Qwen3-0.6B-Q4_K_M`, `n=10`. Measured from outside
-the process, including the ~110 ms the OS spends launching it, that is ~0.6 s wall clock.
-[Phase breakdown](docs/benchmarks.md#cold-start-phase-breakdown). Measured with `f32`
-weights, before `f16` weight storage became the default. A same-session T4 comparison
-of the two weight types puts `f16` 7% faster here, with half the VRAM and 36–42% faster
-decode ([f16 weight storage](docs/benchmarks.md#f16-weight-storage)).
+**~448 ms cold start, p50**: `reflex system1` from process start to its scored result
+(the engine's own timer), AWS EC2 `g5.xlarge` (NVIDIA A10G, 24 GB),
+`Qwen3-0.6B-Q4_K_M`, `n=10`, two interleaved rounds, quantized-resident weights (the
+default since 2026-10-20). The two rounds are 445 and 451 ms; from outside the process
+that is ~0.58 s wall clock. [Phase breakdown](docs/benchmarks.md#current-default-qr-on-an-a10g-2026-10-20).
+`reflex generate` reaches its first token in 458–461 ms, against 620 ms with
+`REFLEX_QUANT_RESIDENT=0` (`f16`). The older ~483 ms figure was a T4/`f32` measurement;
+see [f16 weight storage](docs/benchmarks.md#f16-weight-storage) and
+[QR as the default](docs/design/quantized-resident-weights.md#qr-as-the-default-2026-10-20).
 
 > **Architectural boundary.** Reflex is a local execution engine for single-tenant
 > decisions: one request at a time, no scheduler, no batching, no network server inside
@@ -74,20 +76,20 @@ serverless endpoint in one click, no build required ([worker docs](.runpod/READM
 | DeepSeek-V2/V3 MLA (`deepseek2`) | DeepSeek-V2-Lite, DeepSeek-Coder-V2-Lite-Instruct, GigaChat3.1-10B-A1.8B, GLM-4.7-Flash (f16 weights, 80 GB GPU); two synthetic fixtures. Group-limited routing (the 671B V3/R1), MTP heads, Moonlight (`kimi-k2` tokenizer) and Kanana-2 (`kanana2`) are not supported |
 | Granite 4.0-H Mamba-2 hybrid (`granitehybrid`) | Granite 4.0-H 350M and 1B `Q8_0`; a synthetic fixture. MoE variants (Tiny, Small), Falcon-H1, Nemotron-H, Jamba and pure Mamba-2 are not supported |
 | Kolibri-1 MoE (`kolibri1`) | Aleph Alpha's Kolibri-1 78B, `Q4_K_M`; a synthetic fixture |
-| Gemma 4 dense, text only (`gemma4`) | Gemma 4 12B-it and 31B-it `Q8_0` (the 31B needs an 80 GB GPU with `REFLEX_QUANT_RESIDENT=0`; QR is default); a synthetic fixture. E2B/E4B and 26B-A4B are not supported |
+| Gemma 4 dense, text only (`gemma4`) | Gemma 4 12B-it and 31B-it `Q8_0` (31B runs on a 48 GB card with QR; the `f16` opt-out needs ~80 GB); a synthetic fixture. E2B/E4B and 26B-A4B are not supported |
 
 Each architecture counted as supported only after its generated tokens matched an
 independent implementation (llama.cpp, or a CPU reference) on real hardware.
 
 - **GGUF only.** Convert other checkpoints with llama.cpp's `convert_hf_to_gguf.py`.
-- **Weights are held quantized on the GPU by default** (Q4_K/Q6_K on the dense path, Q8_0 on Gemma 4): VRAM is about half what `f16` would use. `--weights f32` (or
+- **Weights are held quantized on the GPU by default** (Q4_K/Q6_K on the dense path, Q8_0 on Gemma 4): on an A10G that is 270 MiB resident for Qwen3-0.6B vs 878 MiB with `f16`, 4.1 GB for Mistral 7B vs 13.8 GB, and 11.1 GB for Gemma 4 12B vs 20.9 GB. `--weights f32` (or
    `REFLEX_WEIGHTS=f32`) keeps the exact `f32` reference mode for everything that is dequantized; norms, MoE routers, activations and the KV cache are
    `f32` in both modes. `reflex check` defaults to `f32`.
 - **Context**: up to 65,535 positions per sequence (prompt + generated tokens + any
   imported KV cache); longer requests fail with a clear `context_overflow` error.
 - **`system1`** works on every architecture; on the Qwen3.5 hybrid models each candidate
   must be a single token.
-- **QR off**: `REFLEX_QUANT_RESIDENT=0` loads matrix weights as `f16` (about 2 bytes per parameter). This makes short warm prompts and system1 faster than QR, at the cost of roughly double the VRAM and a ~15–40% decode regression.
+- **QR off**: `REFLEX_QUANT_RESIDENT=0` loads matrix weights as `f16` (about 2 bytes per parameter). This makes short warm prompts and `system1` faster on the smallest model (Qwen3-0.6B), at the cost of 2–3.4x the resident VRAM and slower decode (measured ~8–10% on Qwen3-0.6B, ~30–40% on Qwen3-1.7B/TinyLlama, ~2x on Mistral 7B). On a 24 GB card it does not fit Gemma 4 12B for `generate`.
 - DeepSeek's MTP heads and group-limited expert routing are not supported.
 
 ## How it compares
@@ -95,8 +97,9 @@ independent implementation (llama.cpp, or a CPU reference) on real hardware.
 Cold starts measured from outside the process, Tesla T4, `Qwen3-0.6B-Q4_K_M`, unless
 noted. The engine-vs-engine rows time `reflex generate` to its first token (0.83 s p50,
 `n=30`), the metric every engine shares; the headline above times `system1` scoring.
-Every Reflex figure here was measured with `f32` weights, before `f16` became the default.
-In a same-session comparison of the two weight types, `f16`'s first token was 8% sooner
+Every Reflex figure in this table is the historical `f32`-weights T4 measurement, taken
+before `f16` and then QR became the default; the headline above is the current QR/A10G
+measurement. In a same-session f16-era comparison, `f16`'s first token was 8% sooner
 ([f16 weight storage](docs/benchmarks.md#f16-weight-storage)).
 
 | vs. | Result | Caveat |
