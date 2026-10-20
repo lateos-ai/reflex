@@ -1444,6 +1444,9 @@ impl Model {
             } => self.gemv_q4k(x, w, 1),
             WeightData::Quant {
                 ty: GgmlType::Q6K, ..
+            } if self.gemv_q6k_r1_k.is_some() => self.launch_gemv_q6k_r1(x, w),
+            WeightData::Quant {
+                ty: GgmlType::Q6K, ..
             } => self.gemv_q6k(x, w),
             WeightData::Quant {
                 ty: GgmlType::Q8_0, ..
@@ -1608,7 +1611,11 @@ impl Model {
 
     /// `gemv_q6k_r1_kernel` (4 output rows per warp, decode path for Q6_K):
     /// into the `w.shape[1]` floats at `y`. Requires `gemv_q6k_r1_k`.
-    fn launch_gemv_q6k_r1(&self, x: &CudaSlice<f32>, w: &Weight) -> Result<CudaSlice<f32>, ReflexError> {
+    fn launch_gemv_q6k_r1(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
         let in_features = w.shape[0] as usize;
         let out_features = w.shape[1] as usize;
         let r1 = self.gemv_q6k_r1_k.as_ref().ok_or_else(|| {
@@ -1634,7 +1641,16 @@ impl Model {
         unsafe {
             r1.function
                 .clone()
-                .launch(cfg, (x, w_ptr, *dev_y.device_ptr(), in_features as u32, out_features as u32))
+                .launch(
+                    cfg,
+                    (
+                        x,
+                        w_ptr,
+                        *dev_y.device_ptr(),
+                        in_features as u32,
+                        out_features as u32,
+                    ),
+                )
                 .map_err(|e| crate::gpu_err!(e, "gemv_q6k_r1 launch: {e}"))?;
         }
         Ok(dev_y)

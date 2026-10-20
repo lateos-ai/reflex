@@ -215,7 +215,15 @@ impl Model {
             } else {
                 k_row
             };
-            self.gemv_qkv_to(&ws.normed, &l.attn_q, &l.attn_k, &l.attn_v, ptr(&ws.q), k_out, v_row)?;
+            self.gemv_qkv_to(
+                &ws.normed,
+                &l.attn_q,
+                &l.attn_k,
+                &l.attn_v,
+                ptr(&ws.q),
+                k_out,
+                v_row,
+            )?;
             if let Some(b) = &l.attn_bias {
                 self.add_at(ptr(&ws.q), nq * hd, b.q.f32()?, nq * hd)?;
                 self.add_at(k_out, kv_stride, b.k.f32()?, kv_stride)?;
@@ -291,7 +299,13 @@ impl Model {
                 ptr(&ws.ffn_normed),
             )?;
 
-            self.gemv_gate_up_to(&ws.ffn_normed, &l.ffn_gate, &l.ffn_up, ptr(&ws.gate), ptr(&ws.up))?;
+            self.gemv_gate_up_to(
+                &ws.ffn_normed,
+                &l.ffn_gate,
+                &l.ffn_up,
+                ptr(&ws.gate),
+                ptr(&ws.up),
+            )?;
             self.silu_and_mul_to(&ws.gate, &ws.up, cfg.ffn_hidden_size, ptr(&ws.act))?;
             self.gemv_to(&ws.act, &l.ffn_down, ptr(&ws.down))?;
         }

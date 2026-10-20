@@ -131,12 +131,8 @@ extern "C" __global__ void gemv_qkv_f16_kernel(
         row_in_proj = warp_row - q_out - k_out;
     }
 
-    float sum = warp_dot_f16(x, w_ptr + (unsigned long long)row_in_proj * in_features, in_features, lane);
-    
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(0xffffffffu, sum, offset);
-    }
+    // `warp_dot_f16` already performs the warp-shuffle reduction.
+    const float sum = warp_dot_f16(x, w_ptr + (unsigned long long)row_in_proj * in_features, in_features, lane);
     if (lane == 0u) {
         y_ptr[row_in_proj] = sum;
     }
@@ -242,12 +238,8 @@ extern "C" __global__ void gemv_gate_up_f16_kernel(
         row_in_proj = warp_row - gate_out;
     }
 
-    float sum = warp_dot_f16(x, w_ptr + (unsigned long long)row_in_proj * in_features, in_features, lane);
-    
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(0xffffffffu, sum, offset);
-    }
+    // `warp_dot_f16` already performs the warp-shuffle reduction.
+    const float sum = warp_dot_f16(x, w_ptr + (unsigned long long)row_in_proj * in_features, in_features, lane);
     if (lane == 0u) {
         y_ptr[row_in_proj] = sum;
     }

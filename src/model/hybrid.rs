@@ -570,7 +570,7 @@ impl Model {
                 include_bytes!(env!("REFLEX_KERNEL_GEMV_FUSED")),
                 "gemv_fused",
                 "gemv_gate_up_f16_kernel",
-             )?,
+            )?,
             gemv_q4k_k: None,
             gemv_q4k_r1_k: None,
             dequant_q4k_coalesced_k: None,
