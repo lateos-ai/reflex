@@ -61,6 +61,21 @@ fn arch_numeric(arch: &str) -> Option<String> {
     }
 }
 
+/// A kernel source's `// reflex-min-arch: NN` line (in its first 20 lines), as
+/// `NN`. Portable-PTX builds pass no `-arch`, so nvcc targets its own default
+/// virtual arch (`compute_52` on CUDA 12); a file that needs newer PTX
+/// instructions (`mma.sync`, `ldmatrix`: `compute_75`) names its floor here and
+/// gets `-arch=compute_NN` in that mode. The cubin and fatbin modes already
+/// name exact archs; such a file guards its body with `__CUDA_ARCH__` for
+/// older ones, and the host never launches it there.
+fn min_arch_directive(src: &str) -> Option<String> {
+    src.lines().take(20).find_map(|line| {
+        let rest = line.trim().strip_prefix("//")?.trim();
+        let n = rest.strip_prefix("reflex-min-arch:")?.trim();
+        (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then(|| n.to_string())
+    })
+}
+
 fn main() {
     let src_dir = Path::new("src/kernels_cuda");
     println!("cargo:rerun-if-changed={}", src_dir.display());
@@ -182,6 +197,9 @@ fn main() {
         // can actually load/launch kernels here (type-check only, per docs/DEVELOPMENT.md's
         // "Working without CUDA" section).
         if let Some(nvcc) = &nvcc {
+            let min_arch = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|src| min_arch_directive(&src));
             let mut cmd = Command::new(nvcc);
             cmd.arg(mode_flag).arg(&path).arg("-o").arg(&out_file);
             match (&arch, arch_list.is_empty()) {
@@ -205,8 +223,12 @@ fn main() {
                         "-gencode=arch=compute_{highest_n},code=compute_{highest_n}"
                     ));
                 }
-                // Portable PTX: no arch flag at all.
-                (None, true) => {}
+                // Portable PTX: no arch flag, unless the file names a floor.
+                (None, true) => {
+                    if let Some(n) = &min_arch {
+                        cmd.arg(format!("-arch=compute_{n}"));
+                    }
+                }
             }
 
             let status = cmd

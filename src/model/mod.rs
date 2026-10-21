@@ -279,6 +279,9 @@ pub struct Model {
     attn_decode: DecodeAttnKernels,
     /// Fused decode norms, loaded lazily; see [`DecodeOpKernels`].
     decode_ops: DecodeOpKernels,
+    /// Tensor-core prefill GEMMs on quantized-resident weights, loaded lazily;
+    /// see [`QuantMmaKernels`].
+    quant_mma: QuantMmaKernels,
     /// Reused buffers for the dense decode step, allocated on the first one;
     /// see `decode_step.rs`.
     decode_ws: DecodeWorkspaceSlot,
