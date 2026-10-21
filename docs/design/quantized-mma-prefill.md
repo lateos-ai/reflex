@@ -1,9 +1,11 @@
 # Design: tensor-core prefill straight from quantized weights
 
-Status: design, 2026-10-21. Step 1 (build floor, lazy module, dispatch hook) is in;
-no GGUF type has a kernel yet, so behavior is unchanged. Nothing is measured yet; the
-numbers in "Where the gap comes from" are arithmetic on the published A10G results,
-not a profile.
+Status: 2026-10-21. Step 1 (build floor, lazy module, dispatch hook) is in. Step 2's
+Q4_K kernel (`gemm_q4k_mma_m{1..4}_kernel`, no split-K) and its tests
+(`quant_mma_tests.rs`) are written but **not yet compiled or run on a GPU**; with QR
+and `--weights f16` they are live for Q4_K weights at 2+ rows. Nothing is measured
+yet; the numbers in "Where the gap comes from" are arithmetic on the published A10G
+results, not a profile. The go/no-go run is `quant_mma_q4k_prefill_timings`.
 
 ## The problem
 

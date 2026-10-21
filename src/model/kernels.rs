@@ -556,15 +556,31 @@ impl DecodeOpKernels {
     }
 }
 
-/// GGUF types `gemm_q_mma.cu` has a kernel for, in its function order. Empty
-/// until the first kernel lands (step 2 of docs/design/quantized-mma-prefill.md),
-/// so nothing dispatches there yet.
-const QUANT_MMA_TYPES: [GgmlType; 0] = [];
-const QUANT_MMA_NAMES: [&str; 1] = ["gemm_q4k_mma_kernel"];
-/// `gemm_q_mma.cu`'s block tile: output rows, input rows, threads (4 warps).
+/// GGUF types `gemm_q_mma.cu` has kernels for. Type `i`'s kernels are
+/// `QUANT_MMA_NAMES[i * QUANT_MMA_MAX_MT..][..QUANT_MMA_MAX_MT]`, one per
+/// number of 16-row m tiles a block carries (1..=4).
+const QUANT_MMA_TYPES: [GgmlType; 1] = [GgmlType::Q4K];
+const QUANT_MMA_MAX_MT: usize = 4;
+const QUANT_MMA_NAMES: [&str; 5] = [
+    "gemm_q4k_mma_m1_kernel",
+    "gemm_q4k_mma_m2_kernel",
+    "gemm_q4k_mma_m3_kernel",
+    "gemm_q4k_mma_m4_kernel",
+    "q4k_mma_dequant_check_kernel",
+];
+/// Index of `q4k_mma_dequant_check_kernel` in [`QUANT_MMA_NAMES`] (tests).
+#[cfg(test)]
+pub(super) const QUANT_MMA_Q4K_CHECK: usize = 4;
+/// `gemm_q_mma.cu`'s block tile: output rows and threads (4 warps). A block
+/// carries `16 * mt` input rows.
 const QUANT_MMA_BLOCK_N: u32 = 64;
-const QUANT_MMA_BLOCK_M: u32 = 64;
 const QUANT_MMA_THREADS: u32 = 128;
+
+/// m16 tiles per block for a `rows`-row GEMM: just enough for `rows` up to 64,
+/// else 4 with more blocks along the rows.
+fn quant_mma_tiles(rows: usize) -> usize {
+    rows.div_ceil(16).clamp(1, QUANT_MMA_MAX_MT)
+}
 
 /// The quantized-weight tensor-core prefill GEMMs behind [`Model::gemm_quant_mma`]
 /// (`gemm_q_mma.cu`): one module, loaded on the first quantized-resident
@@ -598,20 +614,41 @@ impl QuantMmaKernels {
         })
     }
 
-    /// The kernel for a `ty` weight, loading the module on first use, or `None`
-    /// when this path doesn't apply: disabled, no kernel for `ty`, or a device
-    /// below sm_75.
+    /// For tests that compare the two paths on one loaded model.
+    #[cfg(test)]
+    pub(super) fn set_enabled(&self, on: bool) {
+        self.enabled.set(on);
+    }
+
+    /// Whether `Model::gemm` takes this path for a `ty` weight of 2+ rows,
+    /// leaving `--weights` aside (tests).
+    #[cfg(test)]
+    pub(super) fn applies(&self, device: &Arc<CudaDevice>, ty: GgmlType) -> bool {
+        matches!(self.kernel(device, ty, 2), Ok(Some(_)))
+    }
+
+    /// The module's kernels, loading it on first use (tests).
+    #[cfg(test)]
+    pub(super) fn all(&self, device: &Arc<CudaDevice>) -> Result<&[AotKernel], ReflexError> {
+        self.module(device)
+    }
+
+    /// The kernel for a `rows`-row GEMM on a `ty` weight, loading the module on
+    /// first use, or `None` when this path doesn't apply: disabled, no kernel
+    /// for `ty`, or a device below sm_75.
     fn kernel(
         &self,
         device: &Arc<CudaDevice>,
         ty: GgmlType,
+        rows: usize,
     ) -> Result<Option<&AotKernel>, ReflexError> {
         if !self.enabled.get() {
             return Ok(None);
         }
-        let Some(index) = QUANT_MMA_TYPES.iter().position(|&t| t == ty) else {
+        let Some(type_index) = QUANT_MMA_TYPES.iter().position(|&t| t == ty) else {
             return Ok(None);
         };
+        let index = type_index * QUANT_MMA_MAX_MT + quant_mma_tiles(rows) - 1;
         let device_ok = *self.device_ok.get_or_init(|| {
             device
                 .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
@@ -627,8 +664,12 @@ impl QuantMmaKernels {
         if !device_ok {
             return Ok(None);
         }
+        Ok(Some(&self.module(device)?[index]))
+    }
+
+    fn module(&self, device: &Arc<CudaDevice>) -> Result<&[AotKernel], ReflexError> {
         if let Some(k) = self.kernels.get() {
-            return Ok(Some(&k[index]));
+            return Ok(k);
         }
         let loaded = aot::load_kernel_module(
             device,
@@ -636,7 +677,7 @@ impl QuantMmaKernels {
             "gemm_q_mma",
             &QUANT_MMA_NAMES,
         )?;
-        Ok(Some(&self.kernels.get_or_init(|| loaded)[index]))
+        Ok(self.kernels.get_or_init(|| loaded))
     }
 }
 
@@ -1931,9 +1972,9 @@ impl Model {
     /// (`--weights f32`, `REFLEX_QUANT_MMA=0`, no kernel for `ty`, a device
     /// below sm_75), and the caller takes the fused-GEMV or scratch path.
     ///
-    /// Grid: 64 output rows by up to 64 input rows per 128-thread block. The
-    /// tile shape never depends on `rows`, so each output element sums in the
-    /// same order whatever the batch size.
+    /// Grid: 64 output rows by `16 * mt` input rows per 128-thread block, `mt`
+    /// (1..=4) from `rows`. Each output element adds its products in the same
+    /// order whatever `mt`, so a row's result doesn't depend on the batch size.
     fn gemm_quant_mma(
         &self,
         x: &CudaSlice<f32>,
@@ -1946,7 +1987,7 @@ impl Model {
         if self.weights_dtype != WeightsDtype::F16 {
             return Ok(None);
         }
-        let Some(k) = self.quant_mma.kernel(&self.device, ty)? else {
+        let Some(k) = self.quant_mma.kernel(&self.device, ty, rows)? else {
             return Ok(None);
         };
         let w_ptr = w.quant_ptr().ok_or_else(|| {
@@ -1957,7 +1998,7 @@ impl Model {
         let cfg = LaunchConfig {
             grid_dim: (
                 (out_features as u32).div_ceil(QUANT_MMA_BLOCK_N),
-                (rows as u32).div_ceil(QUANT_MMA_BLOCK_M),
+                (rows as u32).div_ceil(16 * quant_mma_tiles(rows) as u32),
                 1,
             ),
             block_dim: (QUANT_MMA_THREADS, 1, 1),

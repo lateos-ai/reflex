@@ -151,6 +151,8 @@ mod moe_fixture_tests;
 #[cfg(test)]
 mod prefill_batching_tests;
 #[cfg(test)]
+mod quant_mma_tests;
+#[cfg(test)]
 mod quant_resident_tests;
 #[cfg(test)]
 mod qwen2_tests;
