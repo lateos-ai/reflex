@@ -3,7 +3,7 @@ use crate::gguf::GgufFile;
 use cudarc::driver::CudaDevice;
 
 /// Max |a - b| over max |b|, the comparison the GEMV tests below use.
-fn rel_max_diff(a: &[f32], b: &[f32]) -> f32 {
+pub(super) fn rel_max_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     let scale = b.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-30);
     a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / scale
@@ -20,7 +20,12 @@ fn policy(dtype: WeightsDtype) -> WeightPolicy {
 
 /// [`Model::load_with_options`] with `REFLEX_QUANT_RESIDENT` set to `quant`
 /// for the load only (so run these tests single-threaded).
-fn load_model(device: Arc<CudaDevice>, file: &GgufFile, dtype: WeightsDtype, quant: bool) -> Model {
+pub(super) fn load_model(
+    device: Arc<CudaDevice>,
+    file: &GgufFile,
+    dtype: WeightsDtype,
+    quant: bool,
+) -> Model {
     std::env::set_var("REFLEX_QUANT_RESIDENT", if quant { "1" } else { "0" });
     let opts = LoadOptions {
         weights: dtype,
@@ -32,7 +37,7 @@ fn load_model(device: Arc<CudaDevice>, file: &GgufFile, dtype: WeightsDtype, qua
 }
 
 /// Deterministic pseudo-random activations in [-1, 1).
-fn activations(n: usize, seed: u64) -> Vec<f32> {
+pub(super) fn activations(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
@@ -54,7 +59,9 @@ fn activations(n: usize, seed: u64) -> Vec<f32> {
 /// decode and fused paths read the exact Q4_K values, so they are checked
 /// against the `f32` weight; the scratch path dequantizes into the model's
 /// `--weights` dtype by design, so it is checked against a weight stored in
-/// that dtype. Either way the weights are bit-identical by construction (same
+/// that dtype. With `--weights f16`, 2+ rows take the tensor-core path
+/// (`gemm_q_mma.cu`) instead of both, which computes what the scratch path
+/// does, so those rows are checked against the f16 weight too. Either way the weights are bit-identical by construction (same
 /// decode expression and rounding as the load-time dequant), so only
 /// summation order differs. Run (single-threaded) with:
 /// `REFLEX_TEST_GGUF=<dense Q4_K_M gguf> cargo test --release -- --ignored quant_resident_gemv_matches_f32`
@@ -134,9 +141,12 @@ fn quant_resident_gemv_matches(device: &Arc<CudaDevice>, file: &GgufFile, dtype:
         for rows in [1usize, 2, 5, 8, 13, scratch_rows] {
             let x_host = activations(rows * in_f, rows as u64 + checked as u64);
             let x = device.htod_sync_copy(&x_host).expect("upload x");
-            // Above the fused threshold the quantized path computes from the
-            // `dtype` scratch copy; below it, from the exact Q4_K values.
-            let reference = if rows > quant_fused_max_rows() {
+            // Above the fused threshold (or on tensor cores) the quantized path
+            // computes from `dtype` weights; below it, from the exact Q4_K values.
+            let mma = rows > 1
+                && dtype == WeightsDtype::F16
+                && model.quant_mma.applies(device, GgmlType::Q4K);
+            let reference = if rows > quant_fused_max_rows() || mma {
                 &wd
             } else {
                 &wf
@@ -436,8 +446,10 @@ fn kolibri1_quant_resident_matmuls_match_dequantized() {
                 };
                 for expert in experts {
                     for rows in [1usize, 3, 8, 13, scratch_rows] {
-                        let fused =
-                            rows == 1 || (ty == GgmlType::Q4K && rows <= quant_fused_max_rows());
+                        let mma =
+                            dtype == WeightsDtype::F16 && model.quant_mma.applies(&device, ty);
+                        let fused = rows == 1
+                            || (ty == GgmlType::Q4K && rows <= quant_fused_max_rows() && !mma);
                         let reference = if fused { &wf } else { &wd };
                         let x = device
                             .htod_sync_copy(&activations(rows * in_f, rows as u64 + layer as u64))
@@ -694,7 +706,13 @@ fn q8_0_weight(device: &Arc<CudaDevice>, bytes: &[u8], in_f: usize, out_f: usize
 }
 
 /// `x[rows, in_f] @ w^T` on the host, in f64, `w` row-major `[out_f, in_f]`.
-fn host_matmul(x: &[f32], w: &[f32], rows: usize, in_f: usize, out_f: usize) -> Vec<f32> {
+pub(super) fn host_matmul(
+    x: &[f32],
+    w: &[f32],
+    rows: usize,
+    in_f: usize,
+    out_f: usize,
+) -> Vec<f32> {
     let mut y = vec![0f32; rows * out_f];
     for r in 0..rows {
         let xr = &x[r * in_f..(r + 1) * in_f];
@@ -886,7 +904,7 @@ fn gemma4_q8_0_rows_are_16_byte_aligned() {
 
 /// Synthetic Q4_K blocks for an `[in_f, out_f]` weight: small positive f16 `d`
 /// and `dmin`, every other byte (6-bit scales, nibbles) random.
-fn synthetic_q4k(in_f: usize, out_f: usize, seed: u64) -> Vec<u8> {
+pub(super) fn synthetic_q4k(in_f: usize, out_f: usize, seed: u64) -> Vec<u8> {
     let blocks = in_f / QK_K * out_f;
     let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let mut next = || {

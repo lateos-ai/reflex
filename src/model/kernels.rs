@@ -556,6 +556,228 @@ impl DecodeOpKernels {
     }
 }
 
+/// GGUF types `gemm_q_mma.cu` has kernels for. Type `i`'s kernels are
+/// `QUANT_MMA_NAMES[i * QUANT_MMA_MAX_MT..][..QUANT_MMA_MAX_MT]`, one per
+/// number of 16-row m tiles a block carries (1..=4).
+const QUANT_MMA_TYPES: [GgmlType; 2] = [GgmlType::Q4K, GgmlType::Q6K];
+const QUANT_MMA_MAX_MT: usize = 4;
+const QUANT_MMA_NAMES: [&str; 11] = [
+    "gemm_q4k_mma_m1_kernel",
+    "gemm_q4k_mma_m2_kernel",
+    "gemm_q4k_mma_m3_kernel",
+    "gemm_q4k_mma_m4_kernel",
+    "gemm_q6k_mma_m1_kernel",
+    "gemm_q6k_mma_m2_kernel",
+    "gemm_q6k_mma_m3_kernel",
+    "gemm_q6k_mma_m4_kernel",
+    "q4k_mma_dequant_check_kernel",
+    "q6k_mma_dequant_check_kernel",
+    "gemm_q_mma_splitk_reduce_kernel",
+];
+/// Index of `gemm_q_mma_splitk_reduce_kernel` in [`QUANT_MMA_NAMES`].
+const QUANT_MMA_REDUCE: usize = 10;
+/// Indices of `q4k_mma_dequant_check_kernel` and `q6k_mma_dequant_check_kernel`
+/// in [`QUANT_MMA_NAMES`] (tests).
+#[cfg(test)]
+pub(super) const QUANT_MMA_Q4K_CHECK: usize = 8;
+#[cfg(test)]
+pub(super) const QUANT_MMA_Q6K_CHECK: usize = 9;
+/// `gemm_q_mma.cu`'s block tile: output rows and threads (4 warps). A block
+/// carries `16 * mt` input rows.
+const QUANT_MMA_BLOCK_N: u32 = 64;
+const QUANT_MMA_THREADS: u32 = 128;
+
+/// m16 tiles per block for a `rows`-row GEMM: just enough for `rows` up to 64,
+/// else 4 with more blocks along the rows.
+fn quant_mma_tiles(rows: usize) -> usize {
+    rows.div_ceil(16).clamp(1, QUANT_MMA_MAX_MT)
+}
+
+/// Fewest super-blocks a split-K range gets, so each split still overlaps its
+/// next stage's loads with the current one's math.
+const QUANT_MMA_MIN_KB_PER_SPLIT: usize = 2;
+/// Super-blocks per row from which a GEMM of more than 16 rows splits even
+/// with half the SMs busy (Mistral's `ffn_down`, K = 14336, has 56).
+const QUANT_MMA_LONG_K_BLOCKS: usize = 32;
+
+/// Split-K for a `rows`-row GEMM on a `[in_features, out_features]` quantized
+/// weight, as `(splits, super-blocks per split)`, no split empty. Without
+/// `forced` (`REFLEX_QUANT_MMA_SPLITS`): one split once the grid covers half
+/// the SMs, unless K is long ([`QUANT_MMA_LONG_K_BLOCKS`]) and there are more
+/// than 16 rows; otherwise enough splits to bring the grid to about two blocks
+/// per SM, each at least [`QUANT_MMA_MIN_KB_PER_SPLIT`] super-blocks long. A
+/// split costs a few µs (workspace round trip, reduce launch), which only a
+/// badly underfilled grid or a long K loop earns back (A10G timings in
+/// docs/design/quantized-mma-prefill.md); long prefills fill the GPU
+/// unsplit. A row's bits depend on the split count, so
+/// they stay the same across batch sizes only while it does (the cuBLAS paths
+/// change kernels with the row count too).
+pub(super) fn quant_mma_splits(
+    in_features: usize,
+    out_features: usize,
+    rows: usize,
+    sm_count: usize,
+    forced: Option<usize>,
+) -> (usize, usize) {
+    let nkb = in_features / QK_K;
+    let splits = forced.unwrap_or_else(|| {
+        let tiles = out_features.div_ceil(QUANT_MMA_BLOCK_N as usize)
+            * rows.div_ceil(16 * quant_mma_tiles(rows));
+        let long_k = nkb >= QUANT_MMA_LONG_K_BLOCKS && rows > 16;
+        if 2 * tiles >= sm_count && !long_k {
+            return 1;
+        }
+        let want = (2 * sm_count + tiles / 2) / tiles;
+        want.min(nkb / QUANT_MMA_MIN_KB_PER_SPLIT)
+    });
+    let kb_per_split = nkb.div_ceil(splits.clamp(1, nkb.max(1)));
+    (nkb.div_ceil(kb_per_split), kb_per_split)
+}
+
+/// The quantized-weight tensor-core prefill GEMMs behind [`Model::gemm_quant_mma`]
+/// (`gemm_q_mma.cu`): one module, loaded on the first quantized-resident
+/// prefill of 2+ rows with `--weights f16`, so decode-only runs and 1-row
+/// prompts never pay for it. Needs compute capability 7.5 (`mma.sync`).
+/// `REFLEX_QUANT_MMA=0` keeps the fused-GEMV / dequantize-to-scratch paths, for
+/// A/B runs; `REFLEX_QUANT_MMA_SPLITS=<n>` forces the split-K count, for tuning.
+pub(super) struct QuantMmaKernels {
+    enabled: std::cell::Cell<bool>,
+    /// `REFLEX_QUANT_MMA_SPLITS`, else `None` (pick from the grid size).
+    splits: std::cell::Cell<Option<usize>>,
+    kernels: std::sync::OnceLock<Vec<AotKernel>>,
+    /// Whether the device is sm_75 or newer, read once.
+    device_ok: std::sync::OnceLock<bool>,
+    sm_count: std::sync::OnceLock<usize>,
+}
+
+impl QuantMmaKernels {
+    pub(super) fn from_env() -> Result<Self, ReflexError> {
+        let enabled = match std::env::var("REFLEX_QUANT_MMA").as_deref() {
+            Err(_) | Ok("") | Ok("1") => true,
+            Ok("0") => false,
+            Ok(other) => {
+                return Err(crate::reflex_err!(
+                    InvalidInput,
+                    "REFLEX_QUANT_MMA must be 1 (the default) or 0, got {other:?}"
+                ))
+            }
+        };
+        let splits = match std::env::var("REFLEX_QUANT_MMA_SPLITS").as_deref() {
+            Err(_) | Ok("") => None,
+            Ok(v) => match v.parse::<usize>() {
+                Ok(n) if n >= 1 => Some(n),
+                _ => {
+                    return Err(crate::reflex_err!(
+                        InvalidInput,
+                        "REFLEX_QUANT_MMA_SPLITS must be a positive integer, got {v:?}"
+                    ))
+                }
+            },
+        };
+        Ok(Self {
+            enabled: std::cell::Cell::new(enabled),
+            splits: std::cell::Cell::new(splits),
+            kernels: std::sync::OnceLock::new(),
+            device_ok: std::sync::OnceLock::new(),
+            sm_count: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// For tests that compare the two paths on one loaded model.
+    #[cfg(test)]
+    pub(super) fn set_enabled(&self, on: bool) {
+        self.enabled.set(on);
+    }
+
+    /// Forces the split-K count (`None`: pick it), for tests.
+    #[cfg(test)]
+    pub(super) fn set_splits(&self, splits: Option<usize>) {
+        self.splits.set(splits);
+    }
+
+    /// `(splits, super-blocks per split)` for this GEMM on this device.
+    pub(super) fn splits(
+        &self,
+        device: &Arc<CudaDevice>,
+        in_features: usize,
+        out_features: usize,
+        rows: usize,
+    ) -> (usize, usize) {
+        let sm_count = *self.sm_count.get_or_init(|| {
+            device
+                .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+                .map(|n| n.max(1) as usize)
+                .unwrap_or(40)
+        });
+        quant_mma_splits(in_features, out_features, rows, sm_count, self.splits.get())
+    }
+
+    /// The split-K reduction kernel (module already loaded by [`Self::kernel`]).
+    fn reduce(&self, device: &Arc<CudaDevice>) -> Result<&AotKernel, ReflexError> {
+        Ok(&self.module(device)?[QUANT_MMA_REDUCE])
+    }
+
+    /// Whether `Model::gemm` takes this path for a `ty` weight of 2+ rows,
+    /// leaving `--weights` aside (tests).
+    #[cfg(test)]
+    pub(super) fn applies(&self, device: &Arc<CudaDevice>, ty: GgmlType) -> bool {
+        matches!(self.kernel(device, ty, 2), Ok(Some(_)))
+    }
+
+    /// The module's kernels, loading it on first use (tests).
+    #[cfg(test)]
+    pub(super) fn all(&self, device: &Arc<CudaDevice>) -> Result<&[AotKernel], ReflexError> {
+        self.module(device)
+    }
+
+    /// The kernel for a `rows`-row GEMM on a `ty` weight, loading the module on
+    /// first use, or `None` when this path doesn't apply: disabled, no kernel
+    /// for `ty`, or a device below sm_75.
+    fn kernel(
+        &self,
+        device: &Arc<CudaDevice>,
+        ty: GgmlType,
+        rows: usize,
+    ) -> Result<Option<&AotKernel>, ReflexError> {
+        if !self.enabled.get() {
+            return Ok(None);
+        }
+        let Some(type_index) = QUANT_MMA_TYPES.iter().position(|&t| t == ty) else {
+            return Ok(None);
+        };
+        let index = type_index * QUANT_MMA_MAX_MT + quant_mma_tiles(rows) - 1;
+        let device_ok = *self.device_ok.get_or_init(|| {
+            device
+                .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+                .and_then(|major| {
+                    device
+                        .attribute(
+                            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                        )
+                        .map(|minor| (major, minor) >= (7, 5))
+                })
+                .unwrap_or(false)
+        });
+        if !device_ok {
+            return Ok(None);
+        }
+        Ok(Some(&self.module(device)?[index]))
+    }
+
+    fn module(&self, device: &Arc<CudaDevice>) -> Result<&[AotKernel], ReflexError> {
+        if let Some(k) = self.kernels.get() {
+            return Ok(k);
+        }
+        let loaded = aot::load_kernel_module(
+            device,
+            include_bytes!(env!("REFLEX_KERNEL_GEMM_Q_MMA")),
+            "gemm_q_mma",
+            &QUANT_MMA_NAMES,
+        )?;
+        Ok(self.kernels.get_or_init(|| loaded))
+    }
+}
+
 /// rmsnorm's block size for a row of `hidden_size` floats.
 fn rmsnorm_block_dim(hidden_size: usize) -> u32 {
     hidden_size.next_multiple_of(32).clamp(32, 256) as u32
@@ -1808,6 +2030,11 @@ impl Model {
             ));
         }
         if let WeightData::Quant { ty, len, .. } = &w.data {
+            if rows >= 2 {
+                if let Some(y) = self.gemm_quant_mma(x, w, *ty, in_features, out_features, rows)? {
+                    return Ok(y);
+                }
+            }
             return match ty {
                 // Up to the threshold, the fused kernel reads the Q4_K bytes
                 // once per 8 rows; above it, dequantize into scratch and use
@@ -1815,9 +2042,9 @@ impl Model {
                 GgmlType::Q4K if rows <= quant_fused_max_rows() => self.gemv_q4k(x, w, rows),
                 // Same for Q8_0 (Gemma 4), 16 rows per pass.
                 GgmlType::Q8_0 if rows <= quant_fused_max_rows() => self.gemv_q8_0(x, w, rows),
-                // No multi-row Q6_K kernel yet: one row is the decode GEMV,
-                // which uses `gemv_q6k_r1_kernel` (4 output rows per warp);
-                // anything more goes through the scratch path.
+                // One row is the decode GEMV (`gemv_q6k_r1_kernel`, 4 output
+                // rows per warp); more rows go through the tensor-core kernel
+                // above when it applies, else the scratch path.
                 GgmlType::Q6K if rows == 1 => {
                     let dev_y = self.launch_gemv_q6k_r1(x, w)?;
                     Ok(dev_y)
@@ -1832,6 +2059,94 @@ impl Model {
             };
         }
         self.gemm_view(x, &w.full_view()?, in_features, out_features, rows)
+    }
+
+    /// [`Self::gemm`] on tensor cores, straight from a quantized-resident
+    /// weight (`gemm_q_mma.cu`, docs/design/quantized-mma-prefill.md): the
+    /// activations are cast to f16 as [`Self::gemm_view`]'s f16 path does, each
+    /// weight is dequantized to the f16 value the scratch path would hold, and
+    /// products accumulate in f32. `None` when the path doesn't apply
+    /// (`--weights f32`, `REFLEX_QUANT_MMA=0`, no kernel for `ty`, a device
+    /// below sm_75), and the caller takes the fused-GEMV or scratch path.
+    ///
+    /// Grid: 64 output rows by `16 * mt` input rows per 128-thread block, `mt`
+    /// (1..=4) from `rows`, by the split-K count ([`quant_mma_splits`]). With
+    /// more than one split, the partial sums go to a `[splits, rows, out]`
+    /// workspace and `gemm_q_mma_splitk_reduce_kernel` adds them in split order.
+    /// Each output element adds its products in the same order whatever `mt`,
+    /// so for a given split count a row's result doesn't depend on the batch.
+    fn gemm_quant_mma(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &Weight,
+        ty: GgmlType,
+        in_features: usize,
+        out_features: usize,
+        rows: usize,
+    ) -> Result<Option<CudaSlice<f32>>, ReflexError> {
+        if self.weights_dtype != WeightsDtype::F16 {
+            return Ok(None);
+        }
+        let Some(k) = self.quant_mma.kernel(&self.device, ty, rows)? else {
+            return Ok(None);
+        };
+        let w_ptr = w.quant_ptr().ok_or_else(|| {
+            ReflexError::Other("internal: quantized weight without a device pointer".to_string())
+        })?;
+        let x16 = self.cast_activations_f16(*x.device_ptr(), rows * in_features)?;
+        let n = rows * out_features;
+        let (splits, kb_per_split) =
+            self.quant_mma
+                .splits(&self.device, in_features, out_features, rows);
+        let mut dev_y = self.alloc_out(n, "gemm_quant_mma")?;
+        let mut ws = if splits > 1 {
+            Some(self.alloc_out(splits * n, "gemm_quant_mma split-K")?)
+        } else {
+            None
+        };
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (out_features as u32).div_ceil(QUANT_MMA_BLOCK_N),
+                (rows as u32).div_ceil(16 * quant_mma_tiles(rows) as u32),
+                splits as u32,
+            ),
+            block_dim: (QUANT_MMA_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            k.function
+                .clone()
+                .launch(
+                    cfg,
+                    (
+                        w_ptr,
+                        &x16,
+                        ws.as_mut().unwrap_or(&mut dev_y),
+                        rows as u32,
+                        in_features as u32,
+                        out_features as u32,
+                        kb_per_split as u32,
+                    ),
+                )
+                .map_err(|e| crate::gpu_err!(e, "gemm_quant_mma launch: {e}"))?;
+        }
+        if let Some(ws) = &ws {
+            let threads = 256u32;
+            let cfg = LaunchConfig {
+                grid_dim: ((n as u32).div_ceil(threads), 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.quant_mma
+                    .reduce(&self.device)?
+                    .function
+                    .clone()
+                    .launch(cfg, (ws, &mut dev_y, n as u32, splits as u32))
+                    .map_err(|e| crate::gpu_err!(e, "gemm_quant_mma split-K reduce: {e}"))?;
+            }
+        }
+        Ok(Some(dev_y))
     }
 
     /// [`Self::gemm`] for a quantized-resident weight that the fused kernel

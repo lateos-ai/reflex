@@ -591,6 +591,7 @@ impl Model {
             attn_tiled: TiledAttnKernels::from_env()?,
             attn_decode: DecodeAttnKernels::from_env()?,
             decode_ops: DecodeOpKernels::from_env()?,
+            quant_mma: QuantMmaKernels::from_env()?,
             decode_ws: DecodeWorkspaceSlot::from_env()?,
             kv_dtype: Cell::new(kv_dtype_from_env()?),
             kv_f16: KvF16Kernels::new(),
