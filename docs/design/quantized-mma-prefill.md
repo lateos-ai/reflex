@@ -4,9 +4,10 @@ Status: 2026-10-22. Steps 1-4 are in and verified on an A10G and a T4 (see "Step
 and 4 results"): Q4_K and Q6_K kernels (`gemm_q{4,6}k_mma_m{1..4}_kernel`) with
 split-K, live for 2+ rows with QR and `--weights f16`. On the A10G, QR warm prefill now
 beats QR off everywhere except Mistral at 513 tokens (9% behind). On the T4 it wins
-up to ~30 rows but loses from ~113 rows, and at 513 Mistral tokens it is slower than
-the old scratch path: the kernel is compute-bound on Turing at large row counts (see
-"What's left"). The numbers in "Where the gap comes from" are arithmetic on the
+up to ~30 rows but loses from ~113 rows. The kernel is compute-bound on Turing at
+large row counts, so on sm_75 a row cap (Q4_K above 384 rows, Q6_K above 256) sends
+long prefills back to the scratch path (see "Row cap"), and no T4 bucket is slower
+than before this work. The numbers in "Where the gap comes from" are arithmetic on the
 published A10G results, not a profile.
 
 ## The problem
@@ -124,9 +125,9 @@ same bits.
 In `Model::gemm`, for a `WeightData::Quant` weight with `weights_dtype == F16` and
 `rows >= 2`: `gemm_q_mma` when the module loaded, else today's path. Today's paths stay
 for `--weights f32`, for devices below sm_75, and behind `REFLEX_QUANT_MMA=0` for A/B
-runs. An upper row limit (`REFLEX_QUANT_MMA_MAX_ROWS`) sends very long prefills back to
-the scratch path if cuBLAS wins there; at 449+ rows the scratch round trip is a small
-share, so a simple kernel may lose to cuBLAS. Measure, don't assume.
+runs. An upper row limit sends long prefills back to the scratch path where cuBLAS
+wins: on sm_75 only, per type (see "Row cap"). `REFLEX_QUANT_MMA_MAX_ROWS=<n>`
+overrides it on any device, for tuning (0 or unset: the built-in rule).
 
 ### Build and module loading
 
@@ -356,14 +357,89 @@ prefill dequantizes every weight 8 times, and Q6_K costs more per weight than Q4
 slower than the old scratch path on every shape, and so is Q4_K on 4096x14336; that
 is why T4 Mistral at 513 tokens went from 646 to 711 ms. Next, in order:
 
-1. **Row cap on sm_75** (quick): above some row count, Q6_K (and Q4_K weights as large
-   as Mistral's FFN) take the scratch path again on Turing. That brings T4 long
-   prompts back to at least the old numbers; the crossover (between 113 and 449 rows)
-   needs measuring.
+1. **Row cap on sm_75**: done, see "Row cap".
 2. **Larger m tiles**: 128+ rows per block halves the dequant per MMA. Needs dynamic
    shared memory above 48 KB (opt-in attribute) and fewer staging registers
    (`cp.async` on sm_80+). This is what would close the A10G 513-token gap and the T4
-   gaps from 113 rows up.
+   gaps from 113 rows up, and let the T4 cap rise or go.
+
+## Row cap (sm_75, 2026-10-22)
+
+`quant_mma_max_rows(ty, compute capability, override)`: on sm_75, a GEMM of more than
+384 rows on a Q4_K weight, or more than 256 on a Q6_K one, gets `None` from
+`gemm_quant_mma`, and `Model::gemm` takes the scratch path as before this work. No cap
+from sm_80 up. The compute capability is read once into `QuantMmaKernels`.
+`REFLEX_QUANT_MMA_MAX_ROWS=<n>` sets the cap on any device (0 or unset: the rule).
+Host test `quant_mma_row_cap_rule`; the kernel tests run with the cap off, so they
+still cover every row count.
+
+**Sweep** (T4, sm_75 cubin, `quant_mma_row_crossover`: kernel time / scratch-path
+time, bold where the kernel loses):
+
+| type, shape | 113 | 160 | 192 | 256 | 320 | 384 | 449 | 513 |
+|---|---|---|---|---|---|---|---|---|
+| Q4_K 1024x2048 | 0.37 | 0.48 | 0.50 | 0.61 | 0.63 | 0.61 | 0.84 | 0.89 |
+| Q4_K 1024x1024 | 0.44 | 0.59 | 0.62 | 0.63 | 0.62 | 0.78 | 0.90 | 0.93 |
+| Q4_K 1024x3072 | 0.39 | 0.48 | 0.50 | 0.53 | 0.65 | 0.75 | 0.74 | 0.86 |
+| Q4_K 3072x1024 | 0.43 | 0.57 | 0.62 | 0.64 | 0.65 | 0.83 | 0.94 | **1.06** |
+| Q4_K 4096x4096 | 0.36 | 0.40 | 0.47 | 0.52 | 0.63 | 0.80 | 0.80 | 0.92 |
+| Q4_K 4096x1024 | 0.44 | 0.64 | 0.68 | 0.71 | 0.69 | 0.86 | 0.99 | **1.04** |
+| Q4_K 4096x14336 | 0.26 | 0.43 | 0.48 | 0.67 | 0.74 | 0.88 | **1.06** | **1.05** |
+| Q4_K 14336x4096 | 0.31 | 0.44 | 0.48 | 0.58 | 0.70 | 0.85 | 0.97 | **1.06** |
+| Q6_K 1024x2048 | 0.68 | 0.82 | 0.86 | **1.11** | **1.01** | **1.02** | **1.28** | **1.39** |
+| Q6_K 1024x1024 | 0.61 | 0.85 | 0.89 | 0.89 | 0.93 | **1.09** | **1.32** | **1.32** |
+| Q6_K 1024x3072 | 0.65 | 0.77 | 0.81 | 0.85 | **1.02** | **1.29** | **1.14** | **1.33** |
+| Q6_K 3072x1024 | 0.61 | 0.88 | 0.95 | 0.92 | 0.93 | **1.21** | **1.37** | **1.42** |
+| Q6_K 4096x4096 | 0.59 | 0.63 | 0.73 | 0.81 | 0.99 | **1.20** | **1.24** | **1.39** |
+| Q6_K 4096x1024 | 0.71 | 0.99 | 0.99 | 0.96 | 0.98 | **1.24** | **1.40** | **1.48** |
+| Q6_K 4096x14336 | 0.44 | 0.74 | 0.78 | **1.02** | **1.06** | **1.24** | **1.48** | **1.45** |
+| Q6_K 14336x4096 | 0.50 | 0.74 | 0.74 | 0.88 | **1.04** | **1.22** | **1.36** | **1.46** |
+
+Q4_K wins on every shape through 384 rows and loses on Mistral's FFN from 449. Q6_K
+wins on every shape through 192 rows and in total at 256 (6.8 vs 7.3 ms over the eight
+shapes); it loses in total from 320. The small Qwen3-0.6B Q4_K shapes keep winning
+at 449, but not cleanly at 513 (3072x1024 loses), so the rule is one constant per
+type, not scaled by weight size.
+
+**Model level** (`reflex bench` warm prefill p50 ms, cap set through the env var, two
+interleaved rounds, ranges over both): every cap from 256 to 384 gives the same
+buckets, since they are all at or below 129 rows or at or above 449. A cap of 128 is
+too low: Mistral at 129 tokens goes from 214 to 357 ms.
+
+| T4 | Qwen3-0.6B 29 / 113 / 449 | Mistral 7B 33 / 129 / 513 |
+|---|---|---|
+| no cap | 8.34-8.44 / 16.4-16.7 / 64.9-65.9 | 63.2-64.2 / 213-215 / 706-708 |
+| cap 256 or 384 | 8.37-8.47 / 16.6-16.7 / 68.8-69.3 | 64.1-64.5 / 214-216 / 638-644 |
+| QR before (`REFLEX_QUANT_MMA=0`) | 23.3 / 30.0 / 69.2-69.3 | 298 / 357-358 / 640-644 |
+| QR off | 11.0 / 16.9 / 55.9-56.1 | 85.4-85.6 / 151-152 / 431-432 |
+
+The cap costs Qwen3-0.6B ~4 ms at 449 tokens (its Q4_K layers would still win there)
+and gives Mistral back ~65 ms at 513. Larger m tiles are the fix for both.
+
+**Verification with the final rule** (T4, sm_75 cubin): kernel tests 1-6 pass for both
+types; `quant_resident_*` on Qwen3-0.6B, and `quant_resident_gemv_matches_f32` and
+`prefill_dense_batched_matches_sequential_prefill` on Mistral, pass (the Kolibri and
+Qwen2.5 tests fail for want of their fixtures, as before); host tests pass. 32 greedy
+tokens are identical in all four modes (MMA, forced 1 split, `REFLEX_QUANT_MMA=0`,
+`REFLEX_QUANT_RESIDENT=0`) on both models, for the short prompt and a ~420-token one
+that crosses both caps. Bench, two interleaved rounds:
+
+| T4 | Qwen3-0.6B 29 / 113 / 449 | Mistral 7B 33 / 129 / 513 |
+|---|---|---|
+| MMA, capped | **8.40** / **16.6** / 68.7, **8.45** / **16.7** / 68.9 | **64.1** / 214 / 636, **64.2** / 216 / 646 |
+| QR off | 10.9 / 16.8 / **55.5**, 11.0 / 16.8 / **56.0** | 85.5 / **151** / **432**, 85.5 / **151** / **432** |
+| QR before (`REFLEX_QUANT_MMA=0`, once) | 23.3 / 30.1 / 69.2 | 298 / 359 / 645 |
+
+Every T4 bucket is now at or below its pre-MMA number; the long ones match it, since
+they take the same path. Decode didn't move (Qwen3-0.6B 204 tok/s, Mistral 31.1).
+
+**A10G check** (sm_86 cubin, same script): no cap there, as intended
+(`quant_mma_row_crossover` takes the kernel at every row count). The same tests pass
+(and the same fixture-less ones fail), greedy tokens are identical in all four modes on
+both prompts, and the bench didn't move: MMA Qwen3-0.6B 5.63 / 9.89 / 27.1 ms and
+Mistral 23.8 / 73.6 / 213-215 ms, against 5.65 / 9.92 / 27.3 and 23.9 / 73.7 / 213.5
+in "Steps 3 and 4 results".
+
 
 ## Order of work
 

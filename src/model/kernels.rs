@@ -634,19 +634,52 @@ pub(super) fn quant_mma_splits(
     (nkb.div_ceil(kb_per_split), kb_per_split)
 }
 
+/// Most rows a GEMM on a `ty` weight sends through the tensor-core kernel on a
+/// device of compute capability `cc`; above it [`Model::gemm`] takes the
+/// dequantize-to-scratch path. `forced` (`REFLEX_QUANT_MMA_MAX_ROWS`) applies
+/// on every device. Without it there is no cap from sm_80 up. Turing (sm_75)
+/// has no k16 MMA, and the kernel dequantizes each weight once per 64-row
+/// block, so it turns compute-bound and loses to scratch + cuBLAS at long
+/// prompts ("Row cap" in docs/design/quantized-mma-prefill.md has the T4
+/// sweep).
+pub(super) fn quant_mma_max_rows(ty: GgmlType, cc: (i32, i32), forced: Option<usize>) -> usize {
+    if let Some(n) = forced {
+        return n;
+    }
+    if cc >= (8, 0) {
+        return usize::MAX;
+    }
+    match ty {
+        GgmlType::Q6K => QUANT_MMA_SM75_MAX_ROWS_Q6K,
+        _ => QUANT_MMA_SM75_MAX_ROWS_Q4K,
+    }
+}
+
+/// [`quant_mma_max_rows`]'s caps on sm_75, per type. On a T4 the Q4_K kernel
+/// beats scratch + cuBLAS on every Qwen3-0.6B and Mistral 7B layer shape up
+/// to 384 rows and loses on Mistral's FFN from 449; Q6_K (more dequant work
+/// per weight) wins on every shape up to 192 rows, in total at 256, and loses
+/// in total from 320.
+const QUANT_MMA_SM75_MAX_ROWS_Q4K: usize = 384;
+const QUANT_MMA_SM75_MAX_ROWS_Q6K: usize = 256;
+
 /// The quantized-weight tensor-core prefill GEMMs behind [`Model::gemm_quant_mma`]
 /// (`gemm_q_mma.cu`): one module, loaded on the first quantized-resident
 /// prefill of 2+ rows with `--weights f16`, so decode-only runs and 1-row
 /// prompts never pay for it. Needs compute capability 7.5 (`mma.sync`).
 /// `REFLEX_QUANT_MMA=0` keeps the fused-GEMV / dequantize-to-scratch paths, for
-/// A/B runs; `REFLEX_QUANT_MMA_SPLITS=<n>` forces the split-K count, for tuning.
+/// A/B runs; `REFLEX_QUANT_MMA_SPLITS=<n>` forces the split-K count and
+/// `REFLEX_QUANT_MMA_MAX_ROWS=<n>` the row cap ([`quant_mma_max_rows`]), for
+/// tuning.
 pub(super) struct QuantMmaKernels {
     enabled: std::cell::Cell<bool>,
     /// `REFLEX_QUANT_MMA_SPLITS`, else `None` (pick from the grid size).
     splits: std::cell::Cell<Option<usize>>,
+    /// `REFLEX_QUANT_MMA_MAX_ROWS`, else `None` (the per-device rule).
+    max_rows: std::cell::Cell<Option<usize>>,
     kernels: std::sync::OnceLock<Vec<AotKernel>>,
-    /// Whether the device is sm_75 or newer, read once.
-    device_ok: std::sync::OnceLock<bool>,
+    /// The device's compute capability, read once.
+    cc: std::sync::OnceLock<(i32, i32)>,
     sm_count: std::sync::OnceLock<usize>,
 }
 
@@ -674,11 +707,24 @@ impl QuantMmaKernels {
                 }
             },
         };
+        let max_rows = match std::env::var("REFLEX_QUANT_MMA_MAX_ROWS").as_deref() {
+            Err(_) | Ok("") | Ok("0") => None,
+            Ok(v) => match v.parse::<usize>() {
+                Ok(n) => Some(n),
+                _ => {
+                    return Err(crate::reflex_err!(
+                        InvalidInput,
+                        "REFLEX_QUANT_MMA_MAX_ROWS must be a non-negative integer, got {v:?}"
+                    ))
+                }
+            },
+        };
         Ok(Self {
             enabled: std::cell::Cell::new(enabled),
             splits: std::cell::Cell::new(splits),
+            max_rows: std::cell::Cell::new(max_rows),
             kernels: std::sync::OnceLock::new(),
-            device_ok: std::sync::OnceLock::new(),
+            cc: std::sync::OnceLock::new(),
             sm_count: std::sync::OnceLock::new(),
         })
     }
@@ -693,6 +739,33 @@ impl QuantMmaKernels {
     #[cfg(test)]
     pub(super) fn set_splits(&self, splits: Option<usize>) {
         self.splits.set(splits);
+    }
+
+    /// Forces the row cap (`None`: the per-device rule), for tests.
+    #[cfg(test)]
+    pub(super) fn set_max_rows(&self, max_rows: Option<usize>) {
+        self.max_rows.set(max_rows);
+    }
+
+    /// The device's compute capability, `(0, 0)` if it can't be read.
+    fn compute_capability(&self, device: &Arc<CudaDevice>) -> (i32, i32) {
+        *self.cc.get_or_init(|| {
+            device
+                .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+                .and_then(|major| {
+                    device
+                        .attribute(
+                            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                        )
+                        .map(|minor| (major, minor))
+                })
+                .unwrap_or((0, 0))
+        })
+    }
+
+    /// Most rows a `ty` GEMM takes this path for on this device.
+    pub(super) fn max_rows(&self, device: &Arc<CudaDevice>, ty: GgmlType) -> usize {
+        quant_mma_max_rows(ty, self.compute_capability(device), self.max_rows.get())
     }
 
     /// `(splits, super-blocks per split)` for this GEMM on this device.
@@ -746,19 +819,7 @@ impl QuantMmaKernels {
             return Ok(None);
         };
         let index = type_index * QUANT_MMA_MAX_MT + quant_mma_tiles(rows) - 1;
-        let device_ok = *self.device_ok.get_or_init(|| {
-            device
-                .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-                .and_then(|major| {
-                    device
-                        .attribute(
-                            sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                        )
-                        .map(|minor| (major, minor) >= (7, 5))
-                })
-                .unwrap_or(false)
-        });
-        if !device_ok {
+        if self.compute_capability(device) < (7, 5) {
             return Ok(None);
         }
         Ok(Some(&self.module(device)?[index]))
@@ -2067,7 +2128,8 @@ impl Model {
     /// weight is dequantized to the f16 value the scratch path would hold, and
     /// products accumulate in f32. `None` when the path doesn't apply
     /// (`--weights f32`, `REFLEX_QUANT_MMA=0`, no kernel for `ty`, a device
-    /// below sm_75), and the caller takes the fused-GEMV or scratch path.
+    /// below sm_75, more rows than [`quant_mma_max_rows`] allows), and the
+    /// caller takes the fused-GEMV or scratch path.
     ///
     /// Grid: 64 output rows by `16 * mt` input rows per 128-thread block, `mt`
     /// (1..=4) from `rows`, by the split-K count ([`quant_mma_splits`]). With
@@ -2084,7 +2146,9 @@ impl Model {
         out_features: usize,
         rows: usize,
     ) -> Result<Option<CudaSlice<f32>>, ReflexError> {
-        if self.weights_dtype != WeightsDtype::F16 {
+        if self.weights_dtype != WeightsDtype::F16
+            || rows > self.quant_mma.max_rows(&self.device, ty)
+        {
             return Ok(None);
         }
         let Some(k) = self.quant_mma.kernel(&self.device, ty, rows)? else {
