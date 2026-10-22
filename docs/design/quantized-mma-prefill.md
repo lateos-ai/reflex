@@ -1,11 +1,10 @@
 # Design: tensor-core prefill straight from quantized weights
 
-Status: 2026-10-21. Step 1 (build floor, lazy module, dispatch hook) is in. Step 2's
-Q4_K kernel (`gemm_q4k_mma_m{1..4}_kernel`, no split-K) and its tests
-(`quant_mma_tests.rs`) are written but **not yet compiled or run on a GPU**; with QR
-and `--weights f16` they are live for Q4_K weights at 2+ rows. Nothing is measured
-yet; the numbers in "Where the gap comes from" are arithmetic on the published A10G
-results, not a profile. The go/no-go run is `quant_mma_q4k_prefill_timings`.
+Status: 2026-10-21. Steps 1 and 2 are in: the Q4_K kernel
+(`gemm_q4k_mma_m{1..4}_kernel`, no split-K) is live for Q4_K weights at 2+ rows with
+QR and `--weights f16`. Step 2 passed its go/no-go on an A10G (see "Step 2 results");
+not yet run on a T4. The numbers in "Where the gap comes from" are arithmetic on the
+published A10G results, not a profile.
 
 ## The problem
 
@@ -152,7 +151,11 @@ dense-model projection shape, rows {2, 5, 8, 12, 13, 16, 17, 29, 33, 64, 113, 44
 2. **Against the scratch path.** Same f16 inputs through scratch + `cublasGemmEx`:
    relative L2 below 1e-5 (summation order only), max abs diff reported.
 3. **Against f64.** A host f64 GEMM over the same f16-rounded inputs: the kernel's
-   error is no worse than cuBLAS's on the same shapes.
+   relative L2 error stays below `3e-9 * in_features` (at least 1e-6), with cuBLAS's
+   printed beside it. Not "no worse than cuBLAS": at a few rows cuBLAS runs CUDA-core
+   f32 FMAs, while `mma.sync` adds inside the tensor core at lower internal precision
+   (A10G, 1024x136 at 2 rows: 1.5e-6 vs 1.8e-7), and the error grows about linearly
+   with K. All of it is far below the f16 input rounding (~3e-4).
 4. **Row independence.** Rows 0..r of a 113-row call are bit-identical to an r-row call
    on the same inputs.
 5. **Determinism.** Two runs give identical bits, including split-K shapes.
@@ -179,6 +182,51 @@ it didn't move.
 
 **Done means:** QR warm prefill at or below QR off at every bucket on both GPUs,
 Qwen3-0.6B cold `system1` no slower than QR off, and 0 token-id divergences.
+
+## Step 2 results (A10G, 2026-10-21)
+
+g5.xlarge, driver 595.91, CUDA 13.2, `REFLEX_CUDA_ARCH=sm_86` cubin and the portable
+PTX build (`-arch=compute_75` from the file's floor, so the two-k8 path, JIT'd for
+sm_86). Not yet run on a T4.
+
+**Tests 1, 2, 4, 5, 6 pass in both builds.** Test 3 failed as first written ("within
+2x cuBLAS's error"); the bound was wrong, not the kernel (see item 3). Worst relative
+L2 against the f64 product, kernel / cuBLAS: 5.4e-7 / 5.4e-7 at 256x40, 2.0e-6 /
+1.7e-6 at 1024x1024, 5.5e-6 / 1.4e-6 at 3072x1024, 6.9e-6 / 3.5e-6 at 4096x4096.
+Both builds give the same numbers. `quant_resident` tests pass (the Kolibri and
+Qwen2.5 ones need fixtures that weren't on the box).
+
+**Greedy tokens:** 32 generated tokens identical with MMA on, `REFLEX_QUANT_MMA=0`
+and `REFLEX_QUANT_RESIDENT=0`, on Qwen3-0.6B and Mistral 7B.
+
+**Kernel micro-benchmark** (`quant_mma_q4k_prefill_timings`, µs; mma / scratch +
+cuBLAS / f16 cuBLAS alone). Go: the kernel beats today's QR path at every shape and
+row count, and beats f16 cuBLAS at 12-64 rows on the wide shapes.
+
+| shape | 12 rows | 29 rows | 113 rows | 449 rows |
+|---|---|---|---|---|
+| 1024x3072 | 12.5 / 56.3 / 23.8 | 16.1 / 54.4 / 25.2 | 37.0 / 65.9 / 33.1 | 84.0 / 142.7 / 104.9 |
+| 3072x1024 | 23.5 / 55.1 / 26.9 | 33.2 / 56.8 / 27.5 | 54.4 / 66.1 / 33.0 | 127.0 / 139.6 / 104.6 |
+| 4096x4096 | 32.3 / 289.5 / 85.1 | 44.6 / 254.1 / 86.3 | 121.1 / 268.8 / 102.3 | 412.0 / 544.8 / 381.2 |
+| 4096x14336 | 90.2 / 763.1 / 264.9 | 104.3 / 836.7 / 267.2 | 326.4 / 883.2 / 313.8 | 1223.9 / 1619.7 / 1047.6 |
+| 14336x4096 | 93.7 / 1029.5 / 264.7 | 137.9 / 843.5 / 267.6 | 401.0 / 878.6 / 309.2 | 1363.3 / 1753.3 / 1185.2 |
+
+It loses to f16 cuBLAS on narrow outputs (`out_features` 1024: 16 blocks on 80 SMs)
+from ~29 rows, and everywhere from ~113 rows: split-K and the larger-row tiles are
+step 3.
+
+**`reflex bench` warm prefill** (p50 ms, 5 warmup + 20 iters; MMA / today's QR /
+QR off):
+
+| model | short | medium | long |
+|---|---|---|---|
+| Qwen3-0.6B, 29 / 113 / 449 | **6.81** / 11.26 / 7.37 | 11.10 / 14.34 / **9.88** | **27.29** / 32.73 / 28.22 |
+| Mistral 7B, 33 / 129 / 513 | **34.2** / 104.4 / 39.5 | 79.4 / 140.7 / **75.0** | 213.9 / 261.2 / **195.5** |
+
+Mistral's 65 ms gap is gone at 33 tokens and down to 4-18 ms above it. What's left:
+the Q6_K tensors (`attn_v`/`ffn_down` in half the layers of a Q4_K_M file) still take
+the scratch path (step 4), and the larger-row tiles (step 3). Decode throughput
+didn't move (Qwen3-0.6B 288 vs 291 tok/s, within run-to-run noise).
 
 ## Order of work
 

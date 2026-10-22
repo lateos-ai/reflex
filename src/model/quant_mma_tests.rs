@@ -169,7 +169,8 @@ fn quant_mma_q4k_dequant_bit_exact() {
 /// call on the scratch path's f16 weights (`cublasGemmEx`, f32 compute): the
 /// inputs are identical, so only summation order may differ. For the smaller
 /// shapes, both are also compared with an f64 host product of those same f16
-/// inputs, and the kernel's error must stay within twice cuBLAS's.
+/// inputs: the kernel's relative L2 error must stay below `3e-9 * in_features`
+/// (at least 1e-6; the worst case per shape is printed next to cuBLAS's).
 #[test]
 #[ignore]
 fn quant_mma_q4k_matches_f16_gemm() {
@@ -186,6 +187,7 @@ fn quant_mma_q4k_matches_f16_gemm() {
             _ => unreachable!(),
         };
         let w32: Vec<f32> = w16.iter().map(|v| v.to_f32()).collect();
+        let (mut worst, mut worst_cublas) = (0.0f64, 0.0f64);
         for rows in ROWS {
             let x = activations(rows * in_f, (k * 1000 + rows) as u64);
             let got = gemm_host(&model, &x, &wq, rows);
@@ -204,11 +206,26 @@ fn quant_mma_q4k_matches_f16_gemm() {
                 let x16: Vec<f32> = x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
                 let exact = host_matmul(&x16, &w32, rows, in_f, out_f);
                 let (e_mma, e_cublas) = (rel_l2(&got, &exact), rel_l2(&want, &exact));
+                worst = worst.max(e_mma);
+                worst_cublas = worst_cublas.max(e_cublas);
+                // Not a multiple of cuBLAS's error: at a few rows cuBLAS picks
+                // CUDA-core kernels with plain f32 FMAs, while mma.sync adds
+                // inside the tensor core at lower internal precision (1.5e-6
+                // vs 1.8e-7 at 1024x136, 2 rows, on an A10G). That error grows
+                // about linearly with in_features (A10G worst: 2.0e-6 at 1024,
+                // 5.5e-6 at 3072, 6.9e-6 at 4096), hence a bound in K. All of
+                // it sits far below the f16 rounding of the inputs (~3e-4).
+                let bound = (3e-9 * in_f as f64).max(1e-6);
                 assert!(
-                    e_mma <= 2.0 * e_cublas + 1e-7,
+                    e_mma < bound,
                     "{in_f}x{out_f} rows={rows}: kernel error {e_mma:e} vs cuBLAS {e_cublas:e}"
                 );
             }
+        }
+        if worst > 0.0 {
+            eprintln!(
+                "{in_f}x{out_f}: worst relative L2 vs f64: kernel {worst:e}, cuBLAS {worst_cublas:e}"
+            );
         }
     }
 }
