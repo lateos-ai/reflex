@@ -37,8 +37,9 @@ const SHAPES: [(usize, usize); 10] = [
 const ROWS: [usize; 14] = [2, 5, 8, 12, 13, 16, 17, 29, 33, 48, 64, 65, 113, 129];
 
 /// The test model: `REFLEX_TEST_GGUF` loaded quantized-resident with f16
-/// weights, with the tensor-core path available. `None` (with a skip message)
-/// on a device below sm_75.
+/// weights, with the tensor-core path available at every row count (no row
+/// cap, [`quant_mma_max_rows`]). `None` (with a skip message) on a device
+/// below sm_75.
 fn test_model(device: &Arc<CudaDevice>) -> Option<Model> {
     let path = std::env::var("REFLEX_TEST_GGUF")
         .expect("set REFLEX_TEST_GGUF to a dense Q4_K GGUF to run this test");
@@ -52,6 +53,7 @@ fn test_model(device: &Arc<CudaDevice>) -> Option<Model> {
         model.dequant_q4k_coalesced_f16_k.is_some() && model.dequant_q6k_coalesced_f16_k.is_some(),
         "QR model must load the Q4_K and Q6_K scratch dequant kernels"
     );
+    model.quant_mma.set_max_rows(Some(usize::MAX));
     Some(model)
 }
 
@@ -415,6 +417,30 @@ fn quant_mma_split_rule() {
     }
 }
 
+/// The row cap ([`quant_mma_max_rows`]): per type on sm_75, none from sm_80
+/// up, and `REFLEX_QUANT_MMA_MAX_ROWS` on every device. Host only.
+#[test]
+fn quant_mma_row_cap_rule() {
+    let (q4, q6) = (GgmlType::Q4K, GgmlType::Q6K);
+    // T4: Q4_K through 384 rows, Q6_K through 256.
+    assert_eq!(quant_mma_max_rows(q4, (7, 5), None), 384);
+    assert_eq!(quant_mma_max_rows(q6, (7, 5), None), 256);
+    // Ampere and newer: no cap.
+    for cc in [(8, 0), (8, 6), (8, 9), (9, 0), (12, 0)] {
+        assert_eq!(quant_mma_max_rows(q4, cc, None), usize::MAX);
+        assert_eq!(quant_mma_max_rows(q6, cc, None), usize::MAX);
+    }
+    // The override wins everywhere.
+    assert_eq!(quant_mma_max_rows(q6, (7, 5), Some(1000)), 1000);
+    assert_eq!(quant_mma_max_rows(q4, (8, 6), Some(128)), 128);
+    // The bench's long buckets take the scratch path on a T4, the medium ones
+    // (113 / 129 rows) stay on the kernel.
+    for ty in [q4, q6] {
+        let cap = quant_mma_max_rows(ty, (7, 5), None);
+        assert!((129..449).contains(&cap), "{ty:?}: {cap}");
+    }
+}
+
 /// Activations beyond f16's range saturate in the shared cast, so the result
 /// stays finite and matches the scratch path.
 #[test]
@@ -514,6 +540,77 @@ fn quant_mma_prefill_timings() {
                 eprintln!(
                     "{ty:?} {in_f}x{out_f} {rows}: {mma:.1} ({unsplit:.1}) | {today:.1} | {f16:.1} ({:.2} MB, {splits} splits)",
                     bytes.len() as f64 / 1e6
+                );
+            }
+        }
+    }
+}
+
+/// Where the tensor-core kernel stops beating the scratch path as rows grow
+/// (the row cap, [`quant_mma_max_rows`]): per type and the Qwen3-0.6B and
+/// Mistral 7B layer shapes, the kernel past any cap against the scratch path
+/// (`REFLEX_QUANT_MMA=0`), and which one `Model::gemm` picks with the built-in
+/// cap. Prints only.
+#[test]
+#[ignore]
+fn quant_mma_row_crossover() {
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let Some(model) = test_model(&device) else {
+        return;
+    };
+    let dev = &model.device;
+    let time = |f: &dyn Fn(usize)| {
+        for i in 0..3 {
+            f(i);
+        }
+        dev.synchronize().unwrap();
+        let iters = 30;
+        let t = std::time::Instant::now();
+        for i in 0..iters {
+            f(i);
+        }
+        dev.synchronize().unwrap();
+        t.elapsed().as_secs_f64() * 1e6 / iters as f64
+    };
+    eprintln!("crossover: type shape rows: mma us | scratch us | mma/scratch | capped path");
+    let caps = TYPES.map(|ty| {
+        model.quant_mma.set_max_rows(None);
+        let cap = model.quant_mma.max_rows(dev, ty);
+        model.quant_mma.set_max_rows(Some(usize::MAX));
+        cap
+    });
+    for (ty, cap) in TYPES.into_iter().zip(caps) {
+        for (in_f, out_f) in [
+            (1024usize, 2048usize),
+            (1024, 1024),
+            (1024, 3072),
+            (3072, 1024),
+            (4096, 4096),
+            (4096, 1024),
+            (4096, 14336),
+            (14336, 4096),
+        ] {
+            let bytes = synthetic(ty, in_f, out_f, (in_f + out_f) as u64);
+            let copies = (48_000_000 / (in_f * out_f * 2)).clamp(2, 64);
+            let wqs: Vec<Weight> = (0..copies)
+                .map(|_| quant_weight(dev, ty, &bytes, in_f, out_f))
+                .collect();
+            for rows in [113usize, 160, 192, 256, 320, 384, 449, 513] {
+                let x = dev
+                    .htod_sync_copy(&activations(rows * in_f, rows as u64))
+                    .unwrap();
+                let mma = time(&|i| {
+                    model.gemm(&x, &wqs[i % copies], rows).unwrap();
+                });
+                model.quant_mma.set_enabled(false);
+                let scratch = time(&|i| {
+                    model.gemm(&x, &wqs[i % copies], rows).unwrap();
+                });
+                model.quant_mma.set_enabled(true);
+                eprintln!(
+                    "crossover: {ty:?} {in_f}x{out_f} {rows}: {mma:.1} | {scratch:.1} | {:.2} | {}",
+                    mma / scratch,
+                    if rows > cap { "scratch" } else { "mma" }
                 );
             }
         }
