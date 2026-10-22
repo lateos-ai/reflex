@@ -440,6 +440,22 @@ both prompts, and the bench didn't move: MMA Qwen3-0.6B 5.63 / 9.89 / 27.1 ms an
 Mistral 23.8 / 73.6 / 213-215 ms, against 5.65 / 9.92 / 27.3 and 23.9 / 73.7 / 213.5
 in "Steps 3 and 4 results".
 
+**Against llama.cpp** (T4, sm_75 cubin of github/master 9884f89; llama.cpp `22bdcc4` through a
+small greedy-ids tool, EOS-only stopping): `reflex check --weights f16 --max-tokens 32` on
+Qwen3-0.6B and Mistral 7B, for a short prompt (22 / 24 tokens) and a long one (528 / 573
+tokens, past both caps), in four modes: MMA (capped), `REFLEX_QUANT_MMA_MAX_ROWS=100000`,
+`REFLEX_QUANT_MMA=0` and `REFLEX_QUANT_RESIDENT=0`. All four modes give the same 32 tokens in
+every case, and 12 of the 16 runs match stock llama.cpp exactly. The other four are Qwen3-0.6B's
+long prompt, where all four modes fork from stock llama.cpp at token 2. The top-2 gap there is
+0.022, and llama.cpp disagrees with itself: with flash attention off and an f32 KV cache it picks
+Reflex's token, then matches all four modes 32/32. QR off forks at the same token, so the MMA
+path isn't the cause. First-token top logits are within 0.12 of stock llama.cpp in every mode,
+close to how much they move between llama.cpp's own two configurations (up to 0.16). At 528
+and 573 rows the uncapped run gives the same bits as `REFLEX_QUANT_MMA=0`, but the MMA kernel
+does run there: a traced build showed every GEMM taking it, and forcing 2 splits changes the
+logits. With one split it apparently sums in the same order as the cuBLAS kernel the scratch
+path picks at those sizes.
+
 
 ## Order of work
 
