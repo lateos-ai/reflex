@@ -559,18 +559,26 @@ impl DecodeOpKernels {
 /// GGUF types `gemm_q_mma.cu` has kernels for. Type `i`'s kernels are
 /// `QUANT_MMA_NAMES[i * QUANT_MMA_MAX_MT..][..QUANT_MMA_MAX_MT]`, one per
 /// number of 16-row m tiles a block carries (1..=4).
-const QUANT_MMA_TYPES: [GgmlType; 1] = [GgmlType::Q4K];
+const QUANT_MMA_TYPES: [GgmlType; 2] = [GgmlType::Q4K, GgmlType::Q6K];
 const QUANT_MMA_MAX_MT: usize = 4;
-const QUANT_MMA_NAMES: [&str; 5] = [
+const QUANT_MMA_NAMES: [&str; 10] = [
     "gemm_q4k_mma_m1_kernel",
     "gemm_q4k_mma_m2_kernel",
     "gemm_q4k_mma_m3_kernel",
     "gemm_q4k_mma_m4_kernel",
+    "gemm_q6k_mma_m1_kernel",
+    "gemm_q6k_mma_m2_kernel",
+    "gemm_q6k_mma_m3_kernel",
+    "gemm_q6k_mma_m4_kernel",
     "q4k_mma_dequant_check_kernel",
+    "q6k_mma_dequant_check_kernel",
 ];
-/// Index of `q4k_mma_dequant_check_kernel` in [`QUANT_MMA_NAMES`] (tests).
+/// Indices of `q4k_mma_dequant_check_kernel` and `q6k_mma_dequant_check_kernel`
+/// in [`QUANT_MMA_NAMES`] (tests).
 #[cfg(test)]
-pub(super) const QUANT_MMA_Q4K_CHECK: usize = 4;
+pub(super) const QUANT_MMA_Q4K_CHECK: usize = 8;
+#[cfg(test)]
+pub(super) const QUANT_MMA_Q6K_CHECK: usize = 9;
 /// `gemm_q_mma.cu`'s block tile: output rows and threads (4 warps). A block
 /// carries `16 * mt` input rows.
 const QUANT_MMA_BLOCK_N: u32 = 64;
@@ -1945,9 +1953,9 @@ impl Model {
                 GgmlType::Q4K if rows <= quant_fused_max_rows() => self.gemv_q4k(x, w, rows),
                 // Same for Q8_0 (Gemma 4), 16 rows per pass.
                 GgmlType::Q8_0 if rows <= quant_fused_max_rows() => self.gemv_q8_0(x, w, rows),
-                // No multi-row Q6_K kernel yet: one row is the decode GEMV,
-                // which uses `gemv_q6k_r1_kernel` (4 output rows per warp);
-                // anything more goes through the scratch path.
+                // One row is the decode GEMV (`gemv_q6k_r1_kernel`, 4 output
+                // rows per warp); more rows go through the tensor-core kernel
+                // above when it applies, else the scratch path.
                 GgmlType::Q6K if rows == 1 => {
                     let dev_y = self.launch_gemv_q6k_r1(x, w)?;
                     Ok(dev_y)

@@ -1,9 +1,11 @@
 # Design: tensor-core prefill straight from quantized weights
 
-Status: 2026-10-21. Steps 1 and 2 are in: the Q4_K kernel
+Status: 2026-10-22. Steps 1 and 2 are in: the Q4_K kernel
 (`gemm_q4k_mma_m{1..4}_kernel`, no split-K) is live for Q4_K weights at 2+ rows with
 QR and `--weights f16`. Step 2 passed its go/no-go on an A10G (see "Step 2 results");
-not yet run on a T4. The numbers in "Where the gap comes from" are arithmetic on the
+not yet run on a T4. Step 4's Q6_K kernel (`gemm_q6k_mma_m{1..4}_kernel`) is written
+and dispatched, done before step 3 (see "Step 4: Q6_K"); it compiles for sm_75, sm_86
+and PTX but has not run on a GPU yet. The numbers in "Where the gap comes from" are arithmetic on the
 published A10G results, not a profile.
 
 ## The problem
@@ -109,9 +111,9 @@ same bits.
 - **Grid fill.** Qwen3-0.6B's 1024-wide projections give only 16 `BN = 64` blocks for
   40 (T4) or 80 (A10G) SMs, so small `out_features` get split-K, chosen from
   `(K, N, SM count)` to reach ~2 blocks per SM.
-- **Types.** One template over a `dequant_pair<T>(smem, row, k)` per GGUF type: Q4_K
-  first, then Q6_K (needed for the bench gap to close on Q4_K_M files) and Q8_0
-  (Gemma 4). Each type's dequant expression is copied from its coalesced scratch
+- **Types.** One template over a per-type traits struct (`QmmaQ4K`, `QmmaQ6K`: block
+  size, staging, scales, B fragment): Q4_K first, then Q6_K (needed for the bench gap
+  to close on Q4_K_M files) and Q8_0 (Gemma 4). Each type's dequant expression is copied from its coalesced scratch
   kernel, which is the bit-exactness reference.
 
 ### Dispatch and fallbacks
@@ -199,7 +201,7 @@ Qwen2.5 ones need fixtures that weren't on the box).
 **Greedy tokens:** 32 generated tokens identical with MMA on, `REFLEX_QUANT_MMA=0`
 and `REFLEX_QUANT_RESIDENT=0`, on Qwen3-0.6B and Mistral 7B.
 
-**Kernel micro-benchmark** (`quant_mma_q4k_prefill_timings`, µs; mma / scratch +
+**Kernel micro-benchmark** (`quant_mma_prefill_timings`, then Q4_K only, µs; mma / scratch +
 cuBLAS / f16 cuBLAS alone). Go: the kernel beats today's QR path at every shape and
 row count, and beats f16 cuBLAS at 12-64 rows on the wide shapes.
 
@@ -227,6 +229,38 @@ Mistral's 65 ms gap is gone at 33 tokens and down to 4-18 ms above it. What's le
 the Q6_K tensors (`attn_v`/`ffn_down` in half the layers of a Q4_K_M file) still take
 the scratch path (step 4), and the larger-row tiles (step 3). Decode throughput
 didn't move (Qwen3-0.6B 288 vs 291 tok/s, within run-to-run noise).
+
+## Step 4: Q6_K (2026-10-22, not yet run on a GPU)
+
+Done before step 3. In a Q4_K_M file `attn_v` and `ffn_down` are Q6_K in about half
+the layers, and they still took the scratch path: at 33 rows on the A10G, a
+14336x4096 Q4_K weight costs ~840 µs through scratch against ~270 µs for f16 cuBLAS,
+and Mistral has 16 such `ffn_down`s. That is most likely the bulk of the 4-18 ms
+Mistral still trails QR off by (an estimate, not a profile).
+
+- **Same kernel.** `gemm_q_mma_impl<Q, MT>` is the step-2 kernel with the per-type
+  parts moved into a traits struct; the Q4_K kernels do the same math in the same
+  order as before.
+- **Staging an unaligned row.** A Q6_K block is 210 bytes, so rows and blocks are only
+  2-byte aligned (arena offsets are 256-aligned). Each weight row stages the 14 aligned
+  16-byte chunks that cover its block and reads the block at the address's offset in
+  the first one (0-14, even). 14 chunks always cover it, and each of them holds at
+  least one of the block's bytes, so no load touches a 16-byte granule outside the
+  tensor. Rows are staged 240 bytes apart (60 words) so the 8 rows a warp reads at
+  once sit on 8 different banks. With 64 m rows, shared memory is exactly 48 KB
+  (33 KB activations + 15 KB weights).
+- **Dequant.** One scale per k16 step (`scales[8n + s%2 + 2r]`), `d * (float)sc`
+  computed once per step and `* (float)q` per element, the coalesced kernel's
+  expression and order, rounded with `__float2half_rn`. The fragment-to-element
+  mapping was checked against the coalesced kernel's indexing for all 256 elements
+  on the host.
+- **Registers.** No spills; the 4-tile kernel uses 255 registers on sm_75 and sm_86
+  (Q4_K: 247/251).
+- **Tests.** `quant_mma_tests.rs` now runs tests 1-6 and the micro-benchmark for both
+  types (`quant_mma_dequant_bit_exact`, `quant_mma_matches_f16_gemm`,
+  `quant_mma_rows_independent_and_deterministic`, `quant_mma_saturates_like_scratch`,
+  `quant_mma_prefill_timings`), on synthetic Q6_K blocks with signed scales and a `d`
+  that is sometimes zero or negative.
 
 ## Order of work
 
