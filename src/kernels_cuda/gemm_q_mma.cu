@@ -49,9 +49,15 @@
 // In both cases the f16 weights equal the scratch path's bit for bit
 // (`q*_mma_dequant_check_kernel` checks it).
 //
+// Split-K: grid z splits the super-blocks into ranges of `kb_per_split`. With one
+// split the kernel writes y; with more, split z writes its partial sums to
+// y + z * rows * out_features (a workspace) and `gemm_q_mma_splitk_reduce_kernel`
+// adds them in split order. No atomics, so repeated runs give the same bits.
+//
 // The tile shape doesn't depend on `rows` (MT only sets how many m16 tiles a
-// block carries), so each output element adds its products in the same order
-// whatever the batch size.
+// block carries), so for a given split count each output element adds its
+// products in the same order whatever the batch size. The host picks the split
+// count from the grid size, which does depend on `rows`.
 
 #include <cuda_fp16.h>
 #include <cstring>
@@ -209,9 +215,9 @@ __device__ __forceinline__ void qmma_mma(float* c, const unsigned int* a, unsign
 
 // w: Q blocks, out_features rows of in_features/256 blocks (Q4_K rows 16-byte
 // aligned; Q6_K blocks 2-byte aligned). x16: [rows, in_features] f16.
-// y: [rows, out_features] f32, every element written. in_features must be a
-// multiple of 256.
-// Grid: (ceil(out/64), ceil(rows/(16*MT))), block 128.
+// y: [splits, rows, out_features] f32, every element written. in_features must
+// be a multiple of 256; every split's range must be non-empty.
+// Grid: (ceil(out/64), ceil(rows/(16*MT)), splits), block 128.
 template <typename Q, int MT>
 __device__ __forceinline__ void gemm_q_mma_impl(
     const unsigned char* __restrict__ w,
@@ -219,7 +225,8 @@ __device__ __forceinline__ void gemm_q_mma_impl(
     float* __restrict__ y,
     unsigned int rows,
     unsigned int in_features,
-    unsigned int out_features) {
+    unsigned int out_features,
+    unsigned int kb_per_split) {
 #if GEMM_Q_MMA_ENABLED
     constexpr int BM = 16 * MT;
     constexpr int A_CHUNKS = BM * (QMMA_BK / 8) / QMMA_THREADS;  // 16-byte chunks per thread
@@ -238,6 +245,9 @@ __device__ __forceinline__ void gemm_q_mma_impl(
     const unsigned int m0 = blockIdx.y * BM;
     const unsigned int nblocks = in_features / QMMA_BK;
     const unsigned long long row_bytes = (unsigned long long)nblocks * Q::kBytes;
+    const unsigned int kb_begin = blockIdx.z * kb_per_split;
+    const unsigned int kb_end = min(kb_begin + kb_per_split, nblocks);
+    y += (unsigned long long)blockIdx.z * rows * out_features;
 
     uint4 a_reg[A_CHUNKS];
     uint4 w_reg[W_CHUNKS];
@@ -307,11 +317,11 @@ __device__ __forceinline__ void gemm_q_mma_impl(
         }
     }
 
-    load(0);
+    load(kb_begin);
     store();
     __syncthreads();
-    for (unsigned int kb = 0; kb < nblocks; kb++) {
-        if (kb + 1 < nblocks) {
+    for (unsigned int kb = kb_begin; kb < kb_end; kb++) {
+        if (kb + 1 < kb_end) {
             load(kb + 1);
         }
         const unsigned char* blk0 = block_at(warp * 16u + g, kb);
@@ -341,7 +351,7 @@ __device__ __forceinline__ void gemm_q_mma_impl(
             }
         }
         __syncthreads();
-        if (kb + 1 < nblocks) {
+        if (kb + 1 < kb_end) {
             store();
             __syncthreads();
         }
@@ -378,8 +388,10 @@ __device__ __forceinline__ void gemm_q_mma_impl(
         float* __restrict__ y,                                                     \
         unsigned int rows,                                                         \
         unsigned int in_features,                                                  \
-        unsigned int out_features) {                                               \
-        gemm_q_mma_impl<Q, MT>(w, x16, y, rows, in_features, out_features);        \
+        unsigned int out_features,                                                 \
+        unsigned int kb_per_split) {                                               \
+        gemm_q_mma_impl<Q, MT>(w, x16, y, rows, in_features, out_features,         \
+                               kb_per_split);                                      \
     }
 
 GEMM_Q_MMA_ENTRY(q4k, QmmaQ4K, 1)
@@ -390,6 +402,25 @@ GEMM_Q_MMA_ENTRY(q6k, QmmaQ6K, 1)
 GEMM_Q_MMA_ENTRY(q6k, QmmaQ6K, 2)
 GEMM_Q_MMA_ENTRY(q6k, QmmaQ6K, 3)
 GEMM_Q_MMA_ENTRY(q6k, QmmaQ6K, 4)
+
+// y[i] = ws[0][i] + ws[1][i] + ... + ws[splits-1][i], added in that order, for
+// i < n (n = rows * out_features). Grid: ceil(n/256), block 256. Not gated on
+// the arch: it is plain f32 code, but only launched where the GEMM runs.
+extern "C" __global__ void gemm_q_mma_splitk_reduce_kernel(
+    const float* __restrict__ ws,
+    float* __restrict__ y,
+    unsigned int n,
+    unsigned int splits) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    float s = ws[i];
+    for (unsigned int z = 1; z < splits; z++) {
+        s += ws[(unsigned long long)z * n + i];
+    }
+    y[i] = s;
+}
 
 // Test hook: writes the f16 weights the GEMM's lanes build, at the positions
 // their fragments say they hold, as a row-major [out_features, in_features]

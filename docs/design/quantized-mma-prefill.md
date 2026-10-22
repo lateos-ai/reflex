@@ -3,9 +3,9 @@
 Status: 2026-10-22. Steps 1 and 2 are in: the Q4_K kernel
 (`gemm_q4k_mma_m{1..4}_kernel`, no split-K) is live for Q4_K weights at 2+ rows with
 QR and `--weights f16`. Step 2 passed its go/no-go on an A10G (see "Step 2 results");
-not yet run on a T4. Step 4's Q6_K kernel (`gemm_q6k_mma_m{1..4}_kernel`) is written
-and dispatched, done before step 3 (see "Step 4: Q6_K"); it compiles for sm_75, sm_86
-and PTX but has not run on a GPU yet. The numbers in "Where the gap comes from" are arithmetic on the
+not yet run on a T4. Step 4's Q6_K kernel (`gemm_q6k_mma_m{1..4}_kernel`, see
+"Step 4: Q6_K") and step 3's split-K (see "Step 3: split-K") are written and
+dispatched; they compile for sm_75, sm_86 and PTX but have not run on a GPU yet. The numbers in "Where the gap comes from" are arithmetic on the
 published A10G results, not a profile.
 
 ## The problem
@@ -77,9 +77,11 @@ cuBLAS already has between GPUs. At 2-16 rows activations go from f32 to f16, wh
 does change numerics: those rows then match what the QR-off f16 path has always
 computed. That is the "own numerics check" this needs (see Verification).
 
-**Row independence.** A row's output must not depend on how many other rows are in the
-batch, so the tile shape and split-K factor depend only on `(in_features,
-out_features)` and the GPU, never on `rows`. Each output element then sums its products
+**Row independence.** A row's output should not depend on how many other rows are in the
+batch, so the tile shape depends only on `(in_features, out_features)` and the GPU,
+never on `rows`. The split-K factor was meant to follow the same rule; step 3 drops
+that (see "Step 3: split-K"): it depends on the grid size, so row independence holds
+between calls that get the same split count. Each output element then sums its products
 in the same order whatever the batch, so a batched prefill gives the same bits as the
 same rows run in smaller batches (decode still differs: it uses the f32-activation
 GEMV).
@@ -230,9 +232,43 @@ the Q6_K tensors (`attn_v`/`ffn_down` in half the layers of a Q4_K_M file) still
 the scratch path (step 4), and the larger-row tiles (step 3). Decode throughput
 didn't move (Qwen3-0.6B 288 vs 291 tok/s, within run-to-run noise).
 
+## Step 3: split-K (2026-10-22, not yet run on a GPU)
+
+Done after step 4. Grid z splits each row's super-blocks into equal ranges (the last
+one shorter, none empty); with more than one split, split z writes its partial sums
+to a `[splits, rows, out]` f32 workspace and `gemm_q_mma_splitk_reduce_kernel` adds
+them in split order. No atomics, so repeated runs give the same bits.
+
+- **Split count from the grid, not from `(K, N)` alone.** A count fixed per shape, as
+  first planned, would give Qwen3-0.6B's 1024-wide outputs ~10 splits on an A10G at
+  every row count. At 449 rows that adds `splits * 8` bytes of workspace traffic per
+  output element against `2K` flops, about as much time as the GEMM itself.
+  `quant_mma_splits` instead aims for about two blocks per SM over the whole grid
+  (output blocks x row blocks): `round(2 * SMs / blocks)`, at most `K / 512`
+  (2+ super-blocks per split, so loads still overlap math), and 1 once the grid fills
+  the GPU. So a row's bits match across batch sizes only while the split count
+  matches. The cuBLAS paths (QR off and scratch) are no stricter: cuBLAS picks
+  kernels by `m`.
+- **Examples** (A10G, 80 SMs): Qwen3-0.6B `o_proj` (3072x1024) at 29 rows: 6 splits of
+  2; Mistral `ffn_down` (14336x4096) at 29 rows: 3 splits of 19; any shape at 449
+  rows: 1. On a T4 (40 SMs) the 3072x1024 case gets 4 splits of 3.
+- **`REFLEX_QUANT_MMA_SPLITS=<n>`** forces the count (clamped to the super-block
+  count), for tuning runs.
+- **Tests.** `quant_mma_split_rule` (host only: examples, no empty split),
+  `quant_mma_split_k_matches_unsplit` (forced 2, 3, 5 and one split per super-block
+  against 1 split: relative L2 < 1e-6), and `quant_mma_rows_independent_and_deterministic`
+  now pins the count (1, 3, 5) for the row-independence part and checks repeat
+  determinism with the picked count. `quant_mma_prefill_timings` prints the
+  unsplit time and the split count next to the split one, to tune the rule.
+- Larger row tiles (above 64 rows per block) are not done: they need more than 48 KB
+  of shared memory (dynamic shared memory and an opt-in attribute) or 8 warps.
+  Whether they're worth it waits for the GPU numbers: at 113 and 449 rows the
+  Q4_K kernel was within ~4-30% of f16 cuBLAS, and part of that is the
+  narrow-output grid fill that split-K addresses.
+
 ## Step 4: Q6_K (2026-10-22, not yet run on a GPU)
 
-Done before step 3. In a Q4_K_M file `attn_v` and `ffn_down` are Q6_K in about half
+Done first, then step 3. In a Q4_K_M file `attn_v` and `ffn_down` are Q6_K in about half
 the layers, and they still took the scratch path: at 33 rows on the A10G, a
 14336x4096 Q4_K weight costs ~840 µs through scratch against ~270 µs for f16 cuBLAS,
 and Mistral has 16 such `ffn_down`s. That is most likely the bulk of the 4-18 ms

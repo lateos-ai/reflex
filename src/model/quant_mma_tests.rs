@@ -288,9 +288,11 @@ fn quant_mma_matches_f16_gemm() {
     }
 }
 
-/// A row's output doesn't depend on how many rows share the call (the tile
-/// shape and summation order don't depend on `rows`), and repeated calls give
-/// the same bits.
+/// For a fixed split-K count, a row's output doesn't depend on how many rows
+/// share the call (the tile shape and summation order don't depend on `rows`),
+/// and repeated calls give the same bits, with the picked split count too. The
+/// shape has 12 super-blocks per row, so 3 splits of 4 and 5 forced splits
+/// (4 of 3) both run.
 #[test]
 #[ignore]
 fn quant_mma_rows_independent_and_deterministic() {
@@ -298,21 +300,111 @@ fn quant_mma_rows_independent_and_deterministic() {
     let Some(model) = test_model(&device) else {
         return;
     };
-    let (in_f, out_f, all) = (1024usize, 3072usize, 129usize);
+    let (in_f, out_f, all) = (3072usize, 1024usize, 129usize);
     for ty in TYPES {
         let wq = quant_weight(&device, ty, &synthetic(ty, in_f, out_f, 5), in_f, out_f);
         let x = activations(all * in_f, 77);
-        let full = gemm_host(&model, &x, &wq, all);
-        assert!(
-            bits_equal(&full, &gemm_host(&model, &x, &wq, all)),
-            "{ty:?}: repeated call differs"
-        );
-        for rows in [2usize, 16, 17, 33, 64, 65, 128] {
-            let part = gemm_host(&model, &x[..rows * in_f], &wq, rows);
+        for rows in [2usize, 29, all] {
+            let part = &x[..rows * in_f];
             assert!(
-                bits_equal(&part, &full[..rows * out_f]),
-                "{ty:?}: first {rows} rows differ from the same rows in a {all}-row call"
+                bits_equal(
+                    &gemm_host(&model, part, &wq, rows),
+                    &gemm_host(&model, part, &wq, rows)
+                ),
+                "{ty:?} rows={rows}: repeated call differs"
             );
+        }
+        for splits in [1usize, 3, 5] {
+            model.quant_mma.set_splits(Some(splits));
+            let full = gemm_host(&model, &x, &wq, all);
+            for rows in [2usize, 16, 17, 33, 64, 65, 128] {
+                let part = gemm_host(&model, &x[..rows * in_f], &wq, rows);
+                assert!(
+                    bits_equal(&part, &full[..rows * out_f]),
+                    "{ty:?} splits={splits}: first {rows} rows differ from the same rows in a {all}-row call"
+                );
+            }
+        }
+        model.quant_mma.set_splits(None);
+    }
+}
+
+/// Split-K only changes the summation order: every forced split count matches
+/// the unsplit kernel to f32 rounding, including counts that don't divide the
+/// super-blocks evenly and one per super-block.
+#[test]
+#[ignore]
+fn quant_mma_split_k_matches_unsplit() {
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let Some(model) = test_model(&device) else {
+        return;
+    };
+    for ty in TYPES {
+        for (k, &(in_f, out_f)) in [(1024usize, 1024usize), (3072, 1024), (4096, 136)]
+            .iter()
+            .enumerate()
+        {
+            let wq = quant_weight(
+                &device,
+                ty,
+                &synthetic(ty, in_f, out_f, k as u64 + 31),
+                in_f,
+                out_f,
+            );
+            for rows in [2usize, 29, 113] {
+                let x = activations(rows * in_f, (k * 100 + rows) as u64);
+                model.quant_mma.set_splits(Some(1));
+                let want = gemm_host(&model, &x, &wq, rows);
+                for splits in [2usize, 3, 5, in_f / QK_K] {
+                    model.quant_mma.set_splits(Some(splits));
+                    let got = gemm_host(&model, &x, &wq, rows);
+                    let e = rel_l2(&got, &want);
+                    assert!(
+                        e < 1e-6,
+                        "{ty:?} {in_f}x{out_f} rows={rows} splits={splits}: relative L2 vs unsplit {e:e}"
+                    );
+                }
+            }
+        }
+        model.quant_mma.set_splits(None);
+    }
+}
+
+/// The split-K rule ([`quant_mma_splits`]): no empty split, about two blocks
+/// per SM for narrow outputs, none once the grid fills the GPU, and forced
+/// counts clamped to the super-block count. Host only.
+#[test]
+fn quant_mma_split_rule() {
+    // A10G (80 SMs): Qwen3-0.6B's o_proj at 29 rows has 16 blocks, so 10
+    // splits are wanted, capped at 12 / 2.
+    assert_eq!(quant_mma_splits(3072, 1024, 29, 80, None), (6, 2));
+    assert_eq!(quant_mma_splits(1024, 1024, 12, 80, None), (2, 2));
+    // Mistral's ffn_down at 29 rows: 64 blocks, 3 splits of 19, 19, 18.
+    assert_eq!(quant_mma_splits(14336, 4096, 29, 80, None), (3, 19));
+    // T4 (40 SMs): 5 splits wanted, 6 super-blocks max; ceil(12 / 5) = 3 per
+    // split leaves 4 splits.
+    assert_eq!(quant_mma_splits(3072, 1024, 29, 40, None), (4, 3));
+    // Long prefills and wide outputs fill the GPU unsplit.
+    assert_eq!(quant_mma_splits(4096, 14336, 449, 80, None), (1, 16));
+    assert_eq!(quant_mma_splits(3072, 1024, 449, 80, None), (1, 12));
+    assert_eq!(quant_mma_splits(4096, 4096, 113, 80, None), (1, 16));
+    // Forced counts.
+    assert_eq!(quant_mma_splits(3072, 1024, 29, 80, Some(5)), (4, 3));
+    assert_eq!(quant_mma_splits(1024, 1024, 29, 80, Some(100)), (4, 1));
+    assert_eq!(quant_mma_splits(256, 40, 2, 80, None), (1, 1));
+    for in_f in (256..=14336).step_by(256) {
+        for out_f in [8usize, 40, 1024, 4096, 14336] {
+            for rows in [2usize, 13, 64, 65, 449] {
+                for sms in [40usize, 80, 132] {
+                    let nkb = in_f / QK_K;
+                    let (s, kps) = quant_mma_splits(in_f, out_f, rows, sms, None);
+                    assert!(s >= 1 && kps >= 1, "{in_f}x{out_f} {rows} {sms}");
+                    assert!(
+                        s * kps >= nkb && (s - 1) * kps < nkb,
+                        "{in_f}x{out_f} {rows} {sms}: ({s}, {kps}) empty split"
+                    );
+                }
+            }
         }
     }
 }
@@ -372,7 +464,9 @@ fn quant_mma_prefill_timings() {
         dev.synchronize().unwrap();
         t.elapsed().as_secs_f64() * 1e6 / iters as f64
     };
-    eprintln!("type shape rows: mma us | QR today us | f16 cuBLAS us (quantized MB)");
+    eprintln!(
+        "type shape rows: mma us (unsplit us) | QR today us | f16 cuBLAS us (quantized MB, splits)"
+    );
     for ty in TYPES {
         for (in_f, out_f) in [
             (1024usize, 2048usize),
@@ -397,6 +491,11 @@ fn quant_mma_prefill_timings() {
                 let mma = time(&|i| {
                     model.gemm(&x, &wqs[i % copies], rows).unwrap();
                 });
+                model.quant_mma.set_splits(Some(1));
+                let unsplit = time(&|i| {
+                    model.gemm(&x, &wqs[i % copies], rows).unwrap();
+                });
+                model.quant_mma.set_splits(None);
                 model.quant_mma.set_enabled(false);
                 let today = time(&|i| {
                     model.gemm(&x, &wqs[i % copies], rows).unwrap();
@@ -405,8 +504,9 @@ fn quant_mma_prefill_timings() {
                 let f16 = time(&|i| {
                     model.gemm(&x, &wds[i % copies], rows).unwrap();
                 });
+                let (splits, _) = model.quant_mma.splits(dev, in_f, out_f, rows);
                 eprintln!(
-                    "{ty:?} {in_f}x{out_f} {rows}: {mma:.1} | {today:.1} | {f16:.1} ({:.2} MB)",
+                    "{ty:?} {in_f}x{out_f} {rows}: {mma:.1} ({unsplit:.1}) | {today:.1} | {f16:.1} ({:.2} MB, {splits} splits)",
                     bytes.len() as f64 / 1e6
                 );
             }
