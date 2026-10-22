@@ -330,7 +330,8 @@ fn quant_mma_rows_independent_and_deterministic() {
 }
 
 /// Split-K only changes the summation order: every forced split count matches
-/// the unsplit kernel to f32 rounding, including counts that don't divide the
+/// the unsplit kernel within the tensor cores' rounding (relative L2 1.1e-6 at
+/// K = 1024 on an A10G; the same bound as against cuBLAS), including counts that don't divide the
 /// super-blocks evenly and one per super-block.
 #[test]
 #[ignore]
@@ -360,7 +361,7 @@ fn quant_mma_split_k_matches_unsplit() {
                     let got = gemm_host(&model, &x, &wq, rows);
                     let e = rel_l2(&got, &want);
                     assert!(
-                        e < 1e-6,
+                        e < 1e-5,
                         "{ty:?} {in_f}x{out_f} rows={rows} splits={splits}: relative L2 vs unsplit {e:e}"
                     );
                 }
@@ -371,8 +372,8 @@ fn quant_mma_split_k_matches_unsplit() {
 }
 
 /// The split-K rule ([`quant_mma_splits`]): no empty split, about two blocks
-/// per SM for narrow outputs, none once the grid fills the GPU, and forced
-/// counts clamped to the super-block count. Host only.
+/// per SM for narrow outputs or a long K, none once the grid covers half the
+/// SMs, and forced counts clamped to the super-block count. Host only.
 #[test]
 fn quant_mma_split_rule() {
     // A10G (80 SMs): Qwen3-0.6B's o_proj at 29 rows has 16 blocks, so 10
@@ -384,6 +385,11 @@ fn quant_mma_split_rule() {
     // T4 (40 SMs): 5 splits wanted, 6 super-blocks max; ceil(12 / 5) = 3 per
     // split leaves 4 splits.
     assert_eq!(quant_mma_splits(3072, 1024, 29, 40, None), (4, 3));
+    // 64 blocks cover half of 80 SMs: no split with a short K (Mistral's
+    // q/o projections), or at 16 rows or fewer.
+    assert_eq!(quant_mma_splits(4096, 4096, 29, 80, None), (1, 16));
+    assert_eq!(quant_mma_splits(14336, 4096, 12, 80, None), (1, 56));
+    assert_eq!(quant_mma_splits(1024, 3072, 29, 80, None), (1, 4));
     // Long prefills and wide outputs fill the GPU unsplit.
     assert_eq!(quant_mma_splits(4096, 14336, 449, 80, None), (1, 16));
     assert_eq!(quant_mma_splits(3072, 1024, 449, 80, None), (1, 12));

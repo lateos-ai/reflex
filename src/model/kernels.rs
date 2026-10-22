@@ -596,13 +596,20 @@ fn quant_mma_tiles(rows: usize) -> usize {
 /// Fewest super-blocks a split-K range gets, so each split still overlaps its
 /// next stage's loads with the current one's math.
 const QUANT_MMA_MIN_KB_PER_SPLIT: usize = 2;
+/// Super-blocks per row from which a GEMM of more than 16 rows splits even
+/// with half the SMs busy (Mistral's `ffn_down`, K = 14336, has 56).
+const QUANT_MMA_LONG_K_BLOCKS: usize = 32;
 
 /// Split-K for a `rows`-row GEMM on a `[in_features, out_features]` quantized
 /// weight, as `(splits, super-blocks per split)`, no split empty. Without
-/// `forced` (`REFLEX_QUANT_MMA_SPLITS`), enough splits to bring the grid to about
-/// two blocks per SM, each at least [`QUANT_MMA_MIN_KB_PER_SPLIT`] super-blocks
-/// long; one once the grid already fills the GPU, so long prefills don't pay
-/// for the partial-sum round trip. A row's bits depend on the split count, so
+/// `forced` (`REFLEX_QUANT_MMA_SPLITS`): one split once the grid covers half
+/// the SMs, unless K is long ([`QUANT_MMA_LONG_K_BLOCKS`]) and there are more
+/// than 16 rows; otherwise enough splits to bring the grid to about two blocks
+/// per SM, each at least [`QUANT_MMA_MIN_KB_PER_SPLIT`] super-blocks long. A
+/// split costs a few µs (workspace round trip, reduce launch), which only a
+/// badly underfilled grid or a long K loop earns back (A10G timings in
+/// docs/design/quantized-mma-prefill.md); long prefills fill the GPU
+/// unsplit. A row's bits depend on the split count, so
 /// they stay the same across batch sizes only while it does (the cuBLAS paths
 /// change kernels with the row count too).
 pub(super) fn quant_mma_splits(
@@ -616,6 +623,10 @@ pub(super) fn quant_mma_splits(
     let splits = forced.unwrap_or_else(|| {
         let tiles = out_features.div_ceil(QUANT_MMA_BLOCK_N as usize)
             * rows.div_ceil(16 * quant_mma_tiles(rows));
+        let long_k = nkb >= QUANT_MMA_LONG_K_BLOCKS && rows > 16;
+        if 2 * tiles >= sm_count && !long_k {
+            return 1;
+        }
         let want = (2 * sm_count + tiles / 2) / tiles;
         want.min(nkb / QUANT_MMA_MIN_KB_PER_SPLIT)
     });
