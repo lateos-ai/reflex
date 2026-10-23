@@ -140,3 +140,31 @@ fn l2_normalize_unit_and_zero() {
     l2_normalize(&mut z);
     assert_eq!(z, vec![0.0; 3]);
 }
+
+/// The tokenizer reproduces HF's token ids for every reference input (the fixture's
+/// and the real model's: retrieval prefixes, the `[`/`<` + U+200C markers, five
+/// scripts, and passages up to ~17K tokens), host-only.
+#[test]
+fn tokenizer_matches_hf_reference_ids() {
+    for (gguf, refs) in [
+        (
+            "test-data/tiny-mistral3-embed.gguf",
+            "test-data/tiny-mistral3-embed-ref.tsv",
+        ),
+        (HEADER, "test-data/nemotron-3.5-embed-ref.tsv"),
+    ] {
+        if !std::path::Path::new(gguf).exists() || !std::path::Path::new(refs).exists() {
+            eprintln!("Skipping {gguf}: it or {refs} is not present");
+            continue;
+        }
+        let file = GgufFile::open(gguf).expect("open");
+        let tok = crate::tokenizer::Tokenizer::from_gguf(&file).expect("tokenizer");
+        let refs = super::encoder_tests::read_refs(refs);
+        assert!(!refs.is_empty());
+        for (i, r) in refs.iter().enumerate() {
+            let ids = tok.encode(&r.text).expect("encode");
+            assert_eq!(ids, r.ids, "{gguf}: input {i} token ids differ from HF");
+        }
+        eprintln!("{gguf}: {} inputs match HF", refs.len());
+    }
+}

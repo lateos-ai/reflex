@@ -15,7 +15,8 @@ Contents: [Subcommands](#subcommands) · [Build features](#build-features) ·
 
 `reflex` is a single binary with subcommands: `generate` (load a GGUF and generate
 tokens), `system1` (single-pass, non-autoregressive candidate scoring — the "System 1"
-decision-loop path), `smoke` (the AOT-pipeline check above), `bench` (warm-latency
+decision-loop path), `embed` (embed one text with an embedding model, see
+[Embeddings](#embeddings)), `smoke` (the AOT-pipeline check above), `bench` (warm-latency
 microbenchmark), `check` (byte-exact-vs-reference correctness check, CI-scriptable),
 and `stdio`/`uds` (local JSON-line IPC, both need `--features ipc`). Run `reflex
 <subcommand>` with no further arguments to see that subcommand's own usage. For real
@@ -229,13 +230,14 @@ objects also carry a **`schema_version`** field so a consumer can detect a shape
 {"schema_version":"1.0.0","process_start_to_first_token_ms":456.4,"gguf_open_ms":37.3,...}
 ```
 
-- **Current version: `1.2.0`** (`SCHEMA_VERSION` in `src/cli_output.rs`). 1.1.0 added
+- **Current version: `1.3.0`** (`SCHEMA_VERSION` in `src/cli_output.rs`). 1.1.0 added
   `weights_dtype` to the `generate`, `system1`, `bench` and `check` result objects.
   1.2.0 added `kv_io_ms` to `generate`'s result: the time spent reading the
   `--import-kv` file or writing the `--export-kv` file, present only with one of them
   (the plain-text line gains the same `kv_io_ms=` field). The read includes uploading
   the file into the model's cache (see [KV cache files](#kv-cache-files)).
-- The four versioned objects are `generate`'s `REFLEX_GENERATE_OK` result, `system1`'s
+  1.3.0 added `embed`'s `REFLEX_EMBED_OK` result (with the vector in `embedding`).
+- The five versioned objects (with `embed`'s result) are `generate`'s `REFLEX_GENERATE_OK` result, `system1`'s
   `REFLEX_SYSTEM1_OK` result, `smoke`'s `REFLEX_SMOKE_OK` result, and each additive
   `REFLEX_PHASE_OK` phase object. Per-item lines (`REFLEX_SYSTEM1_CANDIDATE_OK`,
   `REFLEX_LORA_OK`, `REFLEX_DOCTOR_CHECK`) and the other subcommands' result structs
@@ -299,6 +301,40 @@ the OpenAI adapter sends each model's end-of-turn tokens here (see
 [`sidecar/openai-adapter/README.md`](../sidecar/openai-adapter/README.md)). Without the
 field, stopping is EOS-only, which is also what `reflex check` compares against
 llama.cpp with.
+
+## Embeddings
+
+A GGUF with `<arch>.attention.causal = false` is an embedding model: attention is
+bidirectional and the output is the final hidden state, mean-pooled and L2-normalized.
+Supported: `mistral3` encoders, i.e. NVIDIA's Nemotron-3.5-Embed-1B (text only; the
+`mmproj` vision file is not supported). Other pooling types are rejected.
+
+| surface | how |
+|---|---|
+| CLI | `reflex embed <gguf> "query: What is NeMo?"` prints `REFLEX_EMBEDDING_OK dims=<n> values=[...]` and `REFLEX_EMBED_OK` with the phase timings (`--json`: one object with `embedding`) |
+| IPC (`reflex stdio`/`uds`) | `{"prompt": "query: What is NeMo?", "embed": true}` answers with `embedding` and `prompt_tokens` |
+| C FFI | `reflex_embed(handle, text, &out)`, then `reflex_free_embed_result(&out)` |
+| HTTP | the sidecar's `POST /v1/embeddings` ([`sidecar/openai-adapter`](../sidecar/openai-adapter/README.md)) |
+
+- **Input format:** the engine embeds the text exactly as given. Nemotron-3.5-Embed
+  expects its retrieval prefix: `"query: "` for a search query, `"passage: "` for a
+  document. Its chat template also puts U+200C after every `[` and `<` of the text,
+  and its tokenizer strips those marks again; that only keeps user text from forming a
+  special token. The HTTP sidecar renders inputs through that template for you.
+- **One text per call.** A list of texts is one call each, in order: the engine never
+  batches (see Non-goals).
+- **Truncation:** the model is trained so a prefix of the vector, re-normalized, is a
+  smaller embedding. The sidecar's `dimensions` does that; the engine always returns
+  the full width.
+- **Weights:** `Q4_K`/`Q6_K` stay quantized on the GPU (the default); BF16/F16/Q8_0
+  files are dequantized to `--weights` (f16 by default, `f32` for the closest match to
+  the reference).
+- **Not for generation:** `generate`, `system1`, cache files and pinned prefixes return
+  `invalid_input` on an embedding model, and `embed` returns it on a language model.
+  The f16 K/V cache (`REFLEX_KV_CACHE=f16`) and `REFLEX_ATTN_KERNEL=legacy` are refused
+  at load.
+
+Design, numerics and results: [design/embeddings.md](design/embeddings.md).
 
 ## KV cache files
 

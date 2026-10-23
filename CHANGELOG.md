@@ -5,6 +5,25 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Text embeddings: Nemotron-3.5-Embed-1B.** A GGUF with bidirectional attention
+  (`<arch>.attention.causal = false`) now loads as an embedding model. NVIDIA's
+  Nemotron-3.5-Embed-1B (`mistral3`) is the one supported, text only. New:
+  - **Engine:** bidirectional attention kernels, YaRN RoPE and the Llama-4 query
+    temperature on the dense path, mean pooling, and the Tekken tokenizer
+    (`pre = pixtral`).
+  - **Surfaces:** `reflex embed`, IPC `"embed": true`, C FFI `reflex_embed`, the OpenAI
+    adapter's `POST /v1/embeddings` (with `input_type`, `dimensions` and base64), and
+    Hub jobs with an `input` field.
+
+  Against HF `transformers` in fp32 on a T4, over 27 inputs up to 17,364 tokens, the
+  BF16 file with f32 weights matches to a cosine of 1.0000000; Q8_0 gives 0.99986, and
+  Q4_K_M 0.975 (its quantization: llama.cpp gives the same on that file).
+  From process start to the first embedding takes ~0.5 s (Q4_K_M) to 0.67 s (BF16) on
+  the T4. Causal models are unaffected: their attention cubins are byte-identical and
+  greedy tokens are unchanged. See [docs/design/embeddings.md](docs/design/embeddings.md).
+- **F16 and BF16 GGUFs load on the GPU.** Their tensors used to be converted on the host,
+  one thread, before upload; they now go through the pipelined loader like quantized
+  ones. Nemotron-3.5-Embed BF16's load fell from 4.1 s to 0.45 s on a T4.
 - **Runpod Hub: pick the model when you deploy.** The listing's deploy form has a Model
   dropdown with 12 GGUFs covering every architecture that fits its 16-24 GB cards:
   Qwen3 0.6B (the default, still baked into the image) / 1.7B / 4B / 8B, Qwen2.5 1.5B /

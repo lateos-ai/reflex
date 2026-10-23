@@ -28,6 +28,7 @@ the code that runs them in `src/unicode.cpp`.
 | `deepseek-v3` | `Deepseek3` | `DEEPSEEK3_LLM` | 3 regexes through `std::regex` | `deepseek-v3-tokenizer.gguf` |
 | `gigachat` | `Gpt2` | `GPT2` | as `gpt-2` | `gigachat-tokenizer.gguf` |
 | `glm4` | `Llama3` | `CHATGLM4`: the `LLAMA3` regex, `ignore_merges`, and no BOS (`special_bos_id` nulled) | as `llama-bpe`, BOS off | `glm4-tokenizer.gguf` |
+| `pixtral`, `tekken`, `nemotron-3.5-embed` | `Tekken` | `pixtral` is `LLAMA3` at `79e2e74` and `TEKKEN` in later llama.cpp; `nemotron-3.5-embed` is later llama.cpp's `NEMOTRON_3_5_EMBD` | Mistral's Tekken regex with `ignore_merges`, matched with HF `tokenizers`' semantics (see the gotcha below) | `nemotron-3.5-embed-tokenizer.gguf` (vs HF `tokenizers`) |
 
 A missing key keeps the Qwen2 split, which is what every gpt2 vocab got before. That way
 a file that loaded before still tokenizes the same (apart from the 2026-10-13 `qwen2`
@@ -56,6 +57,7 @@ What uses which pre type, from a header survey (HTTP range requests on the first
 | Kanana-2-30B-A3B | `deepseek2` | `kanana2` (not ported; llama.cpp's `gpt-4o` split) |
 | TinyLlama, Mistral-7B | `llama` | none (`llama` SentencePiece) |
 | Gemma 4 | `gemma4` | none (`gemma4` model) |
+| Nemotron-3.5-Embed-1B (community conversions) | `mistral3` | `pixtral` |
 
 Before this change, `qwen35`, `gpt-2` and `deepseek-llm` files all got the Qwen2 split:
 - **`qwen35`** differs only on combining marks: its letter runs are `[\p{L}\p{M}]+`.
@@ -126,6 +128,22 @@ vocabs: 21/21 identical.
 - **Multi-file GGUF heads.** The DeepSeek-V3 source is shard 1 of 5. Its `split.*` keys
   make `llama-tokenize` look for the other shards. `scripts/gguf_tokenizer_only.py` drops
   them.
+
+- **Tekken: no llama.cpp version tokenizes like HF.** `79e2e74` maps `pixtral` to the
+  LLAMA3 split, which merges digit runs and doesn't split letter runs at case changes.
+  Later llama.cpp has a `TEKKEN` split, but it runs on its collapsed text, where every
+  non-ASCII letter counts as both upper and lower case, so `ÉCOLE` or `ΣΊΣΥΦΟΣ` split
+  differently. The goldens for this type therefore come from HF `tokenizers` 0.23.2 on
+  the model's own `tokenizer.json`, and `tekken_match` implements the regex with Rust's
+  Unicode case properties (exact for `Lu`/`Ll`/`Lo`/`M`; titlecase `Lt` letters and
+  `Other_Lowercase` modifier letters may differ from HF).
+- **Nemotron-3.5-Embed's bracket markers.** Its chat template puts U+200C after every `[`
+  and `<` of user text, so user text can't form a special token, and its HF tokenizer
+  has a normalizer that turns `[`+U+200C and `<`+U+200C back into the plain bracket
+  after special tokens are matched. `Tokenizer::strip_zwnj_markers` does the same, for
+  `pre = nemotron-3.5-embed` and for a Tekken vocab in an embedding model
+  (`<arch>.pooling_type` set), since the published GGUFs predate the dedicated pre type.
+  A Ministral chat model's Tekken vocab keeps the characters, as its HF tokenizer does.
 
 ## Resolved: the original Qwen2 port
 

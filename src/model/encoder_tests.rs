@@ -284,13 +284,13 @@ fn encoder_mean_pool_matches_host_exactly() {
 
 /// One reference line: the exact text HF tokenized (hex UTF-8), its token ids and
 /// HF's embedding.
-struct RefLine {
-    text: String,
-    ids: Vec<u32>,
-    embedding: Vec<f32>,
+pub(super) struct RefLine {
+    pub(super) text: String,
+    pub(super) ids: Vec<u32>,
+    pub(super) embedding: Vec<f32>,
 }
 
-fn read_refs(path: &str) -> Vec<RefLine> {
+pub(super) fn read_refs(path: &str) -> Vec<RefLine> {
     let body = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     body.lines()
         .filter(|l| !l.is_empty())
@@ -387,8 +387,9 @@ fn encoder_fixture_rejects_generation_and_lm_rejects_embed() {
 /// embeddings of the reference inputs (`EMBED_REF`, produced by the archive's
 /// `hf_reference.py`): token ids exact, and a cosine floor by weight type: an
 /// unquantized file (BF16/F16/F32) >= 0.9999 with f32 weights and >= 0.999 with f16,
-/// Q8_0 >= 0.999, anything smaller >= 0.99 (its worst cosine is printed: a 4-6 bit
-/// quantization moves the embedding by more than the engine does).
+/// Q8_0 >= 0.999, anything smaller >= 0.97: a 4-bit file moves the embedding by more
+/// than the engine does (Q4_K_M: 0.975 on a 3-token input, where llama.cpp gives 0.977
+/// on the same file, and ~0.99 on longer ones).
 #[test]
 #[ignore]
 fn nemotron_embed_real_model_matches_hf_reference() {
@@ -402,7 +403,7 @@ fn nemotron_embed_real_model_matches_hf_reference() {
     let (f32_floor, f16_floor) = match ggml_type {
         GgmlType::Bf16 | GgmlType::F16 | GgmlType::F32 => (0.9999, 0.999),
         GgmlType::Q8_0 => (0.999, 0.999),
-        _ => (0.99, 0.99),
+        _ => (0.97, 0.97),
     };
     eprintln!("{path}: attn_q is {ggml_type:?}");
     let model = load(&path, WeightsDtype::F32);
