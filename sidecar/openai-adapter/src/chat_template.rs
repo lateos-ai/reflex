@@ -19,10 +19,20 @@ pub struct ChatTemplate {
     env: Environment<'static>,
     bos_token: String,
     eos_token: String,
+    /// Whether the engine prepends BOS to every prompt (see [`engine_adds_bos`]).
+    /// Templates that open with `{{ bos_token }}` (Llama, Mistral, Gemma) then
+    /// have that leading BOS removed, so the prompt gets one, as HF's
+    /// `apply_chat_template` + tokenize (no special tokens added) gives.
+    strip_bos: bool,
 }
 
 impl ChatTemplate {
-    fn compile(source: String, bos_token: String, eos_token: String) -> Result<Self, String> {
+    fn compile(
+        source: String,
+        bos_token: String,
+        eos_token: String,
+        strip_bos: bool,
+    ) -> Result<Self, String> {
         let mut env = Environment::new();
         // Hugging Face renders chat templates with `trim_blocks` and
         // `lstrip_blocks` on (`apply_chat_template`'s Jinja environment), and
@@ -48,6 +58,7 @@ impl ChatTemplate {
             env,
             bos_token,
             eos_token,
+            strip_bos,
         })
     }
 
@@ -100,7 +111,13 @@ impl ChatTemplate {
             "bos_token": self.bos_token,
             "eos_token": self.eos_token,
         });
-        tmpl.render(ctx).map_err(|e| format!("render failed: {e}"))
+        let rendered = tmpl
+            .render(ctx)
+            .map_err(|e| format!("render failed: {e}"))?;
+        Ok(match rendered.strip_prefix(self.bos_token.as_str()) {
+            Some(rest) if self.strip_bos && !self.bos_token.is_empty() => rest.to_string(),
+            _ => rendered,
+        })
     }
 }
 
@@ -125,6 +142,15 @@ fn resolve_bos_eos(meta: &GgufMeta) -> (String, String) {
         lookup("tokenizer.ggml.bos_token_id"),
         lookup("tokenizer.ggml.eos_token_id"),
     )
+}
+
+/// Whether the engine prepends BOS to a prompt, by its tokenizer's rule
+/// (`src/tokenizer.rs`): `tokenizer.ggml.add_bos_token` when present, else
+/// whether a `bos_token_id` exists, and never for the `glm4` pre-tokenizer.
+fn engine_adds_bos(meta: &GgufMeta) -> bool {
+    meta.get_bool("tokenizer.ggml.add_bos_token")
+        .unwrap_or_else(|| meta.get_u64("tokenizer.ggml.bos_token_id").is_some())
+        && meta.get_str("tokenizer.ggml.pre") != Some("glm4")
 }
 
 /// One self-test message list, rendered once at startup to catch a template that
@@ -187,16 +213,17 @@ pub fn build(gguf_path: &str, chat_template_file_override: Option<&str>) -> Opti
         },
     };
 
-    let template = match ChatTemplate::compile(template_src, bos_token, eos_token) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "[adapter] chat template: {source_desc} failed to compile ({e}); \
+    let template =
+        match ChatTemplate::compile(template_src, bos_token, eos_token, engine_adds_bos(&meta)) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "[adapter] chat template: {source_desc} failed to compile ({e}); \
                  falling back to generic prompt flattening"
-            );
-            return None;
-        }
-    };
+                );
+                return None;
+            }
+        };
 
     if let Err(e) = template.render(&self_test_messages(), true) {
         eprintln!(
@@ -214,6 +241,21 @@ pub fn build(gguf_path: &str, chat_template_file_override: Option<&str>) -> Opti
 mod tests {
     use super::*;
 
+    /// A template opening with `{{ bos_token }}` loses that BOS when the engine
+    /// adds its own, and keeps it otherwise.
+    #[test]
+    fn leading_bos_is_dropped_only_when_the_engine_adds_one() {
+        let src = "{{ bos_token }}[INST] {{ messages[0].content }} [/INST]".to_string();
+        let msg = [TextMessage {
+            role: "user".to_string(),
+            content: "Hi".to_string(),
+        }];
+        let adds = ChatTemplate::compile(src.clone(), "<s>".into(), "</s>".into(), true).unwrap();
+        assert_eq!(adds.render(&msg, true).unwrap(), "[INST] Hi [/INST]");
+        let keeps = ChatTemplate::compile(src, "<s>".into(), "</s>".into(), false).unwrap();
+        assert_eq!(keeps.render(&msg, true).unwrap(), "<s>[INST] Hi [/INST]");
+    }
+
     /// The conversations [`render_templates_in_dir`] renders, as `(role, content)`.
     const CONVERSATIONS: &[&[(&str, &str)]] = &[
         &[("user", "What is the capital of France?")],
@@ -227,7 +269,8 @@ mod tests {
     ];
 
     /// Renders every `<name>.jinja` in `$TEMPLATE_DIR` (with `<name>.bos` /
-    /// `<name>.eos` holding the special tokens) on [`CONVERSATIONS`], opening the
+    /// `<name>.eos` holding the special tokens, and `<name>.addbos` `true` when the
+    /// engine prepends BOS for that model) on [`CONVERSATIONS`], opening the
     /// assistant turn, into `<name>.<i>.rendered`, or `<name>.<i>.error`. A script
     /// compares the files with Python `jinja2` under Hugging Face's settings.
     #[test]
@@ -244,6 +287,7 @@ mod tests {
                 read(path.clone()),
                 read(path.with_extension("bos")),
                 read(path.with_extension("eos")),
+                read(path.with_extension("addbos")) == "true",
             )
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             for (i, conv) in CONVERSATIONS.iter().enumerate() {
