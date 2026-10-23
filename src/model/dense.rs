@@ -2004,7 +2004,7 @@ impl Model {
 
         let use_ws = self.decode_ws_enabled();
         let mut logits = Vec::new();
-        while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
+        while generated.len() < max_new_tokens && !picker.stops_at(next_id) {
             if use_ws {
                 self.decode_step_dense_ws(
                     next_id,

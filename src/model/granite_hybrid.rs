@@ -751,7 +751,7 @@ impl Model {
             &picker.stream_text(&self.tokenizer, &mut pending_bytes, next_id),
         );
 
-        while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
+        while generated.len() < max_new_tokens && !picker.stops_at(next_id) {
             hidden = self.forward_one_token_granite(m, next_id, position, &mut states)?;
             position += 1;
             let mut logits = self.granite_logits(m, &hidden)?;
