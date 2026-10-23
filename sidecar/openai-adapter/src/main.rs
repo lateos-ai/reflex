@@ -20,6 +20,7 @@ mod classify;
 mod gguf_meta;
 mod openai;
 mod reflex_client;
+mod stop_tokens;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, StatusCode};
@@ -50,6 +51,9 @@ struct AppState {
     limits: RequestLimits,
     request_counter: AtomicU64,
     chat_template: Option<ChatTemplate>,
+    /// The model's end-of-generation tokens: sent with every chat request, and
+    /// their text kept out of the reply.
+    stop_tokens: stop_tokens::StopTokens,
     model_info: ModelInfo,
 }
 
@@ -351,6 +355,7 @@ async fn main() {
     } else {
         chat_template::build(&opts.gguf_path, opts.chat_template_file.as_deref())
     };
+    let stop_tokens = stop_tokens::StopTokens::from_gguf(&opts.gguf_path);
 
     let model_info = ModelInfo {
         id: model_label.clone(),
@@ -372,6 +377,7 @@ async fn main() {
         limits: opts.limits,
         request_counter: AtomicU64::new(0),
         chat_template,
+        stop_tokens,
         model_info,
     });
 
@@ -681,7 +687,13 @@ async fn chat_completions(
         .clone()
         .unwrap_or_else(|| state.model_label.clone());
 
-    let line = match build_ipc_line(&req, &prompt, max_tokens, json_schema.as_deref()) {
+    let line = match build_ipc_line(
+        &req,
+        &prompt,
+        max_tokens,
+        json_schema.as_deref(),
+        &state.stop_tokens.ids(),
+    ) {
         Ok(l) => l,
         Err(e) => {
             return error_response(
@@ -723,13 +735,21 @@ async fn chat_completions(
             max_tokens,
             deadline,
             timeout,
+            state.stop_tokens.clone(),
         );
         Sse::new(sse_stream)
             .keep_alive(KeepAlive::default())
             .into_response()
     } else {
-        let response =
-            non_streaming_response(rx, chat_id, created, model_label, prompt, max_tokens);
+        let response = non_streaming_response(
+            rx,
+            chat_id,
+            created,
+            model_label,
+            prompt,
+            max_tokens,
+            state.stop_tokens.clone(),
+        );
         match tokio::time::timeout_at(deadline, response).await {
             Ok(response) => response,
             Err(_) => timeout_response(timeout),
@@ -818,6 +838,7 @@ async fn non_streaming_response(
     model_label: String,
     prompt: String,
     requested_max_tokens: usize,
+    stop_tokens: stop_tokens::StopTokens,
 ) -> Response {
     while let Some(v) = rx.recv().await {
         let event = v.get("event").and_then(Value::as_str).unwrap_or("");
@@ -827,16 +848,15 @@ async fn non_streaming_response(
         if let Some(err) = engine_error(&v) {
             return engine_error_response(&err);
         }
-        let text = v
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("")
+        let token_ids = v.get("token_ids").and_then(Value::as_array);
+        let last_id = token_ids
+            .and_then(|a| a.last())
+            .and_then(Value::as_u64)
+            .map(|id| id as u32);
+        let text = stop_tokens
+            .strip(v.get("text").and_then(Value::as_str).unwrap_or(""), last_id)
             .to_string();
-        let completion_tokens = v
-            .get("token_ids")
-            .and_then(Value::as_array)
-            .map(|a| a.len())
-            .unwrap_or(0);
+        let completion_tokens = token_ids.map(|a| a.len()).unwrap_or(0);
         let prompt_tokens = estimate_prompt_tokens(&prompt);
         let response = ChatCompletionResponse {
             id: chat_id,
@@ -879,6 +899,7 @@ fn build_sse_stream(
     requested_max_tokens: usize,
     deadline: Instant,
     timeout: Duration,
+    stop_tokens: stop_tokens::StopTokens,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
         let role_chunk = ChatCompletionChunk {
@@ -917,6 +938,10 @@ fn build_sse_stream(
             let event = v.get("event").and_then(Value::as_str).unwrap_or("");
             if event == "token" {
                 completion_tokens += 1;
+                let token_id = v.get("token_id").and_then(Value::as_u64).map(|id| id as u32);
+                if token_id.is_some_and(|id| stop_tokens.contains(id)) {
+                    continue; // the stop token: its text isn't part of the reply
+                }
                 let text = v.get("text").and_then(Value::as_str).unwrap_or("").to_string();
                 let chunk = ChatCompletionChunk {
                     id: chat_id.clone(),
@@ -1188,6 +1213,7 @@ mod tests {
             max_tokens,
             Instant::now() + Duration::from_secs(5),
             Duration::from_secs(5),
+            stop_tokens::StopTokens::from_pairs(&[(2, "</s>")]),
         );
         let bytes = axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX)
             .await
@@ -1236,6 +1262,24 @@ mod tests {
         let finish: Value = serde_json::from_str(&data[data.len() - 2]).unwrap();
         assert_eq!(finish["choices"][0]["finish_reason"], "stop");
         assert_eq!(data.last().unwrap(), "[DONE]");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_stop_token_is_not_sent() {
+        let data = sse_data(
+            vec![
+                serde_json::json!({"event": "token", "token_id": 7, "text": "Paris"}),
+                serde_json::json!({"event": "token", "token_id": 2, "text": "</s>"}),
+                serde_json::json!({"event": "final", "ok": true, "text": "Paris</s>", "token_ids": [7, 2]}),
+            ],
+            8,
+        )
+        .await;
+        assert_eq!(data.len(), 4, "{data:?}"); // role, "Paris", finish, [DONE]
+        assert!(data[1].contains("\"Paris\""), "{}", data[1]);
+        assert!(!data.iter().any(|d| d.contains("</s>")), "{data:?}");
+        let finish: Value = serde_json::from_str(&data[2]).unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop");
     }
 
     #[test]

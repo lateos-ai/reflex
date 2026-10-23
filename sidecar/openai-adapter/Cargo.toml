@@ -27,4 +27,9 @@ anyhow = "1"
 # adapter's generic role-labeled flattening, when one is present -- see
 # `src/chat_template.rs`. Pure Rust, no unsafe, the de facto choice other Rust LLM
 # projects use for exactly this job.
-minijinja = "2"
+# `loop_controls`: `{% break %}`/`{% continue %}`, which some templates use.
+minijinja = { version = "2", features = ["loop_controls"] }
+# `pycompat`: the Python `str`/`dict`/`list` methods HF templates call
+# (`.startswith()`, `.get()`, `.split()`, ...), which plain Jinja lacks (Qwen3.5 and
+# Gemma 4 templates fail to render without them).
+minijinja-contrib = { version = "2", features = ["pycompat"] }
