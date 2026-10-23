@@ -1,14 +1,15 @@
 # Design: tensor-core prefill straight from quantized weights
 
-Status: 2026-10-22. Steps 1-4 are in and verified on an A10G and a T4 (see "Steps 3
-and 4 results"): Q4_K and Q6_K kernels (`gemm_q{4,6}k_mma_m{1..4}_kernel`) with
-split-K, live for 2+ rows with QR and `--weights f16`. On the A10G, QR warm prefill now
-beats QR off everywhere except Mistral at 513 tokens (9% behind). On the T4 it wins
-up to ~30 rows but loses from ~113 rows. The kernel is compute-bound on Turing at
-large row counts, so on sm_75 a row cap (Q4_K above 384 rows, Q6_K above 256) sends
-long prefills back to the scratch path (see "Row cap"), and no T4 bucket is slower
-than before this work. The numbers in "Where the gap comes from" are arithmetic on the
-published A10G results, not a profile.
+Status: 2026-10-23. Steps 1-5 are in and verified on an A10G and a T4 (see "Steps 3
+and 4 results" and "Step 5"): Q4_K and Q6_K kernels (`gemm_q{4,6}k_mma_m{1..4}_kernel`,
+plus the 128-row `gemm_q{4,6}k_mma_m8_kernel` from sm_80 up) with split-K, live for 2+
+rows with QR and `--weights f16`. On the A10G, QR warm prefill now beats QR off at
+every bucket, Mistral at 513 tokens included (186.6 vs 195.4 ms). On the T4 it wins up
+to ~30 rows but loses from ~113 rows, and the 128-row tile didn't change that. So on
+sm_75 a row cap (Q4_K above 384 rows, Q6_K above 256) still sends long prefills back
+to the scratch path (see "Row cap"), and no T4 bucket is slower than before this work.
+The numbers in "Where the gap comes from" are arithmetic on the published A10G
+results, not a profile.
 
 ## The problem
 
@@ -127,7 +128,9 @@ In `Model::gemm`, for a `WeightData::Quant` weight with `weights_dtype == F16` a
 for `--weights f32`, for devices below sm_75, and behind `REFLEX_QUANT_MMA=0` for A/B
 runs. An upper row limit sends long prefills back to the scratch path where cuBLAS
 wins: on sm_75 only, per type (see "Row cap"). `REFLEX_QUANT_MMA_MAX_ROWS=<n>`
-overrides it on any device, for tuning (0 or unset: the built-in rule).
+overrides it on any device, for tuning (0 or unset: the built-in rule). Above 64 rows
+the host also picks the block tile, 64 or 128 rows (see "Step 5");
+`REFLEX_QUANT_MMA_TILE=64|128` forces one.
 
 ### Build and module loading
 
@@ -358,10 +361,15 @@ slower than the old scratch path on every shape, and so is Q4_K on 4096x14336; t
 is why T4 Mistral at 513 tokens went from 646 to 711 ms. Next, in order:
 
 1. **Row cap on sm_75**: done, see "Row cap".
-2. **Larger m tiles**: 128+ rows per block halves the dequant per MMA. Needs dynamic
-   shared memory above 48 KB (opt-in attribute) and fewer staging registers
-   (`cp.async` on sm_80+). This is what would close the A10G 513-token gap and the T4
-   gaps from 113 rows up, and let the T4 cap rise or go.
+2. **Larger m tiles**: done for sm_80+, see "Step 5". It closed the A10G 513-token
+   gap. On the T4 the 128-row tile ran no faster than the 64-row one, so the T4 gaps
+   from 113 rows up and the row cap stay.
+3. **Turing.** Still open. On a T4 at 113 rows the kernel takes ~1.6x f16 cuBLAS's time
+   on Mistral's FFN shapes, and halving its dequantization didn't help, so dequant isn't
+   what limits it there. Not profiled yet. Candidates: more warps per block (the kernel
+   runs one 4-warp block per SM on sm_75), or dequantizing once per block into shared
+   memory so the warps can share a B tile.
+4. **Q8_0 (Gemma 4)** still takes the fused-GEMV / scratch path.
 
 ## Row cap (sm_75, 2026-10-22)
 
@@ -399,7 +407,8 @@ Q4_K wins on every shape through 384 rows and loses on Mistral's FFN from 449. Q
 wins on every shape through 192 rows and in total at 256 (6.8 vs 7.3 ms over the eight
 shapes); it loses in total from 320. The small Qwen3-0.6B Q4_K shapes keep winning
 at 449, but not cleanly at 513 (3072x1024 loses), so the rule is one constant per
-type, not scaled by weight size.
+type, not scaled by weight size. Step 5's 128-row tile didn't move these crossovers on
+the T4 (see "Step 5"), so the caps are unchanged.
 
 **Model level** (`reflex bench` warm prefill p50 ms, cap set through the env var, two
 interleaved rounds, ranges over both): every cap from 256 to 384 gives the same
@@ -456,6 +465,118 @@ does run there: a traced build showed every GEMM taking it, and forcing 2 splits
 logits. With one split it apparently sums in the same order as the cuBLAS kernel the scratch
 path picks at those sizes.
 
+
+## Step 5: the 128-row tile (2026-10-23)
+
+`gemm_q{4,6}k_mma_m8_kernel` carries 128 input rows per block (MT = 8) instead of 64,
+with the same four warps, fragments, k-step order and per-element math as the 64-row
+tile. Each lane's B fragment now feeds 8 m16 tiles instead of 4, so a 449-row prefill
+dequantizes each weight 4 times instead of 8. Each output element still gets the same
+products added in the same order, so for the same split count the two tiles give the
+same bits (`quant_mma_wide_tile_matches_narrow` checks it at 65-513 rows, unsplit and
+with 3 splits, for both types).
+
+- **Layout.** A whole super-block of activations for 128 rows is 64 KB, which leaves no
+  room for a second buffer. So activations come in 32-K slices (8 KB), double-buffered,
+  rows unpadded and XOR-swizzled so `ldmatrix` reads are conflict-free. The next
+  super-block's weight bytes arrive an eighth per slice, into a second weight buffer.
+  sm_80+ copies with `cp.async`; sm_75 stages through registers during the slice's math.
+  That's 34.8 KB (Q4_K) or 47.1 KB (Q6_K) of dynamic shared memory, under the 48 KB
+  default, so no opt-in attribute.
+- **What didn't work.**
+  - 64-K slices (51-63 KB, with the opt-in attribute) fit one block per SM on an A10G
+    and ran 20-30% slower than the 64-row tile.
+  - A partly unrolled slice loop (fewer registers) was 15-40% slower than the full
+    unroll, because byte offsets and nibble choice stop being constants.
+  - `__launch_bounds__(128, 1)` made ptxas spill on sm_80+. The kernel uses it only on
+    sm_75, where it avoids a spill.
+- **Shared with the 64-row tile.** The f16 weights are the same bit for bit
+  (`quant_mma_dequant_bit_exact`); four changes apply to both tiles:
+  - Integer-to-float goes through the exponent trick instead of an I2F.
+  - sm_80+ converts each weight pair with one `cvt.rn.f16x2.f32`.
+  - Quant bytes are read as 16-bit words.
+  - A fragments come in through `ldmatrix`.
+
+  On sm_75 the two k8 halves of a step are now interleaved across the two n8 tiles; that
+  made no measurable difference.
+- **Registers** (CUDA 13.2, `-Xptxas -v`): no spills on sm_75, 80, 86, 89 or 90, or in
+  the compute_75 PTX JIT'd for sm_75 and sm_86. The 128-row kernels use 245 / 252
+  registers (Q4_K / Q6_K) on sm_75, 182 / 185 on sm_80, 182 / 184 on sm_86 and sm_89,
+  and 178 / 179 on sm_90.
+- **Dispatch** (`quant_mma_block_rows`). Above 64 rows, from sm_80 up, the 128-row tile
+  runs when two conditions hold:
+  1. Its grid covers half the SMs. Otherwise a 1024-wide output at 113 rows gets 16
+     blocks on 80 SMs: 22.7 µs against 18.0 for the 64-row tile.
+  2. Its last block isn't mostly padding: 2 ceil(rows / 128) = ceil(rows / 64), or at
+     least eight 64-row blocks. At 129-192 or 257-320 rows the extra block costs a full
+     dequantization for a few rows. Without this rule Mistral at 129 tokens went from
+     73.6 ms to 78.0.
+
+  Otherwise it's the 64-row tile, and always on sm_75. `REFLEX_QUANT_MMA_TILE=64|128`
+  forces one tile on any device, for A/B runs.
+
+**Kernel timings** (A10G, sm_86 cubin, `quant_mma_prefill_timings`, µs; picked tile /
+64-row tile / f16 cuBLAS on pre-dequantized weights). At 513 rows the kernel beats f16
+cuBLAS on all five shapes; at 449 it's within 7% of it:
+
+| shape | 113 rows | 449 rows | 513 rows |
+|---|---|---|---|
+| Q4_K 4096x14336 | 278 / 322 / 314 | 1049 / 1211 / 1048 | 1229 / 1378 / 1298 |
+| Q4_K 14336x4096 | 347 / 400 / 309 | 1269 / 1345 / 1184 | 1289 / 1528 / 1316 |
+| Q6_K 4096x14336 | 288 / 346 / 317 | 1084 / 1313 / 1046 | 1287 / 1497 / 1317 |
+| Q4_K 4096x4096 | 109 / 120 / 102 | 395 / 406 / 381 | 397 / 457 / 451 |
+| Q4_K 1024x3072 | 34.1 / 35.8 / 33.3 | 101 / 102 / 105 | 105 / 114 / 131 |
+
+**On the T4 it doesn't pay** (sm_75 cubin, `quant_mma_row_crossover`, µs; 128-row tile /
+64-row tile / scratch path):
+
+| shape | 113 rows | 256 rows | 449 rows | 513 rows |
+|---|---|---|---|---|
+| Q4_K 4096x14336 | 853 / 888 / 2816 | 2141 / 2129 / 3130 | 4201 / 4212 / 4087 | 4895 / 4777 / 4625 |
+| Q4_K 1024x3072 | 99.4 / 68.4 / 168 | 152 / 111 / 208 | 266 / 220 / 293 | 317 / 243 / 289 |
+| Q6_K 14336x4096 | 1057 / 1223 / 2200 | 2616 / 2450 / 3086 | 4490 / 4912 / 3921 | 5264 / 5573 / 4141 |
+
+Within ±10% of the 64-row tile on Mistral's shapes, slower on Qwen3-0.6B's, and the
+crossovers with the scratch path don't move. Both tiles run one 4-warp block per SM on
+a T4. Since halving the dequantization didn't help, dequant isn't what limits the kernel
+on Turing (not profiled). So sm_75 keeps the 64-row tile and the row cap.
+
+**Correctness** (A10G and T4, native cubin; kernel tests also on the portable PTX
+build). Kernel tests 1-6 pass for both types, plus the new tile test, with the same
+worst-case errors as before. Also passing: the `quant_resident_*` tests,
+`prefill_dense_batched_matches_sequential_prefill` on Qwen3-0.6B and Mistral 7B, and
+the host tests. Greedy tokens (32) are identical in six modes on both models, for a
+short prompt and a ~560-token one: picked tile, `REFLEX_QUANT_MMA_TILE=64`,
+`REFLEX_QUANT_MMA_TILE=128`, forced 1 split, `REFLEX_QUANT_MMA=0` and
+`REFLEX_QUANT_RESIDENT=0`. In the GPU nightly suite in QR-default mode (A10G: 133
+passed, 4 skipped for missing models) the one failure,
+`kolibri1_quant_resident_generate_matches_dequantized`, predates this step. It fails the
+same way on the previous master: the 12th greedy token on the random tiny Kolibri
+fixture differs between the MMA path and the dequantized path, and the test passes with
+`REFLEX_QUANT_MMA=0`. Earlier runs skipped it because the fixture wasn't on the box.
+
+**`reflex bench` warm prefill** (p50 ms, 5 warmup + 20 iterations, two interleaved
+rounds, ranges over both):
+
+| A10G | Qwen3-0.6B 29 / 113 / 449 | Mistral 7B 33 / 129 / 513 |
+|---|---|---|
+| step 5 | **5.54-5.56** / **9.63-9.66** / **25.8** | **23.0** / **71.5-71.6** / **186.5-186.6** |
+| before (master) | 5.63-5.64 / 9.86-9.89 / 27.0-27.1 | 23.8 / 73.5-73.6 / 214.0-214.6 |
+| QR off | 7.38 / 9.89 / 28.2 | 39.5 / 75.0 / 195.4 |
+
+| T4 | Qwen3-0.6B 29 / 113 / 449 | Mistral 7B 33 / 129 / 513 |
+|---|---|---|
+| step 5 | **8.02-8.10** / **16.4-16.5** / 68.6-69.0 | **60.5** / 203.5-203.7 / 622.6-623.3 |
+| before (master) | 8.43-8.45 / 16.7 / 68.7-69.0 | 63.2-63.5 / 209.8-210.2 / 622.9-623.0 |
+| QR off | 11.0 / 16.8-16.9 / **55.7-55.8** | 84.8-84.9 / **148.1-148.6** / **414-416** |
+
+The T4 still runs the 64-row tile; its 1-5% gains at the short and medium buckets come
+from the shared dequant and `ldmatrix` changes. Its long buckets take the scratch path,
+as before (row cap).
+
+Decode didn't move (29/33-token bucket, tok/s, step 5 against master: A10G Qwen3-0.6B
+289-291 vs 291-292, Mistral 66.0 vs 66.0; T4 Qwen3-0.6B 203-204 vs 203-204, Mistral
+31.7-31.8 vs 31.8).
 
 ## Order of work
 
