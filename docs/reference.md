@@ -288,6 +288,18 @@ sampling. It works for every architecture.
 Design, format rationale and measurements:
 [design/agent-relay.md](design/agent-relay.md), "JSON Schema constrained decoding".
 
+## Stop tokens
+
+A `generate` stops at the GGUF's `tokenizer.ggml.eos_token_id`. An IPC request can add
+more stop tokens with `"stop_token_ids": [<id>, ...]`: the generation then also ends at
+the first of those, which is generated and returned like EOS (its id ends
+`token_ids`, its text ends `text`). Chat models often end a turn on a token that isn't
+their EOS (Qwen2.5 and Qwen3.5 `<|im_end|>`/`<|endoftext|>`, Gemma 4 `<turn|>`), and
+the OpenAI adapter sends each model's end-of-turn tokens here (see
+[`sidecar/openai-adapter/README.md`](../sidecar/openai-adapter/README.md)). Without the
+field, stopping is EOS-only, which is also what `reflex check` compares against
+llama.cpp with.
+
 ## KV cache files
 
 `reflex generate --export-kv <file>` (IPC `export_kv`) writes the model's state after

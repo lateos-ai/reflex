@@ -51,6 +51,59 @@ listing leads with classification, and on a sub-3B model Q8_0 preserves the fine
 logits the label softmax reads where a 4-bit quant can move a near-tie. No generation
 happens, so the extra bandwidth is paid once at load, not per decoded token.
 
+## Choosing the model
+
+The deploy form's **Model** dropdown (`MODEL`) picks the GGUF. The default is the baked
+Qwen3-0.6B Q8_0, which needs no download. Every other choice is downloaded from Hugging
+Face when a worker starts, before it takes jobs:
+
+| Model | Architecture | Download | GPU |
+|---|---|---|---|
+| Qwen3-0.6B Q8_0 (default, baked in) | `qwen3` | none | 16 GB |
+| Qwen3-1.7B / 4B / 8B Q4_K_M | `qwen3` | 1.1 / 2.5 / 5.0 GB | 16 GB |
+| Qwen2.5-1.5B / 7B Instruct Q4_K_M | `qwen2` | 1.1 / 4.7 GB | 16 GB |
+| TinyLlama-1.1B-Chat Q4_K_M | `llama` | 0.7 GB | 16 GB |
+| Mistral-7B-Instruct-v0.2 Q4_K_M | `llama` | 4.4 GB | 16 GB |
+| Qwen3.5-0.8B Q4_K_M | `qwen35` (hybrid Gated DeltaNet) | 0.5 GB | 16 GB |
+| Granite 4.0-H 350M / 1B Q8_0 | `granitehybrid` (Mamba-2 hybrid) | 0.4 / 1.6 GB | 16 GB |
+| Gemma 4 12B-it Q8_0 | `gemma4` | 12.7 GB | 24 GB |
+
+Checked 2026-10-23 on a Runpod A40 with this branch's engine, adapter and `handler.py`:
+every model downloads, loads and answers a chat, a streamed chat and a classify job.
+Seconds from worker start to ready (download plus load; download speed varies run to
+run, Gemma 4 12B took 49 s and 79 s in two runs):
+
+| Model | Ready (s) | Model | Ready (s) |
+|---|---|---|---|
+| Qwen3-0.6B (baked) | 0.5 | TinyLlama-1.1B | 9.1 |
+| Qwen3-1.7B | 3.4 | Mistral-7B | 28.3 |
+| Qwen3-4B | 31.8 | Qwen3.5-0.8B | 2.9 |
+| Qwen3-8B | 17.0 | Granite 4.0-H 350M | 4.5 |
+| Qwen2.5-1.5B | 3.4 | Granite 4.0-H 1B | 10.0 |
+| Qwen2.5-7B | 13.2 | Gemma 4 12B | 80.5 |
+
+- **Where downloads go.** With a network volume attached, to
+  `/runpod-volume/reflex-models`, so only the first worker ever downloads a model. Without
+  one, to the container disk (25 GB by default), so every new worker downloads again; the
+  log prints progress, and the time adds to that worker's cold start.
+- **Gemma 4 12B needs a 24 GB card.** Pick the `AMPERE_24` or `ADA_24` pool when
+  deploying it; the default `AMPERE_16` cards don't fit it.
+- **Custom GGUF URL** (`GGUF_URL`, advanced) overrides the dropdown with any direct GGUF
+  URL, and **Hugging Face Token** (`HF_TOKEN`, advanced) authenticates gated or private
+  Hugging Face repos (it's sent only to `huggingface.co`). The model must be one of the
+  architectures in the main README's
+  [supported-models table](../README.md#supported-models-and-limits) and fit the GPU and
+  the disk. Several supported models don't fit this listing's 16-24 GB cards: the
+  DeepSeek-V2/V3 MLA family (about 80 GB), Kolibri-1 78B, Qwen3.8-27B and Gemma 4 31B
+  (48-80 GB), and real Qwen3-MoE checkpoints (MoE weights aren't kept quantized). Run
+  those with the `reflex` CLI or `serverless/runpod/` on a bigger GPU.
+- **Classification runs on every model** and the caller contract below applies to all
+  of them, but accuracy is the model's: on the sentiment smoke test the default
+  Qwen3-0.6B Q8_0 and most picks rate the review negative, while TinyLlama, Granite
+  350M and Gemma 4 12B (whose instruction tuning expects its chat format) rate it
+  positive. Check a model on your own labels before relying on it. Chat uses each GGUF's own chat template (see
+  [`sidecar/openai-adapter/README.md`](../sidecar/openai-adapter/README.md)).
+
 ### Classifier caller contract
 
 `POST /v1/classify` scores labels, it does not generate one. Three things decide whether
@@ -303,3 +356,13 @@ and the only 24 GB card with stock at that check. The test config also lists
 `allowedCudaVersions` explicitly, like theirs. `hub.json` adds `ADA_24` as a last-resort pool for
 deployed endpoints. No pin guarantees capacity: if a test job still finds none, retrying it from
 the Hub console when stock returns needs no new release.
+
+**Update, 2026-10-23 (`v0.2.12-runpod-hub`): pick the model at deploy time.** `hub.json`
+gains the Model dropdown (12 GGUFs, Qwen3-0.6B Q8_0 still baked in and the default), a
+Custom GGUF URL field and a Hugging Face token field, and the container disk goes from 10
+to 25 GB for the largest pick (see "Choosing the model"). Running every pick through
+`handler.py` on a Runpod A40 first showed broken chat on most non-Qwen3 models (stop-token
+text in replies, no stop at Qwen3.5's and Gemma 4's end-of-turn tokens, three chat
+templates failing to load). The same release fixes those in the engine (IPC
+`stop_token_ids`) and in `reflex-openai-adapter`. `tests.json` is unchanged: the Hub's
+test job runs the default model.
