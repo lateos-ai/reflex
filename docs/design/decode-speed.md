@@ -357,13 +357,17 @@ opt-out still takes the same path and produces the same results as before the ro
 
 Ranked by the round 2 profile and the round 3 QR-default numbers. Status as of
 2026-10-20:
-- **Close the QR warm-prefill gap.** With QR, warm prefill is still 1.5-2.6x slower than
-  the f16 cuBLAS path at the 1-16-row buckets: Qwen3-0.6B 11.3 vs 7.4 ms, Mistral 7B
-  104.7 vs 39.7 ms, Gemma 4 12B 142.9 ms. That is why Qwen3-0.6B `system1` is 1-2%
-  slower; on larger models the load saving hides it. The next step is a fused
-  dequantize-in-registers tensor-core GEMM (Marlin-style) with its own numerics check,
-  not another change to the existing GEMVs. See
-  [quantized-resident-weights.md](quantized-resident-weights.md#qr-as-the-default-2026-10-20).
+- **Close the QR warm-prefill gap.** *Done for Q4_K/Q6_K on Ampere and newer
+  (2026-10-22/23):* prefill GEMMs now run a tensor-core kernel straight from the quantized
+  blocks, see [quantized-mma-prefill.md](quantized-mma-prefill.md). On an A10G, QR warm
+  prefill beats the f16 cuBLAS path (QR off) at every bucket: Qwen3-0.6B 5.5 / 9.6 /
+  25.8 ms against 7.4 / 9.9 / 28.2 at 29 / 113 / 449 tokens, Mistral 7B 23.0 / 71.5 /
+  186.6 ms against 39.5 / 75.0 / 195.4 at 33 / 129 / 513. Qwen3-0.6B `system1` prompt
+  eval went from slower than QR off to 6.3 vs 19.1 ms. Still open:
+  - On a T4, QR off stays faster from ~113 rows (Mistral 7B from 129 tokens,
+    Qwen3-0.6B at 449). Long prompts there go back to the dequantize-to-scratch path
+    ("Row cap" in that doc).
+  - Q8_0 weights (Gemma 4) still use the fused GEMV and the scratch path.
 - **Cut the remaining per-op host cost.** *Partly done:* fused norms and the reused
   workspace (round 2), and the embedding upload is now async from pinned memory
   (round 3). A single CUDA graph per step didn't pay (above). What remains of the GPU

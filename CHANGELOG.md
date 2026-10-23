@@ -5,6 +5,24 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **128-row tile for long quantized prefills** (sm_80+). Above 64 rows the tensor-core
+  prefill kernel can now carry 128 input rows per block, so it dequantizes each weight half
+  as often. It's used when its grid still covers half the SMs and its last block isn't
+  mostly padding. It gives the same bits as the 64-row tile at the same split count.
+  `REFLEX_QUANT_MMA_TILE=64|128` forces either tile. Both tiles also got cheaper
+  dequantization (same f16 values) and `ldmatrix` loads.
+  - **Warm prefill on an A10G**, p50 ms, new / before / QR off: Qwen3-0.6B at 29 / 113 /
+    449 tokens 5.55 / 9.65 / 25.8 (was 5.63 / 9.88 / 27.1; QR off 7.38 / 9.89 / 28.2);
+    Mistral 7B at 33 / 129 / 513 tokens 23.0 / 71.5 / 186.6 (was 23.8 / 73.5 / 214.3; QR
+    off 39.5 / 75.0 / 195.4). QR is now faster than QR off at every A10G bucket.
+  - **T4 unchanged.** On sm_75 the 128-row tile ran no faster than the 64-row one, so
+    Turing keeps the 64-row tile and the row cap. The 64-row kernel's shared changes still help it there: T4
+    Qwen3-0.6B 8.06 / 16.5 ms at 29 / 113 tokens (was 8.44 / 16.7), Mistral 7B 60.5 / 204 ms
+    at 33 / 129 (was 63.4 / 210). QR off is still faster on the T4 from 129 tokens on Mistral
+    and at 449 on Qwen3-0.6B.
+  - Greedy tokens are identical across both tiles, forced 1 split, `REFLEX_QUANT_MMA=0`
+    and QR off, on Qwen3-0.6B and Mistral 7B, on both GPUs. See "Step 5" in
+    [docs/design/quantized-mma-prefill.md](docs/design/quantized-mma-prefill.md).
 - **Tensor-core prefill straight from quantized weights** (#47, #48). With quantized-resident
   weights and `--weights f16` (both defaults), prefill GEMMs of 2+ rows on Q4_K and Q6_K
   weights now run a `mma.sync` kernel (`gemm_q_mma.cu`, sm_75+, loaded on first use). It
