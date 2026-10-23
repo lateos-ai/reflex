@@ -364,6 +364,7 @@ impl Model {
     /// Errors unless this model has a prefix-state format (cache files and
     /// pinned prefixes): Gemma 4 and granitehybrid don't yet.
     pub fn check_prefix_state_supported(&self) -> Result<(), ReflexError> {
+        self.check_generative()?;
         if self.gemma4.is_some() {
             return Err(crate::reflex_err!(
                 UnsupportedArchitecture,
@@ -391,6 +392,7 @@ impl Model {
         on_first_token: impl FnMut(&[f32]),
         on_token: impl FnMut(u32, &str),
     ) -> Result<(Vec<u32>, String, Option<f64>), ReflexError> {
+        self.check_generative()?;
         let r = self.run_resumed(
             prompt,
             max_new_tokens,
@@ -416,6 +418,7 @@ impl Model {
         on_first_token: impl FnMut(&[f32]),
         on_token: impl FnMut(u32, &str),
     ) -> Result<(Vec<u32>, String, PinnedPrefix, Option<f64>), ReflexError> {
+        self.check_generative()?;
         self.check_prefix_state_supported()?;
         if sampling.json_schema.is_some() {
             return Err(ReflexError::InvalidInput(
@@ -586,6 +589,7 @@ impl Model {
         candidates: &[System1Candidate],
         temperature: f32,
     ) -> Result<(System1Response, Option<f64>), ReflexError> {
+        self.check_generative()?;
         let copy_ms = Cell::new(None);
         let response = if let Some(h) = &self.hybrid {
             let src = self.hybrid_prefix(resume, &copy_ms)?;

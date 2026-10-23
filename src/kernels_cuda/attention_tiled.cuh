@@ -7,6 +7,7 @@
 //   attention_tiled.cu       D 256 and 512 (Gemma 4; Qwen3.5's gated attention, D 256)
 //   attention_tiled_d128.cu  D 128 (Qwen3, Llama, Mistral, most Qwen2.5 and MoE files)
 //   attention_tiled_d64.cu   D 64 (Qwen2.5-0.5B, TinyLlama)
+//   attention_tiled_bidir.cu D 64 and 128 without the causal mask (embedding models)
 //
 // Why: attention_online_kernel gives every (query row, head) pair its own block, which
 // streams that row's whole K/V range from global memory one position per warp. Nothing
@@ -67,7 +68,9 @@ struct AttnParams {
 #define TA_BC 64  // K/V positions per tile
 #define TA_DC 32  // head-dim chunk for Q K^T
 
-template <typename T, int D, int M>
+// CAUSAL = false (attention_tiled_bidir.cu, embedding models): every query row
+// sees all kv_len positions, and `window` is ignored.
+template <typename T, int D, int M, bool CAUSAL = true>
 __device__ __forceinline__ void attention_tiled(
     const float* __restrict__ q,
     const T* __restrict__ k,
@@ -118,9 +121,9 @@ __device__ __forceinline__ void attention_tiled(
     const unsigned int last_row = min(r0 + rows_per_block, rows) - 1;
     const unsigned int q_lo = p.start_pos + r0;
     const unsigned int q_hi = p.start_pos + last_row;  // inclusive
-    const unsigned int key_lo = (p.window != 0 && q_lo + 1 > p.window) ? q_lo + 1 - p.window : 0;
+    const unsigned int key_lo = (CAUSAL && p.window != 0 && q_lo + 1 > p.window) ? q_lo + 1 - p.window : 0;
     const unsigned int tile_lo = key_lo / TA_BC;
-    const unsigned int tile_hi = q_hi / TA_BC + 1;  // exclusive
+    const unsigned int tile_hi = (CAUSAL ? q_hi : kv_len - 1) / TA_BC + 1;  // exclusive
 
     if (tid < M) {
         m_run[tid] = -INFINITY;
@@ -199,8 +202,9 @@ __device__ __forceinline__ void attention_tiled(
 #pragma unroll
             for (int j = 0; j < TN; j++) {
                 const unsigned int pos = kbase + tx + 16 * j;
-                const bool visible = mi < used && row < rows && pos <= qpos
-                    && (p.window == 0 || qpos - pos < p.window);
+                const bool visible = mi < used && row < rows
+                    && (CAUSAL ? pos <= qpos && (p.window == 0 || qpos - pos < p.window)
+                               : pos < kv_len);
                 s_tile[mi * SS + tx + 16 * j] = visible ? s[i][j] * p.scale : -INFINITY;
             }
         }

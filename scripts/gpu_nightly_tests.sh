@@ -21,6 +21,9 @@
 #                            granite-4.0-h-350m-Q8_0.gguf
 #   SPM_GGUF       optional  a real SentencePiece-tokenizer chat GGUF, e.g.
 #                            tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+#   EMBED_GGUF     optional  a real Nemotron-3.5-Embed-1B GGUF (mistral3 encoder), with
+#   EMBED_REF                its HF reference embeddings (test-data/nemotron-3.5-embed-ref.tsv,
+#                            from test-data/tiny-mistral3-embed-src.tar.gz's hf_reference.py)
 #   test-data/*.gguf         optional synthetic fixtures (see docs/DEVELOPMENT.md "Known
 #                            test-fixture limitations"); tests needing them SKIP if absent
 #   CARGO_TEST_FLAGS         default "--release --features ipc"
@@ -37,6 +40,9 @@ MLA_REAL_GGUF="${MLA_REAL_GGUF:-}"
 QWEN2_GGUF="${QWEN2_GGUF:-}"
 GRANITE_GGUF="${GRANITE_GGUF:-}"
 SPM_GGUF="${SPM_GGUF:-}"
+EMBED_GGUF="${EMBED_GGUF:-}"
+EMBED_REF="${EMBED_REF:-test-data/nemotron-3.5-embed-ref.tsv}"
+export EMBED_GGUF EMBED_REF
 read -r -a cargo_flags <<<"${CARGO_TEST_FLAGS:---release --features ipc}"
 LOG_DIR="${LOG_DIR:-bench-results/gpu-tests-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$LOG_DIR"
@@ -55,6 +61,8 @@ requirement() {
     *::granite_real_model_*) echo "$GRANITE_GGUF|$GRANITE_GGUF|set GRANITE_GGUF" ;;
     *::ipc_kv_relay_spm_model_*|*::ipc_json_schema_spm_model_*|*::ipc_system1_resumed_spm_model_*|*::ipc_kv_f16_file_spm_model_*|*::f16_kv_cache_spm_model_*) echo "$SPM_GGUF|$SPM_GGUF|set SPM_GGUF" ;;
     model::granite_hybrid_tests::*) echo "|test-data/tiny-granitehybrid.gguf|fixture missing" ;;
+    *::nemotron_embed_real_model_*) echo "$EMBED_GGUF|$EMBED_GGUF|set EMBED_GGUF" ;;
+    model::encoder_tests::*|*::ipc_embed_fixture_*) echo "|test-data/tiny-mistral3-embed.gguf|fixture missing" ;;
     model::mla_widening_tests::*) echo "|test-data/tiny-mla-v3.gguf|fixture missing" ;;
     lora::moe_expert_lora_fixture_tests::*) echo "|test-data/tiny-qwen3moe-lora.gguf|fixture missing" ;;
     *::qwen3moe_fixture_*) echo "|test-data/tiny-qwen3moe.gguf|fixture missing" ;;

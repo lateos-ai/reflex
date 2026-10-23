@@ -31,7 +31,9 @@ __device__ __forceinline__ float warp_sum(float x) {
     return x;
 }
 
-template <typename T>
+// CAUSAL = false (attention_bidir.cu, embedding models): every query row sees all
+// start_pos + rows positions (rows = gridDim.x), and `window` is ignored.
+template <typename T, bool CAUSAL = true>
 __device__ __forceinline__ void attention_online(
     const float* __restrict__ q,
     const T* __restrict__ k,
@@ -60,8 +62,8 @@ __device__ __forceinline__ void attention_online(
     __syncthreads();
 
     // This block's slice of the causal window [lo, seq_len).
-    const unsigned int seq_len = p.start_pos + row + 1;
-    const unsigned int lo = (p.window != 0 && seq_len > p.window) ? seq_len - p.window : 0;
+    const unsigned int seq_len = CAUSAL ? p.start_pos + row + 1 : p.start_pos + gridDim.x;
+    const unsigned int lo = (CAUSAL && p.window != 0 && seq_len > p.window) ? seq_len - p.window : 0;
     const unsigned int begin = max(split * p.split_len, lo);
     const unsigned int end = min(seq_len, begin + p.split_len);
 

@@ -204,6 +204,17 @@ impl Model {
                 (cfg, block_count, moe.map(|m| m.expert_used_count))
             }
         };
+        // An embedding model's settings (`encoder.rs`), checked before any upload.
+        let encoder_cfg = match (&kolibri, file.metadata.get("general.architecture")) {
+            (None, Some(GgufValue::String(arch))) => parse_encoder_config(file, arch, &cfg)?,
+            _ => None,
+        };
+        if encoder_cfg.is_some() && AttnImpl::from_env()? == AttnImpl::Legacy {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "REFLEX_ATTN_KERNEL=legacy is not supported for embedding models"
+            ));
+        }
         // Qwen2's Q/K/V biases, checked for every layer before any upload.
         let qkv_bias_by_layer = (0..block_count)
             .map(|i| qkv_bias_names(file, i, &cfg))
@@ -217,16 +228,21 @@ impl Model {
             "rmsnorm",
             "rmsnorm_kernel",
         )?;
+        let mut rope_names = vec![
+            "rope_kernel",
+            "rope_batch_kernel",
+            "rope_norm_kernel",
+            "rope_norm_batch_kernel",
+        ];
+        let encoder_yarn = encoder_cfg.is_some_and(|e| e.yarn.is_some());
+        if encoder_yarn {
+            rope_names.push("rope_norm_yarn_batch_kernel");
+        }
         let mut rope_fns = aot::load_kernel_module(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_ROPE")),
             "rope",
-            &[
-                "rope_kernel",
-                "rope_batch_kernel",
-                "rope_norm_kernel",
-                "rope_norm_batch_kernel",
-            ],
+            &rope_names,
         )?
         .into_iter();
         let rope_k = rope_fns
@@ -241,6 +257,19 @@ impl Model {
         let rope_norm_batch_k = rope_fns
             .next()
             .ok_or_else(|| ReflexError::Other("missing rope_norm_batch_kernel".to_string()))?;
+        let encoder = match encoder_cfg {
+            Some(ec) => {
+                let yarn_k = if encoder_yarn {
+                    Some(rope_fns.next().ok_or_else(|| {
+                        ReflexError::Other("missing rope_norm_yarn_batch_kernel".to_string())
+                    })?)
+                } else {
+                    None
+                };
+                Some(EncoderModel::load(&device, ec, yarn_k)?)
+            }
+            None => None,
+        };
         let silu_k = aot::load_kernel(
             &device,
             include_bytes!(env!("REFLEX_KERNEL_SILU_AND_MUL")),
@@ -750,6 +779,7 @@ impl Model {
             mla: None,
             gemma4: None,
             granite: None,
+            encoder,
         })
     }
 
@@ -1365,6 +1395,7 @@ impl Model {
                 cfg.rope_type,
             )?;
         }
+        self.encoder_temp_scale(&mut q, start_pos, rows, cfg.num_q_heads * cfg.head_dim)?;
         prof_mark(PrefillPhase::NormRope, kind)?;
 
         let kv_stride = cfg.num_kv_heads * cfg.head_dim;
@@ -2147,6 +2178,7 @@ impl Model {
         &self,
         prompt: &str,
     ) -> Result<((u32, String), crate::kv_io::DenseKvCache), ReflexError> {
+        self.check_generative()?;
         if self.hybrid.is_some() {
             return Err(ReflexError::Other("--export-kv on a hybrid Qwen3.5 model needs forward_prompt_capture_kv_hybrid, not this function".to_string()));
         }

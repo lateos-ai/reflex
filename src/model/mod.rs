@@ -78,6 +78,7 @@ use std::thread::ScopedJoinHandle;
 mod config;
 mod decode_step;
 mod dense;
+mod encoder;
 mod gemma4;
 mod granite_hybrid;
 mod hybrid;
@@ -92,6 +93,8 @@ use self::config::*;
 pub use self::config::{parse_model_config, LayerConfig, MoeMetaConfig, RopeType};
 use self::decode_step::*;
 use self::dense::*;
+pub use self::encoder::Embedding;
+use self::encoder::*;
 use self::gemma4::*;
 use self::granite_hybrid::*;
 use self::hybrid::*;
@@ -115,6 +118,10 @@ mod attention_tiled_dense_tests;
 mod attention_tiled_tests;
 #[cfg(test)]
 mod decode_step_tests;
+#[cfg(test)]
+mod encoder_config_tests;
+#[cfg(test)]
+mod encoder_tests;
 #[cfg(test)]
 mod f16_kernel_tests;
 #[cfg(test)]
@@ -355,6 +362,10 @@ pub struct Model {
     /// `Self::load_granite_hybrid`); like `hybrid`, `cfg`/`layers`/
     /// `expert_used_count` are unused in that case.
     granite: Option<GraniteHybridModel>,
+    /// `Some` iff this is an embedding model (`<arch>.attention.causal =
+    /// false`, dense path only; see `encoder.rs`): attention is bidirectional
+    /// and [`Self::embed`] is the only entry point.
+    encoder: Option<EncoderModel>,
 }
 
 /// Which forward path a loaded [`Model`] dispatches to -- used by callers
@@ -880,6 +891,7 @@ impl Model {
     /// documented scope choice for its minimal forward pass), and returns
     /// the argmax-sampled first generated token id plus its decoded text.
     pub fn forward_prompt(&self, prompt: &str) -> Result<(u32, String), ReflexError> {
+        self.check_generative()?;
         if let Some(h) = &self.hybrid {
             return self.forward_prompt_hybrid(h, prompt);
         }
@@ -1116,6 +1128,7 @@ impl Model {
         candidates: &[System1Candidate],
         temperature: f32,
     ) -> Result<System1Response, ReflexError> {
+        self.check_generative()?;
         self.system1_evaluate_resumed(prompt, Resume::Fresh, candidates, temperature)
             .map(|(response, _copy_ms)| response)
     }

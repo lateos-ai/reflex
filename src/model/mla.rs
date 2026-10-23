@@ -553,6 +553,7 @@ impl Model {
             }),
             gemma4: None,
             granite: None,
+            encoder: None,
         })
     }
 

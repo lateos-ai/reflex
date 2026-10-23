@@ -5,7 +5,9 @@ reflex-openai-adapter binary that serverless/runpod/ uses as a load-balancing
 endpoint, waits for it to report ready, and forwards each Runpod job to its
 existing POST /v1/chat/completions over loopback -- or, for a job whose input
 has "labels", to POST /v1/classify (one engine pass scoring each label; the
-one response is yielded once, like a non-streaming chat job). See
+one response is yielded once, like a non-streaming chat job), or, for a job
+whose input has "input" and no "messages", to POST /v1/embeddings (an embedding
+model such as Nemotron-3.5-Embed; yielded once the same way). See
 ../.runpod/README.md and ../serverless/runpod/README.md for why two deployment
 paths exist.
 
@@ -219,6 +221,8 @@ def handler(event):
     payload = dict(event.get("input", {}))
     if "labels" in payload:
         path, stream = "/v1/classify", False
+    elif "input" in payload and "messages" not in payload:
+        path, stream = "/v1/embeddings", False
     else:
         path, stream = "/v1/chat/completions", bool(payload.get("stream", False))
         payload["stream"] = stream

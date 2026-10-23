@@ -965,8 +965,8 @@ fn rmsnorm_block_dim(hidden_size: usize) -> u32 {
 }
 
 /// `attention_online.cu`'s block size, in warps, and widest supported head.
-const ATTN_ONLINE_WARPS: usize = 8;
-const ATTN_ONLINE_MAX_DIM: usize = 1024;
+pub(super) const ATTN_ONLINE_WARPS: usize = 8;
+pub(super) const ATTN_ONLINE_MAX_DIM: usize = 1024;
 /// A decode step splits its positions across blocks once there are more than this
 /// many per block, up to `ATTN_ONLINE_MAX_SPLITS` blocks per head.
 const ATTN_ONLINE_SPLIT_POSITIONS: usize = 256;
@@ -2930,6 +2930,12 @@ impl Model {
         base: f32,
         rope_type: RopeType,
     ) -> Result<(), ReflexError> {
+        if self.encoder.as_ref().is_some_and(|e| e.cfg.yarn.is_some()) {
+            return Err(crate::reflex_err!(
+                Other,
+                "internal: an encoder's YaRN RoPE has only the batched kernel"
+            ));
+        }
         let half_rotary = rotary_dim / 2;
         let total_pairs = (num_heads * half_rotary) as u32;
         let threads = 256u32;
@@ -2982,6 +2988,11 @@ impl Model {
         base: f32,
         rope_type: RopeType,
     ) -> Result<(), ReflexError> {
+        if rope_type == RopeType::Norm
+            && self.rope_yarn_batch(t, start_pos, num_heads, head_dim, rotary_dim, rows, base)?
+        {
+            return Ok(());
+        }
         let half_rotary = rotary_dim / 2;
         let total_pairs = (rows * num_heads * half_rotary) as u32;
         let threads = 256u32;
@@ -3417,6 +3428,23 @@ impl Model {
         rows: usize,
         window: usize,
     ) -> Result<CudaSlice<f32>, ReflexError> {
+        if let Some(enc) = &self.encoder {
+            let shape = OnlineAttnShape {
+                rows,
+                start_pos,
+                num_q_heads,
+                group_size: num_q_heads / num_kv_heads,
+                qk_dim: head_dim,
+                v_dim: head_dim,
+                k_pos_stride: num_kv_heads * head_dim,
+                k_head_stride: head_dim,
+                v_pos_stride: num_kv_heads * head_dim,
+                v_head_stride: head_dim,
+                scale: 1.0f32 / (head_dim as f32).sqrt(),
+                window,
+            };
+            return self.attention_prefill_bidir(enc, q, k_cache, v_cache, shape);
+        }
         if self.attn_impl == AttnImpl::Online {
             let shape = OnlineAttnShape {
                 rows,

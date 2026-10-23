@@ -53,7 +53,7 @@ use serde::Serialize;
 /// keep working across a minor bump, so a *major* bump is the signal that an
 /// existing field changed meaning or was removed. Keep in sync with the
 /// docs/reference.md's "`--json` output contract" section.
-pub const SCHEMA_VERSION: &str = "1.2.0";
+pub const SCHEMA_VERSION: &str = "1.3.0";
 
 /// Serializes `value` as one line of JSON to stdout, matching `src/ipc.rs`'s
 /// `write_json_line` discipline (flushed immediately) but deliberately not
@@ -137,6 +137,28 @@ pub struct System1ResultJson {
     pub best_idx: usize,
     pub best_text: String,
     pub entropy: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub joules: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub energy_method: Option<&'static str>,
+    /// `f16` or `f32`: the element type matrix weights were stored in.
+    pub weights_dtype: &'static str,
+}
+
+/// `REFLEX_EMBED_OK`, with the vector `REFLEX_EMBEDDING_OK` prints in plain
+/// text (`reflex embed`).
+#[derive(Serialize)]
+pub struct EmbedResultJson {
+    pub schema_version: &'static str,
+    pub process_start_to_embedding_ms: f64,
+    pub gguf_open_ms: f64,
+    pub cuda_init_ms: f64,
+    pub model_load_ms: f64,
+    pub prompt_eval_ms: f64,
+    pub prompt_tokens: usize,
+    pub dims: usize,
+    /// The mean-pooled, L2-normalized embedding.
+    pub embedding: Vec<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub joules: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -285,7 +307,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"schema_version":"1.2.0","process_start_to_first_result_ms":1.0}"#
+            r#"{"schema_version":"1.3.0","process_start_to_first_result_ms":1.0}"#
         );
     }
 
@@ -301,7 +323,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"schema_version":"1.2.0","phase":"prompt_eval","duration_ms":1.0}"#
+            r#"{"schema_version":"1.3.0","phase":"prompt_eval","duration_ms":1.0}"#
         );
     }
 
