@@ -33,7 +33,10 @@ use rand::{Rng, SeedableRng};
 /// sampled run reproducible (`StdRng::seed_from_u64`); omitted, each call
 /// draws fresh OS entropy. `json_schema` (see `crate::grammar`) constrains every
 /// generated token to continue a value that conforms to the schema; `None` (the
-/// default) leaves the logits untouched.
+/// default) leaves the logits untouched. `stop_token_ids` ends the generation at
+/// any of these tokens as well as at the GGUF's EOS (the token is kept, like EOS):
+/// a chat front end passes a model's end-of-turn tokens here. Empty (the default)
+/// stops at EOS only, which is what `reflex check` compares against llama.cpp with.
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
     pub temperature: f32,
@@ -41,6 +44,7 @@ pub struct SamplingParams {
     pub top_p: Option<f32>,
     pub seed: Option<u64>,
     pub json_schema: Option<std::sync::Arc<crate::grammar::JsonSchema>>,
+    pub stop_token_ids: Vec<u32>,
 }
 
 impl Default for SamplingParams {
@@ -51,6 +55,7 @@ impl Default for SamplingParams {
             top_p: None,
             seed: None,
             json_schema: None,
+            stop_token_ids: Vec::new(),
         }
     }
 }
@@ -110,6 +115,13 @@ impl<'a> TokenPicker<'a> {
         }
         self.generated.push(id);
         Ok(id)
+    }
+
+    /// Whether the generation ends at `id`: EOS, or one of the request's
+    /// `stop_token_ids`. Every architecture's decode loop checks this after each
+    /// pick.
+    pub fn stops_at(&self, id: u32) -> bool {
+        Some(id) == self.eos || self.params.stop_token_ids.contains(&id)
     }
 
     /// The streamed text for token `id` (`Tokenizer::decode_stream`). A constrained
@@ -285,6 +297,25 @@ pub fn sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A generation ends at EOS, and at the request's `stop_token_ids` only when
+    /// it has some: without them, stopping is EOS-only, as before.
+    #[test]
+    fn test_stops_at_eos_and_requested_stop_tokens() {
+        let eos_only = SamplingParams::default();
+        let picker = TokenPicker::new(&eos_only, None, Some(2));
+        assert!(picker.stops_at(2));
+        assert!(!picker.stops_at(151_645));
+        let chat = SamplingParams {
+            stop_token_ids: vec![151_643, 151_645],
+            ..Default::default()
+        };
+        let picker = TokenPicker::new(&chat, None, Some(2));
+        assert!(picker.stops_at(2) && picker.stops_at(151_643) && picker.stops_at(151_645));
+        assert!(!picker.stops_at(7));
+        let no_eos = TokenPicker::new(&eos_only, None, None);
+        assert!(!no_eos.stops_at(2));
+    }
 
     #[test]
     fn test_greedy_matches_argmax_regardless_of_other_fields() {

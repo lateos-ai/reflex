@@ -5,6 +5,33 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Runpod Hub: pick the model when you deploy.** The listing's deploy form has a Model
+  dropdown with 12 GGUFs covering every architecture that fits its 16-24 GB cards:
+  Qwen3 0.6B (the default, still baked into the image) / 1.7B / 4B / 8B, Qwen2.5 1.5B /
+  7B Instruct, TinyLlama 1.1B Chat, Mistral 7B Instruct v0.2, Qwen3.5 0.8B, Granite 4.0-H
+  350M / 1B and Gemma 4 12B-it. Any choice but the default is downloaded once when a
+  worker starts (to the network volume when one is attached), and a Custom GGUF URL field
+  (with an optional Hugging Face token) takes any other supported model. Container disk
+  10 -> 25 GB. See [.runpod/README.md](.runpod/README.md), "Choosing the model".
+- **IPC `stop_token_ids`.** A `generate` request can name extra stop tokens; the
+  generation ends at EOS or at the first of those. Without the field nothing changes
+  (EOS-only, what `reflex check` uses).
+- **OpenAI adapter: chat works on non-Qwen3 models.** Testing every Hub model showed three
+  bugs, now fixed:
+  - Replies ended in the stop token's text (`<|im_end|>`, `</s>`,
+    `<|end_of_text|>`). The adapter now strips it, in streams too.
+  - Models whose turn ends on a token other than their EOS kept generating. The adapter
+    now sends each model's end-of-turn tokens as `stop_token_ids` (Qwen3.5,
+    Gemma 4 `<turn|>`).
+  - The Qwen3.5, Gemma 4 and Mistral chat templates failed to load, so those models
+    got a generic prompt. Templates now render with Hugging Face's settings
+    (`trim_blocks`, `lstrip_blocks`, Python string/dict methods), and a template that
+    rejects a system message gets it folded into the first user turn. All 12 models'
+    templates render byte-identical to Python `jinja2`.
+
+  Checked on a Runpod A40: all 12 models download, load and answer chat, streamed chat
+  and classify jobs, and `reflex generate`'s greedy tokens are unchanged against the
+  previous master (no stop tokens passed).
 - **128-row tile for long quantized prefills** (sm_80+). Above 64 rows the tensor-core
   prefill kernel can now carry 128 input rows per block, so it dequantizes each weight half
   as often. It's used when its grid still covers half the SMs and its last block isn't

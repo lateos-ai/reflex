@@ -249,6 +249,7 @@ pub fn run(args: Vec<String>) {
         top_p,
         seed,
         json_schema: None,
+        stop_token_ids: Vec::new(),
     };
     if quickstart && model_spec.is_some() {
         panic!("--quickstart and --model cannot be combined in the same run");

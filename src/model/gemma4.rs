@@ -836,7 +836,7 @@ impl Model {
             &picker.stream_text(&self.tokenizer, &mut pending_bytes, next_id),
         );
 
-        while generated.len() < max_new_tokens && Some(next_id) != self.tokenizer.eos_token_id {
+        while generated.len() < max_new_tokens && !picker.stops_at(next_id) {
             hidden = self.forward_one_token_gemma4(m, next_id, position, &mut caches)?;
             position += 1;
             let mut logits = self.gemma4_logits(m, &hidden)?;

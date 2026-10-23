@@ -61,6 +61,13 @@ impl GgufMetaValue {
         }
     }
 
+    pub fn as_bool(&self) -> Option<bool> {
+        match *self {
+            GgufMetaValue::Bool(b) => Some(b),
+            _ => None,
+        }
+    }
+
     pub fn as_string_array(&self) -> Option<Vec<&str>> {
         match self {
             GgufMetaValue::Array(items) => items.iter().map(GgufMetaValue::as_str).collect(),
@@ -80,6 +87,10 @@ impl GgufMeta {
 
     pub fn get_u64(&self, key: &str) -> Option<u64> {
         self.metadata.get(key).and_then(GgufMetaValue::as_u64)
+    }
+
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        self.metadata.get(key).and_then(GgufMetaValue::as_bool)
     }
 
     pub fn get_string_array(&self, key: &str) -> Option<Vec<&str>> {

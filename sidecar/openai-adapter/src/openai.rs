@@ -136,16 +136,20 @@ struct IpcGenerateRequest<'a> {
     sampling: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     json_schema: Option<&'a RawValue>,
+    #[serde(skip_serializing_if = "<[u32]>::is_empty")]
+    stop_token_ids: &'a [u32],
 }
 
 /// The IPC request line for a chat completion: the rendered `prompt`, the
-/// already-checked `max_tokens`, the request's `stream` and sampling fields, and
-/// `json_schema` from [`ipc_json_schema`].
+/// already-checked `max_tokens`, the request's `stream` and sampling fields,
+/// `json_schema` from [`ipc_json_schema`], and the model's end-of-generation
+/// tokens (`stop_tokens::StopTokens`).
 pub fn build_ipc_line(
     req: &ChatCompletionRequest,
     prompt: &str,
     max_tokens: usize,
     json_schema: Option<&RawValue>,
+    stop_token_ids: &[u32],
 ) -> serde_json::Result<String> {
     serde_json::to_string(&IpcGenerateRequest {
         prompt,
@@ -153,6 +157,7 @@ pub fn build_ipc_line(
         stream: req.stream,
         sampling: build_sampling(req),
         json_schema,
+        stop_token_ids,
     })
 }
 
@@ -360,7 +365,7 @@ mod tests {
     fn ipc_line(body: &str) -> Result<String, String> {
         let req: ChatCompletionRequest = serde_json::from_slice(body.as_bytes()).unwrap();
         let schema = ipc_json_schema(req.response_format.as_ref())?;
-        Ok(build_ipc_line(&req, "P", 5, schema.as_deref()).unwrap())
+        Ok(build_ipc_line(&req, "P", 5, schema.as_deref(), &[]).unwrap())
     }
 
     const MESSAGES: &str = r#""messages": [{"role": "user", "content": "hi"}]"#;

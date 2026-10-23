@@ -1,16 +1,100 @@
 {
-  "title": "Reflex Classifier (Qwen3-0.6B Q8_0, GGUF-native cold-start inference)",
-  "description": "Zero-shot classification and intent routing on scale-to-zero GPU endpoints, backed by Reflex: a GGUF-native engine that compiles its CUDA kernels ahead of time (no runtime JIT), so a cold worker reaches its first result fast. POST /v1/classify scores every label as a continuation of the prompt in one prefill and returns each label's probability within the set plus the entropy -- nothing is generated, so a decision is one forward pass, not a decode loop. Also serves OpenAI-compatible chat completions, streaming or not. On Runpod, cold Reflex was ~42-44s vs the official vLLM worker's ~150s (same GPU tier/day; vLLM also pulled bf16 weights; endpoint types differed) -- most of both is platform provisioning; Reflex's own engine load was ~1.6s. Qwen3-0.6B Q8_0 baked in. batch_size is always 1 -- steady high-QPS chat wants vLLM. Guide: https://github.com/lateos-ai/reflex/blob/master/docs/deploy-serverless.md",
+  "title": "Reflex: GGUF-native cold-start classifier and chat (12 models)",
+  "description": "Zero-shot classification, intent routing and OpenAI-compatible chat on scale-to-zero GPU endpoints, backed by Reflex: a GGUF-native engine that compiles its CUDA kernels ahead of time (no runtime JIT), so a cold worker reaches its first result fast. POST /v1/classify scores every label as a continuation of the prompt in one prefill and returns each label's probability within the set plus the entropy -- nothing is generated, so a decision is one forward pass, not a decode loop. Chat completions stream or not. Pick the model when you deploy: Qwen3 0.6B (default, baked into the image), 1.7B, 4B or 8B; Qwen2.5 1.5B or 7B Instruct; TinyLlama 1.1B Chat; Mistral 7B Instruct; Qwen3.5 0.8B; Granite 4.0-H 350M or 1B; Gemma 4 12B (24 GB GPU). Any model but the default is downloaded when a worker starts (attach a network volume to keep it across workers), or give your own GGUF URL. On Runpod, cold Reflex was ~42-44s vs the official vLLM worker's ~150s (same GPU tier/day; vLLM also pulled bf16 weights; endpoint types differed) -- most of both is platform provisioning; Reflex's own engine load was ~1.6s. batch_size is always 1 -- steady high-QPS chat wants vLLM. Guide: https://github.com/lateos-ai/reflex/blob/master/.runpod/README.md",
   "type": "serverless",
   "category": "language",
   "iconUrl": "https://raw.githubusercontent.com/lateos-ai/reflex/master/.runpod/icon.jpg",
   "config": {
     "runsOn": "GPU",
-    "containerDiskInGb": 10,
+    "containerDiskInGb": 25,
     "gpuCount": 1,
     "gpuIds": "AMPERE_16,AMPERE_24,ADA_24",
-    "allowedCudaVersions": ["12.4", "12.8", "13.0", "13.2"],
+    "allowedCudaVersions": [
+      "12.4",
+      "12.8",
+      "13.0",
+      "13.2"
+    ],
     "env": [
+      {
+        "key": "MODEL",
+        "input": {
+          "name": "Model",
+          "type": "string",
+          "description": "The GGUF to serve. Qwen3-0.6B Q8_0 is baked into the image (fastest cold start). Any other choice is downloaded from Hugging Face when a worker starts (size in its label): once per worker, or once in all with a network volume attached. Gemma 4 12B needs a 24 GB GPU, not the 16 GB pool.",
+          "options": [
+            {
+              "label": "Qwen3-0.6B Q8_0 (baked in, default; best for classification)",
+              "value": "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+            },
+            {
+              "label": "Qwen3-1.7B Q4_K_M (1.1 GB download)",
+              "value": "unsloth/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q4_K_M.gguf"
+            },
+            {
+              "label": "Qwen3-4B Q4_K_M (2.5 GB download)",
+              "value": "unsloth/Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf"
+            },
+            {
+              "label": "Qwen3-8B Q4_K_M (5.0 GB download)",
+              "value": "unsloth/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf"
+            },
+            {
+              "label": "Qwen2.5-1.5B-Instruct Q4_K_M (1.1 GB download)",
+              "value": "Qwen/Qwen2.5-1.5B-Instruct-GGUF/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+            },
+            {
+              "label": "Qwen2.5-7B-Instruct Q4_K_M (4.7 GB download)",
+              "value": "bartowski/Qwen2.5-7B-Instruct-GGUF/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+            },
+            {
+              "label": "TinyLlama-1.1B-Chat Q4_K_M (0.7 GB download)",
+              "value": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+            },
+            {
+              "label": "Mistral-7B-Instruct-v0.2 Q4_K_M (4.4 GB download)",
+              "value": "TheBloke/Mistral-7B-Instruct-v0.2-GGUF/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+            },
+            {
+              "label": "Qwen3.5-0.8B Q4_K_M, hybrid Gated DeltaNet (0.5 GB download)",
+              "value": "unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf"
+            },
+            {
+              "label": "Granite 4.0-H 350M Q8_0, Mamba-2 hybrid (0.4 GB download)",
+              "value": "ibm-granite/granite-4.0-h-350m-GGUF/granite-4.0-h-350m-Q8_0.gguf"
+            },
+            {
+              "label": "Granite 4.0-H 1B Q8_0, Mamba-2 hybrid (1.6 GB download)",
+              "value": "ibm-granite/granite-4.0-h-1b-GGUF/granite-4.0-h-1b-Q8_0.gguf"
+            },
+            {
+              "label": "Gemma 4 12B-it Q8_0 (12.7 GB download, 24 GB GPU)",
+              "value": "ggml-org/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q8_0.gguf"
+            }
+          ],
+          "default": "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf"
+        }
+      },
+      {
+        "key": "GGUF_URL",
+        "input": {
+          "name": "Custom GGUF URL",
+          "type": "string",
+          "description": "Overrides Model: a direct URL to any GGUF of an architecture Reflex supports, e.g. https://huggingface.co/<owner>/<repo>/resolve/main/<file>.gguf. It must fit the GPU and the container disk. Supported architectures and their limits: https://github.com/lateos-ai/reflex#supported-models-and-limits",
+          "default": "",
+          "advanced": true
+        }
+      },
+      {
+        "key": "HF_TOKEN",
+        "input": {
+          "name": "Hugging Face Token",
+          "type": "string",
+          "description": "Only for a gated or private Hugging Face repo in Custom GGUF URL. Sent only to huggingface.co.",
+          "default": "",
+          "advanced": true
+        }
+      },
       {
         "key": "ADAPTER_ARGS",
         "input": {

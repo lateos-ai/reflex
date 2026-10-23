@@ -105,6 +105,24 @@ request falls back to the flattening too, with its own stderr line -- a bad temp
 degrades gracefully, it never takes the sidecar down or silently produces a garbled
 prompt.
 
+Templates render the way Hugging Face's `apply_chat_template` renders them:
+`trim_blocks` and `lstrip_blocks` on, `{% break %}`/`{% continue %}` available, and
+Python's string, dict and list methods (`.startswith()`, `.get()`, ...) through
+`minijinja-contrib`'s `pycompat`. A template that rejects a leading system message
+(Mistral's only accepts alternating user/assistant turns) gets the system text folded
+into the first user turn instead (`"{system}
+
+{user}"`). The 12 models the Runpod
+Hub worker offers render byte-identical to Python `jinja2` under those settings.
+
+**Stop tokens.** At startup the adapter also reads the model's end-of-generation
+tokens from the GGUF (`src/stop_tokens.rs`) and logs them: the EOS, EOT and EOM ids
+plus any token whose text is a known end-of-turn marker (`<|im_end|>`,
+`<|endoftext|>`, `<|eot_id|>`, `<end_of_turn>`, Gemma 4's `<turn|>`, ..., llama.cpp's
+list). Every chat request sends them as the engine's `stop_token_ids`, so a model
+whose turn ends on something other than its EOS stops there, and the stop token's text
+never appears in `content` or in a streamed delta.
+
 Once running, it logs `REFLEX_ADAPTER_READY addr=<host>:<port>` to stderr (the
 managed `reflex` child's own stderr, including its `REFLEX_STDIO_READY` line, is
 forwarded too, prefixed `[reflex]`).
@@ -306,7 +324,8 @@ limits work as for chat.
   instead of the old generic role-labeled flattening (`src/openai.rs::build_prompt`:
   `"System: ...\nUser: ...\nAssistant:"`), whenever one is present and renders
   successfully. Verified byte-exact against real Python `jinja2`/HF's own template
-  settings on Qwen3-0.6B's real ChatML template (single- and multi-turn), and
+  settings on Qwen3-0.6B's real ChatML template (single- and multi-turn), later on
+  all 12 Runpod Hub models' templates (three conversations each), and
   end-to-end against a real running model on a GPU instance (real Tesla T4):
   templated requests produce genuinely coherent output, including Qwen3's own
   `<think>...</think>` reasoning traces that explicitly reference the system
@@ -334,14 +353,9 @@ limits work as for chat.
   - `--no-chat-template` forces the old flattening even when a template is present
     (A/B comparison / escape hatch); `--chat-template-file <path>` supplies one for
     a GGUF that doesn't ship its own. See the Usage section above.
-  - **The literal EOS marker (e.g. `<|im_end|>`) can appear in `message.content`**
-    when generation stops on it — observed on real GPU hardware. The core
-    engine's decode path doesn't strip the stop token's own text before
-    returning it over IPC; a real OpenAI API never includes it. Cosmetic, not a
-    correctness bug (the model's actual answer is intact and `finish_reason`
-    still correctly reports `"stop"`), and out of scope for this change (core
-    engine decode/generate-loop behavior, not chat-template rendering) — a
-    follow-up for whoever next touches `Model::generate`'s stop handling.
+  - The stop token's text (`<|im_end|>`, `</s>`, ...) used to appear at the end of
+    `message.content`; the adapter now strips it (see "Stop tokens" above). The
+    engine itself still returns it over IPC, as `reflex generate` prints it.
 - **Context is capped at 65,535 positions per request** (prompt tokens +
   `max_tokens`) by the core engine (11,264 if it runs with `REFLEX_ATTN_KERNEL=legacy`)
   — see the root docs/reference.md's "Context-length limit" section. A request over it gets `400` with an OpenAI-style body (`"type":

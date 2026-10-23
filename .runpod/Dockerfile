@@ -121,6 +121,10 @@ RUN mkdir -p /models && curl -fSL \
     "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf" \
     -o /models/model.gguf
 ENV GGUF_PATH=/models/model.gguf
+# The baked model's id in the hub.json MODEL dropdown. Picking it (the default)
+# serves the file above; any other pick, or GGUF_URL, makes handler.py download
+# that GGUF once at worker start.
+ENV BAKED_MODEL=Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
 
 COPY .runpod/handler.py /handler.py
 

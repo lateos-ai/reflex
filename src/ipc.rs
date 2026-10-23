@@ -173,6 +173,12 @@ pub struct IpcRequest {
     /// text so `crate::grammar` sees the properties in the order they're written.
     #[serde(default)]
     pub json_schema: Option<Box<serde_json::value::RawValue>>,
+    /// `generate` path only: also end the generation at any of these token ids
+    /// (e.g. a chat model's end-of-turn tokens), not just at the GGUF's EOS. The
+    /// stop token is generated and returned, as EOS is. Empty (the default) stops
+    /// at EOS only.
+    #[serde(default)]
+    pub stop_token_ids: Vec<u32>,
     /// Milliseconds spent parsing this request's JSON line, filled in by
     /// [`run_request_loop`] (not a wire field) so [`IpcTimings::parse_ms`] can
     /// report it.
@@ -193,6 +199,7 @@ impl IpcRequest {
                 top_p: s.top_p,
                 seed: s.seed,
                 json_schema: None,
+                stop_token_ids: Vec::new(),
             },
         }
     }
@@ -352,6 +359,7 @@ fn run_generate(
     on_token: impl FnMut(u32, &str),
 ) -> Result<(Vec<u32>, String), ReflexError> {
     let mut sampling = req.sampling_params();
+    sampling.stop_token_ids = req.stop_token_ids.clone();
     if let Some(raw) = &req.json_schema {
         if req.pin_prefix || req.export_kv.is_some() {
             let field = if req.pin_prefix {
