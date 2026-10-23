@@ -5,6 +5,33 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Tensor-core prefill straight from quantized weights** (#47, #48). With quantized-resident
+  weights and `--weights f16` (both defaults), prefill GEMMs of 2+ rows on Q4_K and Q6_K
+  weights now run a `mma.sync` kernel (`gemm_q_mma.cu`, sm_75+, loaded on first use). It
+  dequantizes the raw GGUF blocks in registers to the same f16 values the old
+  dequantize-to-scratch path wrote and accumulates in f32. That removes the scratch round
+  trip that made QR prefill slower than `REFLEX_QUANT_RESIDENT=0`.
+  - **Split-K** for grids too small to fill the GPU, with a fixed-order reduction (no
+    atomics, so repeated runs give the same bits). `REFLEX_QUANT_MMA_SPLITS=<n>` forces the
+    count.
+  - **Row cap on sm_75.** Turing has no k16 MMA, so on a T4 Q4_K GEMMs above 384 rows and
+    Q6_K above 256 go back to the scratch path. There's no cap from sm_80 up.
+    `REFLEX_QUANT_MMA_MAX_ROWS=<n>` sets the cap on any device, and `REFLEX_QUANT_MMA=0`
+    turns the kernel off.
+  - **Warm prefill**, p50 ms, new / QR before / QR off. A10G: Qwen3-0.6B at 29 / 113 / 449
+    tokens 5.65 / 9.92 / 27.3 (was 11.25 / 14.42 / 32.9; QR off 7.41 / 9.93 / 28.5); Mistral
+    7B at 33 / 129 / 513 tokens 23.9 / 73.7 / 213.5 (was 105.1 / 140.3 / 261.8; QR off
+    39.5 / 75.1 / 195.8). T4: Qwen3-0.6B 8.40 / 16.6 / 68.7 (was 23.3 / 30.1 / 69.2; QR off
+    10.9 / 16.8 / 55.5); Mistral 7B 64.1 / 214 / 636 (was 298 / 359 / 645; QR off 85.5 /
+    151 / 432). Every bucket is at or below its old QR number. QR off is still faster for
+    Mistral at 513 tokens on the A10G, and on the T4 for Mistral from 129 tokens and
+    Qwen3-0.6B at 449. Decode is unchanged.
+  - **Correctness.** Greedy tokens are identical with the kernel, forced 1 split,
+    `REFLEX_QUANT_MMA=0` and QR off, on both GPUs. `reflex check` against llama.cpp on the T4
+    (Qwen3-0.6B and Mistral 7B, short and 500+-token prompts) gives the same 32 tokens in all
+    modes. The one fork from stock llama.cpp is a 0.022 near-tie, which llama.cpp itself
+    resolves the other way with flash attention off and an f32 KV cache.
+  - See [docs/design/quantized-mma-prefill.md](docs/design/quantized-mma-prefill.md).
 - **Quantized-resident weights are now the default.** `REFLEX_QUANT_RESIDENT` defaults to
   on; set it to `0` to opt out and load matrix weights as `f16`. This halves VRAM usage
   for quantized models (Q4_K/Q6_K on the dense path, Q8_0 on Gemma 4), speeds up cold
