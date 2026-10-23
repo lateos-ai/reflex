@@ -137,10 +137,13 @@ def _resolve_model():
     url = _model_url()
     if url is None:
         return os.environ["GGUF_PATH"]
-    cache = os.path.join(VOLUME_DIR, "reflex-models") if os.path.isdir(VOLUME_DIR) else "/models"
+    root = os.path.join(VOLUME_DIR, "reflex-models") if os.path.isdir(VOLUME_DIR) else "/models"
+    # One directory per URL, so the file keeps its own name (the API's `model`
+    # field is its stem) and two URLs with the same file name don't collide.
+    cache = os.path.join(root, hashlib.sha256(url.encode()).hexdigest()[:12])
     os.makedirs(cache, exist_ok=True)
     name = os.path.basename(urllib.parse.urlparse(url).path) or "model.gguf"
-    dest = os.path.join(cache, f"{hashlib.sha256(url.encode()).hexdigest()[:12]}-{name}")
+    dest = os.path.join(cache, name)
     if os.path.exists(dest):
         print(f"reflex worker: using cached {dest}", flush=True)
         return dest
