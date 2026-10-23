@@ -916,6 +916,38 @@ __device__ __forceinline__ void dequantize_iq4xs_impl(
     }
 }
 
+// F16 and BF16 tensors: one element per "block" (2 bytes), so the pipelined loader
+// (`WeightLoadPipeline::dequantize`) converts them on the device instead of on the
+// host. Both conversions to f32 are exact; the f16 output of a BF16 value rounds once,
+// to nearest even, like the host fallback (`half::f16::from_f32`).
+template <typename OutT>
+__device__ __forceinline__ void dequantize_f16_impl(
+    const unsigned char* __restrict__ blocks,
+    OutT* __restrict__ y,
+    unsigned int num_blocks
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_blocks) {
+        return;
+    }
+    y[i] = store_out<OutT>(le_f16(blocks + 2ull * i));
+}
+
+template <typename OutT>
+__device__ __forceinline__ void dequantize_bf16_impl(
+    const unsigned char* __restrict__ blocks,
+    OutT* __restrict__ y,
+    unsigned int num_blocks
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_blocks) {
+        return;
+    }
+    const unsigned char* b = blocks + 2ull * i;
+    unsigned int bits = ((unsigned int)b[0] | ((unsigned int)b[1] << 8)) << 16;
+    y[i] = store_out<OutT>(__uint_as_float(bits));
+}
+
 // The AOT entry points: one f32-output and one f16-output kernel per format,
 // both instantiating the same templated body above.
 #define DEQUANT_ENTRY_POINTS(name)                                                         extern "C" __global__ void dequantize_##name##_kernel(                                     const unsigned char* __restrict__ blocks, float* __restrict__ y,                       unsigned int num_blocks) {                                                             dequantize_##name##_impl<float>(blocks, y, num_blocks);                            }                                                                                      extern "C" __global__ void dequantize_##name##_f16_kernel(                                 const unsigned char* __restrict__ blocks, __half* __restrict__ y,                      unsigned int num_blocks) {                                                             dequantize_##name##_impl<__half>(blocks, y, num_blocks);                           }
@@ -940,3 +972,5 @@ DEQUANT_ENTRY_POINTS(iq3s)
 DEQUANT_ENTRY_POINTS(iq1s)
 DEQUANT_ENTRY_POINTS(iq1m)
 DEQUANT_ENTRY_POINTS(iq4xs)
+DEQUANT_ENTRY_POINTS(f16)
+DEQUANT_ENTRY_POINTS(bf16)

@@ -42,13 +42,16 @@ fn download(model: &Model, v: &CudaSlice<f32>) -> Vec<f32> {
     model.device.dtoh_sync_copy(v).expect("dtoh")
 }
 
-/// Largest |a - b| over max(|b|, 1e-3), elementwise.
-fn max_rel_err(a: &[f32], b: &[f64]) -> f64 {
+/// `||a - b|| / ||b||` (L2 norms, in f64).
+fn rel_l2_err(a: &[f32], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len());
-    a.iter()
+    let diff: f64 = a
+        .iter()
         .zip(b)
-        .map(|(&x, &y)| (f64::from(x) - y).abs() / y.abs().max(1e-3))
-        .fold(0.0, f64::max)
+        .map(|(&x, &y)| (f64::from(x) - y).powi(2))
+        .sum();
+    let norm: f64 = b.iter().map(|y| y * y).sum();
+    (diff / norm).sqrt()
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
@@ -162,11 +165,11 @@ fn encoder_bidir_attention_matches_host_reference() {
                 )
                 .expect("attention_prefill_bidir");
             let expected = host_bidir_attention(&q, &k, &v, rows, kv_len, nq, nkv, d);
-            let err = max_rel_err(&download(&model, &out), &expected);
-            eprintln!("tiled={tiled} rows={rows} start={start_pos} heads={nq}/{nkv} d={d}: max rel err {err:.2e}");
+            let err = rel_l2_err(&download(&model, &out), &expected);
+            eprintln!("tiled={tiled} rows={rows} start={start_pos} heads={nq}/{nkv} d={d}: rel L2 err {err:.2e}");
             assert!(
-                err < 1e-3,
-                "tiled={tiled} rows={rows} d={d}: max rel err {err}"
+                err < 1e-5,
+                "tiled={tiled} rows={rows} d={d}: rel L2 err {err}"
             );
         }
     }
@@ -382,25 +385,29 @@ fn encoder_fixture_rejects_generation_and_lm_rejects_embed() {
 
 /// The real Nemotron-3.5-Embed-1B (`EMBED_GGUF`) against HF `transformers` fp32
 /// embeddings of the reference inputs (`EMBED_REF`, produced by the archive's
-/// `hf_reference.py`): token ids exact, cosine >= 0.9999 with f32 weights from a
-/// BF16 file, >= 0.999 otherwise (f16 weights, Q8_0).
+/// `hf_reference.py`): token ids exact, and a cosine floor by weight type: an
+/// unquantized file (BF16/F16/F32) >= 0.9999 with f32 weights and >= 0.999 with f16,
+/// Q8_0 >= 0.999, anything smaller >= 0.99 (its worst cosine is printed: a 4-6 bit
+/// quantization moves the embedding by more than the engine does).
 #[test]
 #[ignore]
 fn nemotron_embed_real_model_matches_hf_reference() {
     let path = std::env::var("EMBED_GGUF").expect("set EMBED_GGUF");
     let refs = read_refs(&std::env::var("EMBED_REF").expect("set EMBED_REF"));
-    let bf16 = GgufFile::open(&path)
+    let ggml_type = GgufFile::open(&path)
         .expect("open")
         .tensor_info("blk.0.attn_q.weight")
-        .is_some_and(|t| matches!(t.ggml_type, GgmlType::Bf16 | GgmlType::F32 | GgmlType::F16));
+        .expect("blk.0.attn_q.weight")
+        .ggml_type;
+    let (f32_floor, f16_floor) = match ggml_type {
+        GgmlType::Bf16 | GgmlType::F16 | GgmlType::F32 => (0.9999, 0.999),
+        GgmlType::Q8_0 => (0.999, 0.999),
+        _ => (0.99, 0.99),
+    };
+    eprintln!("{path}: attn_q is {ggml_type:?}");
     let model = load(&path, WeightsDtype::F32);
-    assert_matches_refs(
-        &model,
-        &refs,
-        if bf16 { 0.9999 } else { 0.999 },
-        "f32 weights",
-    );
+    assert_matches_refs(&model, &refs, f32_floor, "f32 weights");
     drop(model);
     let model = load(&path, WeightsDtype::F16);
-    assert_matches_refs(&model, &refs, 0.999, "f16 weights");
+    assert_matches_refs(&model, &refs, f16_floor, "f16 weights");
 }

@@ -41,6 +41,8 @@ fn f16_dequant_kernels_round_the_f32_output_once() {
         GgmlType::IQ1S,
         GgmlType::IQ1M,
         GgmlType::IQ4XS,
+        GgmlType::F16,
+        GgmlType::Bf16,
     ];
     for ggml_type in formats {
         let (_, block_bytes, block_elems) = kernels.f32.for_type(ggml_type).expect("format");
@@ -68,6 +70,57 @@ fn f16_dequant_kernels_round_the_f32_output_once() {
             }
         }
         eprintln!("OK {ggml_type:?}: {} elements", host16.len());
+    }
+}
+
+/// The F16 and BF16 conversion kernels (one element per block) give exactly the
+/// host fallback's values (`dequant::dequantize`, then `half::f16::from_f32` for
+/// f16 output), on random bit patterns including NaN, inf and subnormals, and on a
+/// length that isn't a multiple of the launch's block size.
+#[test]
+#[ignore]
+fn f16_and_bf16_tensor_kernels_match_host_conversion() {
+    let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
+    let kernels = load_dequant_kernels(&device).expect("failed to load dequant kernels");
+    let mut pipeline = WeightLoadPipeline::new(&device).expect("pipeline");
+    let mut rng = rng();
+    for ggml_type in [GgmlType::F16, GgmlType::Bf16] {
+        let count = 100_003usize;
+        let bytes: Vec<u8> = (0..count * 2).map(|_| rng.gen()).collect();
+        let host = dequant::dequantize(ggml_type, &bytes, count as u64).expect("host");
+        let out32 =
+            dequantize_tensor_to_device(&mut pipeline, &kernels, ggml_type, &bytes, count as u64)
+                .expect("f32 conversion");
+        let out16 = dequantize_tensor_to_device_f16(
+            &mut pipeline,
+            &kernels,
+            ggml_type,
+            &bytes,
+            count as u64,
+        )
+        .expect("f16 conversion");
+        let got32 = device.dtoh_sync_copy(&out32).expect("dtoh");
+        let got16 = device.dtoh_sync_copy(&out16).expect("dtoh");
+        for (i, (&h, (&a, &b))) in host.iter().zip(got32.iter().zip(&got16)).enumerate() {
+            if h.is_nan() {
+                assert!(
+                    a.is_nan() && b.is_nan(),
+                    "{ggml_type:?} element {i}: NaN lost"
+                );
+                continue;
+            }
+            assert_eq!(
+                h.to_bits(),
+                a.to_bits(),
+                "{ggml_type:?} element {i}: f32 output"
+            );
+            assert_eq!(
+                half::f16::from_f32(h).to_bits(),
+                b.to_bits(),
+                "{ggml_type:?} element {i}: f16 output"
+            );
+        }
+        eprintln!("OK {ggml_type:?}: {count} elements");
     }
 }
 
