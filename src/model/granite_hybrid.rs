@@ -409,6 +409,7 @@ impl Model {
                 layers,
                 kernels,
             }),
+            encoder: None,
         })
     }
 

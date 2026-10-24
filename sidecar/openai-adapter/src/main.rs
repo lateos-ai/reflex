@@ -1,7 +1,8 @@
 //! `reflex-openai-adapter`: a standalone OpenAI-compatible HTTP sidecar in front of
 //! one managed `reflex stdio <gguf>` process. Implements `POST /v1/chat/completions`
 //! (streaming via SSE and non-streaming JSON), `POST /v1/classify` (System1 label
-//! scoring, not an OpenAI endpoint -- see `classify.rs`), `GET /v1/models`, and a health check
+//! scoring, not an OpenAI endpoint -- see `classify.rs`), `POST /v1/embeddings` (for
+//! an embedding GGUF -- see `embeddings.rs`), `GET /v1/models`, and a health check
 //! served at both `/healthz` and `/ping` (identical handler -- `/ping` exists because
 //! Runpod Serverless load-balancing endpoints hard-poll that exact path, confirmed
 //! against a real deployment) -- see this crate's README for usage, scope, and known
@@ -17,6 +18,7 @@
 
 mod chat_template;
 mod classify;
+mod embeddings;
 mod gguf_meta;
 mod openai;
 mod reflex_client;
@@ -34,7 +36,7 @@ use openai::{
     build_ipc_line, build_prompt, estimate_prompt_tokens, extract_text_messages, finish_reason,
     ipc_json_schema, now_unix, ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
     ChatMessageOut, Choice, ChunkChoice, Delta, ModelInfo, ModelPricing, ModelsResponse,
-    RawMessage, Usage,
+    RawMessage, TextMessage, Usage,
 };
 use reflex_client::ReflexClient;
 use serde_json::Value;
@@ -66,6 +68,36 @@ impl AppState {
     fn next_classify_id(&self) -> String {
         let n = self.request_counter.fetch_add(1, Ordering::Relaxed);
         format!("classify-reflex-{n:x}")
+    }
+
+    /// Renders one `/v1/embeddings` input: the GGUF's chat template over a system
+    /// message holding the retrieval prefix (`query:`/`passage:`) and a user message
+    /// holding the text (Nemotron-3.5-Embed's template gives `"query: <text>"` with
+    /// its bracket markers), else [`embeddings::fallback_render`].
+    fn render_embedding_input(&self, prefix: &str, text: &str) -> String {
+        let messages = [
+            TextMessage {
+                role: "system".to_string(),
+                content: format!("{prefix}:"),
+            },
+            TextMessage {
+                role: "user".to_string(),
+                content: text.to_string(),
+            },
+        ];
+        match &self.chat_template {
+            Some(ct) => match ct.render(&messages, false) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "[adapter] chat template render failed for an embeddings input ({e}); \
+                         using \"{prefix}: <text>\" for it"
+                    );
+                    embeddings::fallback_render(prefix, text)
+                }
+            },
+            None => embeddings::fallback_render(prefix, text),
+        }
     }
 
     /// Renders chat messages into the engine's prompt: the GGUF's chat template
@@ -412,6 +444,10 @@ async fn main() {
         .route(
             "/v1/classify",
             post(classify_handler).layer(DefaultBodyLimit::max(body_limit)),
+        )
+        .route(
+            "/v1/embeddings",
+            post(embeddings_handler).layer(DefaultBodyLimit::max(body_limit)),
         )
         .route("/v1/models", get(list_models))
         .route("/healthz", get(healthz))
@@ -826,6 +862,121 @@ async fn classify_handler(
         )
     };
     match tokio::time::timeout_at(Instant::now() + timeout, response).await {
+        Ok(response) => response,
+        Err(_) => timeout_response(timeout),
+    }
+}
+
+/// `POST /v1/embeddings`; see `embeddings.rs`. Inputs go to the engine one at a
+/// time, in order, each as its own IPC request; the request timeout covers all of
+/// them.
+async fn embeddings_handler(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<embeddings::EmbeddingsRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(req) = match body {
+        Ok(j) => j,
+        Err(e) => return error_response(e.status(), e.body_text()),
+    };
+    let valid = match embeddings::validate(&req) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response_with(
+                StatusCode::BAD_REQUEST,
+                e,
+                "invalid_request_error",
+                Some("invalid_input"),
+            )
+        }
+    };
+    let rendered: Vec<String> = valid
+        .texts
+        .iter()
+        .map(|t| state.render_embedding_input(valid.prefix, t))
+        .collect();
+    for r in &rendered {
+        if let Some(response) = request_limit_violation(&state.limits, r.len(), 0) {
+            return response;
+        }
+    }
+    let model_label = req.model.unwrap_or_else(|| state.model_label.clone());
+    let timeout = state.limits.request_timeout;
+    let work = async move {
+        let mut data = Vec::with_capacity(rendered.len());
+        let mut prompt_tokens = 0u32;
+        for (index, text) in rendered.iter().enumerate() {
+            let line = match serde_json::to_string(&embeddings::ipc_request(text)) {
+                Ok(l) => l,
+                Err(e) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("sidecar: failed to serialize IPC request: {e}"),
+                    )
+                }
+            };
+            let mut rx = match state.client.request(line).await {
+                Ok(rx) => rx,
+                Err(full) => return queue_full_response(full.max_in_flight),
+            };
+            let mut final_event = None;
+            while let Some(v) = rx.recv().await {
+                if v.get("event").and_then(Value::as_str) == Some("final") {
+                    final_event = Some(v);
+                    break;
+                }
+            }
+            let Some(v) = final_event else {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "sidecar: reflex closed the connection without a final response",
+                );
+            };
+            if let Some(err) = engine_error(&v) {
+                return engine_error_response(&err);
+            }
+            let (vector, tokens) = match embeddings::parse_engine_embedding(&v) {
+                Ok(x) => x,
+                Err(e) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("sidecar: {e}"),
+                    )
+                }
+            };
+            let vector = match embeddings::truncate(vector, valid.dimensions) {
+                Ok(v) => v,
+                Err(e) => {
+                    return error_response_with(
+                        StatusCode::BAD_REQUEST,
+                        e,
+                        "invalid_request_error",
+                        Some("invalid_input"),
+                    )
+                }
+            };
+            prompt_tokens += tokens;
+            data.push(embeddings::EmbeddingData {
+                object: "embedding",
+                index,
+                embedding: if valid.base64 {
+                    embeddings::EmbeddingValue::Base64(embeddings::base64_f32(&vector))
+                } else {
+                    embeddings::EmbeddingValue::Float(vector)
+                },
+            });
+        }
+        let response = embeddings::EmbeddingsResponse {
+            object: "list",
+            data,
+            model: model_label,
+            usage: embeddings::EmbeddingsUsage {
+                prompt_tokens,
+                total_tokens: prompt_tokens,
+            },
+        };
+        (StatusCode::OK, Json(response)).into_response()
+    };
+    match tokio::time::timeout_at(Instant::now() + timeout, work).await {
         Ok(response) => response,
         Err(_) => timeout_response(timeout),
     }

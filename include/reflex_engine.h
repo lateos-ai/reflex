@@ -129,6 +129,23 @@ typedef struct {
 } ReflexSystem1Result;
 
 /**
+ * Output of `reflex_embed`. `values` is a heap buffer owned by this crate --
+ * free it (and reset this struct to all-zero/NULL) with
+ * `reflex_free_embed_result`, never with the C caller's own `free`.
+ */
+typedef struct {
+    /**
+     * Array of `dims` floats: the mean-pooled, L2-normalized embedding.
+     */
+    float *values;
+    uintptr_t dims;
+    /**
+     * How many tokens `text` encoded to.
+     */
+    uintptr_t prompt_tokens;
+} ReflexEmbedResult;
+
+/**
  * Returns the last error message set by this thread's most recent failing
  * `reflex_*` call, or NULL if the most recent call succeeded (or none
  * has run yet on this thread). The returned pointer is valid only until the
@@ -261,6 +278,44 @@ int reflex_system1_evaluate(ReflexModel *handle,
  * freed.
  */
 void reflex_free_system1_result(ReflexSystem1Result *result);
+
+/**
+ * Embeds `text` with an embedding model (a GGUF with
+ * `<arch>.attention.causal = false`, e.g. Nemotron-3.5-Embed) -- the same
+ * behavior as `reflex embed <gguf> <text>`. The text is embedded as given:
+ * add the model's input prefix yourself (Nemotron: `"query: "` or
+ * `"passage: "`). A language model fails with
+ * `REFLEX_ERROR_CODE_INVALID_INPUT`, as do `reflex_generate` and
+ * `reflex_system1_evaluate` on an embedding model.
+ *
+ * `handle` must come from `reflex_load` and not have been freed yet. `text`
+ * must be a non-NULL, NUL-terminated UTF-8 C string. `out` must be a
+ * non-NULL pointer to a `ReflexEmbedResult` the caller owns (its initial
+ * contents are ignored, not read).
+ *
+ * On success, fills `*out` and returns 0 -- the caller must eventually pass
+ * `out` to `reflex_free_embed_result`. On failure, leaves `*out` untouched
+ * and returns -1 (call `reflex_last_error` for why).
+ *
+ * # Safety
+ * `handle` must be a live pointer from `reflex_load`, not yet freed, and not
+ * used concurrently from another thread. `text` must point to a valid
+ * NUL-terminated C string readable for the duration of this call. `out`
+ * must point to writable, properly aligned `ReflexEmbedResult` storage.
+ */
+int reflex_embed(ReflexModel *handle, const char *text, ReflexEmbedResult *out);
+
+/**
+ * Frees the buffer inside a `ReflexEmbedResult` previously filled by
+ * `reflex_embed`, and zeroes the struct out. Safe to call on a zeroed/all-NULL
+ * struct (no-op), and more than once on the same struct for that reason --
+ * but never on two different copies of the same non-zeroed struct.
+ *
+ * # Safety
+ * `result`, if non-NULL, must point to a `ReflexEmbedResult` either zeroed or
+ * previously filled by `reflex_embed` and not yet freed.
+ */
+void reflex_free_embed_result(ReflexEmbedResult *result);
 
 /**
  * Frees a handle obtained from `reflex_load`. Safe to call with NULL

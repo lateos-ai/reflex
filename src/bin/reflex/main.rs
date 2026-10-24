@@ -8,6 +8,7 @@
 //! Subcommands:
 //!   generate  - load a GGUF and generate tokens (the main entry point)
 //!   system1   - single-pass, non-autoregressive candidate scoring
+//!   embed     - embed one text with an embedding (encoder) model
 //!   smoke     - minimal AOT-kernel-launch smoke test, no GGUF needed
 //!   bench     - warm-latency microbenchmark (forward pass, decode, system1)
 //!   check     - byte-exact-vs-reference correctness check, CI-scriptable
@@ -19,6 +20,7 @@
 mod bench;
 mod check;
 mod doctor;
+mod embed;
 mod generate;
 mod phase;
 mod smoke;
@@ -34,6 +36,7 @@ const USAGE: &str = "usage: reflex <subcommand> [args...]\n\
      subcommands:\n\
      \x20 generate   load a GGUF and generate tokens\n\
      \x20 system1    single-pass candidate scoring\n\
+     \x20 embed      embed one text with an embedding model\n\
      \x20 smoke      minimal AOT-kernel-launch smoke test\n\
      \x20 bench      warm-latency microbenchmark\n\
      \x20 check      byte-exact-vs-reference correctness check\n\
@@ -122,6 +125,7 @@ fn main() {
     match subcommand.as_str() {
         "generate" => generate::run(rest),
         "system1" => system1::run(rest),
+        "embed" => embed::run(rest),
         "smoke" => smoke::run(rest),
         "bench" => bench::run(rest),
         "check" => check::run(rest),

@@ -624,6 +624,7 @@ impl Model {
             mla: None,
             gemma4: None,
             granite: None,
+            encoder: None,
         })
     }
 

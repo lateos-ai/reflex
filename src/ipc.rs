@@ -71,6 +71,15 @@
 //! the slot as it is after the request: `pinned_seq_len` positions and
 //! `pinned_bytes` of VRAM (both 0 when nothing is pinned).
 //!
+//! **Embeddings**: `"embed": true` runs [`crate::model::Model::embed`] on
+//! `prompt` (an embedding model only: a GGUF with `<arch>.attention.causal =
+//! false`) and answers with `embedding`, the mean-pooled, L2-normalized vector,
+//! and `prompt_tokens`. The text is embedded as given: the caller adds the
+//! model's input prefix (Nemotron-3.5-Embed's `"query: "`/`"passage: "`).
+//! One text per request; it combines with `id` and `timings` only. A language
+//! model rejects `embed`, and an embedding model rejects every other request
+//! with `invalid_input`.
+//!
 //! **JSON Schema** (`generate` path only): `json_schema` constrains the output to
 //! one JSON value that validates against the schema, compact but for an optional
 //! space after each `:` and `,` (`crate::grammar` has
@@ -179,6 +188,10 @@ pub struct IpcRequest {
     /// at EOS only.
     #[serde(default)]
     pub stop_token_ids: Vec<u32>,
+    /// Embed `prompt` with an embedding model instead of generating or scoring
+    /// (see this module's doc comment's "Embeddings" section).
+    #[serde(default)]
+    pub embed: bool,
     /// Milliseconds spent parsing this request's JSON line, filled in by
     /// [`run_request_loop`] (not a wire field) so [`IpcTimings::parse_ms`] can
     /// report it.
@@ -247,6 +260,12 @@ pub struct IpcResponse {
     /// highest `probability` (the first one on a tie).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chosen: Option<usize>,
+    /// `embed` requests only: the mean-pooled, L2-normalized embedding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+    /// `embed` requests only: how many tokens the text encoded to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<usize>,
     /// Present only when the request set `"timings": true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<IpcTimings>,
@@ -617,6 +636,8 @@ impl IpcResponse {
             candidates: None,
             entropy: None,
             chosen: None,
+            embedding: None,
+            prompt_tokens: None,
             timings: None,
         }
     }
@@ -649,6 +670,34 @@ pub struct IpcStreamToken {
 pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> IpcResponse {
     let id = req.id.clone();
     let model_start = std::time::Instant::now();
+    if req.embed {
+        return match run_embed(model, &req) {
+            Ok(e) => IpcResponse {
+                id,
+                event: "final",
+                ok: true,
+                error: None,
+                error_kind: None,
+                token_ids: None,
+                text: None,
+                candidates: None,
+                entropy: None,
+                chosen: None,
+                embedding: Some(e.vector),
+                prompt_tokens: Some(e.prompt_tokens),
+                timings: timings_if(
+                    req.timings,
+                    req.parse_ms,
+                    model_start,
+                    None,
+                    None,
+                    None,
+                    slot,
+                ),
+            },
+            Err(e) => IpcResponse::err(id, e),
+        };
+    }
     if req.candidates.is_empty() {
         let mut first_token_ms = None;
         let mut kv_io_ms = None;
@@ -673,6 +722,8 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
                 candidates: None,
                 entropy: None,
                 chosen: None,
+                embedding: None,
+                prompt_tokens: None,
                 timings: timings_if(
                     req.timings,
                     req.parse_ms,
@@ -725,6 +776,8 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
                     candidates: Some(candidates),
                     entropy: Some(response.entropy),
                     chosen: Some(chosen),
+                    embedding: None,
+                    prompt_tokens: None,
                     timings: timings_if(
                         req.timings,
                         req.parse_ms,
@@ -739,6 +792,28 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
             Err(e) => IpcResponse::err(id, e),
         }
     }
+}
+
+/// Runs an `embed` request after checking it sets no field of the other paths.
+fn run_embed(model: &Model, req: &IpcRequest) -> Result<crate::model::Embedding, ReflexError> {
+    let conflicting = [
+        (!req.candidates.is_empty(), "candidates"),
+        (req.stream, "stream"),
+        (req.sampling.is_some(), "sampling"),
+        (req.import_kv.is_some(), "import_kv"),
+        (req.export_kv.is_some(), "export_kv"),
+        (req.export_kv_dtype.is_some(), "export_kv_dtype"),
+        (req.pin_prefix, "pin_prefix"),
+        (req.use_pinned, "use_pinned"),
+        (req.json_schema.is_some(), "json_schema"),
+        (!req.stop_token_ids.is_empty(), "stop_token_ids"),
+    ];
+    if let Some((_, field)) = conflicting.iter().find(|(set, _)| *set) {
+        return Err(ReflexError::InvalidInput(format!(
+            "embed can't be combined with {field}"
+        )));
+    }
+    model.embed(&req.prompt)
 }
 
 /// Serializes `value` as one line of JSON to `output`, flushed immediately -- a
@@ -775,7 +850,7 @@ pub fn handle_request_streaming<W: Write>(
     req: IpcRequest,
     mut output: W,
 ) -> Result<(), String> {
-    if !req.stream || !req.candidates.is_empty() {
+    if !req.stream || !req.candidates.is_empty() || req.embed {
         let response = handle_request(model, slot, req);
         return write_json_line(&mut output, &response);
     }
@@ -824,6 +899,8 @@ pub fn handle_request_streaming<W: Write>(
             candidates: None,
             entropy: None,
             chosen: None,
+            embedding: None,
+            prompt_tokens: None,
             timings: timings_if(
                 req.timings,
                 req.parse_ms,
@@ -909,6 +986,8 @@ pub fn run_stdio_loop(model: &Model) -> Result<(), String> {
 }
 
 #[cfg(test)]
+mod embed_tests;
+#[cfg(test)]
 mod json_schema_tests;
 #[cfg(test)]
 mod relay_tests;
@@ -989,6 +1068,8 @@ mod tests {
             candidates: None,
             entropy: None,
             chosen: None,
+            embedding: None,
+            prompt_tokens: None,
             timings: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -1236,6 +1317,8 @@ mod tests {
             }]),
             entropy: Some(0.0),
             chosen,
+            embedding: None,
+            prompt_tokens: None,
             timings,
         }
     }

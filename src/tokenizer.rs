@@ -130,6 +130,14 @@ pub enum PreType {
     /// `LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM` (`deepseek-v3`): three regexes
     /// applied in sequence (DeepSeek-V3/R1).
     Deepseek3,
+    /// Mistral's Tekken (`tekken`, `pixtral`, `nemotron-3.5-embed`): the
+    /// `tokenizer.json` regex of Ministral 3 / Pixtral, with `ignore_merges`.
+    /// Letter runs split at case changes (`[Lu..]*[Ll..]+`), one digit per
+    /// piece. Matched with HF `tokenizers`' semantics ([`tekken_match`]):
+    /// llama.cpp `79e2e74` maps `pixtral` to LLAMA3 instead, and later
+    /// llama.cpp to TEKKEN on its collapsed text, where every non-ASCII letter
+    /// counts as both cases.
+    Tekken,
 }
 
 impl PreType {
@@ -159,6 +167,13 @@ impl PreType {
         // Granite 4.0 (`granitehybrid`): llama.cpp sets no flags for `dbrx`,
         // so no `ignore_merges` and the BOS follows `add_bos_token`.
         ("dbrx", PreType::Dbrx),
+        // Mistral's Tekken: Ministral 3 / Pixtral GGUFs (`pixtral`), and
+        // Nemotron-3.5-Embed (`nemotron-3.5-embed` in llama.cpp after
+        // `79e2e74`; earlier conversions say `pixtral`). Checked against HF
+        // `tokenizers` on the model's `tokenizer.json`.
+        ("tekken", PreType::Tekken),
+        ("pixtral", PreType::Tekken),
+        ("nemotron-3.5-embed", PreType::Tekken),
     ];
 
     /// Whether llama.cpp sets `special_bos_id = LLAMA_TOKEN_NULL` for this
@@ -198,10 +213,10 @@ impl PreType {
 
     /// llama.cpp's `ignore_merges` for this pre type (set in
     /// `llama_vocab::impl::load` at `79e2e74`): when a whole pre-token is a
-    /// vocab entry, emit it directly instead of BPE-merging it. Of the
-    /// accepted types only LLAMA3 sets it.
+    /// vocab entry, emit it directly instead of BPE-merging it. LLAMA3 and
+    /// Tekken set it (Tekken's `tokenizer.json` has `"ignore_merges": true`).
     fn ignore_merges(self) -> bool {
-        self == PreType::Llama3
+        matches!(self, PreType::Llama3 | PreType::Tekken)
     }
 }
 
@@ -256,6 +271,16 @@ pub struct Tokenizer {
     /// GGUF on real GPU hardware before this field/the split in `encode`
     /// existed.
     special_tokens: Vec<String>,
+    /// Undo the `[` / `<` + U+200C markers a retrieval chat template puts in
+    /// user text (Nemotron-3.5-Embed's `mark_user_text`): its HF tokenizer has
+    /// a normalizer replacing `"[\u{200c}"` with `"["` and `"<\u{200c}"` with
+    /// `"<"`, applied after special tokens are matched, so marked user text
+    /// can't form a special token but still tokenizes as the plain brackets.
+    /// Set for `pre = nemotron-3.5-embed` (llama.cpp's
+    /// `NEMOTRON_3_5_EMBD`), and for a Tekken vocab in an embedding model
+    /// (`<arch>.pooling_type` set): those files were converted before
+    /// llama.cpp had the dedicated pre type.
+    strip_zwnj_markers: bool,
 }
 
 impl Tokenizer {
@@ -350,6 +375,15 @@ impl Tokenizer {
             .collect();
         special_tokens.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
+        let embedding_model = file
+            .metadata
+            .get("general.architecture")
+            .and_then(GgufValue::as_str)
+            .and_then(|arch| u64_meta(&file.metadata, &format!("{arch}.pooling_type")))
+            .is_some_and(|t| t != 0);
+        let strip_zwnj_markers = pre == Some("nemotron-3.5-embed")
+            || (pre_type == Some(PreType::Tekken) && embedding_model);
+
         Ok(Tokenizer {
             architecture,
             pre_type,
@@ -364,6 +398,7 @@ impl Tokenizer {
             token_to_id,
             merge_rank,
             special_tokens,
+            strip_zwnj_markers,
         })
     }
 
@@ -718,7 +753,14 @@ impl Tokenizer {
     /// [`pretokenize`]). Every split is checked against llama.cpp's
     /// `llama-tokenize`.
     fn encode_gpt2(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
-        let chars: Vec<char> = text.chars().collect();
+        let chars: Vec<char> = if self.strip_zwnj_markers {
+            text.replace("[\u{200c}", "[")
+                .replace("<\u{200c}", "<")
+                .chars()
+                .collect()
+        } else {
+            text.chars().collect()
+        };
         let pre_type = self.pre_type.unwrap_or(PreType::Qwen2);
         let mut ids = Vec::new();
         for (start, end) in pretokenize(pre_type, &chars) {
@@ -1268,6 +1310,7 @@ fn pretokenize(pre_type: PreType, chars: &[char]) -> Vec<(usize, usize)> {
             });
             split_stl(chars, &pieces, deepseek3_main_match)
         }
+        PreType::Tekken => split_stl(chars, &whole, tekken_match),
     }
 }
 
@@ -1642,6 +1685,112 @@ fn deepseek3_main_match(chars: &[char], end: usize, pos: usize) -> Option<usize>
     Some(ws_end)
 }
 
+/// Tekken's regex (Ministral 3 / Pixtral / Nemotron-3.5-Embed
+/// `tokenizer.json`), alternatives tried in order, with HF `tokenizers`'
+/// (leftmost-first, backtracking) semantics:
+///
+/// 1. `[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+`
+/// 2. `[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*`
+/// 3. `\p{N}`
+/// 4. ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
+/// 5. `\s*[\r\n]+`
+/// 6. `\s+(?!\S)`
+/// 7. `\s+`
+///
+/// `\p{L}`/`\p{N}`/`\p{M}`/`\s` come from llama.cpp's tables (as for every
+/// other pre type). Those tables have no letter case, so the two case classes
+/// use Rust's Unicode `Lowercase`/`Uppercase` properties: a lowercase letter
+/// is only in the second class, an uppercase one only in the first, and a
+/// letter that is neither (`Lo`, most `Lm`) or a mark is in both. That
+/// matches `Lu`/`Ll`/`Lo`/`M` exactly; it differs from HF only for titlecase
+/// letters (`Lt`, e.g. `ǅ`) and modifier letters with the `Other_Lowercase`
+/// property.
+fn tekken_match(chars: &[char], end: usize, pos: usize) -> Option<usize> {
+    let upper = |c: char| {
+        let f = CptFlags::of(c);
+        f.is_accent_mark() || (f.is_letter() && !c.is_lowercase())
+    };
+    let lower = |c: char| {
+        let f = CptFlags::of(c);
+        f.is_accent_mark() || (f.is_letter() && !c.is_uppercase())
+    };
+    let run = |from: usize, class: &dyn Fn(char) -> bool| {
+        let mut j = from;
+        while j < end && class(chars[j]) {
+            j += 1;
+        }
+        j
+    };
+    // `[upper]*[lower]+` from `start`: the upper run is greedy and gives back
+    // codepoints until one that can start the lower run.
+    let upper_then_lower = |start: usize| -> Option<usize> {
+        let upper_end = run(start, &upper);
+        (start..=upper_end)
+            .rev()
+            .find(|&k| k < end && lower(chars[k]))
+            .map(|k| run(k, &lower))
+    };
+    let c = chars[pos];
+    let f = CptFlags::of(c);
+    let lead_ok = !matches!(c, '\r' | '\n') && !f.is_letter() && !f.is_number();
+
+    // 1. With the optional leading codepoint first (greedy), then without.
+    if lead_ok && pos + 1 < end {
+        if let Some(m) = upper_then_lower(pos + 1) {
+            return Some(m);
+        }
+    }
+    if let Some(m) = upper_then_lower(pos) {
+        return Some(m);
+    }
+    // 2.
+    if lead_ok && pos + 1 < end && upper(chars[pos + 1]) {
+        return Some(run(run(pos + 1, &upper), &lower));
+    }
+    if upper(c) {
+        return Some(run(run(pos, &upper), &lower));
+    }
+    // 3.
+    if f.is_number() {
+        return Some(pos + 1);
+    }
+    // 4.
+    let other = |c: char| {
+        let f = CptFlags::of(c);
+        !f.whitespace && !f.is_letter() && !f.is_number()
+    };
+    let start = if c == ' ' && pos + 1 < end && other(chars[pos + 1]) {
+        pos + 1
+    } else {
+        pos
+    };
+    if other(chars[start]) {
+        let mut j = run(start, &other);
+        while matches!(cpt_at(chars, end, j), Some('\r' | '\n' | '/')) {
+            j += 1;
+        }
+        return Some(j);
+    }
+    // 5.-7.
+    let ws_end = ws_run_end(chars, end, pos);
+    if ws_end == pos {
+        return None;
+    }
+    if let Some(k) = (pos..ws_end)
+        .rev()
+        .find(|&k| matches!(chars[k], '\r' | '\n'))
+    {
+        return Some(k + 1);
+    }
+    if ws_end == end {
+        return Some(end);
+    }
+    if ws_end - pos >= 2 {
+        return Some(ws_end - 1);
+    }
+    Some(ws_end)
+}
+
 fn u64_meta(metadata: &HashMap<String, GgufValue>, key: &str) -> Option<u64> {
     metadata.get(key).and_then(GgufValue::as_u64)
 }
@@ -1781,6 +1930,7 @@ mod tests {
             token_to_id,
             merge_rank,
             special_tokens: Vec::new(),
+            strip_zwnj_markers: false,
         }
     }
 
@@ -2301,6 +2451,133 @@ mod tests {
         );
     }
 
+    /// Mistral's Tekken pre type on Nemotron-3.5-Embed-1B's vocab
+    /// (`test-data/nemotron-3.5-embed-tokenizer.gguf`, the head of
+    /// `maternion/Nemotron-3.5-Embed-1B-GGUF`'s Q8_0 file through
+    /// `scripts/gguf_tokenizer_only.py`; `pre = pixtral`): ids match HF
+    /// `tokenizers` on the model's own `tokenizer.json`, including case-change
+    /// splits (`HELLOWorld`, `getHTTPResponse`), non-ASCII case, one digit per
+    /// piece, and the normalizer that turns the chat template's `[`/`<` +
+    /// U+200C markers back into plain brackets after special tokens are
+    /// matched (a raw `[INST]` is special token 3, a marked one plain text).
+    #[test]
+    fn test_tekken_encode_matches_hf_tokenizers_if_fixture_present() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test-data")
+            .join("nemotron-3.5-embed-tokenizer.gguf");
+        if !path.exists() {
+            eprintln!(
+                "Skipping test_tekken_encode_matches_hf_tokenizers_if_fixture_present: \
+                 test-data/nemotron-3.5-embed-tokenizer.gguf not present"
+            );
+            return;
+        }
+        let file = GgufFile::open(&path).expect("open nemotron tokenizer GGUF");
+        let tok = Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf");
+        assert_eq!(tok.architecture, "gpt2");
+        assert_eq!(tok.pre_type, Some(PreType::Tekken));
+        assert_eq!(tok.vocab_size(), 131_072);
+        assert_eq!(tok.prompt_bos(), None, "add_bos_token = false");
+        assert!(
+            tok.strip_zwnj_markers,
+            "a Tekken vocab in an embedding model strips the template's markers"
+        );
+        // HF `tokenizers` 0.23.2 on nvidia/Nemotron-3.5-Embed-1B-BF16's tokenizer.json,
+        // `encode(text, add_special_tokens=False)`, for PRE_TYPE_GOLDEN_STRINGS in order.
+        let golden: [&[u32]; PRE_TYPE_GOLDEN_STRINGS.len()] = [
+            &[
+                1049, 1050, 1051, 1052, 1053, 1032, 1051, 1046, 1049, 1052, 1049, 1053, 1057, 1032,
+                1049, 1050, 1051, 1052, 1053, 1054, 1055, 1056, 1057, 1048,
+            ],
+            &[
+                21797, 2405, 1362, 1039, 23947, 1729, 6483, 2127, 1039, 3609, 1494, 1681, 54197,
+                1039, 1068,
+            ],
+            &[
+                22177, 4304, 1033, 1032, 124108, 1625, 29659, 1320, 10008, 15199, 2439, 7282,
+                14742, 13854, 1749, 10709, 6912, 10709, 13266, 1320, 2316, 6430, 2897, 10323, 5221,
+                23266, 1046,
+            ],
+            &[
+                1077, 5422, 1058, 7846, 1044, 74693, 9026, 62951, 1044, 11813, 53660, 13865, 1044,
+                21362, 1044, 51388, 34946,
+            ],
+            &[
+                2839, 1925, 1010, 2839, 2295, 1013, 4688, 1032, 2495, 38498, 1009, 14133, 8217,
+                1293, 1010,
+            ],
+            &[
+                1356, 26303, 119685, 1145, 1139, 1240, 1159, 1143, 1189, 119685, 1142, 1137, 1240,
+                1159, 1142, 1137, 3221, 1157, 1164, 1239, 1184, 1143, 119685, 1145, 1168, 29568,
+                1240, 1159, 1145, 1169, 29568, 1240, 1159, 1145, 1167,
+            ],
+            &[
+                1080, 29586, 65656, 55237, 24421, 1063, 6421, 26433, 7840, 36689, 1032, 126149,
+                90021, 16474, 2126, 1035, 1036, 1037, 1094, 1038, 1042,
+            ],
+            &[1256, 8924, 18971, 1321, 49875, 1293],
+            &[
+                3173, 1102, 1337, 98355, 1324, 1204, 1129, 1261, 1204, 1128, 1308, 1204, 1131, 1111,
+            ],
+            &[
+                1120, 1376, 34377, 1040, 3947, 1044, 1032, 1052, 1050, 1468, 1391, 1319, 1120,
+                9218, 1032, 1049, 1048, 1041, 1445, 1850, 1429, 1662, 16255, 1826,
+            ],
+            &[3997, 13151, 114840, 1675, 11768, 5702, 1287, 1131, 1356],
+            &[
+                1342, 1166, 6495, 1149, 6495, 1140, 6495, 1140, 1342, 1183, 6495, 1137, 6495, 1132,
+                6495, 1148, 6495, 1136, 1032, 11181, 13824, 17979, 1032, 122964,
+            ],
+            &[
+                1072, 20031, 1058, 4148, 3525, 22475, 1803, 115801, 1044, 44575, 1454, 5999, 25940,
+                1058, 1477, 40040, 7213, 1708, 43117, 2944,
+            ],
+        ];
+        let extra: &[(&str, &[u32])] = &[
+            ("HELLOWorld helloWorld CamelCaseWord getHTTPResponse iPhone XMLHttpRequest", &[7626, 1076, 7618, 20249, 52528, 20249, 108915, 11139, 24469, 2012, 30499, 6566, 1623, 16742, 126379, 4967]),
+            ("\u{dc}berMax \u{c4}\u{d6}\u{dc}\u{e4}\u{f6}\u{fc} \u{c9}COLE \u{c9}cole \u{3a3}\u{38a}\u{3a3}\u{3a5}\u{3a6}\u{39f}\u{3a3} Stra\u{df}e", &[79904, 11309, 19369, 30773, 39453, 1654, 1792, 1671, 4664, 9335, 3561, 87370, 9681, 1206, 1138, 27026, 118583, 117850, 25527, 27026, 27277]),
+            ("query: What is NVIDIA NeMo Framework?", &[5272, 1058, 5675, 1395, 1464, 10145, 20501, 4671, 37042, 41667, 1063]),
+            ("passage: see [\u{200c}INST] and <\u{200c}s> tags", &[12107, 1541, 1058, 3219, 1766, 3174, 3074, 1093, 1321, 1534, 1115, 1062, 19762]),
+            ("passage: see [INST] and <s> tags", &[12107, 1541, 1058, 3219, 1032, 3, 1321, 1032, 1, 19762]),
+            ("path/to/file.txt\n/next ... 3.14/2", &[7368, 35466, 55998, 13477, 1010, 1047, 6651, 6421, 1032, 1051, 1046, 1049, 1052, 1047, 1050]),
+        ];
+        for (&text, &expected) in PRE_TYPE_GOLDEN_STRINGS.iter().zip(&golden) {
+            let ids = tok.encode(text).expect("encode");
+            assert_eq!(ids, expected, "ids differ from HF tokenizers for {text:?}");
+            assert_eq!(tok.decode(&ids), text, "round trip failed for {text:?}");
+        }
+        for &(text, expected) in extra {
+            let ids = tok.encode(text).expect("encode");
+            assert_eq!(ids, expected, "ids differ from HF tokenizers for {text:?}");
+        }
+    }
+
+    /// The marker normalization is only for embedding models: the same Tekken
+    /// vocab without `<arch>.pooling_type` (a Ministral chat model) keeps a
+    /// `[` + U+200C as typed, as its HF tokenizer (no normalizer) does.
+    #[test]
+    fn test_tekken_strips_markers_only_for_embedding_models() {
+        for (pooling, strips) in [(None, false), (Some(0u32), false), (Some(1), true)] {
+            let mut file = gpt2_tokenizer_gguf(Some("pixtral"));
+            file.metadata.insert(
+                "general.architecture".to_string(),
+                GgufValue::String("mistral3".to_string()),
+            );
+            if let Some(p) = pooling {
+                file.metadata
+                    .insert("mistral3.pooling_type".to_string(), GgufValue::U32(p));
+            }
+            let tok = Tokenizer::from_gguf(&file).expect("from_gguf");
+            assert_eq!(tok.strip_zwnj_markers, strips, "pooling_type {pooling:?}");
+        }
+        let file = gpt2_tokenizer_gguf(Some("nemotron-3.5-embed"));
+        assert!(
+            Tokenizer::from_gguf(&file)
+                .expect("from_gguf")
+                .strip_zwnj_markers
+        );
+    }
+
     /// Kolibri-1's tokenizer is plain byte-level BPE with Qwen2's split regex
     /// (`tokenizer.ggml.pre = "kolibri1"`, mapped to `LLAMA_VOCAB_PRE_TYPE_QWEN2`
     /// by the community llama.cpp patch), so `encode_gpt2` should handle it
@@ -2638,15 +2915,12 @@ mod tests {
     /// gpt2 vocab got before pre types were read).
     #[test]
     fn test_unknown_pre_type_is_rejected_and_named() {
-        let file = gpt2_tokenizer_gguf(Some("tekken"));
+        let file = gpt2_tokenizer_gguf(Some("jais"));
         let err = Tokenizer::from_gguf(&file)
             .err()
             .expect("an unknown pre type must not load");
         let msg = err.to_string();
-        assert!(
-            msg.contains("'tekken'"),
-            "error should name the value: {msg}"
-        );
+        assert!(msg.contains("'jais'"), "error should name the value: {msg}");
         assert!(
             msg.contains("llama-bpe"),
             "error should list what is supported: {msg}"

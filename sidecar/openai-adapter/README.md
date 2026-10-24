@@ -313,6 +313,54 @@ limits work as for chat.
   through `messages`, and `" negative"` at 0.91 through a plain `prompt`. End a `prompt`
   where the label naturally follows (`... Sentiment:`).
 
+### `POST /v1/embeddings`
+
+OpenAI's embeddings API, for an embedding GGUF (a model with bidirectional attention
+and pooled output: NVIDIA's Nemotron-3.5-Embed-1B). Start the sidecar on that GGUF as
+on any other; chat and classify requests then fail with `400` `invalid_input`, and
+`/v1/embeddings` on a language model does the same.
+
+```
+curl http://127.0.0.1:8000/v1/embeddings   -H "Content-Type: application/json"   -d '{"input": "What is NVIDIA NeMo Framework?", "input_type": "query"}'
+```
+
+Real response (Tesla T4, `Nemotron-3.5-Embed-1B-Q8_0`; the vector shortened here):
+
+```json
+{
+  "object": "list",
+  "data": [{"object": "embedding", "index": 0,
+            "embedding": [0.089690074, 0.0022579792, -0.043266263, 0.02312163, ...]}],
+  "model": "Nemotron-3.5-Embed-1B-Q8_0",
+  "usage": {"prompt_tokens": 11, "total_tokens": 11}
+}
+```
+
+The vectors are unit length, so a dot product is the cosine similarity. With the model
+card's two documents as `"input_type": "passage"`, this query scores 0.459 against the
+NeMo one and 0.113 against the biology one. The vector equals `reflex embed` on
+`"query: What is NVIDIA NeMo Framework?"`.
+
+Request fields:
+
+- `input`: a string, or an array of 1 to 256 strings. Each is embedded on its own, in
+  order (the engine takes one request at a time). Token-id arrays are not supported.
+- `input_type` (NVIDIA's field, optional): `"query"` (the default) for a search query,
+  `"passage"` for a document. The input is rendered with the GGUF's own chat template
+  as a system message holding `"query:"`/`"passage:"` and a user message holding the
+  text, which for Nemotron gives `"query: <text>"` (plus the template's U+200C after
+  each `[` and `<`, which the tokenizer removes again). A GGUF without a template gets
+  `"<input_type>: <text>"`.
+- `dimensions` (optional): keep the first n values and re-normalize them. Nemotron is
+  trained for this (Matryoshka-style); n above the model's width is `400`.
+- `encoding_format` (optional): `"float"` (the default) or `"base64"` (little-endian
+  f32 bytes, as OpenAI returns them).
+- `model`, `user`: echoed back and ignored, respectively.
+
+`usage.prompt_tokens` is the engine's token count summed over the inputs. Each rendered
+input counts against `--max-prompt-bytes`, and the request timeout covers the whole
+list.
+
 ## Known limitations
 
 - **Chat template support is real but narrow.** Reflex itself has no chat-template

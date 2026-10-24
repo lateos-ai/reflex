@@ -767,13 +767,17 @@ pub(super) struct FormatKernels {
     pub(super) iq1s: AotKernel,
     pub(super) iq1m: AotKernel,
     pub(super) iq4xs: AotKernel,
+    /// F16 and BF16 tensors, one element per "block" (`dequantize_f16_impl`/
+    /// `dequantize_bf16_impl`).
+    pub(super) f16_raw: AotKernel,
+    pub(super) bf16_raw: AotKernel,
 }
 
 /// The formats in [`FormatKernels`]' field order, as their `dequant.cu`
 /// kernel-name stems.
-const DEQUANT_FORMATS: [&str; 20] = [
+const DEQUANT_FORMATS: [&str; 22] = [
     "q4k", "q5k", "q6k", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "q8_1", "q2k", "q3k", "q8k",
-    "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", "iq1s", "iq1m", "iq4xs",
+    "iq2xxs", "iq2xs", "iq2s", "iq3xxs", "iq3s", "iq1s", "iq1m", "iq4xs", "f16", "bf16",
 ];
 
 impl FormatKernels {
@@ -803,12 +807,14 @@ impl FormatKernels {
             iq1s: next()?,
             iq1m: next()?,
             iq4xs: next()?,
+            f16_raw: next()?,
+            bf16_raw: next()?,
         })
     }
 
     /// The kernel for `ggml_type` with its block size in bytes and elements,
-    /// or `None` for a type with no on-device kernel (F32/F16/BF16, which go
-    /// through the host fallback).
+    /// or `None` for a type with no on-device kernel (F32, uploaded as is, and
+    /// the integer types, which go through the host fallback).
     pub(super) fn for_type(&self, ggml_type: GgmlType) -> Option<(&AotKernel, usize, usize)> {
         Some(match ggml_type {
             GgmlType::Q4K => (&self.q4k, Q4K_BLOCK_BYTES, QK_K),
@@ -831,6 +837,8 @@ impl FormatKernels {
             GgmlType::IQ1S => (&self.iq1s, IQ1S_BLOCK_BYTES, QK_K),
             GgmlType::IQ1M => (&self.iq1m, IQ1M_BLOCK_BYTES, QK_K),
             GgmlType::IQ4XS => (&self.iq4xs, IQ4XS_BLOCK_BYTES, QK_K),
+            GgmlType::F16 => (&self.f16_raw, 2, 1),
+            GgmlType::Bf16 => (&self.bf16_raw, 2, 1),
             _ => return None,
         })
     }

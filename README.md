@@ -55,6 +55,9 @@ cargo run --release --bin reflex -- system1 model.gguf "The capital of France is
 
 # Generate text:
 cargo run --release --bin reflex -- generate model.gguf "Once upon a time" --max-tokens 32
+
+# Embed text with an embedding model (Nemotron-3.5-Embed):
+cargo run --release --bin reflex -- embed nemotron-embed.gguf "query: What is NeMo?"
 ```
 
 `reflex <subcommand>` with no arguments prints that subcommand's usage. All subcommands,
@@ -77,9 +80,11 @@ serverless endpoint in one click, no build required ([worker docs](.runpod/READM
 | Granite 4.0-H Mamba-2 hybrid (`granitehybrid`) | Granite 4.0-H 350M and 1B `Q8_0`; a synthetic fixture. MoE variants (Tiny, Small), Falcon-H1, Nemotron-H, Jamba and pure Mamba-2 are not supported |
 | Kolibri-1 MoE (`kolibri1`) | Aleph Alpha's Kolibri-1 78B, `Q4_K_M`; a synthetic fixture |
 | Gemma 4 dense, text only (`gemma4`) | Gemma 4 12B-it and 31B-it `Q8_0` (31B runs on a 48 GB card with QR; the `f16` opt-out needs ~80 GB); a synthetic fixture. E2B/E4B and 26B-A4B are not supported |
+| Text embeddings: Nemotron-3.5-Embed (`mistral3`, bidirectional) | Nemotron-3.5-Embed-1B `BF16`/`Q8_0`/`Q4_K_M` (vs HF `transformers`); a synthetic fixture. Images (the `mmproj` file), pooling other than mean and Ministral 3 chat models are not supported. See [docs/reference.md](docs/reference.md#embeddings) |
 
 Each architecture counted as supported only after its generated tokens matched an
-independent implementation (llama.cpp, or a CPU reference) on real hardware.
+independent implementation (llama.cpp, or a CPU reference) on real hardware;
+embeddings were compared with HF `transformers` by cosine similarity.
 
 - **GGUF only.** Convert other checkpoints with llama.cpp's `convert_hf_to_gguf.py`.
 - **Weights are held quantized on the GPU by default** (Q4_K/Q6_K on the dense path, Q8_0 on Gemma 4): on an A10G that is 270 MiB resident for Qwen3-0.6B vs 878 MiB with `f16`, 4.1 GB for Mistral 7B vs 13.8 GB, and 11.1 GB for Gemma 4 12B vs 20.9 GB. `--weights f32` (or
@@ -130,7 +135,7 @@ table below is the long form.
 |---|---|
 | **Serverless / scale-to-zero (start here)** | **[docs/deploy-serverless.md](docs/deploy-serverless.md)** |
 | Docker (one multi-target `Dockerfile`: `reflex`, `adapter`, `runpod-lb`) | [docs/reference.md](docs/reference.md#docker) |
-| OpenAI-compatible HTTP (`/v1/chat/completions`, `/v1/classify`) | [sidecar/openai-adapter](sidecar/openai-adapter/README.md) |
+| OpenAI-compatible HTTP (`/v1/chat/completions`, `/v1/classify`, `/v1/embeddings`) | [sidecar/openai-adapter](sidecar/openai-adapter/README.md) |
 | AWS, scale to zero (Spot, local socket) | [docs/aws-deployment.md](docs/aws-deployment.md) |
 | AWS, always warm (load balancer, HTTPS) | [docs/aws-deployment-warm.md](docs/aws-deployment-warm.md) |
 | Runpod serverless, load-balancing endpoint | [serverless/runpod](serverless/runpod/README.md) |

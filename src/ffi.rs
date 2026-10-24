@@ -11,7 +11,8 @@
 //! `reflex_generate` (prompt in, token ids + text out),
 //! `reflex_system1_evaluate` (prompt + candidate strings in, per-candidate
 //! scores/probabilities out -- see `crate::model::Model::system1_evaluate`'s
-//! doc comment), `reflex_free`. Phase 3's `--export-kv`/`--import-kv`
+//! doc comment), `reflex_embed` (text in, embedding out, for an embedding
+//! model -- see `crate::model::Model::embed`), `reflex_free`. Phase 3's `--export-kv`/`--import-kv`
 //! state I/O is deliberately **not** exposed here -- confirmed out of scope
 //! for this round, a separable capability an embedding host may not need
 //! yet.
@@ -562,6 +563,112 @@ pub unsafe extern "C" fn reflex_free_system1_result(result: *mut ReflexSystem1Re
         r.candidates = ptr::null_mut();
         r.num_candidates = 0;
     }
+}
+
+/// Output of `reflex_embed`. `values` is a heap buffer owned by this crate --
+/// free it (and reset this struct to all-zero/NULL) with
+/// `reflex_free_embed_result`, never with the C caller's own `free`.
+#[repr(C)]
+pub struct ReflexEmbedResult {
+    /// Array of `dims` floats: the mean-pooled, L2-normalized embedding.
+    pub values: *mut f32,
+    pub dims: usize,
+    /// How many tokens `text` encoded to.
+    pub prompt_tokens: usize,
+}
+
+/// Embeds `text` with an embedding model (a GGUF with
+/// `<arch>.attention.causal = false`, e.g. Nemotron-3.5-Embed) -- the same
+/// behavior as `reflex embed <gguf> <text>`. The text is embedded as given:
+/// add the model's input prefix yourself (Nemotron: `"query: "` or
+/// `"passage: "`). A language model fails with
+/// `REFLEX_ERROR_CODE_INVALID_INPUT`, as do `reflex_generate` and
+/// `reflex_system1_evaluate` on an embedding model.
+///
+/// `handle` must come from `reflex_load` and not have been freed yet. `text`
+/// must be a non-NULL, NUL-terminated UTF-8 C string. `out` must be a
+/// non-NULL pointer to a `ReflexEmbedResult` the caller owns (its initial
+/// contents are ignored, not read).
+///
+/// On success, fills `*out` and returns 0 -- the caller must eventually pass
+/// `out` to `reflex_free_embed_result`. On failure, leaves `*out` untouched
+/// and returns -1 (call `reflex_last_error` for why).
+///
+/// # Safety
+/// `handle` must be a live pointer from `reflex_load`, not yet freed, and not
+/// used concurrently from another thread. `text` must point to a valid
+/// NUL-terminated C string readable for the duration of this call. `out`
+/// must point to writable, properly aligned `ReflexEmbedResult` storage.
+#[no_mangle]
+pub unsafe extern "C" fn reflex_embed(
+    handle: *mut ReflexModel,
+    text: *const c_char,
+    out: *mut ReflexEmbedResult,
+) -> c_int {
+    clear_last_error();
+    let result = panic::catch_unwind(AssertUnwindSafe(
+        || -> Result<ReflexEmbedResult, ReflexError> {
+            if handle.is_null() || text.is_null() || out.is_null() {
+                return Err(ReflexError::InvalidInput(
+                    "reflex_embed: handle, text and out must not be NULL".to_string(),
+                ));
+            }
+            let text_str = unsafe { CStr::from_ptr(text) }.to_str().map_err(|e| {
+                crate::reflex_err!(InvalidInput, "reflex_embed: text is not valid UTF-8: {e}")
+            })?;
+            let model = unsafe { &(*handle).model };
+            let embedding = model.embed(text_str)?;
+            let mut boxed = embedding.vector.into_boxed_slice();
+            let values = boxed.as_mut_ptr();
+            let dims = boxed.len();
+            std::mem::forget(boxed);
+            Ok(ReflexEmbedResult {
+                values,
+                dims,
+                prompt_tokens: embedding.prompt_tokens,
+            })
+        },
+    ));
+    match result {
+        Ok(Ok(r)) => {
+            unsafe { ptr::write(out, r) };
+            0
+        }
+        Ok(Err(e)) => {
+            set_last_error(e);
+            -1
+        }
+        Err(payload) => {
+            set_last_panic(payload);
+            -1
+        }
+    }
+}
+
+/// Frees the buffer inside a `ReflexEmbedResult` previously filled by
+/// `reflex_embed`, and zeroes the struct out. Safe to call on a zeroed/all-NULL
+/// struct (no-op), and more than once on the same struct for that reason --
+/// but never on two different copies of the same non-zeroed struct.
+///
+/// # Safety
+/// `result`, if non-NULL, must point to a `ReflexEmbedResult` either zeroed or
+/// previously filled by `reflex_embed` and not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn reflex_free_embed_result(result: *mut ReflexEmbedResult) {
+    if result.is_null() {
+        return;
+    }
+    let r = unsafe { &mut *result };
+    if !r.values.is_null() {
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                r.values, r.dims,
+            )))
+        };
+        r.values = ptr::null_mut();
+    }
+    r.dims = 0;
+    r.prompt_tokens = 0;
 }
 
 /// Frees a handle obtained from `reflex_load`. Safe to call with NULL

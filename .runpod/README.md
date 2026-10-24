@@ -46,6 +46,17 @@ holding that `classification` object, like a non-streaming chat job:
            "labels": [" positive", " negative"]}}
 ```
 
+**Embeddings**: a job whose `input` has `input` and no `messages` goes to the adapter's
+`POST /v1/embeddings` (see
+[`sidecar/openai-adapter/README.md`](../sidecar/openai-adapter/README.md#post-v1embeddings)).
+It needs an embedding GGUF (Nemotron-3.5-Embed-1B, through the Custom GGUF URL field;
+it is not in the Model dropdown yet). The output is a one-element list holding the
+OpenAI `list` object:
+
+```json
+{"input": {"input": ["What is NVIDIA NeMo Framework?"], "input_type": "query"}}
+```
+
 The worker bakes **Qwen3-0.6B-Q8_0** (not the Q4_K_M the `runpod-lb` image uses): the
 listing leads with classification, and on a sub-3B model Q8_0 preserves the fine-grained
 logits the label softmax reads where a 4-bit quant can move a near-tie. No generation

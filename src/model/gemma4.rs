@@ -472,6 +472,7 @@ impl Model {
                 ones,
             }),
             granite: None,
+            encoder: None,
         })
     }
 

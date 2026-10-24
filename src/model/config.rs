@@ -48,10 +48,11 @@ pub enum RopeType {
 /// plugin) defaults to NEOX. Its full-attention layers use no RoPE at all (see
 /// [`KolibriConfig::sliding_layers`]). `qwen2` is listed for the same reason:
 /// `llama_model_rope_type` at `79e2e74` has `LLM_ARCH_QWEN2` in its NEOX
-/// group (docs/design/qwen2.md).
+/// group (docs/design/qwen2.md). `mistral3` (Ministral 3, and the
+/// Nemotron-3.5-Embed encoders built on it) is in its NORM group.
 pub(super) fn rope_type_for(architecture: &str) -> RopeType {
     match architecture {
-        "llama" | "mistral" | "mixtral" => RopeType::Norm,
+        "llama" | "mistral" | "mixtral" | "mistral3" => RopeType::Norm,
         "kolibri1" | "qwen2" => RopeType::Neox,
         _ => RopeType::Neox,
     }
@@ -64,11 +65,15 @@ pub(super) fn rope_type_for(architecture: &str) -> RopeType {
 /// `create_tensor_qkv` prefers over separate `attn_q`/`attn_k`/`attn_v`.
 /// No surveyed Qwen2.5, Qwen3 or Llama GGUF has any of them
 /// (docs/design/qwen2.md).
-const UNSUPPORTED_DENSE_TENSORS: [&str; 4] = [
+const UNSUPPORTED_DENSE_TENSORS: [&str; 7] = [
     "blk.0.attn_output.bias",
     "blk.0.attn_qkv.weight",
     "blk.0.attn_qkv.bias",
     "output.bias",
+    // `mistral3`'s optional MLP biases (and Llama's, in llama.cpp).
+    "blk.0.ffn_gate.bias",
+    "blk.0.ffn_up.bias",
+    "blk.0.ffn_down.bias",
 ];
 
 /// Shared-expert tensors (`qwen2moe`, `qwen35moe`, DeepSeek). The generic MoE
@@ -225,11 +230,20 @@ pub fn parse_model_config(
 
     if !matches!(
         architecture,
-        "qwen3" | "qwen2" | "llama" | "mistral" | "mixtral"
+        "qwen3" | "qwen2" | "llama" | "mistral" | "mixtral" | "mistral3"
     ) && moe.is_none()
     {
         return Err(crate::reflex_err!(UnsupportedArchitecture,
-            "unsupported architecture '{architecture}': only dense 'qwen3'/'qwen2'/'llama'/'mistral' and MoE architectures reporting a nonzero '{architecture}.expert_count' are in scope for this MVP"
+            "unsupported architecture '{architecture}': only dense 'qwen3'/'qwen2'/'llama'/'mistral', 'mistral3' embedding models and MoE architectures reporting a nonzero '{architecture}.expert_count' are in scope for this MVP"
+        ));
+    }
+    // Ministral 3 chat models need YaRN and the query temperature scale on the
+    // decode path too; only the encoder (embedding) form is implemented.
+    if architecture == "mistral3" && !is_encoder(file, architecture) {
+        return Err(crate::reflex_err!(
+            UnsupportedArchitecture,
+            "'mistral3' is supported only as an embedding model ({architecture}.attention.causal = \
+             false, e.g. Nemotron-3.5-Embed); Ministral 3 chat models are not supported yet"
         ));
     }
 
@@ -261,13 +275,13 @@ pub fn parse_model_config(
     // this path implements only the unscaled convention, so reject rather than
     // silently run wrong frequencies (same rejection posture as MLA's Q-LoRA/
     // MTP handling). `deepseek2`'s "yarn" is handled separately on
-    // the MLA path, never here.
+    // the MLA path, never here, and an encoder's by `parse_encoder_config`.
     if let Some(scaling) = file
         .metadata
         .get(&format!("{architecture}.rope.scaling.type"))
         .and_then(GgufValue::as_str)
     {
-        if scaling != "none" {
+        if scaling != "none" && !(scaling == "yarn" && is_encoder(file, architecture)) {
             return Err(crate::reflex_err!(UnsupportedArchitecture,
                 "{architecture}.rope.scaling.type = {scaling:?} is not supported by this MVP (only unscaled RoPE, i.e. no scaling or \"none\", is implemented)"
             ));
@@ -347,6 +361,183 @@ pub fn parse_model_config(
         block_count,
         moe,
     ))
+}
+
+/// Whether `file` describes an encoder: bidirectional attention
+/// (`<arch>.attention.causal = false`, llama.cpp's `LLM_KV_ATTENTION_CAUSAL`,
+/// default true). Such a model produces embeddings (`Model::embed`), never
+/// tokens. A causal model with a pooling type (Qwen3-Embedding's last-token
+/// pooling) is not an encoder here and loads as an ordinary language model.
+pub(super) fn is_encoder(file: &GgufFile, architecture: &str) -> bool {
+    matches!(
+        file.metadata
+            .get(&format!("{architecture}.attention.causal")),
+        Some(GgufValue::Bool(false))
+    )
+}
+
+/// YaRN RoPE scaling for a dense encoder's consecutive-pair rotation
+/// (`rope_norm_yarn*_kernel`, the kernels MLA uses), as the kernel's launch
+/// arguments. See [`parse_encoder_config`] for how they are derived.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct RopeYarn {
+    pub(super) freq_scale: f32,
+    pub(super) ext_factor: f32,
+    /// The kernel multiplies this by `1 + 0.1 * ln(factor)` to get the
+    /// cos/sin magnitude, as ggml's `rope_yarn` does.
+    pub(super) attn_factor: f32,
+    pub(super) corr_dim_start: f32,
+    pub(super) corr_dim_end: f32,
+}
+
+/// Llama-4-style query temperature scaling: Q at absolute position `pos` is
+/// multiplied by `1 + beta * ln(floor(pos / floor_scale) + 1)` after RoPE
+/// (llama.cpp's `build_inp_attn_scale`; HF's `_get_llama_4_attn_scale`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct AttnTemperature {
+    pub(super) beta: f32,
+    pub(super) floor_scale: f32,
+}
+
+/// What an encoder reduces its final hidden states to. Only mean pooling
+/// (llama.cpp's `LLAMA_POOLING_TYPE_MEAN`, 1) is implemented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Pooling {
+    Mean,
+}
+
+/// An encoder's settings beyond [`LayerConfig`], from [`parse_encoder_config`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct EncoderConfig {
+    pub(super) yarn: Option<RopeYarn>,
+    pub(super) temperature: Option<AttnTemperature>,
+    pub(super) pooling: Pooling,
+}
+
+/// Reads an encoder's ([`is_encoder`]) pooling, YaRN and query temperature
+/// settings; `None` for a causal model. Host-only.
+///
+/// YaRN follows llama.cpp's `llama-context.cpp` setup and ggml's
+/// `ggml_rope_yarn_corr_dims` over the rotated width, which match HF
+/// `transformers`' `_compute_yarn_parameters` (floor/ceil-truncated
+/// correction range, same linear ramp). The cos/sin magnitude: with
+/// `rope.scaling.yarn_log_multiplier` (HF's `mscale_all_dim`; `mscale` taken
+/// as 1, as llama.cpp does outside DeepSeek-V2) it is
+/// `get_mscale(f, 1) / get_mscale(f, log_mul)`, 1.0 for Nemotron-3.5-Embed
+/// whose HF config has `mscale = mscale_all_dim = 1`; without the key it is
+/// `get_mscale(f, 1)`. Times `rope.scaling.attn_factor` (default 1).
+/// `attention.temperature_scale` turns on the query temperature, with
+/// `original_context_length` as the floor scale (llama.cpp's
+/// `n_attn_temp_floor_scale = n_ctx_orig_yarn` for `mistral3`).
+pub(super) fn parse_encoder_config(
+    file: &GgufFile,
+    architecture: &str,
+    cfg: &LayerConfig,
+) -> Result<Option<EncoderConfig>, ReflexError> {
+    if !is_encoder(file, architecture) {
+        return Ok(None);
+    }
+    let key = |suffix: &str| format!("{architecture}.{suffix}");
+    let pooling = match u64_meta(file, &key("pooling_type")) {
+        Some(1) => Pooling::Mean,
+        other => {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "{} = {other:?}: only mean pooling (1) is supported for embedding models",
+                key("pooling_type")
+            ))
+        }
+    };
+    if cfg.rope_type != RopeType::Norm {
+        return Err(crate::reflex_err!(
+            UnsupportedArchitecture,
+            "embedding models are supported only with the consecutive-pair RoPE convention \
+             ('{architecture}' uses {:?})",
+            cfg.rope_type
+        ));
+    }
+    let orig_ctx_len = u64_meta(file, &key("rope.scaling.original_context_length"));
+    let scaling = file
+        .metadata
+        .get(&key("rope.scaling.type"))
+        .and_then(GgufValue::as_str);
+    let yarn = match scaling {
+        None | Some("none") => None,
+        Some("yarn") => {
+            let factor = f32_meta(file, &key("rope.scaling.factor")).ok_or_else(|| {
+                crate::reflex_err!(Gguf, "missing {}", key("rope.scaling.factor"))
+            })?;
+            let orig = orig_ctx_len.ok_or_else(|| {
+                crate::reflex_err!(
+                    Gguf,
+                    "missing {}",
+                    key("rope.scaling.original_context_length")
+                )
+            })? as f32;
+            if factor.is_nan() || factor <= 1.0 {
+                return Err(crate::reflex_err!(
+                    Gguf,
+                    "{} = {factor}: YaRN needs a factor above 1",
+                    key("rope.scaling.factor")
+                ));
+            }
+            let beta_fast = f32_meta(file, &key("rope.scaling.yarn_beta_fast")).unwrap_or(32.0);
+            let beta_slow = f32_meta(file, &key("rope.scaling.yarn_beta_slow")).unwrap_or(1.0);
+            let log_mul = f32_meta(file, &key("rope.scaling.yarn_log_multiplier")).unwrap_or(0.0);
+            let rope_attn_factor = f32_meta(file, &key("rope.scaling.attn_factor")).unwrap_or(1.0);
+            let get_mscale = |scale: f32, mscale: f32| {
+                if scale <= 1.0 {
+                    1.0
+                } else {
+                    0.1 * mscale * scale.ln() + 1.0
+                }
+            };
+            let magnitude = if log_mul != 0.0 {
+                get_mscale(factor, 1.0) / get_mscale(factor, log_mul)
+            } else {
+                get_mscale(factor, 1.0)
+            } * rope_attn_factor;
+            let n_dims = cfg.rotary_dim as f32;
+            let corr_dim = |n_rot: f32| {
+                n_dims * (orig / (n_rot * 2.0 * std::f32::consts::PI)).ln()
+                    / (2.0 * cfg.rope_base.ln())
+            };
+            Some(RopeYarn {
+                freq_scale: 1.0 / factor,
+                ext_factor: 1.0,
+                attn_factor: magnitude / (1.0 + 0.1 * factor.ln()),
+                corr_dim_start: corr_dim(beta_fast).floor().max(0.0),
+                corr_dim_end: corr_dim(beta_slow).ceil().min(n_dims - 1.0),
+            })
+        }
+        Some(other) => {
+            return Err(crate::reflex_err!(
+                UnsupportedArchitecture,
+                "{} = {other:?}: embedding models support only \"none\" or \"yarn\"",
+                key("rope.scaling.type")
+            ))
+        }
+    };
+    let temperature =
+        match f32_meta(file, &key("attention.temperature_scale")).filter(|&b| b != 0.0) {
+            None => None,
+            Some(beta) => {
+                let floor_scale = orig_ctx_len.filter(|&n| n > 0).ok_or_else(|| {
+                    crate::reflex_err!(
+                        Gguf,
+                        "{} is set but {} is missing",
+                        key("attention.temperature_scale"),
+                        key("rope.scaling.original_context_length")
+                    )
+                })? as f32;
+                Some(AttnTemperature { beta, floor_scale })
+            }
+        };
+    Ok(Some(EncoderConfig {
+        yarn,
+        temperature,
+        pooling,
+    }))
 }
 
 /// Which trunk blocks of a Qwen3.5 hybrid model are Gated DeltaNet layers

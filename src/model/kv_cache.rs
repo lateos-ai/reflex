@@ -186,6 +186,8 @@ impl Model {
             Some("Granite 4.0-H")
         } else if self.attn_impl == AttnImpl::Legacy {
             Some("REFLEX_ATTN_KERNEL=legacy")
+        } else if self.encoder.is_some() {
+            Some("embedding models")
         } else {
             None
         };

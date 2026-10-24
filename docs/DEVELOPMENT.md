@@ -242,6 +242,15 @@ Rules that follow from measured regressions:
   matrix weight to f16 and back, which isolates weight rounding from the f16 kernels.
   `REFLEX_TOP2_TRACE=1` prints each generated position's top-2 logits.
   [`scripts/verify_f16_weights.sh`](../scripts/verify_f16_weights.sh) uses both.
+- **Embedding models ride the dense path.** A GGUF with `<arch>.attention.causal =
+  false` loads with an `EncoderModel` (`src/model/encoder.rs`): bidirectional attention,
+  YaRN RoPE and the query temperature in the batched prefill, then `Model::embed`
+  (final norm, mean pool, L2 norm). Every hook is a no-op for causal models, and the
+  bidirectional kernels are separate modules (`encoder.cu`,
+  `attention_tiled_bidir.cu`), so causal models never load them. Keep the causal
+  attention cubins byte-identical when touching the shared kernel bodies: the
+  bidirectional path is a `CAUSAL` template flag, not a runtime branch. Design:
+  [design/embeddings.md](design/embeddings.md).
 
 ## GGUF metadata conventions
 
@@ -355,6 +364,22 @@ in `test-data/` locally:
   token. Sources: `TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF`'s
   `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` (SentencePiece, the first 8 MB) and
   `unsloth/Qwen3-0.6B-GGUF`'s `Qwen3-0.6B-Q4_K_M.gguf` (gpt2 byte-level BPE).
+- `test-data/tiny-mistral3-embed.gguf` is a synthetic embedding model: a random
+  `Ministral3Model` text encoder (`is_causal: false`, mean pooling, 2 layers, hidden 128,
+  4 query / 2 KV heads of dim 64) with the real Nemotron-3.5-Embed tokenizer, YaRN
+  (factor 4) and the query temperature over an original context of 64, so inputs past
+  64 tokens exercise both. Converted by llama.cpp's unmodified `convert_hf_to_gguf.py`
+  at `1a24df1` (`79e2e74` predates `mistral3` encoders); `--outtype f32`.
+  `tiny-mistral3-embed-ref.tsv` holds HF `transformers`' fp32 embeddings of its 15
+  comparison inputs. With causal attention, without YaRN or without the temperature,
+  HF's own output moves to a cosine of 0.48, 0.83 and 0.99990 against them, all below
+  the f32 test bar of 0.99999. `nemotron-3.5-embed-1b-header.gguf` (the real 1B's
+  header) and `nemotron-3.5-embed-tokenizer.gguf` back the config and Tekken tokenizer
+  tests. The nightly passes `EMBED_GGUF` (a real Nemotron-3.5-Embed-1B GGUF) and
+  `EMBED_REF` (its HF references, `nemotron-3.5-embed-ref.tsv`) to
+  `nemotron_embed_real_model_matches_hf_reference`. Builder, HF reference script and
+  references: `test-data/tiny-mistral3-embed-src.tar.gz`; see
+  [design/embeddings.md](design/embeddings.md).
 - Tests that need a real model read its path from `REFLEX_TEST_GGUF`. The nightly
   passes `SPM_GGUF` (a SentencePiece chat model, e.g. TinyLlama-1.1B-Chat) to the
   tests that need one (`ipc_kv_relay_spm_model_*`, `ipc_json_schema_spm_model_*`).
