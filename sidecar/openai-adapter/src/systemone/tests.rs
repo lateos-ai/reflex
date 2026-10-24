@@ -637,13 +637,18 @@ fn render_matches_llama_cpp_goldens_if_configured() {
             Ok(body) => m.parse(&body),
             Err(e) => {
                 if g.get("exception").is_none() {
-                    fail(format!("body does not parse here ({e}) but does in llama.cpp"));
+                    fail(format!(
+                        "body does not parse here ({e}) but does in llama.cpp"
+                    ));
                 }
                 continue;
             }
         };
         if g.get("exception").is_some() {
-            fail(format!("llama.cpp threw {}, here {parsed:?}", g["exception"]));
+            fail(format!(
+                "llama.cpp threw {}, here {parsed:?}",
+                g["exception"]
+            ));
             continue;
         }
         if let Some(want) = g.get("error").and_then(|e| e.as_str()) {
@@ -669,18 +674,31 @@ fn render_matches_llama_cpp_goldens_if_configured() {
         let plan = m.plan(&parsed).unwrap();
         let want = g["prompts"].as_array().unwrap();
         if plan.prompts.len() != want.len() {
-            fail(format!("{} prompts, llama.cpp {}", plan.prompts.len(), want.len()));
+            fail(format!(
+                "{} prompts, llama.cpp {}",
+                plan.prompts.len(),
+                want.len()
+            ));
             continue;
         }
         let questions = parsed
             .questions
             .iter()
             .flat_map(|q| (0..m.n_variants(q)).map(move |_| q));
-        for (i, ((prompt, labels), q)) in plan.prompts.iter().zip(&plan.labels).zip(questions).enumerate() {
+        for (i, ((prompt, labels), q)) in plan
+            .prompts
+            .iter()
+            .zip(&plan.labels)
+            .zip(questions)
+            .enumerate()
+        {
             n_prompts += 1;
             let w = &want[i];
             if w["q"].as_str() != Some(q.id.as_str()) {
-                fail(format!("prompt {i}: question {}, llama.cpp {}", q.id, w["q"]));
+                fail(format!(
+                    "prompt {i}: question {}, llama.cpp {}",
+                    q.id, w["q"]
+                ));
             }
             if w["prompt"].as_str() != Some(prompt.as_str()) {
                 fail(format!(
@@ -695,14 +713,24 @@ fn render_matches_llama_cpp_goldens_if_configured() {
                 .map(|p| p.as_str().unwrap())
                 .collect();
             if *labels != pieces {
-                fail(format!("prompt {i}: labels {labels:?}, llama.cpp {pieces:?}"));
+                fail(format!(
+                    "prompt {i}: labels {labels:?}, llama.cpp {pieces:?}"
+                ));
             }
             let t = w["temperature"].as_f64().unwrap() as f32;
             if m.temperature(q) != t {
-                fail(format!("prompt {i}: temperature {} vs {t}", m.temperature(q)));
+                fail(format!(
+                    "prompt {i}: temperature {} vs {t}",
+                    m.temperature(q)
+                ));
             }
         }
     }
     eprintln!("{n_prompts} prompts compared");
-    assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} mismatches:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }

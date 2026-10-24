@@ -1209,7 +1209,13 @@ impl Model {
         recurrent: &mut CudaSlice<f32>,
     ) -> Result<CudaSlice<f32>, ReflexError> {
         let cfg = &h.gdn_cfg;
-        let normed = self.rmsnorm(&x, w.attn_norm.f32()?, rows, h.attn_cfg.hidden_size, cfg.eps)?;
+        let normed = self.rmsnorm(
+            &x,
+            w.attn_norm.f32()?,
+            rows,
+            h.attn_cfg.hidden_size,
+            cfg.eps,
+        )?;
         let qkv = self.granite_mm(&normed, &w.attn_qkv, rows)?;
         let z = self.granite_mm(&normed, &w.attn_gate, rows)?;
         let beta_raw = self.granite_mm(&normed, &w.ssm_beta, rows)?;

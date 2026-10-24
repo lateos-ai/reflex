@@ -77,7 +77,11 @@ fn down(device: &Arc<CudaDevice>, v: &CudaSlice<f32>) -> Vec<f32> {
 fn assert_bits(got: &[f32], want: &[f32], what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: length");
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
-        assert_eq!(g.to_bits(), w.to_bits(), "{what}: element {i}: rows {g} vs loop {w}");
+        assert_eq!(
+            g.to_bits(),
+            w.to_bits(),
+            "{what}: element {i}: rows {g} vs loop {w}"
+        );
     }
 }
 
@@ -137,7 +141,14 @@ fn gdn_rows_conv_and_gates_match_single_token_loop() {
                 unsafe {
                     k.conv.function.clone().launch(
                         linear(conv_dim, 256),
-                        (&row, &dev_w, &mut state_loop, &mut out, conv_dim as u32, taps as u32),
+                        (
+                            &row,
+                            &dev_w,
+                            &mut state_loop,
+                            &mut out,
+                            conv_dim as u32,
+                            taps as u32,
+                        ),
                     )
                 }
                 .unwrap();
@@ -155,7 +166,10 @@ fn gdn_rows_conv_and_gates_match_single_token_loop() {
             let alpha = random(&mut rng, rows * hv, -8.0, 24.0);
             let beta_raw = random(&mut rng, rows * hv, -4.0, 4.0);
             let dt = random(&mut rng, hv, -1.0, 1.0);
-            let a: Vec<f32> = random(&mut rng, hv, 0.0, 2.0).iter().map(|v| -v.exp()).collect();
+            let a: Vec<f32> = random(&mut rng, hv, 0.0, 2.0)
+                .iter()
+                .map(|v| -v.exp())
+                .collect();
             let (dev_dt, dev_a) = (up(&device, &dt), up(&device, &a));
             let (dev_alpha, dev_beta_raw) = (up(&device, &alpha), up(&device, &beta_raw));
             let mut decay_rows = device.alloc_zeros::<f32>(rows * hv).unwrap();
@@ -193,8 +207,16 @@ fn gdn_rows_conv_and_gates_match_single_token_loop() {
                 beta_loop.extend(down(&device, &bt));
             }
             let what = format!("gates hd={hd} rows={rows}");
-            assert_bits(&down(&device, &decay_rows), &decay_loop, &format!("{what} decay"));
-            assert_bits(&down(&device, &beta_rows), &beta_loop, &format!("{what} beta"));
+            assert_bits(
+                &down(&device, &decay_rows),
+                &decay_loop,
+                &format!("{what} decay"),
+            );
+            assert_bits(
+                &down(&device, &beta_rows),
+                &beta_loop,
+                &format!("{what} beta"),
+            );
         }
     }
 }
@@ -255,7 +277,11 @@ fn gdn_rows_l2_norm_and_delta_match_single_token_loop() {
                 }
             }
             let normed = down(&device, &x_rows);
-            assert_bits(&normed, &down(&device, &x_loop), &format!("l2 hd={hd} rows={rows}"));
+            assert_bits(
+                &normed,
+                &down(&device, &x_loop),
+                &format!("l2 hd={hd} rows={rows}"),
+            );
 
             // Delta rule on the normalized rows, from a nonzero S.
             let s0 = random(&mut rng, hv * hd * hd, -0.3, 0.3);
@@ -320,7 +346,11 @@ fn gdn_rows_l2_norm_and_delta_match_single_token_loop() {
             }
             let what = format!("delta hd={hd} rows={rows}");
             assert_bits(&down(&device, &o_rows), &o_loop, &format!("{what} o"));
-            assert_bits(&down(&device, &s_rows), &down(&device, &s_loop), &format!("{what} S"));
+            assert_bits(
+                &down(&device, &s_rows),
+                &down(&device, &s_loop),
+                &format!("{what} S"),
+            );
         }
     }
 }

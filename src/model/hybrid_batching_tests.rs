@@ -34,7 +34,6 @@ fn prefill_hybrid_batched_matches_sequential() {
 }
 
 fn check_hybrid_batched_prompt(model: &Model, h: &HybridModel, prompt: &str) {
-
     let (seq_ids, seq_hidden, _, seq_position) = model
         .prefill_hybrid(h, prompt, None, 0)
         .expect("prefill_hybrid failed");

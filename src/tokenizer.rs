@@ -3500,7 +3500,11 @@ mod tests {
         let file = GgufFile::open(std::path::Path::new(&gguf)).expect("open GGUF");
         let tok = Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf");
         let ids = |v: &serde_json::Value| -> Vec<u32> {
-            v.as_array().unwrap().iter().map(|t| t.as_u64().unwrap() as u32).collect()
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_u64().unwrap() as u32)
+                .collect()
         };
         let mut failures = Vec::new();
         let mut n_prompts = 0;
@@ -3509,7 +3513,9 @@ mod tests {
                 continue;
             }
             let g: serde_json::Value = serde_json::from_str(line).unwrap();
-            let Some(prompts) = g["prompts"].as_array() else { continue };
+            let Some(prompts) = g["prompts"].as_array() else {
+                continue;
+            };
             for (i, p) in prompts.iter().enumerate() {
                 n_prompts += 1;
                 let want = ids(&p["tokens"]);
@@ -3523,7 +3529,12 @@ mod tests {
                         want.len()
                     ));
                 }
-                for (piece, id) in p["label_pieces"].as_array().unwrap().iter().zip(ids(&p["labels"])) {
+                for (piece, id) in p["label_pieces"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .zip(ids(&p["labels"]))
+                {
                     let got = tok.encode_no_special(piece.as_str().unwrap()).unwrap();
                     if got != [id] {
                         failures.push(format!("{} label {piece}: {got:?} vs [{id}]", g["name"]));
@@ -3533,7 +3544,12 @@ mod tests {
         }
         eprintln!("{n_prompts} prompts compared");
         assert!(n_prompts > 0, "no prompts in {goldens}");
-        assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
+        assert!(
+            failures.is_empty(),
+            "{} mismatches:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
     /// `qwen35` (QWEN35; Qwen3.5 and Qwen3.8). `test-data/qwen35-tokenizer.gguf`:
