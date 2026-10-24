@@ -1930,6 +1930,22 @@ impl Model {
                 "encode produced no tokens".to_string(),
             ));
         }
+        let (hidden, states, position) =
+            self.prefill_hybrid_ids(h, &ids, imported, extra_headroom)?;
+        Ok((ids, hidden, states, position))
+    }
+
+    /// [`Self::prefill_hybrid_batched`] on already-tokenized `ids` (non-empty,
+    /// BOS included if wanted): returns the `[ids.len(), hidden_size]` hidden
+    /// state, the layer states and the next position.
+    pub(super) fn prefill_hybrid_ids(
+        &self,
+        h: &HybridModel,
+        ids: &[u32],
+        imported: Option<HybridPrefix<'_>>,
+        extra_headroom: usize,
+    ) -> Result<(CudaSlice<f32>, Vec<HybridLayerState>, usize), ReflexError> {
+        let start_pos = start_pos_of(imported);
         let rows = ids.len();
 
         let mut states = self.alloc_hybrid_states(h, imported, start_pos, rows, extra_headroom)?;
@@ -1954,7 +1970,7 @@ impl Model {
             p.finish(rows)?;
         }
 
-        Ok((ids, hidden, states, start_pos + rows))
+        Ok((hidden, states, start_pos + rows))
     }
 
     /// Hybrid counterpart to [`Self::generate_dense_impl`] (Phase 3 round 2;

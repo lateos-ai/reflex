@@ -84,6 +84,7 @@ mod granite_hybrid;
 mod hybrid;
 mod kernels;
 mod kv_cache;
+mod label_logits;
 mod loading;
 mod mla;
 mod prefill_profile;
@@ -100,6 +101,7 @@ use self::granite_hybrid::*;
 use self::hybrid::*;
 use self::kernels::*;
 use self::kv_cache::*;
+pub use self::label_logits::{LabelLogits, LabelPrompt, LabelPromptResult};
 use self::loading::*;
 pub use self::loading::{F16ActivationStats, LoadOptions, WeightsDtype};
 use self::mla::*;
@@ -146,6 +148,8 @@ mod kolibri_forward_tests;
 mod kv_cache_f16_tests;
 #[cfg(test)]
 mod kv_f16_tests;
+#[cfg(test)]
+mod label_logits_tests;
 #[cfg(test)]
 #[path = "../../reference/mamba2_reference.rs"]
 mod mamba2_reference;

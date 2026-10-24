@@ -462,6 +462,16 @@ impl Tokenizer {
         Ok(ids)
     }
 
+    /// Encodes `text` with special-token text treated as plain text, as the
+    /// start of a sequence (llama.cpp's `common_tokenize(vocab, text, false,
+    /// false)`). Used to resolve label strings to token ids.
+    pub fn encode_no_special(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.encode_plain(text, true)
+    }
+
     /// Whether `text`, encoded with [`Self::encode_continuation`] after a state
     /// of `after_special`, ends on a special token: the `after_special` to encode
     /// whatever comes next with. Empty text leaves the state unchanged.
@@ -3423,6 +3433,52 @@ mod tests {
         assert_eq!(tok.bos_token_id, Some(154822));
         assert!(!tok.add_bos);
         assert_eq!(tok.prompt_bos(), None);
+    }
+
+    /// Decision-model label tables (docs/design/decision-models.md), built the
+    /// way llama.cpp `a4cb4c6`'s `server_decision_context::init` builds them:
+    /// each code encoded alone without special tokens, kept if it is one token.
+    /// `test-data/lev-q8_0-header.gguf`: header of
+    /// https://huggingface.co/ggml-org/lev-GGUF/resolve/main/lev-Q8_0.gguf
+    /// (HTTP range `bytes=0-12582911`, `scripts/gguf_tokenizer_only.py
+    /// --keep-tensor-table`).
+    #[test]
+    fn test_decision_label_tables_if_fixture_present() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-data/lev-q8_0-header.gguf");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let file = GgufFile::open(&path).expect("open lev header");
+        let tok = Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf");
+        let one = |code: &str| match tok.encode_no_special(code).unwrap()[..] {
+            [id] => Some(id),
+            _ => None,
+        };
+
+        // OpenJev: all 52 letters are single tokens.
+        let letters: Vec<u32> = ('A'..='Z')
+            .chain('a'..='z')
+            .map(|c| one(&c.to_string()).expect("letter is one token"))
+            .collect();
+        assert_eq!(letters[0], 32);
+        assert_eq!(letters[25], 57);
+
+        // lev: A..Z then the single-token AA..ZZ codes, at most 255.
+        let codes = ('A'..='Z')
+            .map(|a| a.to_string())
+            .chain(('A'..='Z').flat_map(|a| ('A'..='Z').map(move |b| format!("{a}{b}"))));
+        let lev: Vec<(String, u32)> = codes
+            .filter_map(|c| one(&c).map(|id| (c, id)))
+            .take(255)
+            .collect();
+        assert_eq!(lev.len(), 255);
+        assert_eq!(lev[255 - 1].0, "JT");
+
+        // Special-token text is plain text here.
+        assert!(tok.encode_no_special("<|im_end|>").unwrap().len() > 1);
+        assert_eq!(tok.encode_no_special("").unwrap(), Vec::<u32>::new());
     }
 
     /// `qwen35` (QWEN35; Qwen3.5 and Qwen3.8). `test-data/qwen35-tokenizer.gguf`:

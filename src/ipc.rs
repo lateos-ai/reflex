@@ -80,6 +80,18 @@
 //! model rejects `embed`, and an embedding model rejects every other request
 //! with `invalid_input`.
 //!
+//! **Label logits**: a non-empty `label_prompts` (a list of `{"prompt",
+//! "labels"}`, with no top-level `prompt`) runs
+//! [`crate::model::Model::label_logits`]: for each prompt, the raw LM-head logit
+//! of each label's token at its last position. Each label must encode to one
+//! token. The prompts' common token prefix is evaluated once and each prompt
+//! continues from a copy of it, in order; nothing is kept afterwards, so the
+//! session's pinned prefix is untouched. The response carries `labels` (per
+//! prompt: `tokens`, `token_ids`, `logits`) and `shared_tokens`. The caller
+//! turns logits into probabilities (the sidecar's `/v1/systemone`,
+//! docs/design/decision-models.md). Combines with `id` and `timings` only.
+//! Qwen3.5 hybrid models only for now.
+//!
 //! **JSON Schema** (`generate` path only): `json_schema` constrains the output to
 //! one JSON value that validates against the schema, compact but for an optional
 //! space after each `:` and `,` (`crate::grammar` has
@@ -90,7 +102,7 @@
 //! prompt), not with `pin_prefix`/`export_kv` or `candidates`.
 
 use crate::error::ReflexError;
-use crate::model::{Model, PinnedPrefix, Resume, System1Candidate};
+use crate::model::{LabelPrompt, Model, PinnedPrefix, Resume, System1Candidate};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 
@@ -127,6 +139,8 @@ pub struct IpcRequest {
     /// at a time.
     #[serde(default)]
     pub id: Option<String>,
+    /// Empty when omitted. A `label_prompts` request leaves it empty.
+    #[serde(default)]
     pub prompt: String,
     /// Empty (the default) selects `Model::generate`; non-empty selects
     /// `Model::system1_evaluate` over these candidate continuations.
@@ -192,6 +206,11 @@ pub struct IpcRequest {
     /// (see this module's doc comment's "Embeddings" section).
     #[serde(default)]
     pub embed: bool,
+    /// Non-empty: read label logits over these prompts instead of generating or
+    /// scoring `candidates` (see this module's doc comment's "Label logits"
+    /// section).
+    #[serde(default)]
+    pub label_prompts: Vec<IpcLabelPrompt>,
     /// Milliseconds spent parsing this request's JSON line, filled in by
     /// [`run_request_loop`] (not a wire field) so [`IpcTimings::parse_ms`] can
     /// report it.
@@ -224,6 +243,23 @@ pub struct IpcCandidateResult {
     pub token_ids: Vec<u32>,
     pub score: f32,
     pub probability: f32,
+}
+
+/// One prompt of a `label_prompts` request.
+#[derive(Debug, Deserialize)]
+pub struct IpcLabelPrompt {
+    pub prompt: String,
+    pub labels: Vec<String>,
+}
+
+/// One prompt's result on a `label_prompts` request: the raw LM-head logit of
+/// each label's token at the prompt's last position, in `labels` order.
+#[derive(Debug, Serialize)]
+pub struct IpcLabelResult {
+    /// The prompt's full token count, shared prefix included.
+    pub tokens: usize,
+    pub token_ids: Vec<u32>,
+    pub logits: Vec<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -266,6 +302,12 @@ pub struct IpcResponse {
     /// `embed` requests only: how many tokens the text encoded to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<usize>,
+    /// `label_prompts` requests only: one result per prompt, in request order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<IpcLabelResult>>,
+    /// `label_prompts` requests only: tokens prefilled once for every prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_tokens: Option<usize>,
     /// Present only when the request set `"timings": true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<IpcTimings>,
@@ -638,6 +680,8 @@ impl IpcResponse {
             chosen: None,
             embedding: None,
             prompt_tokens: None,
+            labels: None,
+            shared_tokens: None,
             timings: None,
         }
     }
@@ -670,6 +714,45 @@ pub struct IpcStreamToken {
 pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> IpcResponse {
     let id = req.id.clone();
     let model_start = std::time::Instant::now();
+    if !req.label_prompts.is_empty() {
+        return match run_label_logits(model, &req) {
+            Ok(l) => IpcResponse {
+                id,
+                event: "final",
+                ok: true,
+                error: None,
+                error_kind: None,
+                token_ids: None,
+                text: None,
+                candidates: None,
+                entropy: None,
+                chosen: None,
+                embedding: None,
+                prompt_tokens: None,
+                labels: Some(
+                    l.results
+                        .into_iter()
+                        .map(|r| IpcLabelResult {
+                            tokens: r.tokens,
+                            token_ids: r.label_token_ids,
+                            logits: r.logits,
+                        })
+                        .collect(),
+                ),
+                shared_tokens: Some(l.shared_tokens),
+                timings: timings_if(
+                    req.timings,
+                    req.parse_ms,
+                    model_start,
+                    None,
+                    None,
+                    None,
+                    slot,
+                ),
+            },
+            Err(e) => IpcResponse::err(id, e),
+        };
+    }
     if req.embed {
         return match run_embed(model, &req) {
             Ok(e) => IpcResponse {
@@ -685,6 +768,8 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
                 chosen: None,
                 embedding: Some(e.vector),
                 prompt_tokens: Some(e.prompt_tokens),
+                labels: None,
+                shared_tokens: None,
                 timings: timings_if(
                     req.timings,
                     req.parse_ms,
@@ -724,6 +809,8 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
                 chosen: None,
                 embedding: None,
                 prompt_tokens: None,
+                labels: None,
+                shared_tokens: None,
                 timings: timings_if(
                     req.timings,
                     req.parse_ms,
@@ -778,6 +865,8 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
                     chosen: Some(chosen),
                     embedding: None,
                     prompt_tokens: None,
+                    labels: None,
+                    shared_tokens: None,
                     timings: timings_if(
                         req.timings,
                         req.parse_ms,
@@ -792,6 +881,48 @@ pub fn handle_request(model: &Model, slot: &mut PrefixSlot, req: IpcRequest) -> 
             Err(e) => IpcResponse::err(id, e),
         }
     }
+}
+
+/// Runs a `label_prompts` request after [`check_label_fields`].
+fn run_label_logits(
+    model: &Model,
+    req: &IpcRequest,
+) -> Result<crate::model::LabelLogits, ReflexError> {
+    check_label_fields(req)?;
+    let prompts: Vec<LabelPrompt> = req
+        .label_prompts
+        .iter()
+        .map(|p| LabelPrompt {
+            prompt: p.prompt.clone(),
+            labels: p.labels.clone(),
+        })
+        .collect();
+    model.label_logits(&prompts)
+}
+
+/// A `label_prompts` request sets no field of the other paths, not even
+/// `prompt`.
+fn check_label_fields(req: &IpcRequest) -> Result<(), ReflexError> {
+    let conflicting = [
+        (!req.prompt.is_empty(), "prompt"),
+        (!req.candidates.is_empty(), "candidates"),
+        (req.embed, "embed"),
+        (req.stream, "stream"),
+        (req.sampling.is_some(), "sampling"),
+        (req.import_kv.is_some(), "import_kv"),
+        (req.export_kv.is_some(), "export_kv"),
+        (req.export_kv_dtype.is_some(), "export_kv_dtype"),
+        (req.pin_prefix, "pin_prefix"),
+        (req.use_pinned, "use_pinned"),
+        (req.json_schema.is_some(), "json_schema"),
+        (!req.stop_token_ids.is_empty(), "stop_token_ids"),
+    ];
+    if let Some((_, field)) = conflicting.iter().find(|(set, _)| *set) {
+        return Err(ReflexError::InvalidInput(format!(
+            "label_prompts can't be combined with {field}"
+        )));
+    }
+    Ok(())
 }
 
 /// Runs an `embed` request after checking it sets no field of the other paths.
@@ -850,7 +981,7 @@ pub fn handle_request_streaming<W: Write>(
     req: IpcRequest,
     mut output: W,
 ) -> Result<(), String> {
-    if !req.stream || !req.candidates.is_empty() || req.embed {
+    if !req.stream || !req.candidates.is_empty() || req.embed || !req.label_prompts.is_empty() {
         let response = handle_request(model, slot, req);
         return write_json_line(&mut output, &response);
     }
@@ -901,6 +1032,8 @@ pub fn handle_request_streaming<W: Write>(
             chosen: None,
             embedding: None,
             prompt_tokens: None,
+            labels: None,
+            shared_tokens: None,
             timings: timings_if(
                 req.timings,
                 req.parse_ms,
@@ -1070,6 +1203,8 @@ mod tests {
             chosen: None,
             embedding: None,
             prompt_tokens: None,
+            labels: None,
+            shared_tokens: None,
             timings: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -1249,6 +1384,57 @@ mod tests {
         assert_eq!(PrefixSlot::new().device_bytes(), 0);
     }
 
+    fn label_req(extra: &str) -> IpcRequest {
+        serde_json::from_str(&format!(
+            r#"{{"label_prompts": [{{"prompt": "p", "labels": ["A", "B"]}}]{extra}}}"#
+        ))
+        .expect("should parse")
+    }
+
+    #[test]
+    fn test_label_prompts_parse_without_prompt() {
+        let req = label_req(r#", "id": "x", "timings": true"#);
+        assert!(req.prompt.is_empty());
+        assert_eq!(req.label_prompts.len(), 1);
+        assert_eq!(req.label_prompts[0].labels, ["A", "B"]);
+        assert!(check_label_fields(&req).is_ok());
+    }
+
+    #[test]
+    fn test_label_prompts_reject_other_paths_fields() {
+        for (extra, field) in [
+            (r#", "prompt": "p""#, "prompt"),
+            (r#", "candidates": [" a"]"#, "candidates"),
+            (r#", "embed": true"#, "embed"),
+            (r#", "stream": true"#, "stream"),
+            (r#", "sampling": {"temperature": 0.5}"#, "sampling"),
+            (r#", "import_kv": "sys.cskv""#, "import_kv"),
+            (r#", "export_kv": "out.cskv""#, "export_kv"),
+            (r#", "export_kv_dtype": "f16""#, "export_kv_dtype"),
+            (r#", "pin_prefix": true"#, "pin_prefix"),
+            (r#", "use_pinned": true"#, "use_pinned"),
+            (r#", "json_schema": {"type": "string"}"#, "json_schema"),
+            (r#", "stop_token_ids": [1]"#, "stop_token_ids"),
+        ] {
+            let err = check_label_fields(&label_req(extra)).unwrap_err();
+            assert_eq!(err.kind(), "invalid_input", "{extra}: {err}");
+            assert!(err.to_string().ends_with(&format!("with {field}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_label_response_fields_are_omitted_elsewhere() {
+        let line = serde_json::to_string(&IpcResponse::err(
+            None,
+            ReflexError::InvalidInput("x".to_string()),
+        ))
+        .unwrap();
+        assert!(
+            !line.contains("labels") && !line.contains("shared_tokens"),
+            "{line}"
+        );
+    }
+
     fn candidates_req(extra: &str) -> IpcRequest {
         serde_json::from_str(&format!(
             r#"{{"prompt": "p", "candidates": [" a", " b"]{extra}}}"#
@@ -1319,6 +1505,8 @@ mod tests {
             chosen,
             embedding: None,
             prompt_tokens: None,
+            labels: None,
+            shared_tokens: None,
             timings,
         }
     }
