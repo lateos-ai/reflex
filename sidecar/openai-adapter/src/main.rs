@@ -2,7 +2,9 @@
 //! one managed `reflex stdio <gguf>` process. Implements `POST /v1/chat/completions`
 //! (streaming via SSE and non-streaming JSON), `POST /v1/classify` (System1 label
 //! scoring, not an OpenAI endpoint -- see `classify.rs`), `POST /v1/embeddings` (for
-//! an embedding GGUF -- see `embeddings.rs`), `GET /v1/models`, and a health check
+//! an embedding GGUF -- see `embeddings.rs`), `POST /v1/systemone` (a decision
+//! model's typed answers, llama.cpp's TypeSafe-compatible API -- see `systemone.rs`),
+//! `GET /v1/models`, and a health check
 //! served at both `/healthz` and `/ping` (identical handler -- `/ping` exists because
 //! Runpod Serverless load-balancing endpoints hard-poll that exact path, confirmed
 //! against a real deployment) -- see this crate's README for usage, scope, and known
@@ -23,6 +25,7 @@ mod gguf_meta;
 mod openai;
 mod reflex_client;
 mod stop_tokens;
+mod systemone;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, StatusCode};
@@ -57,6 +60,8 @@ struct AppState {
     /// their text kept out of the reply.
     stop_tokens: stop_tokens::StopTokens,
     model_info: ModelInfo,
+    /// What `/v1/systemone` can do with this GGUF, decided at startup.
+    systemone: systemone::Support,
 }
 
 impl AppState {
@@ -388,6 +393,7 @@ async fn main() {
         chat_template::build(&opts.gguf_path, opts.chat_template_file.as_deref())
     };
     let stop_tokens = stop_tokens::StopTokens::from_gguf(&opts.gguf_path);
+    let systemone = systemone::load(&opts.gguf_path);
 
     let model_info = ModelInfo {
         id: model_label.clone(),
@@ -411,6 +417,7 @@ async fn main() {
         chat_template,
         stop_tokens,
         model_info,
+        systemone,
     });
 
     // Fails the process fast and observably the moment the managed `reflex` child is
@@ -448,6 +455,10 @@ async fn main() {
         .route(
             "/v1/embeddings",
             post(embeddings_handler).layer(DefaultBodyLimit::max(body_limit)),
+        )
+        .route(
+            "/v1/systemone",
+            post(systemone_handler).layer(DefaultBodyLimit::max(body_limit)),
         )
         .route("/v1/models", get(list_models))
         .route("/healthz", get(healthz))
@@ -865,6 +876,108 @@ async fn classify_handler(
         Ok(response) => response,
         Err(_) => timeout_response(timeout),
     }
+}
+
+/// `POST /v1/systemone`: answers a decision model's typed questions; see
+/// `systemone.rs`. Every variant of every question goes to the engine in one IPC
+/// request, which evaluates their shared token prefix once. `--max-prompt-bytes`
+/// applies to each rendered prompt; the queue depth and request timeout as for
+/// the other endpoints.
+async fn systemone_handler(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<systemone::Json>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let model = match &state.systemone {
+        systemone::Support::Ready(m) => m,
+        systemone::Support::NotDecisionModel => {
+            return not_supported_response("This model is not a decision model")
+        }
+        systemone::Support::Unsupported(why) => return not_supported_response(why),
+    };
+    let Json(body) = match body {
+        Ok(j) => j,
+        Err(e) => return error_response(e.status(), e.body_text()),
+    };
+    let parsed = match model.parse(&body) {
+        Ok(p) => p,
+        Err(systemone::RequestError::Invalid(e)) => {
+            return error_response_with(
+                StatusCode::BAD_REQUEST,
+                e,
+                "invalid_request_error",
+                Some("invalid_input"),
+            )
+        }
+        Err(systemone::RequestError::ImagesUnsupported) => {
+            return not_supported_response(systemone::IMAGES_UNSUPPORTED)
+        }
+    };
+    let plan = match model.plan(&parsed) {
+        Ok(p) => p,
+        Err(e) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("sidecar: {e}"))
+        }
+    };
+    for p in &plan.prompts {
+        if let Some(response) = request_limit_violation(&state.limits, p.len(), 0) {
+            return response;
+        }
+    }
+    let line = match serde_json::to_string(&systemone::DecisionModel::ipc_request(&plan)) {
+        Ok(l) => l,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("sidecar: failed to serialize IPC request: {e}"),
+            )
+        }
+    };
+    let mut rx = match state.client.request(line).await {
+        Ok(rx) => rx,
+        Err(full) => return queue_full_response(full.max_in_flight),
+    };
+    let model_label = body
+        .get("model")
+        .and_then(|m| match m {
+            systemone::Json::Str(s) => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| state.model_label.clone());
+    let timeout = state.limits.request_timeout;
+    let response = async move {
+        while let Some(v) = rx.recv().await {
+            if v.get("event").and_then(Value::as_str) != Some("final") {
+                continue;
+            }
+            if let Some(err) = engine_error(&v) {
+                return engine_error_response(&err);
+            }
+            return match model.build_response(&parsed, &v, model_label) {
+                Ok(r) => (StatusCode::OK, Json(r)).into_response(),
+                Err(e) => {
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("sidecar: {e}"))
+                }
+            };
+        }
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "sidecar: reflex closed the connection without a final response",
+        )
+    };
+    match tokio::time::timeout_at(Instant::now() + timeout, response).await {
+        Ok(response) => response,
+        Err(_) => timeout_response(timeout),
+    }
+}
+
+/// `501`, as llama.cpp answers `/v1/systemone` for a model or input it can't take.
+fn not_supported_response(message: &str) -> Response {
+    error_response_with(
+        StatusCode::NOT_IMPLEMENTED,
+        message,
+        "not_supported_error",
+        Some("not_supported"),
+    )
 }
 
 /// `POST /v1/embeddings`; see `embeddings.rs`. Inputs go to the engine one at a

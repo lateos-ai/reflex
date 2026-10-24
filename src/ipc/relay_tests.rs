@@ -1114,3 +1114,76 @@ fn ipc_kv_f16_file_granite_and_gemma4_fixtures_reject() {
         final_ok(&lines[1]);
     }
 }
+
+const TINYOPENJEV_FIXTURE: &str = "test-data/tinyopenjev-for-testing-Q8_0.gguf";
+
+/// `label_prompts` over IPC: the prompts share their state, the response carries
+/// one result per prompt, and the session's pinned prefix is left as it was.
+#[test]
+#[ignore]
+fn ipc_label_logits_tinyopenjev_fixture_shares_prefix_and_keeps_pin() {
+    let model = load(TINYOPENJEV_FIXTURE, WeightsDtype::F32);
+    let state = "<|im_start|>user\nState:\nI was charged twice for my order.\n\nQuestion: ";
+    let tail = "\nOptions:\n[A] yes: \n[B] no: \n\nAnswer with the letter of the best option only.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    let label_req = serde_json::json!({
+        "id": "d",
+        "timings": true,
+        "label_prompts": [
+            {"prompt": format!("{state}Is the customer angry?{tail}"), "labels": ["A", "B"]},
+            {"prompt": format!("{state}Is a refund requested?{tail}"), "labels": ["A", "B"]},
+        ],
+    });
+    let mut slot = PrefixSlot::new();
+    let lines = session_with(
+        &model,
+        &mut slot,
+        &[
+            serde_json::json!({"prompt": "Hello there", "pin_prefix": true, "max_tokens": 1}),
+            label_req.clone(),
+            serde_json::json!({"label_prompts": [{"prompt": "x", "labels": ["A"]}], "use_pinned": true}),
+        ],
+    );
+    final_ok(&lines[0]);
+    let pinned = slot.seq_len().expect("pinned");
+
+    let r = &lines[1];
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["id"], "d");
+    let shared = r["shared_tokens"].as_u64().unwrap();
+    assert!(shared > 10, "{r}");
+    let labels = r["labels"].as_array().unwrap();
+    assert_eq!(labels.len(), 2);
+    for l in labels {
+        assert_eq!(l["token_ids"], serde_json::json!([32, 33]), "{l}");
+        assert_eq!(l["logits"].as_array().unwrap().len(), 2);
+        assert!(l["tokens"].as_u64().unwrap() > shared);
+    }
+    assert_eq!(r["timings"]["pinned_seq_len"].as_u64(), Some(pinned as u64));
+    assert!(
+        r.get("token_ids").is_none() && r.get("candidates").is_none(),
+        "{r}"
+    );
+
+    assert_eq!(lines[2]["error_kind"], "invalid_input", "{}", lines[2]);
+    assert_eq!(slot.seq_len(), Some(pinned));
+
+    // Same answer without the pinned prefix around.
+    let again = session(&model, &[label_req]);
+    assert_eq!(again[0]["labels"], r["labels"]);
+}
+
+/// Architectures other than the Qwen3.5 hybrid say so.
+#[test]
+#[ignore]
+fn ipc_label_logits_granite_fixture_unsupported() {
+    let model = load(GRANITE_FIXTURE, WeightsDtype::F32);
+    let lines = session(
+        &model,
+        &[serde_json::json!({"label_prompts": [{"prompt": "Hello", "labels": ["A"]}]})],
+    );
+    assert_eq!(
+        lines[0]["error_kind"], "unsupported_architecture",
+        "{}",
+        lines[0]
+    );
+}

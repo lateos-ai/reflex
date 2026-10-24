@@ -84,6 +84,7 @@ mod granite_hybrid;
 mod hybrid;
 mod kernels;
 mod kv_cache;
+mod label_logits;
 mod loading;
 mod mla;
 mod prefill_profile;
@@ -100,6 +101,7 @@ use self::granite_hybrid::*;
 use self::hybrid::*;
 use self::kernels::*;
 use self::kv_cache::*;
+pub use self::label_logits::{LabelLogits, LabelPrompt, LabelPromptResult};
 use self::loading::*;
 pub use self::loading::{F16ActivationStats, LoadOptions, WeightsDtype};
 use self::mla::*;
@@ -125,6 +127,8 @@ mod encoder_tests;
 #[cfg(test)]
 mod f16_kernel_tests;
 #[cfg(test)]
+mod gdn_rows_tests;
+#[cfg(test)]
 mod gemma4_config_tests;
 #[cfg(test)]
 mod gemma4_kernel_tests;
@@ -146,6 +150,8 @@ mod kolibri_forward_tests;
 mod kv_cache_f16_tests;
 #[cfg(test)]
 mod kv_f16_tests;
+#[cfg(test)]
+mod label_logits_tests;
 #[cfg(test)]
 #[path = "../../reference/mamba2_reference.rs"]
 mod mamba2_reference;
@@ -1028,48 +1034,6 @@ impl Model {
             .dtod_copy(&src, &mut out)
             .map_err(|e| crate::gpu_err!(e, "last_row dtod: {e}"))?;
         Ok(out)
-    }
-
-    /// Like [`Self::last_row`], but for any row index -- used by the hybrid
-    /// model's layer-major batched prefill (`Self::forward_hybrid_layer_batched`)
-    /// to pull one position's hidden vector out of a `[rows, hidden_size]`
-    /// buffer before feeding it through a `GatedDeltaNet` layer's sequential
-    /// per-token recurrence (`Self::forward_gdn_mixer` takes ownership of a
-    /// single-row `CudaSlice`, not a view into a larger batch).
-    fn extract_row(
-        &self,
-        batched: &CudaSlice<f32>,
-        row: usize,
-        hidden_size: usize,
-    ) -> Result<CudaSlice<f32>, ReflexError> {
-        let offset = row * hidden_size;
-        let mut out = self
-            .device
-            .alloc_zeros::<f32>(hidden_size)
-            .map_err(|e| crate::gpu_err!(e, "extract_row alloc: {e}"))?;
-        let src = batched.slice(offset..offset + hidden_size);
-        self.device
-            .dtod_copy(&src, &mut out)
-            .map_err(|e| crate::gpu_err!(e, "extract_row dtod: {e}"))?;
-        Ok(out)
-    }
-
-    /// Inverse of [`Self::extract_row`]: writes `src` (one position's hidden
-    /// vector) back into row `row` of a `[rows, hidden_size]` buffer -- same
-    /// device-to-device copy convention `Self::forward_attn_block` already
-    /// uses for kv-cache writes, never a host round trip.
-    fn write_row(
-        &self,
-        batched: &mut CudaSlice<f32>,
-        row: usize,
-        hidden_size: usize,
-        src: &CudaSlice<f32>,
-    ) -> Result<(), ReflexError> {
-        let offset = row * hidden_size;
-        let mut dst = batched.slice_mut(offset..offset + hidden_size);
-        self.device
-            .dtod_copy(src, &mut dst)
-            .map_err(|e| crate::gpu_err!(e, "write_row dtod: {e}"))
     }
 
     /// Resolves `candidate`'s actual continuation token ids given `prompt`,

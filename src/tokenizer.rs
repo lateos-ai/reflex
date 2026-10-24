@@ -462,6 +462,16 @@ impl Tokenizer {
         Ok(ids)
     }
 
+    /// Encodes `text` with special-token text treated as plain text, as the
+    /// start of a sequence (llama.cpp's `common_tokenize(vocab, text, false,
+    /// false)`). Used to resolve label strings to token ids.
+    pub fn encode_no_special(&self, text: &str) -> Result<Vec<u32>, ReflexError> {
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.encode_plain(text, true)
+    }
+
     /// Whether `text`, encoded with [`Self::encode_continuation`] after a state
     /// of `after_special`, ends on a special token: the `after_special` to encode
     /// whatever comes next with. Empty text leaves the state unchanged.
@@ -3423,6 +3433,123 @@ mod tests {
         assert_eq!(tok.bos_token_id, Some(154822));
         assert!(!tok.add_bos);
         assert_eq!(tok.prompt_bos(), None);
+    }
+
+    /// Decision-model label tables (docs/design/decision-models.md), built the
+    /// way llama.cpp `a4cb4c6`'s `server_decision_context::init` builds them:
+    /// each code encoded alone without special tokens, kept if it is one token.
+    /// `test-data/lev-q8_0-header.gguf`: header of
+    /// https://huggingface.co/ggml-org/lev-GGUF/resolve/main/lev-Q8_0.gguf
+    /// (HTTP range `bytes=0-12582911`, `scripts/gguf_tokenizer_only.py
+    /// --keep-tensor-table`).
+    #[test]
+    fn test_decision_label_tables_if_fixture_present() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-data/lev-q8_0-header.gguf");
+        if !path.exists() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+        let file = GgufFile::open(&path).expect("open lev header");
+        let tok = Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf");
+        let one = |code: &str| match tok.encode_no_special(code).unwrap()[..] {
+            [id] => Some(id),
+            _ => None,
+        };
+
+        // OpenJev: all 52 letters are single tokens.
+        let letters: Vec<u32> = ('A'..='Z')
+            .chain('a'..='z')
+            .map(|c| one(&c.to_string()).expect("letter is one token"))
+            .collect();
+        assert_eq!(letters[0], 32);
+        assert_eq!(letters[25], 57);
+
+        // lev: A..Z then the single-token AA..ZZ codes, at most 255.
+        let codes = ('A'..='Z')
+            .map(|a| a.to_string())
+            .chain(('A'..='Z').flat_map(|a| ('A'..='Z').map(move |b| format!("{a}{b}"))));
+        let lev: Vec<(String, u32)> = codes
+            .filter_map(|c| one(&c).map(|id| (c, id)))
+            .take(255)
+            .collect();
+        assert_eq!(lev.len(), 255);
+        assert_eq!(lev[255 - 1].0, "JT");
+
+        // Special-token text is plain text here.
+        assert!(tok.encode_no_special("<|im_end|>").unwrap().len() > 1);
+        assert_eq!(tok.encode_no_special("").unwrap(), Vec::<u32>::new());
+    }
+
+    /// Decision prompts and labels tokenized as llama.cpp `a4cb4c6`'s
+    /// `server_decision_context::fill_task` does, from the JSON lines of a harness on
+    /// llama.cpp's own server-decision.cpp (the same goldens the sidecar's
+    /// `render_matches_llama_cpp_goldens_if_configured` checks the text of). Runs only
+    /// when `SYSTEMONE_GOLDEN_GGUF` and `SYSTEMONE_GOLDENS` are set (and needs
+    /// `serde_json`, from the `json-output` feature `ipc` turns on).
+    #[cfg(feature = "json-output")]
+    #[test]
+    fn test_decision_prompt_tokens_match_llama_cpp_goldens_if_configured() {
+        let (Ok(gguf), Ok(goldens)) = (
+            std::env::var("SYSTEMONE_GOLDEN_GGUF"),
+            std::env::var("SYSTEMONE_GOLDENS"),
+        ) else {
+            eprintln!("skipping: SYSTEMONE_GOLDEN_GGUF or SYSTEMONE_GOLDENS not set");
+            return;
+        };
+        let file = GgufFile::open(std::path::Path::new(&gguf)).expect("open GGUF");
+        let tok = Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf");
+        let ids = |v: &serde_json::Value| -> Vec<u32> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_u64().unwrap() as u32)
+                .collect()
+        };
+        let mut failures = Vec::new();
+        let mut n_prompts = 0;
+        for line in std::fs::read_to_string(&goldens).unwrap().lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let g: serde_json::Value = serde_json::from_str(line).unwrap();
+            let Some(prompts) = g["prompts"].as_array() else {
+                continue;
+            };
+            for (i, p) in prompts.iter().enumerate() {
+                n_prompts += 1;
+                let want = ids(&p["tokens"]);
+                let got = tok.encode(p["prompt"].as_str().unwrap()).unwrap();
+                if got != want {
+                    let at = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
+                    failures.push(format!(
+                        "{} prompt {i}: {} tokens vs llama.cpp {}, first difference at {at}",
+                        g["name"],
+                        got.len(),
+                        want.len()
+                    ));
+                }
+                for (piece, id) in p["label_pieces"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .zip(ids(&p["labels"]))
+                {
+                    let got = tok.encode_no_special(piece.as_str().unwrap()).unwrap();
+                    if got != [id] {
+                        failures.push(format!("{} label {piece}: {got:?} vs [{id}]", g["name"]));
+                    }
+                }
+            }
+        }
+        eprintln!("{n_prompts} prompts compared");
+        assert!(n_prompts > 0, "no prompts in {goldens}");
+        assert!(
+            failures.is_empty(),
+            "{} mismatches:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
     }
 
     /// `qwen35` (QWEN35; Qwen3.5 and Qwen3.8). `test-data/qwen35-tokenizer.gguf`:

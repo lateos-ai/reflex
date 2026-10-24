@@ -313,6 +313,85 @@ limits work as for chat.
   through `messages`, and `" negative"` at 0.91 through a plain `prompt`. End a `prompt`
   where the label naturally follows (`... Sentiment:`).
 
+### `POST /v1/systemone`
+
+Typed answers from a **decision model**, in the shape of llama.cpp's `/v1/systemone`
+(TypeSafe's System One API). A decision model reads a `state` and answers each question
+in one forward pass, with no generation. Supported GGUFs: `lev` (ggml-org's `lev-GGUF`)
+and `openjev` (OpenJev, text only), told apart by their `{arch}.decision.type` metadata.
+Start the sidecar on the GGUF as on any other.
+
+```
+curl http://127.0.0.1:8000/v1/systemone \
+  -H "Content-Type: application/json" \
+  -d '{
+    "state": "I was charged twice for my order last week and nobody has replied.",
+    "questions": {
+      "route":   {"type": "choice", "instructions": "Which team should handle this?",
+                  "criteria": {"billing": "payments and refunds", "shipping": null, "technical": null}},
+      "urgency": {"type": "score", "instructions": "How urgent is this?",
+                  "criteria": ["can wait", "this week", "today", "right now"]},
+      "angry":   {"type": "noul", "instructions": "Is the customer angry?"}
+    }
+  }'
+```
+
+Real response (Tesla T4, `lev-Q8_0` with `f16` weights; probabilities shortened):
+
+```json
+{
+  "model": "lev-Q8_0",
+  "answers": {
+    "route": {"type": "choice", "choice": "billing",
+              "probabilities": {"billing": 0.99087, "shipping": 0.00494, "technical": 0.00419},
+              "confidence": 0.98631},
+    "urgency": {"type": "score", "score": 1.32797,
+                "legend": {"0": "can wait", "1": "this week", "2": "today", "3": "right now"},
+                "probabilities": {"0": 0.04153, "1": 0.67583, "2": 0.19576, "3": 0.08687},
+                "confidence": 0.58896},
+    "angry": {"type": "noul", "noul": 0.88407}
+  },
+  "usage": {"input_tokens": 484, "output_tokens": 0}
+}
+```
+
+llama.cpp `a4cb4c6` with f32 activations gave 0.99087, 1.32834 and 0.88428 on the same
+request.
+
+- `state`: any JSON value, not null. Strings are shown as-is; objects, arrays and
+  numbers as JSON (`lev` sorts object keys first, as it was trained). Chat messages
+  (`[{"role", "content"}]`, or `{"messages": [...]}`) are a state like any other.
+- `questions`: a non-empty object, answered in request order. Each has `type` and
+  `instructions` (any JSON value), and `criteria`:
+  - `choice`: an object, option key to description (`null` for none). The answer is
+    the most probable key, the probabilities, and
+    `confidence = (p_max - 1/n) / (1 - 1/n)`.
+  - `score`: an array of 2 to 10 level descriptions, lowest first. The answer is the
+    expected level, the levels as `legend`, the probabilities and a confidence.
+  - `noul`: absent, or `{"true": ..., "false": ...}` descriptions. The answer is the
+    probability that the statement is true (`lev` reads it from a 9-step rating scale).
+- At most 52 options per question on OpenJev and 255 on lev (labels `A`-`Z`, then the
+  single-token two-letter codes).
+- `usage.input_tokens` counts every evaluated prompt in full (lev shows a `choice`
+  question twice, the second time with the options reversed).
+
+Every question's prompts go to the engine as one IPC `label_prompts` request, so their
+shared start (the system message and the state) is evaluated once. Each rendered prompt
+counts against `--max-prompt-bytes`; the queue-depth and timeout limits work as for
+chat. The probabilities are calibrated with the temperatures stored in the GGUF; like
+llama.cpp, the sidecar doesn't promise they are calibrated for your data.
+
+**Errors** are llama.cpp's, with the same messages: `400` `invalid_input` for a bad
+request (`"state" must be provided`, `questions.<id>: "criteria" must be an array of 2
+to 10 levels`, too many options, ...), and `501` `not_supported` for a model that isn't
+a decision model, for `kev` and `laya` decision models, and for any image (`images`
+data URLs or `image_url` parts in a chat state).
+
+**Speed:** on the Qwen3.5 hybrid models the engine evaluates prompts one token at a
+time, about 25 ms per evaluated token for lev on a T4. The example above takes ~7 s
+warm, against ~0.3 s for llama-server; see
+[docs/design/decision-models.md](../../docs/design/decision-models.md#results).
+
 ### `POST /v1/embeddings`
 
 OpenAI's embeddings API, for an embedding GGUF (a model with bidirectional attention

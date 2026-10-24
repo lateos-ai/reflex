@@ -3,8 +3,9 @@ use super::*;
 use crate::gguf::GgufFile;
 use cudarc::driver::CudaDevice;
 
-/// Byte-exact-ish cross-check of `prefill_hybrid_batched` (layer-major
-/// GatedAttention batching, GatedDeltaNet left sequential -- see
+/// Byte-exact-ish cross-check of `prefill_hybrid_batched` (layer-major:
+/// GatedAttention and the GatedDeltaNet projections/FFN as GEMMs, the
+/// GatedDeltaNet recurrence in row-walking kernels -- see
 /// `Model::forward_hybrid_layer_batched`'s doc comment) against
 /// `prefill_hybrid` (the original token-major sequential loop) on the
 /// same prompt/weights -- the blocking check before trusting the batched
@@ -18,13 +19,21 @@ use cudarc::driver::CudaDevice;
 fn prefill_hybrid_batched_matches_sequential() {
     let gguf_path = std::env::var("REFLEX_TEST_GGUF")
         .expect("set REFLEX_TEST_GGUF to a real local Qwen3.5 hybrid GGUF path to run this test");
-    let prompt = "The capital of France is";
-
     let file = GgufFile::open(&gguf_path).expect("failed to open REFLEX_TEST_GGUF");
     let device = CudaDevice::new(0).expect("failed to init CUDA device 0");
     let model = Model::load(device, &file).expect("failed to load hybrid model");
     let h = model.hybrid.as_ref().expect("loaded model is not hybrid");
 
+    // A short prompt, and one of ~150 tokens: long enough that the recurrent
+    // state is carried through many rows of the row-walking GDN kernels.
+    let long_prompt = "The quick brown fox jumps over the lazy dog. ".repeat(15)
+        + "In summary, the fox and the dog are";
+    for prompt in ["The capital of France is", long_prompt.as_str()] {
+        check_hybrid_batched_prompt(&model, h, prompt);
+    }
+}
+
+fn check_hybrid_batched_prompt(model: &Model, h: &HybridModel, prompt: &str) {
     let (seq_ids, seq_hidden, _, seq_position) = model
         .prefill_hybrid(h, prompt, None, 0)
         .expect("prefill_hybrid failed");

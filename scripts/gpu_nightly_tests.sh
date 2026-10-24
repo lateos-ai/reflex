@@ -68,13 +68,15 @@ requirement() {
     *::qwen3moe_fixture_*) echo "|test-data/tiny-qwen3moe.gguf|fixture missing" ;;
     *::qwen35moe_fixture_*|model::kv_f16_tests::upload_state_*) echo "|test-data/tiny-qwen35moe.gguf|fixture missing" ;;
     # ipc_kv_f16_file_granite_and_gemma4_fixtures_reject opens tiny-gemma4.gguf as well.
-    *::ipc_kv_relay_granite_fixture_*|*::ipc_kv_f16_file_granite_and_gemma4_*|*::ipc_pinned_prefix_granite_fixture_*|*::ipc_json_schema_granite_fixture_*|*::ipc_system1_resumed_granite_fixture_*) echo "|test-data/tiny-granitehybrid.gguf|fixture missing" ;;
+    *::ipc_kv_relay_granite_fixture_*|*::ipc_kv_f16_file_granite_and_gemma4_*|*::ipc_pinned_prefix_granite_fixture_*|*::ipc_json_schema_granite_fixture_*|*::ipc_system1_resumed_granite_fixture_*|*::ipc_label_logits_granite_fixture_*) echo "|test-data/tiny-granitehybrid.gguf|fixture missing" ;;
     *::ipc_pinned_prefix_gemma4_fixture_*|*::ipc_json_schema_gemma4_fixture_*|*::ipc_system1_resumed_gemma4_fixture_*) echo "|test-data/tiny-gemma4.gguf|fixture missing" ;;
     *::ipc_pinned_prefix_qwen2_fixture_*) echo "|test-data/tiny-qwen2.gguf|fixture missing" ;;
     *::ipc_pinned_prefix_kolibri1_fixture_*) echo "|test-data/tiny-kolibri1-f32.gguf|fixture missing" ;;
     model::mla_batching_tests::*|*::mla_fixture_f16_kv_cache_*|*::online_attention_matches_legacy_kernels_mla|*::ipc_kv_relay_mla_fixture_*|*::ipc_kv_f16_file_mla_fixture_*|*::ipc_pinned_prefix_mla_fixture_*|*::ipc_json_schema_mla_fixture_*|*::ipc_system1_resumed_mla_fixture_*) echo "|test-data/deepseek-tiny-mla.gguf|fixture missing" ;;
     *::gemma4_quant_resident_matches_dequantized) echo "|test-data/tiny-gemma4-q8_0.gguf|fixture missing (llama-quantize tiny-gemma4.gguf to Q8_0)" ;;
     model::gemma4_model_tests::*|*::quant_resident_q8_0_*|model::attention_tiled_tests::*|*::f16_kv_cache_is_rejected_where_unsupported) echo "|test-data/tiny-gemma4.gguf|fixture missing" ;;
+    *::label_logits_tiny_lev_*) echo "|test-data/tiny-lev.gguf|fixture missing (test-data/tiny-lev-src.tar.gz)" ;;
+    model::label_logits_tests::*|*::ipc_label_logits_tinyopenjev_fixture_*) echo "|test-data/tinyopenjev-for-testing-Q8_0.gguf|fixture missing (ggml-org/tinyopenjev-for-testing-gguf)" ;;
     model::rmsnorm_tests::*) echo "|test-data/tiny-qwen3moe.gguf|fixture missing" ;;
     *::kolibri1_q4km_fixture_generates|model::kolibri_config_tests::kolibri1_*|model::quant_resident_tests::kolibri1_*) echo "|test-data/tiny-kolibri1.gguf|fixture missing" ;;
     # kolibri1_batched_prefill_matches_sequential opens tiny-kolibri1.gguf as well.

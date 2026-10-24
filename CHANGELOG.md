@@ -5,6 +5,39 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Batched Gated DeltaNet prefill (Qwen3.5, `qwen35moe`).** Prompts no longer run
+  through the Gated DeltaNet layers one token at a time. The projections and the FFN
+  are GEMMs over the whole prompt, and the conv and delta-rule recurrences run in
+  kernels that walk the rows in order, keeping the recurrent state in registers. Each
+  row is bit-identical to the single-token kernels; only the GEMM summation order
+  changes (relative L2 1.2e-6 on the last hidden row with f32 weights). lev `Q8_0` on a
+  T4: a 1,054-token prefill takes 0.67 s (was 26.3 s), and the `/v1/systemone`
+  support-ticket example 330 ms warm (was 7.06 s) and 1.7 s from a cold process (was
+  8.4 s; llama-server 3.5 s). `reflex check` token ids unchanged. See
+  [docs/design/decision-models.md](docs/design/decision-models.md#batched-gated-deltanet-prefill).
+- **Decision models: `POST /v1/systemone`.** The OpenAI adapter answers llama.cpp's
+  `/v1/systemone` (TypeSafe's System One API) for the label-token decision models on
+  the Qwen3.5 hybrid path: lev (ggml-org's `lev-GGUF`) and OpenJev, text only. A
+  request is a `state` and typed questions (`choice`, `score`, `noul`); each answer is
+  read from the logits of one label token per option, with the temperatures stored in
+  the GGUF. New:
+  - **Engine:** IPC `label_prompts`, the raw logits of single-token labels at the end of
+    several prompts. Their common token prefix is evaluated once and each prompt
+    continues from a copy of it; the session's pinned prefix is untouched.
+  - **Sidecar:** the `systemone` template, rendered with llama.cpp's `tojson` rules and
+    lev's sorted keys and reversed second variant, plus llama.cpp's validation, error
+    messages, temperature buckets and confidence formulas. `kev`/`laya` models and
+    images get `501`.
+
+  Checked against llama.cpp `a4cb4c6` on a T4 with 53 requests (1 to 60 options, every
+  question type, string/object/array/chat states, non-ASCII, floats, special-token
+  text, 1K-8K-token states, 22 error cases). Every prompt matched llama.cpp's own
+  renderer byte for byte and token for token. Against llama-server with f32 activations
+  and an f32 KV cache, the largest probability difference was 1.3e-3 on lev `Q8_0`
+  (f16 weights) and 2.9e-4 on the tiny test models, with the same choices and
+  `input_tokens` everywhere. With the batched Gated DeltaNet prefill (above), the
+  support-ticket example takes 330 ms warm on a T4 (llama-server: 300 ms). See
+  [docs/design/decision-models.md](docs/design/decision-models.md#results).
 - **Text embeddings: Nemotron-3.5-Embed-1B.** A GGUF with bidirectional attention
   (`<arch>.attention.causal = false`) now loads as an embedding model. NVIDIA's
   Nemotron-3.5-Embed-1B (`mistral3`) is the one supported, text only. New:
