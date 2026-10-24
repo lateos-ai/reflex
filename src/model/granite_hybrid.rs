@@ -414,8 +414,9 @@ impl Model {
     }
 
     /// A projection over `rows` positions: the decode GEMV for one row, a
-    /// cuBLAS GEMM otherwise (the same split every other path uses).
-    fn granite_mm(
+    /// cuBLAS GEMM otherwise (the same split every other path uses). Also
+    /// used by the Qwen3.5 batched Gated DeltaNet mixer.
+    pub(super) fn granite_mm(
         &self,
         x: &CudaSlice<f32>,
         w: &Weight,

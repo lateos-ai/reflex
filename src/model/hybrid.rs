@@ -162,6 +162,10 @@ pub(super) struct HybridModel {
     pub(super) gdn_gates_k: AotKernel,
     pub(super) gdn_delta_k: AotKernel,
     pub(super) gdn_gated_norm_k: AotKernel,
+    pub(super) gdn_conv_rows_k: AotKernel,
+    pub(super) gdn_l2_norm_rows_k: AotKernel,
+    pub(super) gdn_gates_rows_k: AotKernel,
+    pub(super) gdn_delta_rows_k: AotKernel,
 }
 
 impl Model {
@@ -388,6 +392,10 @@ impl Model {
                 "gdn_gates_kernel",
                 "gdn_delta_kernel",
                 "gdn_gated_norm_kernel",
+                "gdn_conv_rows_kernel",
+                "gdn_l2_norm_rows_kernel",
+                "gdn_gates_rows_kernel",
+                "gdn_delta_rows_kernel",
             ],
         )?
         .into_iter();
@@ -406,6 +414,18 @@ impl Model {
         let gdn_gated_norm_k = gdn_fns
             .next()
             .ok_or_else(|| ReflexError::Other("missing gdn_gated_norm_kernel".to_string()))?;
+        let gdn_conv_rows_k = gdn_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing gdn_conv_rows_kernel".to_string()))?;
+        let gdn_l2_norm_rows_k = gdn_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing gdn_l2_norm_rows_kernel".to_string()))?;
+        let gdn_gates_rows_k = gdn_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing gdn_gates_rows_kernel".to_string()))?;
+        let gdn_delta_rows_k = gdn_fns
+            .next()
+            .ok_or_else(|| ReflexError::Other("missing gdn_delta_rows_kernel".to_string()))?;
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
         pipeline.prefetch_from(file);
@@ -620,6 +640,10 @@ impl Model {
                 gdn_gates_k,
                 gdn_delta_k,
                 gdn_gated_norm_k,
+                gdn_conv_rows_k,
+                gdn_l2_norm_rows_k,
+                gdn_gates_rows_k,
+                gdn_delta_rows_k,
             }),
             mla: None,
             gemma4: None,
@@ -966,6 +990,249 @@ impl Model {
         let y = self.gdn_gated_norm(h, &o, &z, w.ssm_norm.f32()?, cfg.eps)?;
         let out_proj = self.gemv(&y, &w.ssm_out)?;
         self.add_inplace(&mut x, &out_proj)?;
+        Ok(x)
+    }
+
+    /// [`Self::gdn_gates`] over `rows` rows: `alpha_raw`/`beta_raw` are
+    /// `[rows, num_v_heads]`, and so are the returned `(beta, decay)`.
+    pub(super) fn gdn_gates_rows(
+        &self,
+        h: &HybridModel,
+        alpha_raw: &CudaSlice<f32>,
+        beta_raw: &CudaSlice<f32>,
+        dt: &CudaSlice<f32>,
+        a: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<(CudaSlice<f32>, CudaSlice<f32>), ReflexError> {
+        let heads = h.gdn_cfg.num_v_heads;
+        let n = rows * heads;
+        let mut dev_decay = self.alloc_out(n, "gdn_gates_rows decay")?;
+        let mut dev_beta = self.alloc_out(n, "gdn_gates_rows beta")?;
+        let threads = 256u32;
+        let launch_cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(threads).max(1), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            h.gdn_gates_rows_k
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (
+                        alpha_raw,
+                        beta_raw,
+                        dt,
+                        a,
+                        &mut dev_decay,
+                        &mut dev_beta,
+                        heads as u32,
+                        rows as u32,
+                    ),
+                )
+                .map_err(|e| crate::gpu_err!(e, "gdn_gates_rows launch: {e}"))?;
+        }
+        Ok((dev_beta, dev_decay))
+    }
+
+    /// [`Self::gdn_conv`] for `rows` positions in order: `qkv` and the
+    /// returned output are `[rows, conv_dim]`; `conv_state` ends where
+    /// `rows` single-token calls would leave it.
+    pub(super) fn gdn_conv_rows(
+        &self,
+        h: &HybridModel,
+        qkv: &CudaSlice<f32>,
+        conv1d: &CudaSlice<f32>,
+        conv_state: &mut CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let conv_dim = h.gdn_cfg.conv_dim();
+        let mut dev_out = self.alloc_out(rows * conv_dim, "gdn_conv_rows")?;
+        let threads = 256u32;
+        let launch_cfg = LaunchConfig {
+            grid_dim: ((conv_dim as u32).div_ceil(threads).max(1), 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            h.gdn_conv_rows_k
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (
+                        qkv,
+                        conv1d,
+                        conv_state,
+                        &mut dev_out,
+                        conv_dim as u32,
+                        h.gdn_cfg.conv_kernel_size as u32,
+                        rows as u32,
+                    ),
+                )
+                .map_err(|e| crate::gpu_err!(e, "gdn_conv_rows launch: {e}"))?;
+        }
+        Ok(dev_out)
+    }
+
+    /// Both of [`Self::forward_gdn_mixer`]'s [`Self::gdn_l2_norm`] calls (q
+    /// heads scaled by `q_scale`, k heads unscaled) for every row of the
+    /// `[rows, conv_dim]` conv output, in one launch.
+    pub(super) fn gdn_l2_norm_qk_rows(
+        &self,
+        h: &HybridModel,
+        conv_out: &mut CudaSlice<f32>,
+        rows: usize,
+        q_scale: f32,
+    ) -> Result<(), ReflexError> {
+        let cfg = &h.gdn_cfg;
+        let launch_cfg = LaunchConfig {
+            grid_dim: ((2 * cfg.num_k_heads) as u32, rows as u32, 1),
+            block_dim: (cfg.norm_block_dim(), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            h.gdn_l2_norm_rows_k
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (
+                        conv_out,
+                        cfg.conv_dim() as u32,
+                        cfg.num_k_heads as u32,
+                        cfg.head_dim as u32,
+                        cfg.eps,
+                        q_scale,
+                        1.0f32,
+                    ),
+                )
+                .map_err(|e| crate::gpu_err!(e, "gdn_l2_norm_rows launch: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::gdn_delta`] for `rows` positions in order: `qkv_normed` is
+    /// `[rows, conv_dim]`, `beta`/`decay` `[rows, num_v_heads]`, and the
+    /// returned output `[rows, value_dim]`. `recurrent` ends where `rows`
+    /// single-token calls would leave it.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn gdn_delta_rows(
+        &self,
+        h: &HybridModel,
+        recurrent: &mut CudaSlice<f32>,
+        qkv_normed: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        decay: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let cfg = &h.gdn_cfg;
+        let key_dim = cfg.key_dim();
+        let mut dev_o = self.alloc_out(rows * cfg.value_dim(), "gdn_delta_rows")?;
+        let launch_cfg = LaunchConfig {
+            grid_dim: (cfg.num_v_heads as u32, 1, 1),
+            block_dim: (cfg.head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            h.gdn_delta_rows_k
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (
+                        recurrent,
+                        qkv_normed,
+                        cfg.conv_dim() as u32,
+                        key_dim as u32,
+                        beta,
+                        decay,
+                        &mut dev_o,
+                        cfg.head_dim as u32,
+                        cfg.num_k_heads as u32,
+                        cfg.num_v_heads as u32,
+                        rows as u32,
+                    ),
+                )
+                .map_err(|e| crate::gpu_err!(e, "gdn_delta_rows launch: {e}"))?;
+        }
+        Ok(dev_o)
+    }
+
+    /// [`Self::gdn_gated_norm`] over `rows` rows: `gdn_gated_norm_kernel`
+    /// normalizes block `b`'s `head_dim` slice, so a grid of
+    /// `rows * num_v_heads` blocks covers `[rows, value_dim]`.
+    pub(super) fn gdn_gated_norm_rows(
+        &self,
+        h: &HybridModel,
+        o: &CudaSlice<f32>,
+        z: &CudaSlice<f32>,
+        norm_w: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let cfg = &h.gdn_cfg;
+        let mut dev_y = self.alloc_out(rows * cfg.value_dim(), "gdn_gated_norm_rows")?;
+        let launch_cfg = LaunchConfig {
+            grid_dim: ((rows * cfg.num_v_heads) as u32, 1, 1),
+            block_dim: (cfg.norm_block_dim(), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            h.gdn_gated_norm_k
+                .function
+                .clone()
+                .launch(
+                    launch_cfg,
+                    (o, z, norm_w, &mut dev_y, cfg.head_dim as u32, cfg.eps),
+                )
+                .map_err(|e| crate::gpu_err!(e, "gdn_gated_norm_rows launch: {e}"))?;
+        }
+        Ok(dev_y)
+    }
+
+    /// [`Self::forward_gdn_mixer`] over `rows` positions (`x` is
+    /// `[rows, hidden_size]`), structured like Granite's
+    /// `granite_ssm_mixer`: the RMSNorm, the four input projections and
+    /// `ssm_out` run over all rows at once (GEMMs, or the decode GEMVs when `rows == 1`), and
+    /// the recurrent steps (conv, delta) are kernels that walk the rows in
+    /// order. Per row, the conv, L2-norm, delta and gated-norm results are
+    /// bit-identical to the single-token kernels; only the projections'
+    /// GEMM-vs-GEMV summation order differs.
+    pub(super) fn forward_gdn_mixer_batched(
+        &self,
+        h: &HybridModel,
+        w: &GatedDeltaNetLayerWeights,
+        mut x: CudaSlice<f32>,
+        rows: usize,
+        conv_state: &mut CudaSlice<f32>,
+        recurrent: &mut CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, ReflexError> {
+        let cfg = &h.gdn_cfg;
+        let normed = self.rmsnorm(&x, w.attn_norm.f32()?, rows, h.attn_cfg.hidden_size, cfg.eps)?;
+        let qkv = self.granite_mm(&normed, &w.attn_qkv, rows)?;
+        let z = self.granite_mm(&normed, &w.attn_gate, rows)?;
+        let beta_raw = self.granite_mm(&normed, &w.ssm_beta, rows)?;
+        let alpha_raw = self.granite_mm(&normed, &w.ssm_alpha, rows)?;
+        prof_mark(PrefillPhase::QkvGemm, LayerKind::Ssm)?;
+
+        let (beta, decay) = self.gdn_gates_rows(
+            h,
+            &alpha_raw,
+            &beta_raw,
+            w.ssm_dt.f32()?,
+            w.ssm_a.f32()?,
+            rows,
+        )?;
+        let mut conv_out = self.gdn_conv_rows(h, &qkv, w.ssm_conv1d.f32()?, conv_state, rows)?;
+        let q_scale = 1.0 / (cfg.head_dim as f32).sqrt();
+        self.gdn_l2_norm_qk_rows(h, &mut conv_out, rows, q_scale)?;
+        let o = self.gdn_delta_rows(h, recurrent, &conv_out, &beta, &decay, rows)?;
+        let y = self.gdn_gated_norm_rows(h, &o, &z, w.ssm_norm.f32()?, rows)?;
+        prof_mark(PrefillPhase::Mixer, LayerKind::Ssm)?;
+        let out_proj = self.granite_mm(&y, &w.ssm_out, rows)?;
+        self.add_inplace(&mut x, &out_proj)?;
+        prof_mark(PrefillPhase::OProj, LayerKind::Ssm)?;
         Ok(x)
     }
 
@@ -1317,9 +1584,8 @@ impl Model {
     /// Batched-prefill variant of [`Self::forward_hybrid_ffn`]: identical
     /// SwiGLU shape, `Self::gemv`->`Self::gemm(..., rows)` and RMSNorm's
     /// row count `1`->`rows`, same as `Self::forward_layer_dense_batched`'s
-    /// FFN tail. Used for the `GatedAttention` sublayer only -- `GatedDeltaNet`
-    /// still calls the unbatched `Self::forward_hybrid_ffn` once per row (see
-    /// `Self::forward_hybrid_layer_batched`).
+    /// FFN tail. Used by both sublayer kinds in
+    /// `Self::forward_hybrid_layer_batched`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_hybrid_ffn_batched(
         &self,
@@ -1596,12 +1862,10 @@ impl Model {
     /// pass each (`Self::forward_gated_attn_mixer_batched`/
     /// `Self::forward_hybrid_ffn_batched`). `GatedDeltaNet` is a real
     /// recurrence (`conv_state`/`recurrent` carry position-to-position
-    /// dependencies) and is **not** batched -- it loops `rows` times over the
-    /// *unmodified* `Self::forward_gdn_mixer`/`Self::forward_hybrid_ffn`,
-    /// extracting/writing one row at a time (`Self::extract_row`/`Self::write_row`)
-    /// from the shared `[rows, hidden_size]` buffer. Total GDN work is
-    /// unchanged from the token-major loop, just grouped by layer instead of
-    /// interleaved.
+    /// dependencies), so only its recurrent steps stay sequential: they run
+    /// in kernels that walk the rows in order
+    /// (`Self::forward_gdn_mixer_batched`), while its projections and FFN are
+    /// batched GEMMs like the attention layers'.
     pub(super) fn forward_hybrid_layer_batched(
         &self,
         h: &HybridModel,
@@ -1611,8 +1875,6 @@ impl Model {
         rows: usize,
         state: &mut HybridLayerState,
     ) -> Result<CudaSlice<f32>, ReflexError> {
-        let hidden_size = h.attn_cfg.hidden_size;
-
         match (layer, state) {
             (
                 HybridLayerWeights::GatedAttention(w),
@@ -1638,16 +1900,16 @@ impl Model {
                     recurrent,
                 },
             ) => {
-                let mut out = hidden;
-                for row in 0..rows {
-                    let row_hidden = self.extract_row(&out, row, hidden_size)?;
-                    let post_mixer =
-                        self.forward_gdn_mixer(h, w, row_hidden, conv_state, recurrent)?;
-                    let row_out =
-                        self.forward_hybrid_layer_ffn(h, post_mixer, &w.post_attn_norm, &w.ffn)?;
-                    self.write_row(&mut out, row, hidden_size, &row_out)?;
-                }
-                prof_mark(PrefillPhase::Mixer, LayerKind::Ssm)?;
+                let post_mixer =
+                    self.forward_gdn_mixer_batched(h, w, hidden, rows, conv_state, recurrent)?;
+                let out = self.forward_hybrid_layer_ffn_batched(
+                    h,
+                    post_mixer,
+                    &w.post_attn_norm,
+                    &w.ffn,
+                    rows,
+                )?;
+                prof_mark(PrefillPhase::Ffn, LayerKind::Ssm)?;
                 Ok(out)
             }
             _ => Err(ReflexError::Other(
