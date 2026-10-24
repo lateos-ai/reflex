@@ -3481,6 +3481,61 @@ mod tests {
         assert_eq!(tok.encode_no_special("").unwrap(), Vec::<u32>::new());
     }
 
+    /// Decision prompts and labels tokenized as llama.cpp `a4cb4c6`'s
+    /// `server_decision_context::fill_task` does, from the JSON lines of a harness on
+    /// llama.cpp's own server-decision.cpp (the same goldens the sidecar's
+    /// `render_matches_llama_cpp_goldens_if_configured` checks the text of). Runs only
+    /// when `SYSTEMONE_GOLDEN_GGUF` and `SYSTEMONE_GOLDENS` are set (and needs
+    /// `serde_json`, from the `json-output` feature `ipc` turns on).
+    #[cfg(feature = "json-output")]
+    #[test]
+    fn test_decision_prompt_tokens_match_llama_cpp_goldens_if_configured() {
+        let (Ok(gguf), Ok(goldens)) = (
+            std::env::var("SYSTEMONE_GOLDEN_GGUF"),
+            std::env::var("SYSTEMONE_GOLDENS"),
+        ) else {
+            eprintln!("skipping: SYSTEMONE_GOLDEN_GGUF or SYSTEMONE_GOLDENS not set");
+            return;
+        };
+        let file = GgufFile::open(std::path::Path::new(&gguf)).expect("open GGUF");
+        let tok = Tokenizer::from_gguf(&file).expect("Tokenizer::from_gguf");
+        let ids = |v: &serde_json::Value| -> Vec<u32> {
+            v.as_array().unwrap().iter().map(|t| t.as_u64().unwrap() as u32).collect()
+        };
+        let mut failures = Vec::new();
+        let mut n_prompts = 0;
+        for line in std::fs::read_to_string(&goldens).unwrap().lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let g: serde_json::Value = serde_json::from_str(line).unwrap();
+            let Some(prompts) = g["prompts"].as_array() else { continue };
+            for (i, p) in prompts.iter().enumerate() {
+                n_prompts += 1;
+                let want = ids(&p["tokens"]);
+                let got = tok.encode(p["prompt"].as_str().unwrap()).unwrap();
+                if got != want {
+                    let at = got.iter().zip(&want).take_while(|(a, b)| a == b).count();
+                    failures.push(format!(
+                        "{} prompt {i}: {} tokens vs llama.cpp {}, first difference at {at}",
+                        g["name"],
+                        got.len(),
+                        want.len()
+                    ));
+                }
+                for (piece, id) in p["label_pieces"].as_array().unwrap().iter().zip(ids(&p["labels"])) {
+                    let got = tok.encode_no_special(piece.as_str().unwrap()).unwrap();
+                    if got != [id] {
+                        failures.push(format!("{} label {piece}: {got:?} vs [{id}]", g["name"]));
+                    }
+                }
+            }
+        }
+        eprintln!("{n_prompts} prompts compared");
+        assert!(n_prompts > 0, "no prompts in {goldens}");
+        assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
+    }
+
     /// `qwen35` (QWEN35; Qwen3.5 and Qwen3.8). `test-data/qwen35-tokenizer.gguf`:
     /// metadata of
     /// https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf

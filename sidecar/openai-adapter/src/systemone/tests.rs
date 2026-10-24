@@ -592,3 +592,117 @@ fn build_response_maps_results_back_in_order() {
         .push(serde_json::json!({"tokens": 1, "logits": [0.0]}));
     assert!(m.build_response(&p, &long, "lev".into()).is_err());
 }
+
+// --- llama.cpp goldens ----------------------------------------------------------
+
+/// Renders a request set and checks it against goldens written by llama.cpp's own
+/// `server_decision_context` (a small harness on `a4cb4c6`'s server-decision.cpp):
+/// the same 400 messages, the same image refusals, and byte for byte the same
+/// prompts, labels and temperatures. Runs only when `SYSTEMONE_GOLDEN_GGUF` (the
+/// decision GGUF), `SYSTEMONE_GOLDEN_REQUESTS` (`[{"name", "body_text"}]`) and
+/// `SYSTEMONE_GOLDENS` (the harness's JSON lines) are set.
+#[test]
+fn render_matches_llama_cpp_goldens_if_configured() {
+    let (Ok(gguf), Ok(requests), Ok(goldens)) = (
+        std::env::var("SYSTEMONE_GOLDEN_GGUF"),
+        std::env::var("SYSTEMONE_GOLDEN_REQUESTS"),
+        std::env::var("SYSTEMONE_GOLDENS"),
+    ) else {
+        eprintln!("skipping: SYSTEMONE_GOLDEN_GGUF, _REQUESTS or SYSTEMONE_GOLDENS not set");
+        return;
+    };
+    let Support::Ready(m) = load(&gguf) else {
+        panic!("{gguf}: not a supported decision model");
+    };
+    let requests: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&requests).unwrap()).unwrap();
+    let bodies: HashMap<String, String> = requests
+        .iter()
+        .map(|r| {
+            (
+                r["name"].as_str().unwrap().to_string(),
+                r["body_text"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+
+    let mut failures = Vec::new();
+    let mut n_prompts = 0;
+    let goldens = std::fs::read_to_string(&goldens).unwrap();
+    for line in goldens.lines().filter(|l| !l.trim().is_empty()) {
+        let g: serde_json::Value = serde_json::from_str(line).unwrap();
+        let name = g["name"].as_str().unwrap();
+        let mut fail = |what: String| failures.push(format!("{name}: {what}"));
+        let parsed = match serde_json::from_str::<Json>(&bodies[name]) {
+            Ok(body) => m.parse(&body),
+            Err(e) => {
+                if g.get("exception").is_none() {
+                    fail(format!("body does not parse here ({e}) but does in llama.cpp"));
+                }
+                continue;
+            }
+        };
+        if g.get("exception").is_some() {
+            fail(format!("llama.cpp threw {}, here {parsed:?}", g["exception"]));
+            continue;
+        }
+        if let Some(want) = g.get("error").and_then(|e| e.as_str()) {
+            match parsed {
+                Err(RequestError::Invalid(got)) if got == want => {}
+                other => fail(format!("want 400 {want:?}, got {other:?}")),
+            }
+            continue;
+        }
+        if g.get("n_images").is_some() {
+            if !matches!(parsed, Err(RequestError::ImagesUnsupported)) {
+                fail(format!("want images 501, got {parsed:?}"));
+            }
+            continue;
+        }
+        let parsed = match parsed {
+            Ok(p) => p,
+            Err(e) => {
+                fail(format!("rejected here: {e:?}"));
+                continue;
+            }
+        };
+        let plan = m.plan(&parsed).unwrap();
+        let want = g["prompts"].as_array().unwrap();
+        if plan.prompts.len() != want.len() {
+            fail(format!("{} prompts, llama.cpp {}", plan.prompts.len(), want.len()));
+            continue;
+        }
+        let questions = parsed
+            .questions
+            .iter()
+            .flat_map(|q| (0..m.n_variants(q)).map(move |_| q));
+        for (i, ((prompt, labels), q)) in plan.prompts.iter().zip(&plan.labels).zip(questions).enumerate() {
+            n_prompts += 1;
+            let w = &want[i];
+            if w["q"].as_str() != Some(q.id.as_str()) {
+                fail(format!("prompt {i}: question {}, llama.cpp {}", q.id, w["q"]));
+            }
+            if w["prompt"].as_str() != Some(prompt.as_str()) {
+                fail(format!(
+                    "prompt {i} differs:\n--- here\n{prompt}\n--- llama.cpp\n{}",
+                    w["prompt"].as_str().unwrap_or("")
+                ));
+            }
+            let pieces: Vec<&str> = w["label_pieces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect();
+            if *labels != pieces {
+                fail(format!("prompt {i}: labels {labels:?}, llama.cpp {pieces:?}"));
+            }
+            let t = w["temperature"].as_f64().unwrap() as f32;
+            if m.temperature(q) != t {
+                fail(format!("prompt {i}: temperature {} vs {t}", m.temperature(q)));
+            }
+        }
+    }
+    eprintln!("{n_prompts} prompts compared");
+    assert!(failures.is_empty(), "{} mismatches:\n{}", failures.len(), failures.join("\n"));
+}

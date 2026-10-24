@@ -610,11 +610,8 @@ impl DecisionModel {
     /// `parse_state` do, then refuses images.
     pub fn parse(&self, body: &Json) -> Result<Parsed, RequestError> {
         let invalid = |m: String| RequestError::Invalid(m);
-        if !matches!(body, Json::Obj(_)) {
-            return Err(invalid(
-                "the request body must be a JSON object".to_string(),
-            ));
-        }
+        // A body that is not an object has no "state" (as in llama.cpp, whose
+        // `contains` is false on a non-object).
         let Some(state) = body.get_non_null("state") else {
             return Err(invalid("\"state\" must be provided".to_string()));
         };
