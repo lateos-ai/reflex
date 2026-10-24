@@ -13,7 +13,8 @@ What has been built, in order. Measurements live in
     (`pre = pixtral`).
   - **Surfaces:** `reflex embed`, IPC `"embed": true`, C FFI `reflex_embed`, the OpenAI
     adapter's `POST /v1/embeddings` (with `input_type`, `dimensions` and base64), and
-    Hub jobs with an `input` field.
+    Hub jobs with an `input` field. The Hub's Model dropdown offers
+    Nemotron-3.5-Embed-1B Q8_0 (1.2 GB download).
 
   Against HF `transformers` in fp32 on a T4, over 27 inputs up to 17,364 tokens, the
   BF16 file with f32 weights matches to a cosine of 1.0000000; Q8_0 gives 0.99986, and
