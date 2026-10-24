@@ -297,12 +297,14 @@ changes how llama.cpp groups prompts and so its own results slightly (its test a
 0.01 between shared and unshared prefixes on the tiny model), so the matched run is done
 with `-np 1` and with the default, and both differences are reported.
 
-**Prompts.** A small C++ harness on llama.cpp's `common/jinja` renders the templates
-for the request set; the sidecar's rendering must match it byte for byte, and token for
-token after tokenization. This covers the `tojson` rules, lev's sorted keys, both
-variants, and non-ASCII and float values in the state.
+**Prompts.** A small C++ harness on llama.cpp's own `server_decision_context` (the
+code `llama-server` runs: its `parse_questions`, `parse_state`, `render` and
+`fill_task`'s tokenization, on `common/jinja`) renders and tokenizes the request set;
+the sidecar's rendering must match it byte for byte, and the engine's tokenization
+token for token. This covers the `tojson` rules, lev's sorted keys, both variants, and
+non-ASCII and float values in the state.
 
-**Requests.** The PR's support-ticket request (five questions over an object state),
+**Requests.** The PR's support-ticket request (three questions over a string state),
 plus 20 or more others: 2 to 52 options (above 26 on lev reaches the two-letter labels
 and the `mid`/`large` buckets), every question type, `noul` with and without
 descriptions, string, object, array and chat-message states, non-ASCII text, a state
@@ -327,6 +329,103 @@ GPU nightly suite.
 **Benchmarks** (T4): process start to first answer, Reflex vs `llama-server` start plus
 one request, with the support-ticket request; warm per-request latency on the same
 request, Reflex vs `llama-server`.
+
+## Results
+
+AWS `g4dn.xlarge` (Tesla T4 16 GB, 4 vCPUs, gp3 root volume), 2026-10-24. llama.cpp
+`a4cb4c6` built twice for `sm_75`: stock, and with `LLAMA_NO_Q8` (quantized weights
+through cuBLAS instead of 8-bit activation kernels). The matched configuration also
+sets `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32`, without which that cuBLAS path computes in
+f16 on a T4. Every llama-server run used `-c 32768`. Reflex ran the sidecar in front of
+`reflex stdio`, with f16 weights for lev and f32 for the tiny models.
+
+**Request set.** 53 requests, sent unchanged to both servers: the support-ticket request;
+an object state and the same state as a JSON string; `choice` with 1, 2, 5, 8, 9, 26, 27,
+52 and (lev only) 60 options; `score` with 2 and 10 levels, including non-string level
+descriptions; `noul` without criteria, with only `true`, and with `null`; array,
+chat-message and `{"messages": ...}` states; French, Chinese, Greek, Hebrew, Russian and
+emoji text, also in keys and question ids; floats (`19.99`, `1e-7`, `1e20`, `1.5e300`,
+`0.0`, a 13-digit fraction) and JSON escapes; special-token text inside the state;
+empty and non-string instructions; unsorted nested keys; ten mixed questions in one
+request; long states of about 1K, 4K and 8K tokens per prompt; and 22 error cases.
+
+**Prompts and tokens.** Every rendered prompt matched llama.cpp's renderer byte for byte
+(54 prompts on tinyopenjev, 79 each on tiny-lev and lev), and the engine's tokenization,
+label tokens and temperatures matched too. So did every `400` message and both image
+refusals. One difference was found and fixed: a body that is not a JSON object
+(`[1, 2]`) gets llama.cpp's `"state" must be provided` (nlohmann's `contains` is false
+on a non-object), not a message of the sidecar's own. A body that is not valid JSON is
+a `400` from both, with different parser messages.
+
+**Answers.** Reflex against each llama-server configuration, over every answered request
+(30 on tinyopenjev, 31 on the lev models). "Worst" is the largest difference of any
+probability, `score` or `noul`:
+
+| model | vs matched, `-np 1` | vs matched, default (4 slots) | vs stock |
+|---|---|---|---|
+| tinyopenjev (f32) | 4.6e-7 | 2.9e-4 | 1.3e-3, one `choice` differs |
+| tiny-lev (f32) | 2.4e-7 | 2.5e-7 | 9.0e-4, four `choice`s differ |
+| lev `Q8_0` (Reflex f16) | 1.29e-3 | 1.29e-3 | 2.0e-2, 31 values over 2e-3, one `choice` differs |
+
+Both matched configurations **pass** on all three models: every value within 2e-3, the
+same `choice` for every question and the same `input_tokens` for every request. The
+other columns are llama.cpp's own spread:
+
+- **`-np` on the tiny OpenJev model.** llama.cpp's matched runs with `-np 1` and with
+  the default differ from each other by the same 2.9e-4 (on tiny-lev by 2e-8, on lev by
+  1.9e-6). With 4 slots it evaluates a request's prompts as one group from a shared
+  prefix; Reflex shares a prefix too, but the summation order of its kernels lines up
+  with llama.cpp's unshared run there.
+- **Stock llama.cpp** is far from its own matched build: up to 1.85e-2 on lev (lev
+  `array_state`'s `noul` 0.848 stock, 0.829 matched, 0.828 Reflex). Stock 8-bit
+  activations move lev's label logits by a few hundredths. The `choice` differences in
+  that column are near-ties on the random tiny models (top two within 4e-4) and one on
+  lev (`ten_questions.q9`, 12 options, top two 6e-6 apart); stock llama.cpp
+  disagrees with its matched build on exactly the same questions.
+- **lev's 1.29e-3** is Reflex's f16 weights against f32 arithmetic on the `Q8_0` blocks
+  (an f16 product of an int8 and an f16 scale is rounded; lev's f32 weights don't fit
+  the T4). It is under the 2e-3 bar, but it is the margin to watch if a later change
+  touches the hybrid path.
+
+A model without `decision.type` gets `501` `This model is not a decision model` from
+both.
+
+**Regression.** The GPU nightly suite on this branch: 148 passed, 0 failed, 4 skipped
+(real Granite, IQ, DeepSeek-V2-Lite and Qwen2.5 GGUFs, not on this machine), including
+the five `label_logits_tests` and the two `ipc_label_logits_*` tests, and the existing
+`system1`, prefill and llama.cpp fixture tests. `reflex check` itself was not re-run.
+
+**Benchmarks**, support-ticket request on lev `Q8_0` (four prompts, 484 tokens in all,
+67 of them shared):
+
+| | Reflex (sidecar + `reflex stdio`, f16) | llama-server (stock) |
+|---|---|---|
+| cold, page cache warm (n=5): process start to first answer | 8.40 s (8.38-8.43) | 3.54 s (3.50-3.64) |
+| cold, page cache dropped (n=3) | 41.2 s | 37.2 s |
+| warm, per request (n=100) | 7.06 s | 295 ms |
+
+Reflex loads faster (about 1.3 s from process start to ready, against about 3.2 s for
+llama-server), but **its first request costs 7 s, and so does every later one.** The
+cost is not in `label_logits`: `REFLEX_PREFILL_PROFILE=1` puts 99.5% of a 149-token lev
+prefill in the Gated DeltaNet mixer (3,659 of 3,680 ms; 821 ms on Qwen3.5-0.8B), with the
+host enqueue time equal to the GPU time. The Qwen3.5 hybrid path runs those layers one
+token at a time, so each evaluated token costs about 25 ms on lev (283 evaluated tokens
+here: the shared 67 once, then 46, 46, 82 and 42). llama.cpp's chunked prefill evaluates
+the whole request in ~0.3 s. Prefix sharing helps (484 tokens are counted, 283
+evaluated), but it can't close a ~25x gap.
+
+With the page cache dropped, both are bound by the volume (135 MB/s for the 4.5 GB file,
+33 s for a plain `dd`), and Reflex's 41 s is that read plus the 7 s request. An earlier
+disk-cold run showed llama-server at 4.1 s; it was measured while the previous Reflex
+process was still exiting and holding the file mapped, so the cache drop missed those
+pages. The benchmark now waits for every server process to exit before dropping the
+cache.
+
+**What it means.** The decision endpoint is correct: Reflex gives llama.cpp's answers on
+lev and the tiny models. It is not yet the cold-start win this work was meant to be. On
+the Qwen3.5 hybrid models that needs a batched (chunked) Gated DeltaNet prefill; Granite
+4.0-H already walks the rows inside each kernel for its Mamba-2 layers, which is the
+smaller step.
 
 ## Not supported in Phase 1
 

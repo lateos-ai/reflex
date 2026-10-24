@@ -336,6 +336,60 @@ Supported: `mistral3` encoders, i.e. NVIDIA's Nemotron-3.5-Embed-1B (text only; 
 
 Design, numerics and results: [design/embeddings.md](design/embeddings.md).
 
+## Decision models
+
+A decision model answers typed questions about a piece of text in one forward pass per
+question, with no generation: each answer is a probability distribution over the
+options, read from the logits of one label token per option at the end of the prompt.
+Supported: the label-token types on the Qwen3.5 hybrid path, `lev` (ggml-org's
+`lev-GGUF`) and `openjev` (OpenJev's text input). `kev` and `laya` models and images are
+not supported yet.
+
+| surface | how |
+|---|---|
+| HTTP | the sidecar's `POST /v1/systemone`, llama.cpp's TypeSafe System One API: `state` plus typed `questions` (`choice`, `score`, `noul`) in, answers with probabilities and confidences out ([`sidecar/openai-adapter`](../sidecar/openai-adapter/README.md#post-v1systemone)) |
+| IPC (`reflex stdio`/`uds`) | `label_prompts`, below: the engine half, raw logits only |
+
+The sidecar renders the GGUF's `systemone` template for each question, sends every
+prompt in one IPC request and turns the logits into answers. The engine request:
+
+```json
+{"id": "q1", "label_prompts": [
+  {"prompt": "<|im_start|>user\n...<|im_start|>assistant\n<think>\n\n</think>\n\n", "labels": ["A", "B", "C"]},
+  {"prompt": "<|im_start|>user\n...", "labels": ["A", "B"]}
+]}
+```
+
+```json
+{"id": "q1", "event": "final", "ok": true, "shared_tokens": 67,
+ "labels": [{"tokens": 113, "token_ids": [32, 33, 34], "logits": [21.43, 13.54, 12.89]},
+            {"tokens": 109, "token_ids": [32, 33], "logits": [9.97, 6.04]}]}
+```
+
+- **Prompts** are encoded like every other prompt (special-token text parsed). Each
+  label is encoded alone, with special-token text as plain text, and must be exactly
+  one token; anything else fails the request with `invalid_input`. At most 256 prompts
+  and 255 labels per prompt.
+- **Results** come back in prompt order: `tokens` is the prompt's full length,
+  `token_ids` the labels' tokens, `logits` their raw LM-head logits at the last
+  position (no temperature, no softmax).
+- **Shared prefix:** the longest token prefix common to all prompts (leaving each at
+  least one token) is evaluated once, and each prompt continues from a copy of that
+  state, one after another. `shared_tokens` is its length (0 for one prompt). The copy
+  lives only for the request: the session's [pinned prefix](#kv-cache-files) is
+  untouched, and `label_prompts` doesn't combine with `pin_prefix`/`use_pinned`.
+- **Combines with** `id` and `timings` only; any other field fails with
+  `invalid_input`. Architectures other than Qwen3.5 hybrid fail with
+  `unsupported_architecture`.
+- **Speed:** the Gated DeltaNet layers of the Qwen3.5 hybrid path evaluate a prompt one
+  token at a time, so a request costs about 25 ms per evaluated token for lev on a T4
+  (the support-ticket example: 283 tokens, ~7 s). llama.cpp's chunked prefill answers
+  the same request in ~0.3 s. Reflex starts faster (~1.3 s to ready vs ~3.2 s), so this
+  path is not yet a cold-start win.
+
+Prompts, tokens and probabilities match llama.cpp on lev and on two small test models;
+design and results: [design/decision-models.md](design/decision-models.md).
+
 ## KV cache files
 
 `reflex generate --export-kv <file>` (IPC `export_kv`) writes the model's state after

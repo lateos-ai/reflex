@@ -391,6 +391,13 @@ in `test-data/` locally:
   `test-data/tiny-lev.gguf` is the same weights with lev's decision metadata and
   template written in (builder: `test-data/tiny-lev-src.tar.gz`). Both are CC BY-NC
   4.0, like OpenJev, and stay local. Their outputs are not meaningful.
+  `test-data/decision-models-src.tar.gz` holds the llama.cpp comparison: a harness on
+  llama.cpp's own `server_decision_context` that writes prompt and token goldens, the
+  request set, the goldens for all three models, and the HTTP comparison and benchmark
+  scripts. The sidecar's `render_matches_llama_cpp_goldens_if_configured` and the
+  engine's `test_decision_prompt_tokens_match_llama_cpp_goldens_if_configured` check a
+  GGUF against those goldens when `SYSTEMONE_GOLDEN_GGUF`, `SYSTEMONE_GOLDENS` (and,
+  for the sidecar, `SYSTEMONE_GOLDEN_REQUESTS`) are set.
 - Tests that need a real model read its path from `REFLEX_TEST_GGUF`. The nightly
   passes `SPM_GGUF` (a SentencePiece chat model, e.g. TinyLlama-1.1B-Chat) to the
   tests that need one (`ipc_kv_relay_spm_model_*`, `ipc_json_schema_spm_model_*`).

@@ -81,6 +81,7 @@ serverless endpoint in one click, no build required ([worker docs](.runpod/READM
 | Kolibri-1 MoE (`kolibri1`) | Aleph Alpha's Kolibri-1 78B, `Q4_K_M`; a synthetic fixture |
 | Gemma 4 dense, text only (`gemma4`) | Gemma 4 12B-it and 31B-it `Q8_0` (31B runs on a 48 GB card with QR; the `f16` opt-out needs ~80 GB); a synthetic fixture. E2B/E4B and 26B-A4B are not supported |
 | Text embeddings: Nemotron-3.5-Embed (`mistral3`, bidirectional) | Nemotron-3.5-Embed-1B `BF16`/`Q8_0`/`Q4_K_M` (vs HF `transformers`); a synthetic fixture. Images (the `mmproj` file), pooling other than mean and Ministral 3 chat models are not supported. See [docs/reference.md](docs/reference.md#embeddings) |
+| Decision models: lev, OpenJev (`qwen35` with `decision.type` `lev`/`openjev`) | ggml-org's lev `Q8_0` (f16 weights) and llama.cpp's tiny OpenJev test model, vs llama.cpp's `/v1/systemone`. Text only; `kev` and `laya` models are not supported. Served by the sidecar's `POST /v1/systemone`; see [docs/reference.md](docs/reference.md#decision-models) |
 
 Each architecture counted as supported only after its generated tokens matched an
 independent implementation (llama.cpp, or a CPU reference) on real hardware;
@@ -135,7 +136,7 @@ table below is the long form.
 |---|---|
 | **Serverless / scale-to-zero (start here)** | **[docs/deploy-serverless.md](docs/deploy-serverless.md)** |
 | Docker (one multi-target `Dockerfile`: `reflex`, `adapter`, `runpod-lb`) | [docs/reference.md](docs/reference.md#docker) |
-| OpenAI-compatible HTTP (`/v1/chat/completions`, `/v1/classify`, `/v1/embeddings`) | [sidecar/openai-adapter](sidecar/openai-adapter/README.md) |
+| OpenAI-compatible HTTP (`/v1/chat/completions`, `/v1/classify`, `/v1/embeddings`), and llama.cpp's `/v1/systemone` | [sidecar/openai-adapter](sidecar/openai-adapter/README.md) |
 | AWS, scale to zero (Spot, local socket) | [docs/aws-deployment.md](docs/aws-deployment.md) |
 | AWS, always warm (load balancer, HTTPS) | [docs/aws-deployment-warm.md](docs/aws-deployment-warm.md) |
 | Runpod serverless, load-balancing endpoint | [serverless/runpod](serverless/runpod/README.md) |

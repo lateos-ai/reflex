@@ -5,6 +5,30 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Decision models: `POST /v1/systemone`.** The OpenAI adapter answers llama.cpp's
+  `/v1/systemone` (TypeSafe's System One API) for the label-token decision models on
+  the Qwen3.5 hybrid path: lev (ggml-org's `lev-GGUF`) and OpenJev, text only. A
+  request is a `state` and typed questions (`choice`, `score`, `noul`); each answer is
+  read from the logits of one label token per option, with the temperatures stored in
+  the GGUF. New:
+  - **Engine:** IPC `label_prompts`, the raw logits of single-token labels at the end of
+    several prompts. Their common token prefix is evaluated once and each prompt
+    continues from a copy of it; the session's pinned prefix is untouched.
+  - **Sidecar:** the `systemone` template, rendered with llama.cpp's `tojson` rules and
+    lev's sorted keys and reversed second variant, plus llama.cpp's validation, error
+    messages, temperature buckets and confidence formulas. `kev`/`laya` models and
+    images get `501`.
+
+  Checked against llama.cpp `a4cb4c6` on a T4 with 53 requests (1 to 60 options, every
+  question type, string/object/array/chat states, non-ASCII, floats, special-token
+  text, 1K-8K-token states, 22 error cases). Every prompt matched llama.cpp's own
+  renderer byte for byte and token for token. Against llama-server with f32 activations
+  and an f32 KV cache, the largest probability difference was 1.3e-3 on lev `Q8_0`
+  (f16 weights) and 2.9e-4 on the tiny test models, with the same choices and
+  `input_tokens` everywhere. Not fast yet: the Qwen3.5 hybrid path evaluates prompts
+  one token at a time, so the support-ticket example takes ~7 s warm on a T4, against
+  ~0.3 s for llama-server. See
+  [docs/design/decision-models.md](docs/design/decision-models.md#results).
 - **Text embeddings: Nemotron-3.5-Embed-1B.** A GGUF with bidirectional attention
   (`<arch>.attention.causal = false`) now loads as an embedding model. NVIDIA's
   Nemotron-3.5-Embed-1B (`mistral3`) is the one supported, text only. New:
