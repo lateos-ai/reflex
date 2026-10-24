@@ -65,7 +65,8 @@ build options and output formats: [docs/reference.md](docs/reference.md).
 
 No GPU of your own? Reflex is listed on the
 [Runpod Hub](https://console.runpod.io/hub/listing/lateos-ai/reflex): deploy it as a
-serverless endpoint in one click, no build required ([worker docs](.runpod/README.md)).
+serverless endpoint in one click, no build required ([worker docs](.runpod/README.md)),
+with optional retrieval over your own documents ([RAG](.runpod/README.md#optional-rag)).
 
 ## Supported models and limits
 

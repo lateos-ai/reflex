@@ -87,12 +87,13 @@ RUN apt-get update \
 
 # The only new runtime dependencies this whole addition introduces: a Python
 # interpreter and the runpod SDK, needed solely to speak Runpod's queue job
-# envelope (see handler.py), plus curl to fetch the model below. Nothing else in
+# envelope (see handler.py), plus curl to fetch the model below. numpy is for the
+# optional RAG mode's vector search (rag.py; unused unless RAG=on). Nothing else in
 # this image needs Python.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --no-cache-dir runpod
+    && pip3 install --no-cache-dir runpod numpy
 
 COPY --from=builder /build/target/release/reflex /usr/local/bin/reflex
 COPY --from=builder /build/sidecar/openai-adapter/target/release/reflex-openai-adapter /usr/local/bin/reflex-openai-adapter
@@ -126,6 +127,6 @@ ENV GGUF_PATH=/models/model.gguf
 # that GGUF once at worker start.
 ENV BAKED_MODEL=Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
 
-COPY .runpod/handler.py /handler.py
+COPY .runpod/handler.py .runpod/rag.py /
 
 ENTRYPOINT ["python3", "-u", "/handler.py"]
