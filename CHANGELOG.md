@@ -5,6 +5,14 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Runpod Hub: optional RAG.** A new `RAG` deploy field (off by default) makes the Hub
+  worker run an embedding model (Nemotron-3.5-Embed-1B) next to the chat model. A chat
+  job with a `rag` object is answered from the passages closest to its question, taken
+  from documents sent with the job, a folder on the network volume (`RAG_DIR`) or a
+  corpus URL (`RAG_CORPUS_URL`). The passages are returned with the answer, and the
+  corpus index is cached on the volume. Retrieval is host-side Python in the worker
+  (`.runpod/rag.py`); the engine and the adapter are unchanged. See
+  [.runpod/README.md](.runpod/README.md#optional-rag).
 - **Batched Gated DeltaNet prefill (Qwen3.5, `qwen35moe`).** Prompts no longer run
   through the Gated DeltaNet layers one token at a time. The projections and the FFN
   are GEMMs over the whole prompt, and the conv and delta-rule recurrences run in

@@ -58,6 +58,10 @@ OpenAI `list` object:
 {"input": {"input": ["What is NVIDIA NeMo Framework?"], "input_type": "query"}}
 ```
 
+**Retrieval (RAG)**: with the deploy form's RAG field set to `on`, a chat job with a `rag`
+object is answered from your documents, and its output carries the passages used. See
+[Optional RAG](#optional-rag).
+
 The worker bakes **Qwen3-0.6B-Q8_0** (not the Q4_K_M the `runpod-lb` image uses): the
 listing leads with classification, and on a sub-3B model Q8_0 preserves the fine-grained
 logits the label softmax reads where a 4-bit quant can move a near-tie. No generation
@@ -173,6 +177,96 @@ JSON as the job's `error`.
 `reflex-openai-adapter` flags, e.g. `--max-tokens-cap 1024 --default-max-tokens 128`; see
 [`sidecar/openai-adapter/README.md`](../sidecar/openai-adapter/README.md)'s flag list and
 request limits.
+
+## Optional RAG
+
+Off by default; with `RAG` off, the worker behaves exactly as described above. With
+`RAG` set to `on`, the worker starts a second `reflex-openai-adapter` that serves an
+embedding model (`RAG_EMBED_MODEL`, Nemotron-3.5-Embed-1B Q8_0 by default) on another
+loopback port, next to the chat model. A chat job with a `rag` object then goes through
+these steps in `handler.py` and `rag.py`:
+
+1. Embeds the question: the last user message, or `rag.query`.
+2. Embeds the job's own `rag.documents`, if any.
+3. Scores them and the corpus index by cosine similarity, and keeps the best `top_k`
+   passages.
+4. Writes those passages, numbered, into the system message, with an instruction to answer
+   from them and cite `[n]`.
+5. Sends the request to the chat model as usual.
+
+The engine and the adapter are unchanged; retrieval is host-side Python in the worker.
+
+```json
+{"input": {
+  "messages": [{"role": "user", "content": "Where is the spare key?"}],
+  "max_tokens": 64,
+  "rag": {"documents": ["The spare key is under the blue pot.", "Lunch is at noon."]}
+}}
+```
+
+The output is the usual one-element list, with the chat completion plus a `rag` object:
+
+```json
+[{"object": "chat.completion", "choices": [...],
+  "rag": {"query": "Where is the spare key?",
+          "passages": [{"n": 1, "id": "doc0#0", "doc": "doc0", "origin": "request",
+                        "score": 0.61, "text": "The spare key is under the blue pot."}]}}]
+```
+
+`n` is the number the prompt cites. `origin` is `request` or `corpus`. `score` is the
+cosine similarity. With `"stream": true`, the first streamed item is
+`{"object": "rag.context", "query": ..., "passages": [...]}`, followed by the usual
+`chat.completion.chunk`s.
+
+**`rag` fields** (all optional, `{}` searches the corpus with the last user message):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `documents` | `[]` | Up to 64 strings or `{"id", "text"}` objects, 1 MB of text in all, chunked and searched for this job only (nothing is stored) |
+| `query` | last user message | The text to search with |
+| `top_k` | `RAG_TOP_K` (4) | Passages to add, 1-32 |
+| `use_corpus` | `true` | `false` searches only `documents` |
+| `min_score` | none | Drop passages scoring below this |
+
+`rag` can't be combined with `labels`. A `rag` job on a worker with RAG off fails with an
+error saying so. On a RAG worker, plain embedding jobs (`input` and no `messages`) go to
+the embedding model, so one endpoint can also serve embeddings for client-side retrieval.
+
+**The corpus.** There are two optional sources, embedded when a worker starts, before it
+takes jobs:
+
+- **`RAG_DIR`**, by default `/runpod-volume/rag` on the network volume: every `.txt` and
+  `.md` file is one document (its id is its path), and every line of a `.jsonl` file is
+  one (`{"text": ..., "id": optional}`). Other files and dot-directories are skipped,
+  and the log lists the skipped files. A missing default folder is fine; a folder you
+  set yourself must exist.
+- **`RAG_CORPUS_URL`**: a `.jsonl`, `.txt` or `.md` file, or a `.tar.gz`/`.tgz`/`.tar`/`.zip`
+  of them. It's downloaded once (the same resuming downloader as the models, and
+  `HF_TOKEN` applies to huggingface.co). An archive member with an absolute path or `..`
+  fails the worker, and links are skipped.
+
+Documents are split into passages of `RAG_CHUNK_CHARS` characters (1200), each repeating
+the last `RAG_CHUNK_OVERLAP` characters (200) of the one before, at paragraph, line,
+sentence or word breaks. The index (vectors plus passage text) is cached under
+`/runpod-volume/reflex-rag/index/<key>/`, or `/models/reflex-rag/` without a volume. The
+key covers the embedding model, the chunk settings and every source file's path, size and
+modification time, so editing a file or a setting rebuilds the index on the next worker
+start, and unchanged corpora load from the cache. The retrieved context is capped at
+`RAG_MAX_CONTEXT_CHARS` (24000; set it as an endpoint environment variable): lower-scored
+passages are dropped first.
+
+**Costs to plan for:**
+
+- **Start-up.** Indexing is one engine forward pass per passage, so time a large corpus
+  on the first start. The cache makes later starts quick only with a network volume; on
+  container disk, every new worker re-embeds.
+- **Memory.** The embedding model adds a 1.2 GB download and about 2.4 GB of VRAM (f16
+  weights) to the chat model's.
+- **Context.** Passages go into the prompt, so a small model's context window and the
+  adapter's 256 KiB prompt limit bound `top_k` × chunk size.
+
+Answer quality is the chat model's: a 0.6B model follows the passages less reliably than
+a 7B one.
 
 ## GPU pin: portable PTX, not sm_86 (unlike `serverless/runpod/`)
 

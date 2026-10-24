@@ -19,6 +19,14 @@ Downloads go to the network volume (/runpod-volume/reflex-models) when one is
 attached, so later workers reuse them, else to the container disk. HF_TOKEN, if
 set, is sent to huggingface.co for gated repos.
 
+Optional RAG (RAG=on, see rag.py): a second adapter serves an embedding GGUF
+(RAG_EMBED_MODEL, Nemotron-3.5-Embed-1B by default) on another loopback port.
+At worker start the corpus (a RAG_DIR folder and/or RAG_CORPUS_URL) is chunked,
+embedded and cached as an index; a job whose input has "rag" gets the passages
+closest to its question written into its system message, and the answer comes
+back with those passages. Embedding jobs on such a worker go to the second
+adapter. With RAG off (the default) nothing here changes.
+
 The handler is a generator, so Runpod's /stream/{job_id} works. With
 "stream": true in the job input, each Server-Sent Event the adapter sends is
 yielded as one chat.completion.chunk dict; otherwise the single complete
@@ -42,9 +50,13 @@ import urllib.request
 
 import runpod
 
+import rag
+
 ADAPTER_HOST = "127.0.0.1"
 ADAPTER_PORT = 8000
 ADAPTER_BASE = f"http://{ADAPTER_HOST}:{ADAPTER_PORT}"
+EMBED_PORT = 8001
+EMBED_BASE = f"http://{ADAPTER_HOST}:{EMBED_PORT}"
 READY_TIMEOUT_SECONDS = 120
 POLL_INTERVAL_SECONDS = 0.25
 
@@ -52,7 +64,10 @@ VOLUME_DIR = "/runpod-volume"
 DOWNLOAD_ATTEMPTS = 5
 DOWNLOAD_CHUNK = 8 << 20
 
-_adapter_process = None
+DEFAULT_EMBED_MODEL = "maternion/Nemotron-3.5-Embed-1B-GGUF/Nemotron-3.5-Embed-1B-Q8_0.gguf"
+
+_rag_cfg = None
+_rag_index = None
 
 
 def _fail(message):
@@ -60,20 +75,23 @@ def _fail(message):
     sys.exit(1)
 
 
-def _model_url():
-    """The GGUF to download, or None to use the baked model."""
-    url = os.environ.get("GGUF_URL", "").strip()
+def _log(message):
+    print(f"reflex worker: {message}", flush=True)
+
+
+def _model_url(model, url="", what="MODEL"):
+    """The GGUF to download for a model id ("<owner>/<repo>/<file>.gguf") or a
+    direct URL, or None to use the baked model."""
     if url:
         if not url.startswith(("https://", "http://")):
             _fail(f"GGUF_URL must be an http(s) URL, got {url!r}")
         return url
-    model = os.environ.get("MODEL", "").strip()
     if not model or model == os.environ.get("BAKED_MODEL"):
         return None
     owner, _, rest = model.partition("/")
     repo, _, filename = rest.partition("/")
     if not (owner and repo and filename.endswith(".gguf")):
-        _fail(f"MODEL must be <owner>/<repo>/<file>.gguf, got {model!r}")
+        _fail(f"{what} must be <owner>/<repo>/<file>.gguf, got {model!r}")
     return f"https://huggingface.co/{owner}/{repo}/resolve/main/{urllib.parse.quote(filename)}"
 
 
@@ -134,15 +152,22 @@ def _download(url, dest):
     _fail(f"{url}: download failed after {DOWNLOAD_ATTEMPTS} attempts")
 
 
-def _resolve_model():
+def _cache_root(name):
+    """Where downloads and indexes go: the network volume when one is attached, so
+    later workers reuse them, else the container disk."""
+    if os.path.isdir(VOLUME_DIR):
+        return os.path.join(VOLUME_DIR, name)
+    return os.path.join("/models", name)
+
+
+def _resolve_model(model, url="", what="MODEL"):
     """Path of the GGUF to serve: the baked one, or the selected one, downloaded once."""
-    url = _model_url()
+    url = _model_url(model, url, what)
     if url is None:
         return os.environ["GGUF_PATH"]
-    root = os.path.join(VOLUME_DIR, "reflex-models") if os.path.isdir(VOLUME_DIR) else "/models"
     # One directory per URL, so the file keeps its own name (the API's `model`
     # field is its stem) and two URLs with the same file name don't collide.
-    cache = os.path.join(root, hashlib.sha256(url.encode()).hexdigest()[:12])
+    cache = os.path.join(_cache_root("reflex-models"), hashlib.sha256(url.encode()).hexdigest()[:12])
     os.makedirs(cache, exist_ok=True)
     name = os.path.basename(urllib.parse.urlparse(url).path) or "model.gguf"
     dest = os.path.join(cache, name)
@@ -156,17 +181,17 @@ def _resolve_model():
     return dest
 
 
-def _wait_for_ready():
+def _wait_for_ready(process, base):
     deadline = time.monotonic() + READY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        if _adapter_process.poll() is not None:
+        if process.poll() is not None:
             print(
-                f"reflex-openai-adapter exited early with code {_adapter_process.returncode}",
+                f"reflex-openai-adapter exited early with code {process.returncode}",
                 file=sys.stderr,
             )
             sys.exit(1)
         try:
-            with urllib.request.urlopen(f"{ADAPTER_BASE}/healthz", timeout=2) as resp:
+            with urllib.request.urlopen(f"{base}/healthz", timeout=2) as resp:
                 if resp.status == 200:
                     return
                 # 204: still loading the model, keep polling.
@@ -181,28 +206,90 @@ def _wait_for_ready():
     sys.exit(1)
 
 
-def _watchdog():
-    _adapter_process.wait()
+def _watchdog(process):
+    process.wait()
     print(
-        f"reflex-openai-adapter exited unexpectedly with code {_adapter_process.returncode}",
+        f"reflex-openai-adapter exited unexpectedly with code {process.returncode}",
         file=sys.stderr,
     )
     os._exit(1)
 
 
-def _start_adapter():
-    global _adapter_process
-    gguf_path = _resolve_model()
+def _spawn_adapter(gguf_path, port, extra_args):
+    """Start one reflex-openai-adapter on a loopback port and wait until it is
+    ready; if it ever exits, the watchdog takes the whole worker down."""
+    process = subprocess.Popen(
+        ["reflex-openai-adapter", gguf_path, "--host", ADAPTER_HOST, "--port", str(port)]
+        + extra_args,
+    )
+    _wait_for_ready(process, f"http://{ADAPTER_HOST}:{port}")
+    threading.Thread(target=_watchdog, args=(process,), daemon=True).start()
+
+
+def _post_embeddings(body):
+    """POST body to the embedding adapter's /v1/embeddings and return its JSON."""
+    request = urllib.request.Request(
+        f"{EMBED_BASE}/v1/embeddings",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=300) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise rag.RagError(f"embedding server: HTTP {e.code}: {detail}") from None
+    except urllib.error.URLError as e:
+        raise rag.RagError(f"embedding server: {e}") from None
+
+
+def _start_rag():
+    """Start the embedding adapter, then load or build the corpus index."""
+    global _rag_cfg, _rag_index
+    try:
+        cfg = rag.config_from_env(os.environ, DEFAULT_EMBED_MODEL)
+    except rag.RagError as e:
+        _fail(str(e))
+    if not os.environ.get("GGUF_URL", "").strip() and os.environ.get("MODEL", "").strip() == cfg["embed_model"]:
+        _fail("RAG needs a chat model in Model; the embedding model is RAG_EMBED_MODEL")
+    embed_path = _resolve_model(cfg["embed_model"], what="RAG_EMBED_MODEL")
+    _spawn_adapter(embed_path, EMBED_PORT, [])
+
+    cache_root = _cache_root("reflex-rag")
+    sources = []
+    if os.path.isdir(cfg["dir"]):
+        sources.append((cfg["dir"], "dir"))
+    elif cfg["dir"] != rag.DEFAULT_DIR:
+        # The default folder is optional (the deploy form always sends it); one the
+        # user named must exist.
+        _fail(f"RAG_DIR {cfg['dir']} does not exist (is the network volume attached?)")
+    try:
+        if cfg["corpus_url"]:
+            sources.append((rag.fetch_corpus(cfg["corpus_url"], cache_root, _download, _log), "url"))
+        if sources:
+            started = time.monotonic()
+            _rag_index = rag.build_or_load_index(
+                sources, cfg, cache_root, _post_embeddings, _log, exclude=(_cache_root("reflex-models"),)
+            )
+            if _rag_index is not None:
+                _log(f"corpus index ready in {time.monotonic() - started:.1f} s ({len(_rag_index)} chunks)")
+        else:
+            _log("no corpus configured; only per-request documents will be searched")
+    except rag.RagError as e:
+        _fail(f"RAG corpus: {e}")
+    _rag_cfg = cfg
+
+
+def _start_adapters():
+    if rag.env_flag(os.environ.get("RAG", "off")):
+        _start_rag()
+    gguf_path = _resolve_model(os.environ.get("MODEL", "").strip(), os.environ.get("GGUF_URL", "").strip())
     # Optional extra adapter flags (e.g. "--max-tokens-cap 1024"); unset = the
     # adapter's own request-limit defaults. Its default --request-timeout-secs (300)
     # matches this shim's own urlopen timeout below.
     extra_args = shlex.split(os.environ.get("ADAPTER_ARGS", ""))
-    _adapter_process = subprocess.Popen(
-        ["reflex-openai-adapter", gguf_path, "--host", ADAPTER_HOST, "--port", str(ADAPTER_PORT)]
-        + extra_args,
-    )
-    _wait_for_ready()
-    threading.Thread(target=_watchdog, daemon=True).start()
+    _spawn_adapter(gguf_path, ADAPTER_PORT, extra_args)
 
 
 def _sse_events(resp):
@@ -219,17 +306,29 @@ def _sse_events(resp):
 
 def handler(event):
     payload = dict(event.get("input", {}))
+    base, rag_info = ADAPTER_BASE, None
+    if "rag" in payload:
+        if _rag_cfg is None:
+            yield {"error": 'this worker has RAG off: redeploy with RAG set to "on" to send "rag" jobs'}
+            return
+        try:
+            payload, rag_info = rag.prepare(payload, _rag_cfg, _rag_index, _post_embeddings)
+        except rag.RagError as e:
+            yield {"error": str(e)}
+            return
     if "labels" in payload:
         path, stream = "/v1/classify", False
     elif "input" in payload and "messages" not in payload:
         path, stream = "/v1/embeddings", False
+        if _rag_cfg is not None:
+            base = EMBED_BASE  # a RAG worker's embedding model
     else:
         path, stream = "/v1/chat/completions", bool(payload.get("stream", False))
         payload["stream"] = stream
 
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
-        f"{ADAPTER_BASE}{path}",
+        f"{base}{path}",
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -240,8 +339,15 @@ def handler(event):
         # the whole job.
         with urllib.request.urlopen(request, timeout=300) as resp:
             if not stream:
-                yield json.loads(resp.read())
+                result = json.loads(resp.read())
+                if rag_info is not None:
+                    result["rag"] = rag_info
+                yield result
                 return
+            if rag_info is not None:
+                # The passages first, so a streaming client can show its sources
+                # before the answer.
+                yield dict(object="rag.context", **rag_info)
             for chunk in _sse_events(resp):
                 if "error" in chunk:
                     # A mid-stream error event (e.g. the adapter's timeout).
@@ -255,5 +361,5 @@ def handler(event):
 
 
 if __name__ == "__main__":
-    _start_adapter()
+    _start_adapters()
     runpod.serverless.start({"handler": handler, "return_aggregate_stream": True})
