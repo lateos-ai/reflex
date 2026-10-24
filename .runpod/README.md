@@ -49,8 +49,9 @@ holding that `classification` object, like a non-streaming chat job:
 **Embeddings**: a job whose `input` has `input` and no `messages` goes to the adapter's
 `POST /v1/embeddings` (see
 [`sidecar/openai-adapter/README.md`](../sidecar/openai-adapter/README.md#post-v1embeddings)).
-It needs an embedding GGUF (Nemotron-3.5-Embed-1B, through the Custom GGUF URL field;
-it is not in the Model dropdown yet). The output is a one-element list holding the
+It needs an embedding model: pick Nemotron-3.5-Embed-1B in the Model dropdown. That
+model serves only embedding jobs; chat and classify jobs on it return an error, and
+embedding jobs on the other models do too. The output is a one-element list holding the
 OpenAI `list` object:
 
 ```json
@@ -78,6 +79,7 @@ Face when a worker starts, before it takes jobs:
 | Qwen3.5-0.8B Q4_K_M | `qwen35` (hybrid Gated DeltaNet) | 0.5 GB | 16 GB |
 | Granite 4.0-H 350M / 1B Q8_0 | `granitehybrid` (Mamba-2 hybrid) | 0.4 / 1.6 GB | 16 GB |
 | Gemma 4 12B-it Q8_0 | `gemma4` | 12.7 GB | 24 GB |
+| Nemotron-3.5-Embed-1B Q8_0 (embeddings only) | `mistral3` (encoder) | 1.2 GB | 16 GB |
 
 Checked 2026-10-23 on a Runpod A40 with this branch's engine, adapter and `handler.py`:
 every model downloads, loads and answers a chat, a streamed chat and a classify job.
@@ -92,6 +94,10 @@ run, Gemma 4 12B took 49 s and 79 s in two runs):
 | Qwen3-8B | 17.0 | Granite 4.0-H 350M | 4.5 |
 | Qwen2.5-1.5B | 3.4 | Granite 4.0-H 1B | 10.0 |
 | Qwen2.5-7B | 13.2 | Gemma 4 12B | 80.5 |
+
+Nemotron-3.5-Embed-1B was checked the same way on an AWS T4: it downloads (9.1 s), is
+ready in 11.4 s, answers embedding jobs (including `dimensions` and base64), and returns
+`invalid_input` for chat and classify jobs.
 
 - **Where downloads go.** With a network volume attached, to
   `/runpod-volume/reflex-models`, so only the first worker ever downloads a model. Without
@@ -108,7 +114,7 @@ run, Gemma 4 12B took 49 s and 79 s in two runs):
   DeepSeek-V2/V3 MLA family (about 80 GB), Kolibri-1 78B, Qwen3.8-27B and Gemma 4 31B
   (48-80 GB), and real Qwen3-MoE checkpoints (MoE weights aren't kept quantized). Run
   those with the `reflex` CLI or `serverless/runpod/` on a bigger GPU.
-- **Classification runs on every model** and the caller contract below applies to all
+- **Classification runs on every model but Nemotron** and the caller contract below applies to all
   of them, but accuracy is the model's: on the sentiment smoke test the default
   Qwen3-0.6B Q8_0 and most picks rate the review negative, while TinyLlama, Granite
   350M and Gemma 4 12B (whose instruction tuning expects its chat format) rate it

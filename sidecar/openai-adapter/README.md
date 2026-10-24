@@ -112,8 +112,8 @@ Python's string, dict and list methods (`.startswith()`, `.get()`, ...) through
 (Mistral's only accepts alternating user/assistant turns) gets the system text folded
 into the first user turn instead (`"{system}
 
-{user}"`). The 12 models the Runpod
-Hub worker offers render byte-identical to Python `jinja2` under those settings.
+{user}"`). The 12 chat models the
+Runpod Hub worker offers render byte-identical to Python `jinja2` under those settings.
 
 **Stop tokens.** At startup the adapter also reads the model's end-of-generation
 tokens from the GGUF (`src/stop_tokens.rs`) and logs them: the EOS, EOT and EOM ids
