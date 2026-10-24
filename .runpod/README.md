@@ -257,16 +257,34 @@ passages are dropped first.
 
 **Costs to plan for:**
 
-- **Start-up.** Indexing is one engine forward pass per passage, so time a large corpus
-  on the first start. The cache makes later starts quick only with a network volume; on
-  container disk, every new worker re-embeds.
-- **Memory.** The embedding model adds a 1.2 GB download and about 2.4 GB of VRAM (f16
-  weights) to the chat model's.
+- **Start-up.** Indexing is one engine forward pass per passage: about 60 passages a
+  second on an RTX 4090 (below). The cache makes later starts quick only with a network
+  volume; on container disk, every new worker re-embeds.
+- **Memory.** The embedding model adds a 1.2 GB download and about 1 GB of VRAM to the
+  chat model's (12.7 GB → 13.6 GB peak next to Gemma 4 12B on a 24 GB RTX 4090).
 - **Context.** Passages go into the prompt, so a small model's context window and the
   adapter's 256 KiB prompt limit bound `top_k` × chunk size.
 
 Answer quality is the chat model's: a 0.6B model follows the passages less reliably than
 a 7B one.
+
+**Checked 2026-10-24** on a Runpod RTX 4090 (this branch built on the pod, the real
+adapters driven through `handler.handler`, a local directory standing in for the network
+volume, Qwen3-0.6B Q8_0 unless noted):
+
+| Scenario | Result |
+|---|---|
+| RAG off | The four `tests.json` jobs answer as before; a `rag` job returns the RAG-off error |
+| `RAG_DIR`: 15 design docs (416 KB) + one planted fact | 506 passages indexed in 8.2 s (worker ready in 16.9 s, including the 7.5 s Nemotron download). "What is the office cat called?" → "The office cat is called Biscuit. [1]", top passage the planted file (0.43; the next is 0.14) |
+| Same worker restarted | `using cached index`, ready in 1.3 s |
+| A corpus file touched | Index rebuilt (8.1 s) |
+| `rag.documents` only, `use_corpus: false` | Correct answer from the job's document |
+| Streamed `rag` job | First item `rag.context`, then the chunks |
+| Embedding job on a RAG worker | Served by the embedder |
+| `RAG_CORPUS_URL` = this repository's GitHub `.tar.gz` | 236 files extracted, 920 passages from 36 documents in 14.1 s; "what is batch_size always set to?" → "1", citing README/DEVELOPMENT/reference |
+| `RAG_CORPUS_URL` = a `.jsonl` | Correct answer with the record's id |
+| `MODEL` = Nemotron, or a missing `RAG_DIR` you set | Worker fails at start with the error message |
+| Gemma 4 12B Q8_0 + RAG on the 24 GB card | Fits (13.6 GB peak); correct grounded answer |
 
 ## GPU pin: portable PTX, not sm_86 (unlike `serverless/runpod/`)
 

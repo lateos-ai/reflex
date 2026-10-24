@@ -263,8 +263,10 @@ def build_or_load_index(sources, cfg, cache_root, post_embeddings, log, exclude=
     docs, fingerprint = [], []
     for root, label in sources:
         d, fp, skipped = load_sources(root, label, (cache_root,) + tuple(exclude))
-        for rel in skipped:
-            log(f"skipping {label}/{rel} (not .txt, .md or .jsonl)")
+        if skipped:
+            # One line, not one per file: a repository archive skips hundreds.
+            shown = ", ".join(skipped[:5]) + (f", ... ({len(skipped) - 5} more)" if len(skipped) > 5 else "")
+            log(f"skipping {len(skipped)} {label} file(s) that are not .txt, .md or .jsonl: {shown}")
         docs += [dict(doc, id=f"{label}/{doc['id']}" if len(sources) > 1 else doc["id"]) for doc in d]
         fingerprint += fp
     if not docs:
