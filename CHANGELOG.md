@@ -5,6 +5,16 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Batched Gated DeltaNet prefill (Qwen3.5, `qwen35moe`).** Prompts no longer run
+  through the Gated DeltaNet layers one token at a time. The projections and the FFN
+  are GEMMs over the whole prompt, and the conv and delta-rule recurrences run in
+  kernels that walk the rows in order, keeping the recurrent state in registers. Each
+  row is bit-identical to the single-token kernels; only the GEMM summation order
+  changes (relative L2 1.2e-6 on the last hidden row with f32 weights). lev `Q8_0` on a
+  T4: a 1,054-token prefill takes 0.67 s (was 26.3 s), and the `/v1/systemone`
+  support-ticket example 330 ms warm (was 7.06 s) and 1.7 s from a cold process (was
+  8.4 s; llama-server 3.5 s). `reflex check` token ids unchanged. See
+  [docs/design/decision-models.md](docs/design/decision-models.md#batched-gated-deltanet-prefill).
 - **Decision models: `POST /v1/systemone`.** The OpenAI adapter answers llama.cpp's
   `/v1/systemone` (TypeSafe's System One API) for the label-token decision models on
   the Qwen3.5 hybrid path: lev (ggml-org's `lev-GGUF`) and OpenJev, text only. A
@@ -25,9 +35,8 @@ What has been built, in order. Measurements live in
   renderer byte for byte and token for token. Against llama-server with f32 activations
   and an f32 KV cache, the largest probability difference was 1.3e-3 on lev `Q8_0`
   (f16 weights) and 2.9e-4 on the tiny test models, with the same choices and
-  `input_tokens` everywhere. Not fast yet: the Qwen3.5 hybrid path evaluates prompts
-  one token at a time, so the support-ticket example takes ~7 s warm on a T4, against
-  ~0.3 s for llama-server. See
+  `input_tokens` everywhere. With the batched Gated DeltaNet prefill (above), the
+  support-ticket example takes 330 ms warm on a T4 (llama-server: 300 ms). See
   [docs/design/decision-models.md](docs/design/decision-models.md#results).
 - **Text embeddings: Nemotron-3.5-Embed-1B.** A GGUF with bidirectional attention
   (`<arch>.attention.causal = false`) now loads as an embedding model. NVIDIA's

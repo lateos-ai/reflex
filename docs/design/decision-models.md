@@ -393,10 +393,11 @@ both.
 **Regression.** The GPU nightly suite on this branch: 148 passed, 0 failed, 4 skipped
 (real Granite, IQ, DeepSeek-V2-Lite and Qwen2.5 GGUFs, not on this machine), including
 the five `label_logits_tests` and the two `ipc_label_logits_*` tests, and the existing
-`system1`, prefill and llama.cpp fixture tests. `reflex check` itself was not re-run.
+`system1`, prefill and llama.cpp fixture tests.
 
 **Benchmarks**, support-ticket request on lev `Q8_0` (four prompts, 484 tokens in all,
-67 of them shared):
+67 of them shared), first with the one-token-at-a-time Gated DeltaNet prefill this
+endpoint was built on:
 
 | | Reflex (sidecar + `reflex stdio`, f16) | llama-server (stock) |
 |---|---|---|
@@ -404,28 +405,78 @@ the five `label_logits_tests` and the two `ipc_label_logits_*` tests, and the ex
 | cold, page cache dropped (n=3) | 41.2 s | 37.2 s |
 | warm, per request (n=100) | 7.06 s | 295 ms |
 
-Reflex loads faster (about 1.3 s from process start to ready, against about 3.2 s for
-llama-server), but **its first request costs 7 s, and so does every later one.** The
-cost is not in `label_logits`: `REFLEX_PREFILL_PROFILE=1` puts 99.5% of a 149-token lev
-prefill in the Gated DeltaNet mixer (3,659 of 3,680 ms; 821 ms on Qwen3.5-0.8B), with the
-host enqueue time equal to the GPU time. The Qwen3.5 hybrid path runs those layers one
-token at a time, so each evaluated token costs about 25 ms on lev (283 evaluated tokens
-here: the shared 67 once, then 46, 46, 82 and 42). llama.cpp's chunked prefill evaluates
-the whole request in ~0.3 s. Prefix sharing helps (484 tokens are counted, 283
-evaluated), but it can't close a ~25x gap.
+Reflex loaded faster (about 1.3 s from process start to ready, against about 3.2 s for
+llama-server), but its first request cost 7 s, and so did every later one.
+`REFLEX_PREFILL_PROFILE=1` put 99.5% of a 149-token lev prefill in the Gated DeltaNet
+mixer (3,659 of 3,680 ms), with the host enqueue time equal to the GPU time: the Qwen3.5
+hybrid path ran those layers one token at a time, about 25 ms per evaluated token on lev
+(283 evaluated tokens here: the shared 67 once, then 46, 46, 82 and 42).
 
 With the page cache dropped, both are bound by the volume (135 MB/s for the 4.5 GB file,
-33 s for a plain `dd`), and Reflex's 41 s is that read plus the 7 s request. An earlier
-disk-cold run showed llama-server at 4.1 s; it was measured while the previous Reflex
-process was still exiting and holding the file mapped, so the cache drop missed those
-pages. The benchmark now waits for every server process to exit before dropping the
-cache.
+33 s for a plain `dd`). An earlier disk-cold run showed llama-server at 4.1 s; it was
+measured while the previous Reflex process was still exiting and holding the file
+mapped, so the cache drop missed those pages. The benchmark waits for every server
+process to exit before dropping the cache.
 
-**What it means.** The decision endpoint is correct: Reflex gives llama.cpp's answers on
-lev and the tiny models. It is not yet the cold-start win this work was meant to be. On
-the Qwen3.5 hybrid models that needs a batched (chunked) Gated DeltaNet prefill; Granite
-4.0-H already walks the rows inside each kernel for its Mamba-2 layers, which is the
-smaller step.
+### Batched Gated DeltaNet prefill
+
+The Gated DeltaNet layers now prefill like Granite 4.0-H's Mamba-2 layers: the RMSNorm,
+the four input projections, `ssm_out` and the FFN run over all rows as GEMMs, and the
+recurrence runs in kernels that walk the rows in order (`gdn_conv_rows_kernel`,
+`gdn_delta_rows_kernel` and friends in `kernels_cuda/gated_deltanet.cu`).
+`gdn_delta_rows_kernel` keeps each thread's column of the state in registers for the
+whole prompt, where the single-token kernel read and wrote it four times per token.
+There is no chunked closed form (llama.cpp's WY/UT transform). This helps every Qwen3.5
+and `qwen35moe` prefill, not only `/v1/systemone`.
+
+Each row kernel does the single-token kernel's arithmetic in the same order, and a GPU
+test checks them bit for bit against a loop of the single-token kernels (1, 7 and 149
+rows; head dims 128, 32 and 160, the last on the global-memory fallback). Against the
+token-major prefill, the last hidden row moves by a relative L2 of 1.2e-6 with f32
+weights and 4.6e-4 with f16 (Qwen3.5-0.8B), from the GEMM summation order.
+
+Rerun on the same T4 (`g4dn.xlarge`), same harness:
+
+| | before | batched | llama-server (stock) |
+|---|---|---|---|
+| cold, page cache warm (n=5) | 8.40 s | **1.71 s** (1.70-1.74) | 3.51 s (3.50-3.62) |
+| cold, page cache dropped (n=3) | 41.2 s | **34.5 s** | 37.3 s |
+| warm, per request (n=100) | 7.06 s | **330 ms** (p90 331) | 300 ms (p90 302) |
+
+From a cold process with the page cache warm, Reflex now answers the ticket request
+**in half llama-server's time**, and a little sooner with it dropped (both are then
+bound by the 4.5 GB read). A warm request is 10% slower than llama-server's.
+
+One-token `generate` prefills on lev (f16 weights, warm process):
+
+| prompt tokens | before | batched | Gated DeltaNet mixer (recurrent kernels only) |
+|---|---|---|---|
+| 113 | 2,818 ms | 91 ms | 30 ms |
+| 1,054 | 26,279 ms | 667 ms | 278 ms |
+| 4,216 | - | 3,099 ms | 1,289 ms |
+
+The rest is the GEMMs and the attention layers. The recurrence is still sequential in
+the prompt, so it is the largest single share at every length (42% at 4K tokens); a
+chunked form is the next step if long prompts matter.
+
+**Answers after the change** (same 53 requests, same llama-server builds). Reflex
+against the matched configuration: lev 1.28e-3 with `-np 1` and with the default slot
+count, tiny-lev 2.5e-7, tinyopenjev 4.6e-7 (`-np 1`) and 2.9e-4 (default). All pass:
+same choices and `input_tokens`. The stock column is unchanged: the same differing
+values and `choice`s, which stock llama.cpp also shows against its own matched build.
+
+**Regression after the change.** GPU nightly 150 passed, 1 failed, 4 skipped. The
+failure, `kolibri1_quant_resident_generate_matches_dequantized` (the 12th greedy token
+under f16), fails the same way with the binary from before this change; it doesn't touch
+the hybrid path. `reflex check` on Qwen3.5-0.8B (f32 and f16), the `qwen35moe` fixture and
+lev, with a short and a ~550-token prompt, 32 tokens each: the same token ids before and
+after on all 8 rows, and the same as llama.cpp with f32 activations and an f32 KV cache
+on 7. The eighth (Qwen3.5-0.8B, short prompt) differs from llama.cpp at step 29, a
+0.019 near-tie, before and after alike.
+
+**What it means.** The decision endpoint gives llama.cpp's answers on lev and the tiny
+models, and with the batched prefill it is now a cold-start win on the T4: 1.7 s from
+process start to the first answer, against 3.5 s.
 
 ## Not supported in Phase 1
 

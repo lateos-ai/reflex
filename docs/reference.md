@@ -381,11 +381,9 @@ prompt in one IPC request and turns the logits into answers. The engine request:
 - **Combines with** `id` and `timings` only; any other field fails with
   `invalid_input`. Architectures other than Qwen3.5 hybrid fail with
   `unsupported_architecture`.
-- **Speed:** the Gated DeltaNet layers of the Qwen3.5 hybrid path evaluate a prompt one
-  token at a time, so a request costs about 25 ms per evaluated token for lev on a T4
-  (the support-ticket example: 283 tokens, ~7 s). llama.cpp's chunked prefill answers
-  the same request in ~0.3 s. Reflex starts faster (~1.3 s to ready vs ~3.2 s), so this
-  path is not yet a cold-start win.
+- **Speed:** on a T4, the support-ticket example on lev `Q8_0` (283 evaluated tokens)
+  takes 330 ms warm (llama-server: 300 ms) and 1.7 s from process start to the first
+  answer (llama-server: 3.5 s).
 
 Prompts, tokens and probabilities match llama.cpp on lev and on two small test models;
 design and results: [design/decision-models.md](design/decision-models.md).
