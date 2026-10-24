@@ -68,6 +68,15 @@ impl GgufMetaValue {
         }
     }
 
+    /// An `f32` value widened, or an `f64` one.
+    pub fn as_f64(&self) -> Option<f64> {
+        match *self {
+            GgufMetaValue::F32(v) => Some(v as f64),
+            GgufMetaValue::F64(v) => Some(v),
+            _ => None,
+        }
+    }
+
     pub fn as_string_array(&self) -> Option<Vec<&str>> {
         match self {
             GgufMetaValue::Array(items) => items.iter().map(GgufMetaValue::as_str).collect(),

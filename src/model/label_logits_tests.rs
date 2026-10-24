@@ -161,3 +161,52 @@ fn label_logits_rejects_bad_labels() {
     let err = model.label_logits(&[]).unwrap_err();
     assert_eq!(err.kind(), "invalid_input");
 }
+
+/// `test-data/tiny-lev.gguf`: tinyopenjev's weights with lev's decision metadata
+/// and template (`test-data/tiny-lev-src.tar.gz`). lev reads up to 255 labels,
+/// `A`-`Z` then the two-letter codes that are one token; the engine must accept
+/// every one the sidecar builds, and read them all in one gather.
+const TINY_LEV: &str = "test-data/tiny-lev.gguf";
+
+#[test]
+#[ignore]
+fn label_logits_tiny_lev_reads_all_255_labels() {
+    if !std::path::Path::new(TINY_LEV).exists() {
+        eprintln!("Skipping: {TINY_LEV} not present");
+        return;
+    }
+    let file = GgufFile::open(TINY_LEV).expect("open tiny-lev");
+    let device = CudaDevice::new(0).expect("CUDA device 0");
+    let opts = LoadOptions {
+        weights: WeightsDtype::F32,
+        lora_adapter: None,
+    };
+    let model = Model::load_with_options(device, &file, &opts).expect("load tiny-lev");
+    let codes = ('A'..='Z')
+        .map(|a| a.to_string())
+        .chain(('A'..='Z').flat_map(|a| ('A'..='Z').map(move |b| format!("{a}{b}"))));
+    let labels: Vec<String> = codes
+        .filter(|c| model.tokenizer.encode_no_special(c).unwrap().len() == 1)
+        .take(255)
+        .collect();
+    assert_eq!(labels.len(), 255);
+    assert_eq!(labels[254], "JT");
+    let p = prompt("Which team?", &["billing", "shipping"]);
+    let out = model
+        .label_logits(&[LabelPrompt {
+            prompt: p.clone(),
+            labels: labels.clone(),
+        }])
+        .expect("label_logits");
+    let r = &out.results[0];
+    assert_eq!(r.logits.len(), 255);
+    assert!(r.logits.iter().all(|x| x.is_finite()));
+    // The same rows read in any subset give the same values.
+    let some = model
+        .label_logits(&[LabelPrompt {
+            prompt: p,
+            labels: vec![labels[254].clone(), labels[0].clone()],
+        }])
+        .expect("subset");
+    assert_eq!(some.results[0].logits, [r.logits[254], r.logits[0]]);
+}

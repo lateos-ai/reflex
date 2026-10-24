@@ -197,6 +197,10 @@ where `n` is the number of options (2 for a `noul`, even on lev's rating scale):
 - every other type: `2` for n <= 2, `3_5`, `6_10`, `11` above (no shipped file uses
   these yet).
 
+llama.cpp reads each temperature as text: the `f32` goes through `std::to_string`
+(6 decimals) and back through `strtof`, so lev's `choice` temperature is 1.460645, not
+1.4606453. The sidecar does the same round trip.
+
 **Probabilities.** A softmax per variant, then the mean of the variants, in double
 precision:
 
@@ -236,9 +240,11 @@ the engine scores token positions.
   question;
 - computes the probabilities, confidences and the response.
 
-**Engine:** a new IPC request kind that takes a list of prompts, each with the label
-strings to read, and returns, for each prompt, the raw logit of each label at its last
-position and its token count. That is a generalization of hybrid `system1`, which
+**Engine:** `Model::label_logits`, reached by the IPC request
+`{"label_prompts": [{"prompt": ..., "labels": ["A", "B", ...]}, ...]}`. For each prompt
+it returns `{"tokens", "token_ids", "logits"}`: the prompt's token count and the raw
+logit of each label at its last position. The response also carries `shared_tokens`.
+The request combines with `id` and `timings` only. That is a generalization of hybrid `system1`, which
 already gathers raw LM-head logits for single-token candidates (`gemv_gather_lm_head`)
 but resolves them as continuations of one prompt and returns only one prompt's scores.
 
