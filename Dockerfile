@@ -35,6 +35,11 @@
 # `-runtime-` image's cuda-libraries meta-package (NCCL, cuFFT, cuSPARSE, cuSOLVER,
 # NPP, nvJPEG...) is dead weight that adds image-pull time to every cold start.
 ARG REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-base-ubuntu22.04
+# Compliance bundle (docs/compliance/README.md): 1 adds the SBOMs, third-party
+# licenses, the runtime's apt package list and the base image names to
+# /usr/share/reflex/compliance/ in every target. 0 (the default) adds nothing, and
+# BuildKit skips the stages that would make them.
+ARG COMPLIANCE_BUNDLE=0
 
 # ---- Shared toolchain + source -------------------------------------------------------
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS toolchain
@@ -42,11 +47,15 @@ FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS toolchain
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --no-modify-path
+# The toolchain is the one rust-toolchain.toml pins, installed before the rest of the
+# source is copied so a source change doesn't reinstall it.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --no-modify-path
 ENV PATH="/root/.cargo/bin:${PATH}"
 ENV CUDA_PATH="/usr/local/cuda"
 
 WORKDIR /build
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install
 COPY . .
 
 # Kernel build mode (see docs/reference.md's "Kernel build modes"; measurements in
@@ -100,8 +109,34 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libcublas-12-4 \
     && rm -rf /var/lib/apt/lists/*
 
+# ---- Compliance bundle (COMPLIANCE_BUNDLE=1 only) -------------------------------------
+# `bundle-files` is an empty stage by default; every target copies it, so with
+# COMPLIANCE_BUNDLE=0 the targets' contents are unchanged. Tool versions match
+# .github/workflows/compliance.yml.
+FROM toolchain AS compliance-src
+ARG REFLEX_RUNTIME_BASE
+RUN cargo install --locked cargo-cyclonedx@0.5.9 \
+    && cargo install --locked --features cli cargo-about@0.9.2 \
+    && sh scripts/compliance-bundle.sh /compliance \
+    && cp docs/compliance/data-handling.md /compliance/ \
+    && printf '{\n  "reflex_engine_crate_version": "%s",\n  "rustc": "%s",\n  "base_images": {"builder": "nvidia/cuda:12.4.1-devel-ubuntu22.04", "runtime": "%s"}\n}\n' \
+        "$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)" "$(rustc --version)" "$REFLEX_RUNTIME_BASE" \
+        > /compliance/build.json
+
+FROM runtime AS runtime-packages
+RUN dpkg-query -W > /dpkg.txt
+
+FROM scratch AS bundle-files-1
+COPY --from=compliance-src /compliance/ /usr/share/reflex/compliance/
+COPY --from=runtime-packages /dpkg.txt /usr/share/reflex/compliance/dpkg.txt
+
+FROM scratch AS bundle-files-0
+
+FROM bundle-files-${COMPLIANCE_BUNDLE} AS bundle-files
+
 # ---- target: adapter -----------------------------------------------------------------
 FROM runtime AS adapter
+COPY --from=bundle-files / /
 COPY --from=build-adapter /build/target/release/reflex /usr/local/bin/reflex
 COPY --from=build-adapter /build/sidecar/openai-adapter/target/release/reflex-openai-adapter /usr/local/bin/reflex-openai-adapter
 # The adapter spawns `reflex stdio` as its own child process, so both binaries share
@@ -131,5 +166,6 @@ CMD []
 
 # ---- target: reflex (default: keep this stage last) ----------------------------------
 FROM runtime AS reflex
+COPY --from=bundle-files / /
 COPY --from=build-reflex /build/target/release/reflex /usr/local/bin/reflex
 ENTRYPOINT ["/usr/local/bin/reflex", "generate"]

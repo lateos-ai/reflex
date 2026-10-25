@@ -1,0 +1,8 @@
+# The Rust toolchain every build uses: CI, the Dockerfiles (.runpod/, .modal/ and the
+# root one install exactly this) and local builds. Pinned so an image's SBOM
+# (.github/workflows/compliance.yml) describes a build that can be reproduced. Applies
+# to sidecar/openai-adapter too (rustup looks in parent directories).
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

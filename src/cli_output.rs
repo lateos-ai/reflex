@@ -1,4 +1,5 @@
-//! `--json` output for `generate`/`system1`/`bench`/`smoke`/`check`/`doctor`.
+//! `--json` output for `generate`/`system1`/`bench`/`smoke`/`check`/`doctor`/
+//! `model-info`.
 //! `#[cfg(feature = "json-output")]` for the whole module: deliberately its
 //! own feature rather than reusing `ipc` (see Cargo.toml), since JSON output
 //! on these subcommands has nothing to do with the `stdio`/`uds` IPC
@@ -16,7 +17,8 @@
 //! sometimes present.
 //!
 //! **Versioning**: the versioned result objects ([`GenerateResultJson`],
-//! [`System1ResultJson`], [`SmokeResultJson`], [`PhaseTimingJson`]) also carry
+//! [`System1ResultJson`], [`SmokeResultJson`], [`PhaseTimingJson`],
+//! [`ModelInfoJson`]) also carry
 //! a `schema_version` field (the current [`SCHEMA_VERSION`]) -- the one field
 //! with no plain-text `key=value` counterpart, added so a JSON consumer can
 //! detect a shape change. It's additive; readers that ignore unknown fields
@@ -44,16 +46,18 @@
 //! either its existing `println!` or [`print_json_line`], never both.
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 /// Version of the `--json` output contract, emitted as the `schema_version`
 /// field on the versioned result objects ([`GenerateResultJson`],
-/// [`System1ResultJson`], [`SmokeResultJson`], and [`PhaseTimingJson`]).
+/// [`System1ResultJson`], [`SmokeResultJson`], [`PhaseTimingJson`] and
+/// [`ModelInfoJson`]).
 ///
 /// Additive/forward-compatible: `serde` readers that ignore unknown fields
 /// keep working across a minor bump, so a *major* bump is the signal that an
 /// existing field changed meaning or was removed. Keep in sync with the
 /// docs/reference.md's "`--json` output contract" section.
-pub const SCHEMA_VERSION: &str = "1.3.0";
+pub const SCHEMA_VERSION: &str = "1.4.0";
 
 /// Serializes `value` as one line of JSON to stdout, matching `src/ipc.rs`'s
 /// `write_json_line` discipline (flushed immediately) but deliberately not
@@ -286,6 +290,31 @@ pub struct DoctorSummaryJson {
     pub checks_failed: usize,
 }
 
+/// `reflex model-info`: a GGUF's provenance metadata, without loading the
+/// model. `general` holds every scalar (or array-of-scalars, joined with
+/// `", "`) `general.*` key except `architecture`/`file_type`, keyed without
+/// the `general.` prefix (`license`, `name`, `source.url`, ...), exactly as
+/// the file states them. `sha256` is present only with `--sha256`.
+#[derive(Serialize)]
+pub struct ModelInfoJson {
+    pub schema_version: &'static str,
+    pub path: String,
+    pub size_bytes: u64,
+    pub gguf_version: u32,
+    pub tensor_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<String>,
+    /// `general.file_type` (llama.cpp's `llama_ftype`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<u64>,
+    /// Its name (`Q8_0`, `Q4_K_M`, ...) when the number is a known one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_type_name: Option<&'static str>,
+    pub general: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,7 +336,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"schema_version":"1.3.0","process_start_to_first_result_ms":1.0}"#
+            r#"{"schema_version":"1.4.0","process_start_to_first_result_ms":1.0}"#
         );
     }
 
@@ -323,7 +352,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"schema_version":"1.3.0","phase":"prompt_eval","duration_ms":1.0}"#
+            r#"{"schema_version":"1.4.0","phase":"prompt_eval","duration_ms":1.0}"#
         );
     }
 

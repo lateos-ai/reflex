@@ -1,0 +1,58 @@
+# cargo-deny policy for both Cargo projects (the engine at the root and
+# sidecar/openai-adapter, which has its own lockfile):
+#
+#   cargo deny check licenses bans sources
+#   cargo deny --manifest-path sidecar/openai-adapter/Cargo.toml check --config deny.toml licenses bans sources
+#
+# CI runs both (.github/workflows/ci.yml). Advisories are left out of CI on purpose: a
+# new RustSec advisory would fail unrelated pull requests; run `cargo deny check
+# advisories` by hand before a release. about.toml accepts the same licenses for
+# THIRD_PARTY_LICENSES.html.
+
+[graph]
+# Every optional feature (ipc, download, nvml, python, ...), not just the default
+# build: users build them, so their dependencies' licenses count too.
+all-features = true
+
+[licenses]
+# Permissive licenses only. A dependency under anything else fails the check until
+# it is reviewed and added here (or given an exception below).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# One allow list serves both projects, so a license only one of them uses is fine.
+unused-allowed-license = "allow"
+
+# Both come in only through the optional `download` feature (hf-hub), which no image
+# or default build includes, and both are used unmodified.
+[[licenses.exceptions]]
+# Mozilla's CA certificate list, as data.
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
+[[licenses.exceptions]]
+# File-level copyleft: only changes to option-ext's own files would have to be
+# published under MPL-2.0.
+crate = "option-ext"
+allow = ["MPL-2.0"]
+
+[bans]
+# Two versions of one crate is common in a dependency tree and not a license or
+# supply-chain problem; it is reported, not failed.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only: no git dependencies, no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

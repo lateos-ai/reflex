@@ -103,14 +103,31 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  # License, ban and source policy for both Cargo projects (deny.toml). Advisories
+  # are deliberately not checked here: see deny.toml's header.
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: cargo deny (engine)
+        run: cargo deny check licenses bans sources
+
+      - name: cargo deny (sidecar)
+        run: cargo deny --manifest-path sidecar/openai-adapter/Cargo.toml --config deny.toml check licenses bans sources
+
   # .runpod/handler.py is a thin Python translation shim for the Runpod Hub's
   # queue-based worker requirement (see .runpod/README.md) -- it has no engine
-  # logic of its own, so a syntax-only compile check is proportionate. It is not
-  # imported/run here since that would require pip-installing the runpod SDK and
-  # either mocking or spawning a real reflex-openai-adapter subprocess for no
-  # additional coverage value. Its optional RAG logic (.runpod/rag.py) is pure
-  # Python with the embedding server passed in, so it is unit-tested here with a
-  # fake one. Python 3.10 is the Hub image's (Ubuntu 22.04) interpreter.
+  # logic of its own. Its optional RAG logic (.runpod/rag.py) is pure Python with
+  # the embedding server passed in, so it is unit-tested here with a fake one;
+  # test_compliance.py imports handler.py itself with a stub runpod module and a
+  # faked adapter and download server, so the compliance wiring (and the
+  # unchanged responses with every option off) is tested without the SDK. Python
+  # 3.10 is the Hub image's (Ubuntu 22.04) interpreter.
   hub-handler-syntax-check:
     runs-on: ubuntu-latest
     steps:
@@ -120,12 +137,12 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Compile-check handler.py and rag.py (syntax only)
-        run: python -m py_compile .runpod/handler.py .runpod/rag.py
+      - name: Compile-check the worker's Python (syntax only)
+        run: python -m py_compile .runpod/handler.py .runpod/rag.py .runpod/compliance.py
 
-      - name: Unit-test rag.py
+      - name: Unit-test rag.py and compliance.py
         run: |
-          python -m pip install --quiet numpy
+          python -m pip install --quiet numpy==2.2.6
           python -m unittest discover -s .runpod -p 'test_*.py' -v
 
   # scripts/bench_compare.py gates the GPU nightly's perf check (gpu-nightly.yml);

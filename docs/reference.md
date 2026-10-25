@@ -9,7 +9,8 @@ Contents: [Subcommands](#subcommands) · [Build features](#build-features) ·
 [Context-length limit](#context-length-limit) · [`--json` output contract](#--json-output-contract) ·
 [JSON Schema output](#json-schema-output) · [KV cache files](#kv-cache-files) ·
 [Error categories](#error-categories) · [Host-side building blocks](#host-side-building-blocks) ·
-[Docker](#docker) · [Runpod](#runpod) · [Kubernetes](#kubernetes)
+[`reflex model-info`](#reflex-model-info) · [Docker](#docker) · [Runpod](#runpod) ·
+[Kubernetes](#kubernetes)
 
 ## Subcommands
 
@@ -18,7 +19,9 @@ tokens), `system1` (single-pass, non-autoregressive candidate scoring — the "S
 decision-loop path), `embed` (embed one text with an embedding model, see
 [Embeddings](#embeddings)), `smoke` (the AOT-pipeline check above), `bench` (warm-latency
 microbenchmark), `check` (byte-exact-vs-reference correctness check, CI-scriptable),
-and `stdio`/`uds` (local JSON-line IPC, both need `--features ipc`). Run `reflex
+`doctor` (GPU/CUDA health report), `model-info` (a GGUF's license, source and sha256,
+no GPU; see [`reflex model-info`](#reflex-model-info)) and `stdio`/`uds` (local
+JSON-line IPC, both need `--features ipc`). Run `reflex
 <subcommand>` with no further arguments to see that subcommand's own usage. For real
 HTTP clients (OpenRouter, the OpenAI SDKs, curl), see
 [`sidecar/openai-adapter`](../sidecar/openai-adapter/README.md) — a separate
@@ -40,7 +43,7 @@ feature matrix*, not a release build — see the table for what it drags in.
 |---|---|---|
 | *(none — core)* | `generate`/`system1`/`smoke`/`bench`/`check`, every supported model architecture | CUDA toolkit only (`nvcc`) |
 | `ipc` | `reflex stdio` / `reflex uds` (also enables `json-output` via `serde`) | none |
-| `json-output` | `--json` on `generate`/`system1`/`bench`/`smoke`/`check`/`doctor` | none |
+| `json-output` | `--json` on `generate`/`system1`/`bench`/`smoke`/`check`/`doctor`/`model-info` | none |
 | `download` | `--model <org/repo:file.gguf>` / `--quickstart` (HF downloader via `hf-hub`) | `libssl-dev` + `pkg-config` on Linux (**not** Windows/macOS, where `hf-hub` uses a different TLS backend) |
 | `nvml` | `reflex` energy instrumentation and the `reflex-energy` whole-process meter (dlopen'd `libnvidia-ml`, never linked) | none |
 | `python` | PyO3 bindings (`src/python.rs`) | a Python 3.8+ interpreter on the build host (`pyo3-build-config` probes for it) |
@@ -230,14 +233,15 @@ objects also carry a **`schema_version`** field so a consumer can detect a shape
 {"schema_version":"1.0.0","process_start_to_first_token_ms":456.4,"gguf_open_ms":37.3,...}
 ```
 
-- **Current version: `1.3.0`** (`SCHEMA_VERSION` in `src/cli_output.rs`). 1.1.0 added
+- **Current version: `1.4.0`** (`SCHEMA_VERSION` in `src/cli_output.rs`). 1.1.0 added
   `weights_dtype` to the `generate`, `system1`, `bench` and `check` result objects.
   1.2.0 added `kv_io_ms` to `generate`'s result: the time spent reading the
   `--import-kv` file or writing the `--export-kv` file, present only with one of them
   (the plain-text line gains the same `kv_io_ms=` field). The read includes uploading
   the file into the model's cache (see [KV cache files](#kv-cache-files)).
   1.3.0 added `embed`'s `REFLEX_EMBED_OK` result (with the vector in `embedding`).
-- The five versioned objects (with `embed`'s result) are `generate`'s `REFLEX_GENERATE_OK` result, `system1`'s
+  1.4.0 added `model-info`'s result (see [`reflex model-info`](#reflex-model-info)).
+- The six versioned objects (with `embed`'s and `model-info`'s results) are `generate`'s `REFLEX_GENERATE_OK` result, `system1`'s
   `REFLEX_SYSTEM1_OK` result, `smoke`'s `REFLEX_SMOKE_OK` result, and each additive
   `REFLEX_PHASE_OK` phase object. Per-item lines (`REFLEX_SYSTEM1_CANDIDATE_OK`,
   `REFLEX_LORA_OK`, `REFLEX_DOCTOR_CHECK`) and the other subcommands' result structs
@@ -485,6 +489,42 @@ None of these care how kernels get compiled — they're pure host-side GGUF/toke
 logic. There is deliberately no NVRTC runtime-compile-and-load path anywhere in this
 codebase — that's the thing this project's AOT design replaces, not reuses.
 
+## `reflex model-info`
+
+```
+reflex model-info <path-to-gguf> [--sha256] [--json]
+```
+
+Prints what a GGUF says about itself, for provenance records (model cards, the Hub
+worker's attestation): every `general.*` metadata key the converter wrote (name,
+license, source URL, organization, quantizer, base models, ...), the architecture and
+`general.file_type`. It parses only the header (mmap): no model load, no GPU, so it
+works in a `REFLEX_SKIP_CUDA=1` build. `--sha256` also hashes the whole file (seconds
+for a multi-GB model, so it is opt-in). Values are reported exactly as the file states
+them; a missing `general.license` stays missing.
+
+Plain text is one `REFLEX_MODEL_INFO_GENERAL key=general.<key> value="<value>"` line per
+key, in key order, then:
+
+```
+REFLEX_MODEL_INFO_OK path="model.gguf" size_bytes=366195616 gguf_version=3 tensor_count=402 architecture=granitehybrid file_type=7 file_type_name=Q8_0 sha256=c7d98736...
+```
+
+`--json` (needs `--features json-output`; the adapter images have it) prints one
+object instead (`ModelInfoJson`, schema 1.4.0):
+
+```json
+{"schema_version":"1.4.0","path":"model.gguf","size_bytes":366195616,"gguf_version":3,
+ "tensor_count":402,"architecture":"granitehybrid","file_type":7,"file_type_name":"Q8_0",
+ "general":{"license":"apache-2.0","base_model.0.organization":"Ibm Granite",...},
+ "sha256":"c7d98736..."}
+```
+
+`general` is keyed without the `general.` prefix; arrays of scalars are joined with
+`", "`. `file_type_name` is llama.cpp's name for the `llama_ftype` value, absent for an
+unknown one. `sha256` appears only with `--sha256`. See
+[docs/compliance/](compliance/README.md) for how this fits the other compliance records.
+
 ## Docker
 
 A multi-stage `Dockerfile` is included: the builder stage has the full CUDA devel
@@ -518,6 +558,12 @@ docker run --rm --gpus all -v /path/to/models:/models \
   --entrypoint /usr/local/bin/reflex reflex \
   system1 /models/Qwen3-0.6B-Q4_K_M.gguf "Q: ...? A:" --candidate " Yes" --candidate " No"
 ```
+
+`--build-arg COMPLIANCE_BUNDLE=1` (any target) adds the SBOMs, third-party licenses,
+apt package list and base image names under `/usr/share/reflex/compliance/`; the
+default (`0`) leaves every image's contents unchanged. See
+[docs/compliance/](compliance/README.md#the-compliance-bundle). The Rust toolchain all
+Dockerfiles install is the one `rust-toolchain.toml` pins.
 
 The CUDA major/minor version in both Docker stages must stay consistent with
 `Cargo.toml`'s pinned `cudarc` feature (`"cuda-12000"`, i.e. CUDA 12.x) — a mismatch is
@@ -573,6 +619,20 @@ type that requires a Python SDK handler). Two details that matter there:
   `sm_89`). `scripts/deploy_runpod.sh` still pins the SKU to **RTX A4500** by default, but
   only because benchmarks need one fixed SKU. A single-arch image for the AWS guides' T4 (`sm_75`) and one for the A4500
   (`sm_86`) are not interchangeable; the fatbin is.
+
+The Runpod Hub's queue worker ([`.runpod/`](../.runpod/README.md)) has three opt-in
+compliance options, all `off` by default:
+
+| Option | Values | What it does |
+| --- | --- | --- |
+| `COMPLIANCE` | `off`, `on` | Every response gains a `compliance` block (model file sha256 and license, engine version, image digest, GPU, the job's usage and wall time); a stream ends with a `compliance.attestation` event; `{"compliance": "report"}` returns the image's compliance bundle and a model card. A listed model whose sha256 doesn't match `.runpod/models.json` stops the worker. |
+| `AUDIT_LOG` | `off`, `stdout`, `volume` | One JSON line per job, to the worker's logs or to `/runpod-volume/reflex-audit/<worker-id>.jsonl`. |
+| `AUDIT_LOG_CONTENT` | `off`, `hash`, `full` | Whether audit lines leave out the prompt and answer, carry their sha256, or carry them as sent. |
+
+Model files are hashed while they download (or at image build, for the baked model)
+and the digest is kept next to the file, so these options add no hashing to later
+cold starts. Shapes and details: [.runpod/README.md](../.runpod/README.md#compliance-records-and-audit-log)
+and [docs/compliance/](compliance/README.md).
 
 ## Kubernetes
 
