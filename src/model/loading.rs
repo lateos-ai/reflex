@@ -439,6 +439,84 @@ pub(super) fn load_profile_enabled() -> bool {
     std::env::var("REFLEX_LOAD_PROFILE").is_ok_and(|v| v == "1")
 }
 
+/// `REFLEX_LOAD_INIT_SHARE=0` keeps the whole init on the init thread (see
+/// [`LoadInit::join`]), for A/B runs.
+fn load_init_share_enabled() -> bool {
+    std::env::var("REFLEX_LOAD_INIT_SHARE").map_or(true, |v| v != "0")
+}
+
+/// The one scoped thread a load spawns for its host/driver setup (the
+/// tokenizer, then the cuBLAS handle), so that setup overlaps the weight load
+/// instead of sitting on the serial path. Still exactly one extra thread per
+/// load (see `docs/DEVELOPMENT.md`'s Non-goals): what changed is that the load
+/// thread, once its weight loop is done, takes the cuBLAS half itself if the
+/// init thread hasn't started it yet, instead of waiting idle in `join`. A
+/// short weight loop (Qwen3-0.6B: ~73 ms on a T4) used to wait ~136 ms for
+/// both halves in sequence; a long one (Mistral 7B) finds both already done.
+pub(super) struct LoadInit<'scope> {
+    handle: ScopedJoinHandle<'scope, Result<(Tokenizer, Option<CudaBlas>), ReflexError>>,
+    /// Set by whichever thread starts on the cuBLAS handle first.
+    cublas_claimed: Arc<AtomicBool>,
+    device: Arc<CudaDevice>,
+    weights: WeightsDtype,
+}
+
+impl<'scope> LoadInit<'scope> {
+    pub(super) fn spawn<'env>(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        file: &'env GgufFile,
+        device: Arc<CudaDevice>,
+        weights: WeightsDtype,
+    ) -> Self {
+        let cublas_claimed = Arc::new(AtomicBool::new(false));
+        let claimed = cublas_claimed.clone();
+        let init_device = device.clone();
+        let handle = scope.spawn(move || {
+            let t = std::time::Instant::now();
+            let tokenizer = Tokenizer::from_gguf(file)?;
+            if load_profile_enabled() {
+                eprintln!(
+                    "REFLEX_LOAD_INIT tokenizer_ms={:.2}",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            let cublas = if claimed.swap(true, Ordering::AcqRel) {
+                None
+            } else {
+                Some(Model::build_cublas(&init_device, weights, "init")?)
+            };
+            Ok((tokenizer, cublas))
+        });
+        Self {
+            handle,
+            cublas_claimed,
+            device,
+            weights,
+        }
+    }
+
+    /// Waits for the init thread. If it hasn't started on the cuBLAS handle
+    /// yet, builds the handle on this thread meanwhile (unless
+    /// `REFLEX_LOAD_INIT_SHARE=0`). A tokenizer error wins over a cuBLAS one.
+    pub(super) fn join(self) -> Result<(Tokenizer, CudaBlas), ReflexError> {
+        let mine = (load_init_share_enabled() && !self.cublas_claimed.swap(true, Ordering::AcqRel))
+            .then(|| Model::build_cublas(&self.device, self.weights, "load"));
+        let (tokenizer, theirs) = self.handle.join().map_err(|_| {
+            ReflexError::Other("background load-init thread panicked".to_string())
+        })??;
+        let cublas = match (mine, theirs) {
+            (Some(mine), _) => mine?,
+            (None, Some(theirs)) => theirs,
+            (None, None) => {
+                return Err(ReflexError::Other(
+                    "load init: no thread built the cuBLAS handle".to_string(),
+                ))
+            }
+        };
+        Ok((tokenizer, cublas))
+    }
+}
+
 /// The loader's own wall-time parts of `model_load_ms`, for
 /// [`report_load_profile`].
 pub(super) struct LoadTimes {

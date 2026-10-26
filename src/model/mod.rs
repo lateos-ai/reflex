@@ -72,6 +72,7 @@ use cudarc::driver::{
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
 
@@ -836,26 +837,20 @@ impl Model {
         }))
     }
 
-    /// Builds the `Tokenizer` and the cuBLAS handle (with `CUBLAS_PEDANTIC_MATH`
-    /// pinned) for the one scoped background thread each `load_*` wrapper spawns,
-    /// so their combined host/driver setup overlaps the GPU-bound weight load
-    /// instead of sitting on the serial path. Both are pure setup needing no loaded
-    /// weights; `CudaBlas::new` binds the primary context to this thread itself
-    /// (`device.bind_to_thread`). Run sequentially on one thread rather than two so
-    /// the load still spawns exactly one extra thread.
-    fn load_background_init(
-        file: &GgufFile,
-        device: Arc<CudaDevice>,
+    /// Builds the cuBLAS handle (with `CUBLAS_PEDANTIC_MATH` pinned) and runs the
+    /// f16 warm-up, on whichever thread [`LoadInit`] gives it to. `CudaBlas::new`
+    /// binds the primary context to the calling thread itself
+    /// (`device.bind_to_thread`). `thread` only labels the profile line.
+    fn build_cublas(
+        device: &Arc<CudaDevice>,
         weights: WeightsDtype,
-    ) -> Result<(Tokenizer, CudaBlas), ReflexError> {
+        thread: &str,
+    ) -> Result<CudaBlas, ReflexError> {
         let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
         let t_start = std::time::Instant::now();
-        let tokenizer = Tokenizer::from_gguf(file)?;
-        let tokenizer_ms = ms(t_start);
-        let t_cublas = std::time::Instant::now();
         let cublas = CudaBlas::new(device.clone())
             .map_err(|e| crate::gpu_err!(e, "cublas handle: {e:?}"))?;
-        let cublas_new_ms = ms(t_cublas);
+        let cublas_new_ms = ms(t_start);
         let t_math = std::time::Instant::now();
         unsafe {
             cublas_sys::lib()
@@ -867,16 +862,14 @@ impl Model {
                 .map_err(|e| crate::gpu_err!(e, "cublasSetMathMode: {e:?}"))?;
         }
         let math_mode_ms = ms(t_math);
-        let (warm_gemm_ms, warm_sync_ms) = Self::warm_cublas(&device, &cublas, weights)?;
+        let (warm_gemm_ms, warm_sync_ms) = Self::warm_cublas(device, &cublas, weights)?;
         if load_profile_enabled() {
-            // This thread's parts (`REFLEX_LOAD_PROFILE=1`); the load thread's
-            // wait for it is `init_join_wait_ms` on the `REFLEX_LOAD_PROFILE` line.
             eprintln!(
-                "REFLEX_LOAD_INIT tokenizer_ms={tokenizer_ms:.2} cublas_new_ms={cublas_new_ms:.2} math_mode_ms={math_mode_ms:.2} warm_gemm_ms={warm_gemm_ms:.2} warm_sync_ms={warm_sync_ms:.2} total_ms={:.2}",
+                "REFLEX_LOAD_CUBLAS thread={thread} cublas_new_ms={cublas_new_ms:.2} math_mode_ms={math_mode_ms:.2} warm_gemm_ms={warm_gemm_ms:.2} warm_sync_ms={warm_sync_ms:.2} total_ms={:.2}",
                 ms(t_start)
             );
         }
-        Ok((tokenizer, cublas))
+        Ok(cublas)
     }
 
     /// With f16 weights, one tiny `cublasGemmEx` (the call f16 prefill makes), so

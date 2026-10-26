@@ -181,9 +181,7 @@ impl Model {
         policy: &WeightPolicy,
     ) -> Result<Self, ReflexError> {
         std::thread::scope(|scope| {
-            let init_device = device.clone();
-            let warm = policy.matrix_dtype;
-            let init = scope.spawn(move || Self::load_background_init(file, init_device, warm));
+            let init = LoadInit::spawn(scope, file, device.clone(), policy.matrix_dtype);
             Self::load_hybrid_inner(device, file, policy, init)
         })
     }
@@ -192,7 +190,7 @@ impl Model {
         device: Arc<CudaDevice>,
         file: &GgufFile,
         policy: &WeightPolicy,
-        init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), ReflexError>>,
+        init: LoadInit<'scope>,
     ) -> Result<Self, ReflexError> {
         let architecture = file
             .metadata
@@ -546,9 +544,7 @@ impl Model {
             }
         };
 
-        let (tokenizer, cublas) = init.join().map_err(|_| {
-            ReflexError::Other("background load-init thread panicked".to_string())
-        })??;
+        let (tokenizer, cublas) = init.join()?;
 
         let f16_act_stats = device
             .alloc_zeros::<u32>(2)
