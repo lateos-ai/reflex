@@ -1,0 +1,123 @@
+{
+  "_comment": "License and expected sha256 of each Hub MODEL dropdown entry, keyed by its value in hub.json. Checked on Hugging Face on 2026-10-25: license from the GGUF repo's and the base model's model-card metadata (they agree for every entry), sha256 and size from the Hub API's LFS record at `revision`. The worker downloads resolve/main, so if a repo replaces a file, COMPLIANCE=on fails on the hash until this entry is updated. Not legal advice: read each license yourself.",
+  "verified": "2026-10-25",
+  "models": {
+    "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf": {
+      "license": "apache-2.0",
+      "license_url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/blob/main/LICENSE",
+      "source": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF",
+      "base_model": "https://huggingface.co/Qwen/Qwen3-0.6B",
+      "revision": "23749fefcc72300e3a2ad315e1317431b06b590a",
+      "size_bytes": 639446688,
+      "sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031"
+    },
+    "unsloth/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q4_K_M.gguf": {
+      "license": "apache-2.0",
+      "license_url": "https://huggingface.co/Qwen/Qwen3-1.7B/blob/main/LICENSE",
+      "source": "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF",
+      "base_model": "https://huggingface.co/Qwen/Qwen3-1.7B",
+      "revision": "d7f544eead698dbd1f15126ef60b45a1e1933222",
+      "size_bytes": 1107409472,
+      "sha256": "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897"
+    },
+    "unsloth/Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf": {
+      "license": "apache-2.0",
+      "license_url": "https://huggingface.co/Qwen/Qwen3-4B/blob/main/LICENSE",
+      "source": "https://huggingface.co/unsloth/Qwen3-4B-GGUF",
+      "base_model": "https://huggingface.co/Qwen/Qwen3-4B",
+      "revision": "22c9fc8a8c7700b76a1789366280a6a5a1ad1120",
+      "size_bytes": 2497281312,
+      "sha256": "f6f851777709861056efcdad3af01da38b31223a3ba26e61a4f8bf3a2195813a"
+    },
+    "unsloth/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf": {
+      "license": "apache-2.0",
+      "license_url": "https://huggingface.co/Qwen/Qwen3-8B/blob/main/LICENSE",
+      "source": "https://huggingface.co/unsloth/Qwen3-8B-GGUF",
+      "base_model": "https://huggingface.co/Qwen/Qwen3-8B",
+      "revision": "a6adef130ffb23ddaf1a62fec9dced968c9bc482",
+      "size_bytes": 5027784512,
+      "sha256": "120307ba529eb2439d6c430d94104dabd578497bc7bfe7e322b5d9933b449bd4"
+    },
+    "Qwen/Qwen2.5-1.5B-Instruct-GGUF/qwen2.5-1.5b-instruct-q4_k_m.gguf": {
+      "license": "apache-2.0",
+      "license_url": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/blob/main/LICENSE",
+      "source": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+      "base_model": "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct",
+      "revision": "91cad51170dc346986eccefdc2dd33a9da36ead9",
+      "size_bytes": 1117320736,
+      "sha256": "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e"
+    },
+    "bartowski/Qwen2.5-7B-Instruct-GGUF/Qwen2.5-7B-Instruct-Q4_K_M.gguf": {
+      "license": "apache-2.0",
+      "license_url": "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/LICENSE",
+      "source": "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF",
+      "base_model": "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct",
+      "revision": "8911e8a47f92bac19d6f5c64a2e2095bd2f7d031",
+      "size_bytes": 4683074240,
+      "sha256": "65b8fcd92af6b4fefa935c625d1ac27ea29dcb6ee14589c55a8f115ceaaa1423"
+    },
+    "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf": {
+      "license": "apache-2.0",
+      "license_url": "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+      "source": "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+      "base_model": "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+      "revision": "52e7645ba7c309695bec7ac98f4f005b139cf465",
+      "size_bytes": 668788096,
+      "sha256": "9fecc3b3cd76bba89d504f29b616eedf7da85b96540e490ca5824d3f7d2776a0"
+    },
+    "TheBloke/Mistral-7B-Instruct-v0.2-GGUF/mistral-7b-instruct-v0.2.Q4_K_M.gguf": {
+      "license": "apache-2.0",
+      "license_url": "https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2",
+      "source": "https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
+      "base_model": "https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2",
+      "revision": "3a6fbf4a41a1d52e415a4958cde6856d34b2db93",
+      "size_bytes": 4368439584,
+      "sha256": "3e0039fd0273fcbebb49228943b17831aadd55cbcbf56f0af00499be2040ccf9"
+    },
+    "unsloth/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf": {
+      "license": "apache-2.0",
+      "license_url": "https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/LICENSE",
+      "source": "https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF",
+      "base_model": "https://huggingface.co/Qwen/Qwen3.5-0.8B",
+      "revision": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
+      "size_bytes": 532517120,
+      "sha256": "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517"
+    },
+    "ibm-granite/granite-4.0-h-350m-GGUF/granite-4.0-h-350m-Q8_0.gguf": {
+      "license": "apache-2.0",
+      "license_url": "https://huggingface.co/ibm-granite/granite-4.0-h-350m",
+      "source": "https://huggingface.co/ibm-granite/granite-4.0-h-350m-GGUF",
+      "base_model": "https://huggingface.co/ibm-granite/granite-4.0-h-350m",
+      "revision": "a864f823cce6e6048b5752e2816fe7a23987d790",
+      "size_bytes": 366195616,
+      "sha256": "c7d9873640dc303b6773dcc44e72e5bdf533e1c95ca8421e6191fbff5c94c942"
+    },
+    "ibm-granite/granite-4.0-h-1b-GGUF/granite-4.0-h-1b-Q8_0.gguf": {
+      "license": "apache-2.0",
+      "license_url": "https://huggingface.co/ibm-granite/granite-4.0-h-1b",
+      "source": "https://huggingface.co/ibm-granite/granite-4.0-h-1b-GGUF",
+      "base_model": "https://huggingface.co/ibm-granite/granite-4.0-h-1b",
+      "revision": "c2cb1972f511add21f3bae244990b8ff3a3ffb23",
+      "size_bytes": 1558926560,
+      "sha256": "f29248184ca766350e56e6d161c2a637ad302a6d595e15d4a62cd58327a0ac0e"
+    },
+    "ggml-org/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q8_0.gguf": {
+      "license": "apache-2.0",
+      "license_url": "https://ai.google.dev/gemma/docs/gemma_4_license",
+      "source": "https://huggingface.co/ggml-org/gemma-4-12B-it-GGUF",
+      "base_model": "https://huggingface.co/google/gemma-4-12B-it",
+      "revision": "a29b2a6b584a5bdcb672ccdcda99ea9faeacc51a",
+      "size_bytes": 12669646976,
+      "sha256": "abfc3044b93795f6a446fc1a04468ac2d5fc5e9c92e237f09a5b3384c5a433e4"
+    },
+    "maternion/Nemotron-3.5-Embed-1B-GGUF/Nemotron-3.5-Embed-1B-Q8_0.gguf": {
+      "license": "openmdw-1.1",
+      "license_url": "https://openmdw.ai/license/1-1/",
+      "source": "https://huggingface.co/maternion/Nemotron-3.5-Embed-1B-GGUF",
+      "base_model": "https://huggingface.co/nvidia/Nemotron-3.5-Embed-1B-BF16",
+      "revision": "2629508ae2baf624c6450c6195535999919edf94",
+      "size_bytes": 1220295616,
+      "sha256": "604ea36c087b51abd3e76f537fd2f302d3f154d0665332d644a3c06fb1102938"
+    }
+  }
+}

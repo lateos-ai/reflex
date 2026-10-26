@@ -127,6 +127,11 @@ Optional features (`ipc`, `json-output`, `download`, `nvml`, `python`) and their
 host dependencies are listed in the reference's
 [Build features](reference.md#build-features) section.
 
+The toolchain is pinned in `rust-toolchain.toml` (rustup installs it on first use). A
+new dependency must pass the license policy in `deny.toml`, which CI checks for both
+Cargo projects with `cargo deny check licenses bans sources` (see
+[docs/compliance/](compliance/README.md)).
+
 `cargo test` rebuilds only the test harness binaries. It does **not** rebuild
 `target/release/reflex`, so after a source change, run
 `cargo build --release --bin reflex` before trusting the binary's behavior.

@@ -1,0 +1,45 @@
+name: Compliance bundle
+
+# The Rust side of the compliance bundle (docs/compliance/README.md): CycloneDX SBOMs
+# for the engine and sidecar/openai-adapter, and the license text of every crate in
+# both lockfiles, uploaded as one artifact. Reads Cargo.lock only; nothing is built,
+# so it needs no CUDA. The Dockerfiles make the same files with COMPLIANCE_BUNDLE=1,
+# through the same script and tool versions.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the channel rust-toolchain.toml pins.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-cyclonedx and cargo-about
+        run: |
+          cargo install --locked cargo-cyclonedx@0.5.9
+          cargo install --locked --features cli cargo-about@0.9.2
+
+      - name: License policy (deny.toml)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - run: |
+          cargo deny check licenses bans sources
+          cargo deny --manifest-path sidecar/openai-adapter/Cargo.toml --config deny.toml check licenses bans sources
+
+      - name: Build the bundle
+        run: |
+          sh scripts/compliance-bundle.sh compliance-bundle
+          cp docs/compliance/*.md compliance-bundle/
+          git rev-parse HEAD > compliance-bundle/commit.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reflex-compliance-bundle-${{ github.ref_name }}
+          path: compliance-bundle/
+          if-no-files-found: error

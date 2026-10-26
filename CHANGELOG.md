@@ -5,6 +5,18 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Opt-in compliance records.** `reflex model-info <gguf>` prints a GGUF's
+  provenance metadata (license, source, size, optional sha256), no GPU needed. The
+  Runpod Hub worker gains three deploy fields, all off by default: `COMPLIANCE=on`
+  adds an attestation (model sha256 checked against `.runpod/models.json`, license,
+  engine version, GPU, the job's token counts and wall time) to every response and
+  answers `{"compliance": "report"}` with the image's SBOMs, third-party licenses and a
+  model card; `AUDIT_LOG=stdout|volume` writes one JSON line per job, with the prompt
+  and answer optionally hashed or in full (`AUDIT_LOG_CONTENT`). The images carry the
+  compliance bundle (CycloneDX SBOMs, license texts, package lists) under
+  `/usr/share/reflex/compliance/`. With every option off, responses are unchanged:
+  checked on an RTX A5000 against the previous handler, byte-identical for chat,
+  streamed chat and classify. See [docs/compliance/README.md](docs/compliance/README.md).
 - **Runpod Hub: optional RAG.** A new `RAG` deploy field (off by default) makes the Hub
   worker run an embedding model (Nemotron-3.5-Embed-1B) next to the chat model. A chat
   job with a `rag` object is answered from the passages closest to its question, taken

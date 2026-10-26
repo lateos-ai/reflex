@@ -31,11 +31,14 @@ FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --no-modify-path
+# The toolchain rust-toolchain.toml pins, installed before the rest of the source.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --no-modify-path
 ENV PATH="/root/.cargo/bin:${PATH}"
 ENV CUDA_PATH="/usr/local/cuda"
 
 WORKDIR /build
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install
 COPY . .
 
 ARG REFLEX_CUDA_ARCH="sm_89"

@@ -27,6 +27,12 @@ closest to its question written into its system message, and the answer comes
 back with those passages. Embedding jobs on such a worker go to the second
 adapter. With RAG off (the default) nothing here changes.
 
+Optional compliance records (see compliance.py), all off by default: COMPLIANCE=on
+adds an attestation (model sha256 and license, engine, GPU, the job's usage and wall
+time) to every response and answers {"compliance": "report"} jobs with the image's
+compliance bundle; AUDIT_LOG=stdout|volume writes one JSON line per job. With every
+option off, nothing is hashed and every job's response is unchanged.
+
 The handler is a generator, so Runpod's /stream/{job_id} works. With
 "stream": true in the job input, each Server-Sent Event the adapter sends is
 yielded as one chat.completion.chunk dict; otherwise the single complete
@@ -50,6 +56,7 @@ import urllib.request
 
 import runpod
 
+import compliance
 import rag
 
 ADAPTER_HOST = "127.0.0.1"
@@ -68,6 +75,13 @@ DEFAULT_EMBED_MODEL = "maternion/Nemotron-3.5-Embed-1B-GGUF/Nemotron-3.5-Embed-1
 
 _rag_cfg = None
 _rag_index = None
+
+# Set at worker start only when a compliance option is on (see compliance.py).
+_hash_downloads = False
+_attestation = None
+_audit = None
+_audit_content = "off"
+_model_sha256 = None
 
 
 def _fail(message):
@@ -95,11 +109,13 @@ def _model_url(model, url="", what="MODEL"):
     return f"https://huggingface.co/{owner}/{repo}/resolve/main/{urllib.parse.quote(filename)}"
 
 
-def _download(url, dest):
+def _download(url, dest, sha256=False):
     """Fetch url to dest through a per-process '.part' file (workers sharing a
     network volume may download the same model at once), resuming after a
-    dropped connection, then rename it into place."""
+    dropped connection, then rename it into place. With sha256, the file is
+    hashed as it arrives and the digest saved as <dest>.sha256."""
     part = f"{dest}.{os.getpid()}.part"
+    digest, hashed = None, 0
     headers = {"User-Agent": "reflex-runpod-worker"}
     token = os.environ.get("HF_TOKEN", "").strip()
     if token and urllib.parse.urlparse(url).hostname == "huggingface.co":
@@ -114,6 +130,9 @@ def _download(url, dest):
             with urllib.request.urlopen(request, timeout=60) as resp:
                 if have and resp.status != 206:
                     have = 0  # the server ignored the range: start over
+                if sha256 and (digest is None or hashed != have):
+                    # Re-read the prefix only if the hash fell out of step with it.
+                    digest, hashed = compliance.download_hash(part, have), have
                 length = resp.headers.get("Content-Length")
                 if length is not None:
                     total = have + int(length)
@@ -132,6 +151,9 @@ def _download(url, dest):
                             break
                         out.write(chunk)
                         have += len(chunk)
+                        if digest is not None:
+                            digest.update(chunk)
+                            hashed = have
                         now = time.monotonic()
                         if now - last_report >= 10:
                             last_report = now
@@ -139,6 +161,8 @@ def _download(url, dest):
                             print(f"reflex worker: {have / 1e9:.2f}{of} GB downloaded", flush=True)
             if total is None or have == total:
                 os.replace(part, dest)
+                if digest is not None:
+                    compliance.write_sha256(dest, digest.hexdigest())
                 return
             print(f"reflex worker: download stopped at {have} of {total} bytes", flush=True)
         except urllib.error.HTTPError as e:
@@ -176,7 +200,7 @@ def _resolve_model(model, url="", what="MODEL"):
         return dest
     print(f"reflex worker: downloading {url} to {dest}", flush=True)
     started = time.monotonic()
-    _download(url, dest)
+    _download(url, dest, sha256=_hash_downloads)
     print(f"reflex worker: downloaded in {time.monotonic() - started:.1f} s", flush=True)
     return dest
 
@@ -245,7 +269,8 @@ def _post_embeddings(body):
 
 
 def _start_rag():
-    """Start the embedding adapter, then load or build the corpus index."""
+    """Start the embedding adapter, then load or build the corpus index. Returns
+    the embedding GGUF's path."""
     global _rag_cfg, _rag_index
     try:
         cfg = rag.config_from_env(os.environ, DEFAULT_EMBED_MODEL)
@@ -279,12 +304,49 @@ def _start_rag():
     except rag.RagError as e:
         _fail(f"RAG corpus: {e}")
     _rag_cfg = cfg
+    return embed_path
+
+
+def _start_compliance(cfg, gguf_path, embed_path):
+    """Describe the served model(s) once, for the attestation and the audit log."""
+    global _attestation, _model_sha256
+    model_id = os.environ.get("MODEL", "").strip() or os.environ.get("BAKED_MODEL", "")
+    url = os.environ.get("GGUF_URL", "").strip()
+    try:
+        if not cfg["compliance"]:
+            _model_sha256 = compliance.file_sha256(gguf_path, _log)
+            return
+        models = compliance.load_models()
+        model = compliance.describe_model(gguf_path, model_id, url, models, _log)
+        embed = None
+        if embed_path is not None:
+            embed = compliance.describe_model(embed_path, _rag_cfg["embed_model"], "", models, _log)
+        _attestation = compliance.static_block(
+            model, os.environ, compliance.gpu_name(), compliance.read_build_info(), embed
+        )
+        _model_sha256 = model["sha256"]
+        _log(f"compliance on: {model['file']} sha256 {model['sha256']}, license {model['license']}")
+    except (compliance.ComplianceError, OSError, ValueError) as e:
+        _fail(f"compliance: {e}")
 
 
 def _start_adapters():
+    global _hash_downloads, _audit, _audit_content
+    try:
+        cfg = compliance.config_from_env(os.environ)
+        if cfg["audit_log"] != "off":
+            # Before any download, so a missing volume fails fast.
+            _audit = compliance.AuditLog(cfg["audit_log"], VOLUME_DIR, os.environ)
+    except (compliance.ComplianceError, OSError) as e:
+        _fail(str(e))
+    _audit_content = cfg["audit_content"]
+    _hash_downloads = compliance.enabled(cfg)
+    embed_path = None
     if rag.env_flag(os.environ.get("RAG", "off")):
-        _start_rag()
+        embed_path = _start_rag()
     gguf_path = _resolve_model(os.environ.get("MODEL", "").strip(), os.environ.get("GGUF_URL", "").strip())
+    if compliance.enabled(cfg):
+        _start_compliance(cfg, gguf_path, embed_path)
     # Optional extra adapter flags (e.g. "--max-tokens-cap 1024"); unset = the
     # adapter's own request-limit defaults. Its default --request-timeout-secs (300)
     # matches this shim's own urlopen timeout below.
@@ -305,26 +367,89 @@ def _sse_events(resp):
 
 
 def handler(event):
+    outcome = {}
+    if _attestation is None and _audit is None:
+        yield from _handle(event, outcome)
+        return
+    started, started_utc = time.monotonic(), compliance.utc_now()
+    try:
+        for item in _handle(event, outcome):
+            compliance.observe(item, outcome)
+            if (
+                _attestation is not None
+                and not outcome.get("stream")
+                and outcome.get("endpoint") != "report"
+                and "error" not in item
+            ):
+                wall_ms = (time.monotonic() - started) * 1000
+                item = dict(item, compliance=compliance.job_attestation(_attestation, outcome, wall_ms))
+            yield item
+        if _attestation is not None and outcome.get("stream") and "error" not in outcome:
+            # Last, after the answer's chunks, so it can carry the job's wall time.
+            wall_ms = (time.monotonic() - started) * 1000
+            yield dict(object="compliance.attestation", **compliance.job_attestation(_attestation, outcome, wall_ms))
+    finally:
+        if _audit is not None:
+            record = compliance.audit_record(
+                event,
+                outcome,
+                started_utc,
+                (time.monotonic() - started) * 1000,
+                _model_sha256,
+                os.environ.get("REFLEX_IMAGE_DIGEST", "").strip() or None,
+                _audit_content,
+            )
+            try:
+                _audit.write(record)
+            except OSError as e:
+                print(f"reflex worker: audit log write failed: {e}", file=sys.stderr, flush=True)
+
+
+def _handle(event, outcome):
+    """One job. Records what handler's compliance wrapper reads (endpoint, stream,
+    the RAG passages, an error's class) in outcome, which nothing reads when every
+    compliance option is off."""
     payload = dict(event.get("input", {}))
     base, rag_info = ADAPTER_BASE, None
+    if "compliance" in payload:
+        if _attestation is not None:
+            outcome["endpoint"] = "report"
+            if payload["compliance"] != "report":
+                outcome["error_class"] = "compliance"
+                yield {"error": f'"compliance" must be "report", got {payload["compliance"]!r}'}
+                return
+            yield compliance.report(_attestation)
+            return
+        if not any(key in payload for key in ("messages", "labels", "input")):
+            # Not a chat, classify or embedding job: a report request to a worker
+            # with COMPLIANCE off. Anything else goes to the adapter as before.
+            outcome["endpoint"], outcome["error_class"] = "report", "compliance_off"
+            yield {"error": 'this worker has COMPLIANCE off: redeploy with COMPLIANCE set to "on" for reports'}
+            return
     if "rag" in payload:
         if _rag_cfg is None:
+            outcome["error_class"] = "rag_off"
             yield {"error": 'this worker has RAG off: redeploy with RAG set to "on" to send "rag" jobs'}
             return
         try:
             payload, rag_info = rag.prepare(payload, _rag_cfg, _rag_index, _post_embeddings)
         except rag.RagError as e:
+            outcome["error_class"] = "rag"
             yield {"error": str(e)}
             return
     if "labels" in payload:
         path, stream = "/v1/classify", False
+        outcome["endpoint"] = "classify"
     elif "input" in payload and "messages" not in payload:
         path, stream = "/v1/embeddings", False
+        outcome["endpoint"] = "embed"
         if _rag_cfg is not None:
             base = EMBED_BASE  # a RAG worker's embedding model
     else:
         path, stream = "/v1/chat/completions", bool(payload.get("stream", False))
         payload["stream"] = stream
+        outcome["endpoint"] = "chat"
+    outcome["stream"], outcome["rag_info"] = stream, rag_info
 
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -351,12 +476,15 @@ def handler(event):
             for chunk in _sse_events(resp):
                 if "error" in chunk:
                     # A mid-stream error event (e.g. the adapter's timeout).
+                    outcome["error_class"] = "stream"
                     yield {"error": json.dumps(chunk["error"])}
                     return
                 yield chunk
     except urllib.error.HTTPError as e:
+        outcome["error_class"] = f"http_{e.code}"
         yield {"error": e.read().decode("utf-8", errors="replace")}
     except urllib.error.URLError as e:
+        outcome["error_class"] = "connection"
         yield {"error": str(e)}
 
 

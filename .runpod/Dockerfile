@@ -46,17 +46,27 @@
 # runtime is CUDA `base` + libcublas-12-4, not the full `-runtime-` image: see the root
 # Dockerfile.
 ARG REFLEX_RUNTIME_BASE=nvidia/cuda:12.4.1-base-ubuntu22.04
+# Compliance bundle (docs/compliance/README.md): 1 writes the SBOMs, third-party
+# licenses, pip and apt package lists, base image names and the baked model's sha256
+# to /usr/share/reflex/compliance/ (a few hundred KB; nothing runs at worker start).
+# On by default here, unlike the root Dockerfile: the Hub's COMPLIANCE=on report job
+# reads these files, and the Hub build takes no build args. 0 skips the extra stage.
+ARG COMPLIANCE_BUNDLE=1
 
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --no-modify-path
+# The toolchain is the one rust-toolchain.toml pins, installed before the rest of the
+# source is copied so a source change doesn't reinstall it.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --no-modify-path
 ENV PATH="/root/.cargo/bin:${PATH}"
 ENV CUDA_PATH="/usr/local/cuda"
 
 WORKDIR /build
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install
 COPY . .
 
 # Kernel build mode, same args and precedence as the root Dockerfile: a non-empty
@@ -77,6 +87,16 @@ RUN set -- --release --bin reflex --features ipc; \
 # glibc-version skew against the ubuntu22.04 runtime.
 RUN cd sidecar/openai-adapter && cargo build --release
 
+# SBOMs and third-party licenses, read from the lockfiles (COMPLIANCE_BUNDLE=1 only;
+# BuildKit skips this stage otherwise). Tool versions match compliance.yml.
+FROM builder AS compliance-src
+RUN cargo install --locked cargo-cyclonedx@0.5.9 \
+    && cargo install --locked --features cli cargo-about@0.9.2 \
+    && sh scripts/compliance-bundle.sh /compliance \
+    && cp docs/compliance/data-handling.md /compliance/ \
+    && sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1 > /compliance/reflex-engine-version \
+    && rustc --version > /compliance/rustc-version
+
 FROM ${REFLEX_RUNTIME_BASE} AS runtime
 
 # The only CUDA library these binaries load besides the driver: cuBLAS
@@ -89,11 +109,12 @@ RUN apt-get update \
 # interpreter and the runpod SDK, needed solely to speak Runpod's queue job
 # envelope (see handler.py), plus curl to fetch the model below. numpy is for the
 # optional RAG mode's vector search (rag.py; unused unless RAG=on). Nothing else in
-# this image needs Python.
+# this image needs Python. Versions pinned so the image (and its SBOM) can be
+# rebuilt as is; numpy 2.2 is the last line that supports Ubuntu 22.04's Python 3.10.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip curl ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --no-cache-dir runpod numpy
+    && pip3 install --no-cache-dir runpod==1.12.0 numpy==2.2.6
 
 COPY --from=builder /build/target/release/reflex /usr/local/bin/reflex
 COPY --from=builder /build/sidecar/openai-adapter/target/release/reflex-openai-adapter /usr/local/bin/reflex-openai-adapter
@@ -127,6 +148,29 @@ ENV GGUF_PATH=/models/model.gguf
 # that GGUF once at worker start.
 ENV BAKED_MODEL=Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf
 
-COPY .runpod/handler.py .runpod/rag.py /
+COPY .runpod/handler.py .runpod/rag.py .runpod/compliance.py .runpod/models.json /
+
+# Reported as the attestation's engine.image_digest when COMPLIANCE=on. An image
+# can't know its own registry digest while it is being built, so whoever builds it
+# passes what identifies the build (a release tag, a commit, a digest from an earlier
+# build). Empty by default, reported as null.
+ARG REFLEX_IMAGE_DIGEST=""
+ENV REFLEX_IMAGE_DIGEST=${REFLEX_IMAGE_DIGEST}
 
 ENTRYPOINT ["python3", "-u", "/handler.py"]
+
+FROM runtime AS bundle-0
+
+FROM runtime AS bundle-1
+ARG REFLEX_RUNTIME_BASE
+COPY --from=compliance-src /compliance /usr/share/reflex/compliance
+# The baked model's sha256 (read by compliance.py instead of hashing 639 MB at
+# start), and what the runtime image itself contains.
+RUN cd /models && sha256sum model.gguf > model.gguf.sha256 \
+    && cd /usr/share/reflex/compliance \
+    && pip3 freeze --all > pip-freeze.txt \
+    && dpkg-query -W > dpkg.txt \
+    && REFLEX_RUNTIME_BASE="$REFLEX_RUNTIME_BASE" python3 -c 'import json, os; print(json.dumps({"reflex_engine_crate_version": open("reflex-engine-version").read().strip(), "rustc": open("rustc-version").read().strip(), "base_images": {"builder": "nvidia/cuda:12.4.1-devel-ubuntu22.04", "runtime": os.environ["REFLEX_RUNTIME_BASE"]}, "baked_model": os.environ["BAKED_MODEL"], "baked_model_sha256": open("/models/model.gguf.sha256").read().split()[0]}, indent=2))' > build.json \
+    && rm reflex-engine-version rustc-version
+
+FROM bundle-${COMPLIANCE_BUNDLE}

@@ -1,0 +1,24 @@
+# cargo-about configuration for THIRD_PARTY_LICENSES.html (the license text of every
+# Rust dependency), built by .github/workflows/compliance.yml and, with
+# COMPLIANCE_BUNDLE=1, by the Dockerfiles:
+#
+#   cargo about generate --all-features about.hbs > THIRD_PARTY_LICENSES.html
+#
+# The accepted licenses match deny.toml's [licenses] allow list and exceptions.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# deny.toml's two exceptions, both from the optional `download` feature (hf-hub).
+[webpki-roots]
+accepted = ["CDLA-Permissive-2.0"]
+
+[option-ext]
+accepted = ["MPL-2.0"]

@@ -62,6 +62,11 @@ OpenAI `list` object:
 object is answered from your documents, and its output carries the passages used. See
 [Optional RAG](#optional-rag).
 
+**Compliance records**: with `COMPLIANCE` set to `on`, every response also carries a
+`compliance` block, and a `{"compliance": "report"}` job returns the compliance bundle.
+With `AUDIT_LOG` on, each job writes one JSON line. See
+[Compliance records and audit log](#compliance-records-and-audit-log).
+
 The worker bakes **Qwen3-0.6B-Q8_0** (not the Q4_K_M the `runpod-lb` image uses): the
 listing leads with classification, and on a sub-3B model Q8_0 preserves the fine-grained
 logits the label softmax reads where a 4-bit quant can move a near-tie. No generation
@@ -285,6 +290,86 @@ volume, Qwen3-0.6B Q8_0 unless noted):
 | `RAG_CORPUS_URL` = a `.jsonl` | Correct answer with the record's id |
 | `MODEL` = Nemotron, or a missing `RAG_DIR` you set | Worker fails at start with the error message |
 | Gemma 4 12B Q8_0 + RAG on the 24 GB card | Fits (13.6 GB peak); correct grounded answer |
+
+## Compliance records and audit log
+
+> **Not legal advice.** These options record facts about each job. They don't make a
+> deployment compliant with anything. See [docs/compliance/](../docs/compliance/README.md).
+
+Three deploy-form options, all `off` by default. With all three off nothing is hashed
+or logged, and every job's response is exactly what it was without them
+(`test_compliance.py` checks this).
+
+| Option | Values | Effect |
+| --- | --- | --- |
+| `COMPLIANCE` | `off`, `on` | Attestation on every response, and the report job |
+| `AUDIT_LOG` | `off`, `stdout`, `volume` | One JSON line per job |
+| `AUDIT_LOG_CONTENT` (advanced) | `off`, `hash`, `full` | Whether audit lines carry the prompt and answer |
+
+**Model hashes.** With either option on, a model downloaded at worker start is hashed
+while it downloads, and the digest is saved as `<file>.sha256` next to it on the
+volume. The baked model's digest is written at image build. A later worker reads those
+64 bytes instead of rehashing. A cached model with no `.sha256` yet is hashed once.
+
+**Attestation (`COMPLIANCE=on`).** At start the worker describes the served model
+once, from `reflex model-info` and [`models.json`](models.json). That file records each
+dropdown model's license, license URL, source, Hugging Face revision and expected
+sha256, as checked on Hugging Face on the date it states. If the file's sha256 doesn't
+match, the worker stops with an error naming both hashes. A `GGUF_URL` model gets the
+license `unknown (user-supplied)`. A non-streaming job's output then gains:
+
+```json
+"compliance": {
+  "schema": "reflex.compliance/1",
+  "model": {"id": "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf", "file": "model.gguf",
+            "sha256": "9465e63a...", "sha256_matches_models_json": true,
+            "architecture": "qwen3", "file_type": "Q8_0", "license": "apache-2.0",
+            "license_url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/blob/main/LICENSE",
+            "gguf_general": {"name": "...", "license": "..."}, "...": "..."},
+  "engine": {"reflex_engine_crate_version": "0.2.0", "image_digest": null, "compliance_bundle": true},
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "job": {"endpoint": "chat", "wall_time_ms": 412.3,
+          "usage": {"prompt_tokens": 12, "completion_tokens": 16, "total_tokens": 28}}
+}
+```
+
+A streamed job ends with one more item, `{"object": "compliance.attestation", ...}`,
+holding the same fields. Its `job` has `stream_chunks` instead of `usage`, because the
+adapter's stream chunks carry no token counts. A classify job's `job` has no `usage`
+either: the adapter's classify response has none (each label's own token count is in
+the answer's `labels`). A RAG job's `job.rag_sources` lists the
+documents its passages came from. `image_digest` is whatever the image was built with
+(`--build-arg REFLEX_IMAGE_DIGEST=...`). The Hub build passes none, so it is `null`.
+Error outputs are passed through unchanged.
+
+**Report job.** `{"input": {"compliance": "report"}}` returns one object:
+`attestation` (the block above, without `job`), `model_card` (Markdown, filled in from
+the model file and `models.json`; see
+[the template](../docs/compliance/model-card-template.md)), and `files`: everything in
+the image's `/usr/share/reflex/compliance/`. That covers the CycloneDX SBOMs (parsed),
+the third-party license HTML, `pip-freeze.txt`, `dpkg.txt`, `build.json` and the
+data-handling statement. Any expected file the image lacks is listed in `missing`. On
+a worker with `COMPLIANCE` off, the same job returns an error. The output is a few
+hundred KB.
+
+**Audit log.** One line per job, written when the job finishes (including failed
+ones):
+
+```json
+{"schema":"reflex.audit/1","job_id":"...","ts":"2026-10-25T14:03:11.204Z","endpoint":"chat",
+ "model_sha256":"9465e63a...","image_digest":null,"status":"ok","latency_ms":412.3,
+ "usage":{"prompt_tokens":12,"completion_tokens":16,"total_tokens":28}}
+```
+
+A failed job has `"status": "error"` and an `error_class` (`http_400`, `connection`,
+`stream`, `rag`, `rag_off`, ...). `AUDIT_LOG_CONTENT=hash` adds `prompt_sha256` (of the
+job input as canonical JSON) and `output_sha256` (of the answer text; for classify,
+the labels). `full` adds `prompt` and `output` as sent instead. Embedding vectors are
+never logged. With `stdout` the lines go to the worker's Runpod logs. With `volume`
+they are appended to `/runpod-volume/reflex-audit/<worker-id>.jsonl`, one file per
+worker so concurrent workers never share one. That mode needs a network volume, and
+the worker stops at start without one. The worker never rotates, deletes, ships or
+reads these files: retention and access control are yours.
 
 ## GPU pin: portable PTX, not sm_86 (unlike `serverless/runpod/`)
 
