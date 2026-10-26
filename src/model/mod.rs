@@ -848,9 +848,15 @@ impl Model {
         device: Arc<CudaDevice>,
         weights: WeightsDtype,
     ) -> Result<(Tokenizer, CudaBlas), ReflexError> {
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
+        let t_start = std::time::Instant::now();
         let tokenizer = Tokenizer::from_gguf(file)?;
+        let tokenizer_ms = ms(t_start);
+        let t_cublas = std::time::Instant::now();
         let cublas = CudaBlas::new(device.clone())
             .map_err(|e| crate::gpu_err!(e, "cublas handle: {e:?}"))?;
+        let cublas_new_ms = ms(t_cublas);
+        let t_math = std::time::Instant::now();
         unsafe {
             cublas_sys::lib()
                 .cublasSetMathMode(
@@ -860,7 +866,16 @@ impl Model {
                 .result()
                 .map_err(|e| crate::gpu_err!(e, "cublasSetMathMode: {e:?}"))?;
         }
-        Self::warm_cublas(&device, &cublas, weights)?;
+        let math_mode_ms = ms(t_math);
+        let (warm_gemm_ms, warm_sync_ms) = Self::warm_cublas(&device, &cublas, weights)?;
+        if load_profile_enabled() {
+            // This thread's parts (`REFLEX_LOAD_PROFILE=1`); the load thread's
+            // wait for it is `init_join_wait_ms` on the `REFLEX_LOAD_PROFILE` line.
+            eprintln!(
+                "REFLEX_LOAD_INIT tokenizer_ms={tokenizer_ms:.2} cublas_new_ms={cublas_new_ms:.2} math_mode_ms={math_mode_ms:.2} warm_gemm_ms={warm_gemm_ms:.2} warm_sync_ms={warm_sync_ms:.2} total_ms={:.2}",
+                ms(t_start)
+            );
+        }
         Ok((tokenizer, cublas))
     }
 
@@ -871,14 +886,16 @@ impl Model {
     /// cold `system1` scoring pass went 44.0 -> 9.8 ms for +14 ms of model load.
     /// f32 gets none: a tiny `Sgemm` didn't shorten its 21 ms first call
     /// (scoring 39.1 -> 37.7 ms), so it would only add load time.
+    /// Returns the host time of the setup + GemmEx call and of the final sync, in ms.
     fn warm_cublas(
         device: &Arc<CudaDevice>,
         cublas: &CudaBlas,
         weights: WeightsDtype,
-    ) -> Result<(), ReflexError> {
+    ) -> Result<(f64, f64), ReflexError> {
         if weights != WeightsDtype::F16 {
-            return Ok(());
+            return Ok((0.0, 0.0));
         }
+        let t_gemm = std::time::Instant::now();
         const M: usize = 64;
         const N: usize = 8;
         const K: usize = 64;
@@ -887,9 +904,12 @@ impl Model {
         let x = device.alloc_zeros::<half::f16>(K * N).map_err(alloc_err)?;
         let mut y = device.alloc_zeros::<f32>(M * N).map_err(alloc_err)?;
         kernels::gemm_ex_f16_raw(cublas, *w.device_ptr(), &x, &mut y, M, N, K)?;
+        let gemm_ms = t_gemm.elapsed().as_secs_f64() * 1000.0;
+        let t_sync = std::time::Instant::now();
         device
             .synchronize()
-            .map_err(|e| crate::gpu_err!(e, "warm_cublas sync: {e}"))
+            .map_err(|e| crate::gpu_err!(e, "warm_cublas sync: {e}"))?;
+        Ok((gemm_ms, t_sync.elapsed().as_secs_f64() * 1000.0))
     }
 
     /// Encodes `prompt`, runs it through every layer one position at a time
