@@ -169,6 +169,23 @@ engine answers one request at a time and never knows other agents exist. Example
 [examples/](examples/README.md#composing-agents). Design and measurements:
 [docs/design/agent-relay.md](docs/design/agent-relay.md#composing-agents-phase-h).
 
+## Retrieval over your documents (opt-in RAG)
+
+The Runpod Hub worker can answer chat jobs from your own documents. It is off by
+default; with `RAG=on` the worker also runs an embedding model (Nemotron-3.5-Embed-1B,
+about 1 GB more VRAM) next to the chat model, and a chat job carrying a `rag` field:
+
+- searches the job's own `rag.documents` and an optional corpus: a folder on the network
+  volume (`RAG_DIR`, `.txt`/`.md`/`.jsonl`) or a file or archive at `RAG_CORPUS_URL`;
+- adds the best passages, numbered, to the system message and asks the model to cite them;
+- returns those passages, with their scores, alongside the answer.
+
+The corpus is embedded once when a worker starts and the index is cached on the network
+volume until a file or setting changes (506 passages in 8.2 s on an RTX 4090; a restart
+loads the cache in 1.3 s). Retrieval is Python in the worker; the engine and the adapter
+are unchanged. Fields, limits and costs:
+[.runpod/README.md](.runpod/README.md#optional-rag).
+
 ## Compliance records (opt-in)
 
 For deployments that need to show what served a request, Reflex can produce records
@@ -213,6 +230,8 @@ The reasoning, and what the engine may grow instead:
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): building, testing, and the rules for changes
 - [docs/design/agent-relay.md](docs/design/agent-relay.md): agent-to-agent handoffs
   (pinned prefixes, cache files, constrained output) and their measurements
+- [.runpod/README.md](.runpod/README.md#optional-rag): the Hub worker's opt-in RAG
+  (corpus sources, `rag` job fields, costs)
 - [docs/compliance/](docs/compliance/README.md): opt-in compliance records (SBOMs,
   model provenance, attestation, audit log)
 - [docs/gpu-ci.md](docs/gpu-ci.md): the nightly GPU workflow
