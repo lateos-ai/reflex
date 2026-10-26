@@ -17,9 +17,8 @@ build = "build.rs"
 # link against this crate unmodified.
 crate-type = ["rlib", "cdylib", "staticlib"]
 # Explicit (rather than relying on the `[package] name`'s auto hyphen->underscore
-# conversion) because `maturin build --features python` (see src/python.rs) reads
-# this literally and rejects a hyphenated module name outright -- it must match the
-# `#[pymodule] fn reflex_engine` symbol name in src/python.rs.
+# conversion) so the C FFI's library file name (`libreflex_engine`) and the
+# `reflex_engine::` paths in `src/bin/` are a stated contract, not an accident.
 name = "reflex_engine"
 
 [dependencies]
@@ -29,7 +28,7 @@ memmap2 = "0.9"
 # Temperature/top-k/top-p sampling (`src/sampling.rs`), used by `Model::generate`
 # unconditionally (greedy argmax stays the default and needs no RNG draw at all --
 # see `SamplingParams::is_greedy`), so this is a core dependency, not feature-gated
-# like `ipc`/`python`/`download` above.
+# like `ipc`/`download` below.
 rand = "0.8"
 # Local IPC (`reflex stdio`/`reflex uds`, see src/ipc.rs), feature-gated: this
 # project's default `cargo build` stays at its original 3-dependency footprint
@@ -38,16 +37,12 @@ serde = { version = "1", features = ["derive"], optional = true }
 # `raw_value`: IPC keeps a request's `json_schema` as raw text, so `src/grammar.rs`
 # sees its properties in the order they were written.
 serde_json = { version = "1", optional = true, features = ["raw_value"] }
-# Python bindings (see src/python.rs), feature-gated for the same reason as `ipc`
-# above. abi3-py38 targets the stable/limited Python C API so one build works
-# across CPython 3.8+ without a per-version build matrix.
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"], optional = true }
 # hf-hub as a GGUF downloader/cache only (see src/hf.rs) -- never a new tensor-format
 # ingestion path (no safetensors parsing). Feature-gated for the same reason as
-# `ipc`/`python` above.
+# `ipc` above.
 hf-hub = { version = "0.3", optional = true }
 # NVML energy instrumentation (see src/energy.rs), feature-gated for the same
-# reason as `ipc`/`python`/`download` above. Loads libnvidia-ml.so/nvml.dll at
+# reason as `ipc`/`download` above. Loads libnvidia-ml.so/nvml.dll at
 # runtime via dlopen (never linked at build time), so this feature never breaks
 # a REFLEX_SKIP_CUDA=1 dev build.
 nvml-wrapper = { version = "0.13", optional = true }
@@ -65,9 +60,6 @@ default = []
 # time -- cargo unifies the shared deps, no duplication/conflict from having
 # both features on at once.
 ipc = ["json-output"]
-# Requires a Python 3.8+ interpreter on the build host (pyo3-build-config
-# probes for it; abi3 avoids a per-version matrix but not Python discovery).
-python = ["dep:pyo3"]
 # Requires libssl-dev + pkg-config on the build HOST at Linux build time
 # (hf-hub -> ureq -> openssl-sys on Linux; native-tls on Windows, no extra dep).
 download = ["dep:hf-hub"]

@@ -160,7 +160,8 @@ table below is the long form.
 | Kubernetes (one Job per invocation) | [docs/reference.md](docs/reference.md#kubernetes) |
 | Embedding in another program | C FFI (`include/reflex_engine.h`), local IPC (`reflex stdio`/`uds`) |
 
-The Python bindings (`--features python`) do not currently build.
+From Python (or any language), drive `reflex stdio` or `reflex uds`: one JSON request
+per line, no client library ([example](docs/aws-deployment.md#pattern-a--uds-socket-cross-process-the-actual-sidecar-client)).
 
 ## Agent-to-agent handoffs
 

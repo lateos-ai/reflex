@@ -10,7 +10,7 @@
 # THIRD_PARTY_LICENSES.html.
 
 [graph]
-# Every optional feature (ipc, download, nvml, python, ...), not just the default
+# Every optional feature (ipc, download, nvml, ...), not just the default
 # build: users build them, so their dependencies' licenses count too.
 all-features = true
 

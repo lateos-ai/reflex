@@ -39,11 +39,8 @@ jobs:
         run: cargo build --locked --all-targets --features ipc
 
       - name: Feature-matrix build (each optional feature in isolation, nvcc skipped)
-        # `python` and `--all-features` are deliberately excluded: the `python`
-        # feature does not currently compile (pre-existing `Send` incompatibility
-        # between pyo3's `#[pyclass]` bound and `WeightLoadPipeline`'s `*mut u8`
-        # pinned-host pointer). The four features below are the ones the deploy Dockerfiles
-        # actually use, and must keep building independently.
+        # These are the four optional features; the deploy Dockerfiles use them, and
+        # each must keep building independently.
         # `shell: bash`: the loop is bash syntax, and windows-latest defaults to pwsh.
         shell: bash
         run: |
@@ -55,8 +52,7 @@ jobs:
         run: cargo clippy --locked --all-targets --features ipc -- -D warnings
 
       # Lints the `download` feature (not just type-checks it, as the feature
-      # matrix above does). Ubuntu-only because it needs libssl-dev/pkg-config;
-      # `python` stays out (needs maturin, and currently doesn't compile).
+      # matrix above does). Ubuntu-only because it needs libssl-dev/pkg-config.
       - name: Clippy (ipc + download, Ubuntu only)
         if: runner.os == 'Linux'
         run: |

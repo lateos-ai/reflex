@@ -1,6 +1,6 @@
 //! The engine's error type. Every fallible engine function returns
 //! `Result<_, ReflexError>`, so callers (the CLI, the C FFI, the IPC protocol and
-//! through it the OpenAI sidecar, the Python bindings) can branch on *what kind* of
+//! through it the OpenAI sidecar) can branch on *what kind* of
 //! failure happened instead of matching on message text.
 //!
 //! The message (`Display`) is exactly the text the engine produced before errors were
