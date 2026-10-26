@@ -148,6 +148,47 @@ table below is the long form.
 
 The Python bindings (`--features python`) do not currently build.
 
+## Agent-to-agent handoffs
+
+Multi-agent loops make many short, sequential calls, so what matters is the cost of
+each hop from one agent to the next. Reflex gives an orchestrator the pieces for a cheap
+hop and leaves the wiring to it:
+
+- **A warm process per agent** (`reflex stdio`/`uds`) that keeps one pinned prefix,
+  such as the agent's role prompt, in VRAM. A System-1 routing decision against the pin
+  takes 12.5 ms, against 543 ms for a fresh `reflex system1` process (T4).
+- **KV cache files** (`export_kv`/`import_kv`, `--export-kv`/`--import-kv`): one agent
+  writes its context to a file and the next one, warm or cold, resumes from it instead
+  of prefilling again.
+- **JSON Schema constrained output** (`json_schema`, `--json-schema`) for structured
+  handoffs.
+
+Routing, the message envelope and where the files live belong to the orchestrator; the
+engine answers one request at a time and never knows other agents exist. Examples
+(an orchestrator in Python and a cold shell chain) and the envelope schema are in
+[examples/](examples/README.md#composing-agents). Design and measurements:
+[docs/design/agent-relay.md](docs/design/agent-relay.md#composing-agents-phase-h).
+
+## Compliance records (opt-in)
+
+For deployments that need to show what served a request, Reflex can produce records
+that are all off by default (with every option off, nothing is hashed or logged and
+responses are unchanged):
+
+- **Supply chain:** CycloneDX SBOMs of the engine and the OpenAI adapter, plus the
+  license text of every dependency, built from the lockfiles in CI or with
+  `scripts/compliance-bundle.sh`. The Runpod Hub image ships them.
+- **Model provenance:** `reflex model-info <gguf> [--sha256] [--json]` prints a GGUF's
+  license, source, architecture, quantization and sha256, no GPU needed.
+- **Runpod Hub worker:** `COMPLIANCE=on` adds an attestation (model sha256 and license,
+  engine version, GPU, wall time, and token counts for chat and embedding jobs) to
+  every response, plus a report job that returns the SBOMs and a model card.
+  `AUDIT_LOG=stdout|volume` writes one JSON line per job.
+
+These records are facts, not legal advice. Overview, model card template and
+data-handling statement: [docs/compliance/](docs/compliance/README.md). Hub options:
+[.runpod/README.md](.runpod/README.md#compliance-records-and-audit-log).
+
 ## Non-goals
 
 These are permanent, not a backlog:
@@ -170,6 +211,10 @@ The reasoning, and what the engine may grow instead:
   `--json` output, error categories, Docker, Kubernetes
 - [docs/benchmarks.md](docs/benchmarks.md): every measurement, with method and caveats
 - [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): building, testing, and the rules for changes
+- [docs/design/agent-relay.md](docs/design/agent-relay.md): agent-to-agent handoffs
+  (pinned prefixes, cache files, constrained output) and their measurements
+- [docs/compliance/](docs/compliance/README.md): opt-in compliance records (SBOMs,
+  model provenance, attestation, audit log)
 - [docs/gpu-ci.md](docs/gpu-ci.md): the nightly GPU workflow
 - [CHANGELOG.md](CHANGELOG.md): what has been built, in order
 
