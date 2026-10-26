@@ -30,13 +30,13 @@
 use crate::error::ReflexError;
 use crate::gguf::{GgufFile, GgufValue};
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::Hasher;
 
 const WORD_BOUNDARY: char = '\u{2581}'; // '▁', SentencePiece's space marker
 
 /// A small, non-cryptographic hasher (the classic Firefox/rustc `FxHash`
-/// algorithm) used only for [`Tokenizer`]'s two build-time bulk maps
-/// (`token_to_id`, `merge_rank`). `std`'s default SipHash is designed for
+/// algorithm) used only for [`Tokenizer`]'s two build-time bulk indexes
+/// (`token_to_id`, `merge_rank`; see [`SlotTable`]). `std`'s default SipHash is designed for
 /// HashDoS resistance on untrusted input, which these maps never see -- keys
 /// come from a GGUF file the user already chose to load, in the same trust
 /// boundary as the weights themselves. That is the same "speed, no DOS
@@ -86,8 +86,233 @@ impl Hasher for FxHasher {
     }
 }
 
-type FxBuildHasher = BuildHasherDefault<FxHasher>;
-type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
+/// [`FxHasher`] over `parts` in order, one `write` per part.
+fn fx_hash(parts: &[&[u8]]) -> u64 {
+    let mut h = FxHasher::default();
+    for p in parts {
+        h.write(p);
+    }
+    h.finish()
+}
+
+/// Open-addressing slot table shared by [`VocabIndex`] and [`MergeIndex`]:
+/// each slot holds an entry index (or `EMPTY`), probed linearly from the top
+/// bits of the key's hash (FxHash's multiply mixes the top bits best).
+/// Built once per load for ~150K keys, so it avoids what a
+/// `HashMap<String, _>` costs there: one or two heap strings per key.
+#[derive(Default)]
+struct SlotTable {
+    slots: Vec<u32>,
+    shift: u32,
+}
+
+impl SlotTable {
+    const EMPTY: u32 = u32::MAX;
+
+    /// Room for `n` entries at load factor <= 1/2.
+    fn with_capacity(n: usize) -> Self {
+        let size = (n.max(4) * 2).next_power_of_two();
+        Self {
+            slots: vec![Self::EMPTY; size],
+            shift: 64 - size.trailing_zeros(),
+        }
+    }
+
+    /// The slot holding the entry `is_key` accepts, or the empty slot where it
+    /// belongs. The table must have at least one empty slot.
+    fn probe(&self, hash: u64, mut is_key: impl FnMut(u32) -> bool) -> usize {
+        let mask = self.slots.len() - 1;
+        let mut i = (hash >> self.shift) as usize;
+        loop {
+            let e = self.slots[i];
+            if e == Self::EMPTY || is_key(e) {
+                return i;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
+
+/// Token text -> id, with [`HashMap::insert`]'s semantics (a repeated key keeps
+/// the last id). Key bytes live in one shared buffer.
+#[derive(Default)]
+struct VocabIndex {
+    table: SlotTable,
+    bytes: String,
+    /// `(start, end, id)` into `bytes`, one per distinct key.
+    entries: Vec<(u32, u32, u32)>,
+}
+
+impl VocabIndex {
+    fn with_capacity(keys: usize, bytes: usize) -> Self {
+        Self {
+            table: SlotTable::with_capacity(keys),
+            bytes: String::with_capacity(bytes),
+            entries: Vec::with_capacity(keys),
+        }
+    }
+
+    fn from_tokens(tokens: &[String]) -> Self {
+        let mut index = Self::with_capacity(tokens.len(), tokens.iter().map(String::len).sum());
+        for (id, t) in tokens.iter().enumerate() {
+            index.insert(t, id as u32);
+        }
+        index
+    }
+
+    fn key(&self, e: u32) -> &str {
+        let (start, end, _) = self.entries[e as usize];
+        &self.bytes[start as usize..end as usize]
+    }
+
+    fn insert(&mut self, key: impl AsRef<str>, id: u32) {
+        let key = key.as_ref();
+        if (self.entries.len() + 1) * 2 > self.table.slots.len() {
+            self.grow();
+        }
+        let slot = self
+            .table
+            .probe(fx_hash(&[key.as_bytes()]), |e| self.key(e) == key);
+        match self.table.slots[slot] {
+            SlotTable::EMPTY => {
+                let start = self.bytes.len() as u32;
+                self.bytes.push_str(key);
+                self.table.slots[slot] = self.entries.len() as u32;
+                self.entries.push((start, self.bytes.len() as u32, id));
+            }
+            e => self.entries[e as usize].2 = id,
+        }
+    }
+
+    fn grow(&mut self) {
+        self.table = SlotTable::with_capacity(self.entries.len() * 2);
+        for e in 0..self.entries.len() as u32 {
+            let slot = self
+                .table
+                .probe(fx_hash(&[self.key(e).as_bytes()]), |_| false);
+            self.table.slots[slot] = e;
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&u32> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let slot = self
+            .table
+            .probe(fx_hash(&[key.as_bytes()]), |e| self.key(e) == key);
+        match self.table.slots[slot] {
+            SlotTable::EMPTY => None,
+            e => Some(&self.entries[e as usize].2),
+        }
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Test-only: rebuilds the index without `key`.
+    #[cfg(test)]
+    fn remove(&mut self, key: &str) {
+        let kept: Vec<(String, u32)> = (0..self.entries.len() as u32)
+            .filter(|&e| self.key(e) != key)
+            .map(|e| (self.key(e).to_string(), self.entries[e as usize].2))
+            .collect();
+        *self = Self::default();
+        for (k, id) in kept {
+            self.insert(&k, id);
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<&str> for VocabIndex {
+    type Output = u32;
+
+    fn index(&self, key: &str) -> &u32 {
+        self.get(key).expect("key not in vocab index")
+    }
+}
+
+/// BPE merge pair `(left, right)` -> rank, with [`HashMap::insert`]'s semantics
+/// (a repeated pair keeps the last rank). Pair bytes live in one shared buffer.
+#[derive(Default)]
+struct MergeIndex {
+    table: SlotTable,
+    bytes: String,
+    /// `(start, split, end, rank)`: left is `bytes[start..split]`, right is
+    /// `bytes[split..end]`.
+    entries: Vec<(u32, u32, u32, usize)>,
+}
+
+impl MergeIndex {
+    fn with_capacity(pairs: usize, bytes: usize) -> Self {
+        Self {
+            table: SlotTable::with_capacity(pairs),
+            bytes: String::with_capacity(bytes),
+            entries: Vec::with_capacity(pairs),
+        }
+    }
+
+    fn pair(&self, e: u32) -> (&str, &str) {
+        let (start, split, end, _) = self.entries[e as usize];
+        (
+            &self.bytes[start as usize..split as usize],
+            &self.bytes[split as usize..end as usize],
+        )
+    }
+
+    fn hash(left: &str, right: &str) -> u64 {
+        fx_hash(&[left.as_bytes(), right.as_bytes()])
+    }
+
+    fn insert(&mut self, left: &str, right: &str, rank: usize) {
+        if (self.entries.len() + 1) * 2 > self.table.slots.len() {
+            self.grow();
+        }
+        let slot = self
+            .table
+            .probe(Self::hash(left, right), |e| self.pair(e) == (left, right));
+        match self.table.slots[slot] {
+            SlotTable::EMPTY => {
+                let start = self.bytes.len() as u32;
+                self.bytes.push_str(left);
+                let split = self.bytes.len() as u32;
+                self.bytes.push_str(right);
+                self.table.slots[slot] = self.entries.len() as u32;
+                self.entries
+                    .push((start, split, self.bytes.len() as u32, rank));
+            }
+            e => self.entries[e as usize].3 = rank,
+        }
+    }
+
+    fn grow(&mut self) {
+        self.table = SlotTable::with_capacity(self.entries.len() * 2);
+        for e in 0..self.entries.len() as u32 {
+            let (l, r) = self.pair(e);
+            let slot = self.table.probe(Self::hash(l, r), |_| false);
+            self.table.slots[slot] = e;
+        }
+    }
+
+    fn get(&self, left: &str, right: &str) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let slot = self
+            .table
+            .probe(Self::hash(left, right), |e| self.pair(e) == (left, right));
+        match self.table.slots[slot] {
+            SlotTable::EMPTY => None,
+            e => Some(self.entries[e as usize].3),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 fn byte_fallback_token(byte: u8) -> String {
     format!("<0x{byte:02X}>")
@@ -249,8 +474,8 @@ pub struct Tokenizer {
     pub eos_token_id: Option<u32>,
     pub unk_token_id: Option<u32>,
     pub pad_token_id: Option<u32>,
-    token_to_id: FxHashMap<String, u32>,
-    merge_rank: FxHashMap<(String, String), usize>,
+    token_to_id: VocabIndex,
+    merge_rank: MergeIndex,
     /// Vocab entries whose `tokenizer.ggml.token_type` is `CONTROL` (3) or
     /// `USER_DEFINED` (4) -- e.g. ChatML's `<|im_start|>`/`<|im_end|>`, or
     /// `<think>`/`</think>`. Sorted longest-first so [`Self::encode`]'s
@@ -318,14 +543,34 @@ impl Tokenizer {
             Some(v) => i32_array(v, "tokenizer.ggml.token_type")?,
             None => Vec::new(),
         };
-        let merges_raw = match file.metadata.get("tokenizer.ggml.merges") {
-            Some(v) => string_array_value(v, "tokenizer.ggml.merges")?,
-            None => Vec::new(),
+        // Read in place from the metadata: copying each entry into its own
+        // `String` first was a large part of this function's cost on a
+        // ~150K-merge vocab.
+        let merges_raw: &[GgufValue] = match file.metadata.get("tokenizer.ggml.merges") {
+            Some(GgufValue::Array(items)) => items,
+            Some(other) => {
+                return Err(crate::reflex_err!(
+                    Tokenizer,
+                    "expected array for 'tokenizer.ggml.merges', got {other:?}"
+                ))
+            }
+            None => &[],
         };
 
-        let mut merge_rank =
-            FxHashMap::with_capacity_and_hasher(merges_raw.len(), FxBuildHasher::default());
-        for (rank, entry) in merges_raw.iter().enumerate() {
+        let mut merge_rank = MergeIndex::with_capacity(
+            merges_raw.len(),
+            merges_raw
+                .iter()
+                .map(|v| v.as_str().map_or(0, str::len))
+                .sum(),
+        );
+        for (rank, v) in merges_raw.iter().enumerate() {
+            let entry = v.as_str().ok_or_else(|| {
+                crate::reflex_err!(
+                    Tokenizer,
+                    "expected string array element in 'tokenizer.ggml.merges', got {v:?}"
+                )
+            })?;
             let mut parts = entry.split(' ');
             let left = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
                 crate::reflex_err!(
@@ -339,14 +584,10 @@ impl Tokenizer {
                     "malformed merge entry '{entry}' (expected 'left right')"
                 )
             })?;
-            merge_rank.insert((left.to_string(), right.to_string()), rank);
+            merge_rank.insert(left, right, rank);
         }
 
-        let token_to_id: FxHashMap<String, u32> = tokens
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.clone(), i as u32))
-            .collect();
+        let token_to_id = VocabIndex::from_tokens(&tokens);
 
         let bos_token_id =
             u64_meta(&file.metadata, "tokenizer.ggml.bos_token_id").map(|v| v as u32);
@@ -511,7 +752,12 @@ impl Tokenizer {
                     }
                     // Only reachable when `special_tokens` (built from `tokens`) is
                     // non-empty, so the lookup below always succeeds.
-                    out.push(Fragment::Special(self.token_to_id[special.as_str()]));
+                    out.push(Fragment::Special(
+                        *self
+                            .token_to_id
+                            .get(special)
+                            .expect("special tokens come from the vocab"),
+                    ));
                     i += special.len();
                     plain_start = i;
                 }
@@ -825,10 +1071,7 @@ impl Tokenizer {
         loop {
             let mut best: Option<(usize, usize)> = None; // (rank, index of left symbol)
             for i in 0..symbols.len().saturating_sub(1) {
-                if let Some(&rank) = self
-                    .merge_rank
-                    .get(&(symbols[i].clone(), symbols[i + 1].clone()))
-                {
+                if let Some(rank) = self.merge_rank.get(&symbols[i], &symbols[i + 1]) {
                     if best.is_none_or(|(best_rank, _)| rank < best_rank) {
                         best = Some((rank, i));
                     }
@@ -941,11 +1184,10 @@ impl Tokenizer {
                 return;
             };
             let (l, r) = (&symbols[left], &symbols[right]);
-            let key = (
-                word[l.start..l.end].to_string(),
-                word[r.start..r.end].to_string(),
-            );
-            if let Some(&rank) = self.merge_rank.get(&key) {
+            if let Some(rank) = self
+                .merge_rank
+                .get(&word[l.start..l.end], &word[r.start..r.end])
+            {
                 heap.push(Reverse((rank, left, l.end, r.end)));
             }
         };
@@ -1904,11 +2146,7 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let token_to_id: FxHashMap<String, u32> = tokens
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.clone(), i as u32))
-            .collect();
+        let token_to_id = VocabIndex::from_tokens(&tokens);
 
         let merges: [(&str, &str); 8] = [
             ("l", "l"),
@@ -1920,11 +2158,10 @@ mod tests {
             ("wor", "l"),
             ("worl", "d"),
         ];
-        let merge_rank = merges
-            .iter()
-            .enumerate()
-            .map(|(rank, (l, r))| ((l.to_string(), r.to_string()), rank))
-            .collect();
+        let mut merge_rank = MergeIndex::default();
+        for (rank, (l, r)) in merges.iter().enumerate() {
+            merge_rank.insert(l, r, rank);
+        }
 
         Tokenizer {
             architecture: "llama".to_string(),
@@ -1961,11 +2198,11 @@ mod tests {
     /// GGUFs) merges by score, as llama.cpp does, instead of not at all.
     fn build_scored_tokenizer() -> Tokenizer {
         let mut tok = build_synthetic_tokenizer();
-        tok.merge_rank = FxHashMap::default();
+        tok.merge_rank = MergeIndex::default();
         // Lone "▁" scored like Mistral's (-1e9): it must still merge into
         // "▁hello" when that token exists.
         tok.tokens.push("\u{2581}hello".to_string());
-        tok.token_to_id.insert("\u{2581}hello".to_string(), 20);
+        tok.token_to_id.insert("\u{2581}hello", 20);
         tok.scores = tok
             .tokens
             .iter()
@@ -1999,8 +2236,7 @@ mod tests {
             ("ab", -2.0),
             ("bc", -1.0),
         ] {
-            tok.token_to_id
-                .insert(piece.to_string(), tok.tokens.len() as u32);
+            tok.token_to_id.insert(piece, tok.tokens.len() as u32);
             tok.tokens.push(piece.to_string());
             tok.scores.push(score);
         }
@@ -2422,8 +2658,7 @@ mod tests {
         let mut tok = build_synthetic_tokenizer();
         let special_id = tok.tokens.len() as u32;
         tok.tokens.push("<|im_start|>".to_string());
-        tok.token_to_id
-            .insert("<|im_start|>".to_string(), special_id);
+        tok.token_to_id.insert("<|im_start|>", special_id);
         tok.special_tokens = vec!["<|im_start|>".to_string()];
 
         let ids = tok.encode("<|im_start|>hello").expect("encode");
@@ -2442,8 +2677,7 @@ mod tests {
         let mut tok = build_synthetic_tokenizer();
         let special_id = tok.tokens.len() as u32;
         tok.tokens.push("<|im_start|>".to_string());
-        tok.token_to_id
-            .insert("<|im_start|>".to_string(), special_id);
+        tok.token_to_id.insert("<|im_start|>", special_id);
         tok.special_tokens = vec!["<|im_start|>".to_string()];
 
         let ids = tok.encode("hello<|im_start|>world").expect("encode");
