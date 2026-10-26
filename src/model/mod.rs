@@ -865,7 +865,7 @@ impl Model {
         let (warm_gemm_ms, warm_sync_ms) = Self::warm_cublas(device, &cublas, weights)?;
         if load_profile_enabled() {
             eprintln!(
-                "REFLEX_LOAD_CUBLAS thread={thread} cublas_new_ms={cublas_new_ms:.2} math_mode_ms={math_mode_ms:.2} warm_gemm_ms={warm_gemm_ms:.2} warm_sync_ms={warm_sync_ms:.2} total_ms={:.2}",
+                "\nREFLEX_LOAD_CUBLAS thread={thread} cublas_new_ms={cublas_new_ms:.2} math_mode_ms={math_mode_ms:.2} warm_gemm_ms={warm_gemm_ms:.2} warm_sync_ms={warm_sync_ms:.2} total_ms={:.2}",
                 ms(t_start)
             );
         }

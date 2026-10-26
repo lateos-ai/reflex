@@ -361,8 +361,9 @@ impl Model {
             // The prefetch readers walk the data section in file order, so
             // they would read the expert bytes this load skips.
             pipeline.keep_fill_workers = true;
+            init.no_prefetch();
         } else {
-            pipeline.prefetch_from(file);
+            pipeline.prefetch_from(file, &init);
         }
         if profile_on {
             pipeline.profile = Some(LoadProfile::default());
