@@ -173,7 +173,7 @@ hop and leaves the wiring to it:
   takes 12.5 ms, against 543 ms for a fresh `reflex system1` process (T4).
 - **KV cache files** (`export_kv`/`import_kv`, `--export-kv`/`--import-kv`): one agent
   writes its context to a file and the next one, warm or cold, resumes from it instead
-  of prefilling again.
+  of prefilling again ([format and guarantees](docs/kv-cache-format.md)).
 - **JSON Schema constrained output** (`json_schema`, `--json-schema`) for structured
   handoffs.
 

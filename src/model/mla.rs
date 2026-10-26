@@ -1310,7 +1310,7 @@ impl Model {
             Some(PrefixSource::Host { cache, copy_ms }) => {
                 if cache.qk_dim != qk_dim {
                     return Err(crate::reflex_err!(
-                        Other,
+                        KvCache,
                         "imported KV cache shape mismatch: file has qk_dim={}, model expects qk_dim={}",
                         cache.qk_dim,
                         qk_dim
@@ -1318,7 +1318,7 @@ impl Model {
                 }
                 if cache.kv_caches.len() != m.layers.len() {
                     return Err(crate::reflex_err!(
-                        Other,
+                        KvCache,
                         "imported KV cache has {} layers, model has {}",
                         cache.kv_caches.len(),
                         m.layers.len()

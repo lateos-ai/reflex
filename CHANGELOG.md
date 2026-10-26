@@ -5,6 +5,13 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **KV cache file spec.** [docs/kv-cache-format.md](docs/kv-cache-format.md) documents
+  the byte layout of all seven cache-file versions and what orchestrators can rely on.
+  New tests build each version by hand and check it imports and re-exports
+  byte-identically. A file whose layer count doesn't match the model, or an MLA file
+  with the wrong `qk_dim`, now reports the `kv_cache` error category instead of
+  `other` (same message).
+
 - **Comparison table on the current default.** README's "How it compares" now measures
   Reflex with quantized-resident weights: on a T4 (2026-10-30, `n=30` each, interleaved),
   `reflex generate` reaches its first token in 0.47 s p50 against `llama-simple`'s
