@@ -625,7 +625,7 @@ compliance options, all `off` by default:
 
 | Option | Values | What it does |
 | --- | --- | --- |
-| `COMPLIANCE` | `off`, `on` | Every response gains a `compliance` block (model file sha256 and license, engine version, image digest, GPU, the job's usage and wall time); a stream ends with a `compliance.attestation` event; `{"compliance": "report"}` returns the image's compliance bundle and a model card. A listed model whose sha256 doesn't match `.runpod/models.json` stops the worker. |
+| `COMPLIANCE` | `off`, `on` | Every response gains a `compliance` block (model file sha256 and license, engine version, image digest, GPU, the job's usage when the adapter reports one (not for classify; a stream's chunk count instead) and wall time); a stream ends with a `compliance.attestation` event; `{"compliance": "report"}` returns the image's compliance bundle and a model card. A listed model whose sha256 doesn't match `.runpod/models.json` stops the worker. |
 | `AUDIT_LOG` | `off`, `stdout`, `volume` | One JSON line per job, to the worker's logs or to `/runpod-volume/reflex-audit/<worker-id>.jsonl`. |
 | `AUDIT_LOG_CONTENT` | `off`, `hash`, `full` | Whether audit lines leave out the prompt and answer, carry their sha256, or carry them as sent. |
 

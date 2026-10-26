@@ -335,7 +335,9 @@ license `unknown (user-supplied)`. A non-streaming job's output then gains:
 
 A streamed job ends with one more item, `{"object": "compliance.attestation", ...}`,
 holding the same fields. Its `job` has `stream_chunks` instead of `usage`, because the
-adapter's stream chunks carry no token counts. A RAG job's `job.rag_sources` lists the
+adapter's stream chunks carry no token counts. A classify job's `job` has no `usage`
+either: the adapter's classify response has none (each label's own token count is in
+the answer's `labels`). A RAG job's `job.rag_sources` lists the
 documents its passages came from. `image_digest` is whatever the image was built with
 (`--build-arg REFLEX_IMAGE_DIGEST=...`). The Hub build passes none, so it is `null`.
 Error outputs are passed through unchanged.

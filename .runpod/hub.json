@@ -187,7 +187,7 @@
         "input": {
           "name": "Compliance records",
           "type": "string",
-          "description": "on: every response carries a \"compliance\" block (the model file's sha256, its license from the GGUF and the worker's model table, the engine version, the GPU, and the job's token counts and wall time; streams end with a compliance.attestation event), and a job with {\"compliance\": \"report\"} returns the image's SBOMs, third-party licenses and a model card. The worker refuses to start if a listed model's sha256 does not match. Hashes are taken while a model downloads, so a cold start pays nothing extra after the first. off (default): no change. Not legal advice.",
+          "description": "on: every response carries a \"compliance\" block (the model file's sha256, its license from the GGUF and the worker's model table, the engine version, the GPU, and the job's token counts (chat and embeddings) and wall time; streams end with a compliance.attestation event), and a job with {\"compliance\": \"report\"} returns the image's SBOMs, third-party licenses and a model card. The worker refuses to start if a listed model's sha256 does not match. Hashes are taken while a model downloads, so a cold start pays nothing extra after the first. off (default): no change. Not legal advice.",
           "options": [
             {"label": "off (default)", "value": "off"},
             {"label": "on", "value": "on"}

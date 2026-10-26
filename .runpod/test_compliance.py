@@ -112,16 +112,19 @@ CHUNKS = [
     {"id": "c", "object": "chat.completion.chunk", "created": 1, "model": "m", "choices": [{"index": 0, "delta": {"content": t}, "finish_reason": None}]}
     for t in ("Hel", "lo")
 ]
+# The adapter's real /v1/classify shape (checked against the real engine): no usage.
 CLASSIFY = {
-    "id": "classify-1",
-    "object": "classify",
+    "id": "classify-reflex-0",
+    "object": "classification",
     "created": 1,
     "model": "m",
     "label": " negative",
     "label_index": 1,
-    "labels": [{"label": " positive", "probability": 0.1}, {"label": " negative", "probability": 0.9}],
+    "labels": [
+        {"label": " positive", "probability": 0.1, "score": 13.2, "tokens": 1},
+        {"label": " negative", "probability": 0.9, "score": 14.6, "tokens": 1},
+    ],
     "entropy": 0.47,
-    "usage": {"prompt_tokens": 9, "completion_tokens": 0, "total_tokens": 9},
 }
 EMBED = {"object": "list", "data": [{"object": "embedding", "index": 0, "embedding": [0.5, 0.5]}], "model": "m", "usage": {"prompt_tokens": 3, "total_tokens": 3}}
 
@@ -380,7 +383,10 @@ class AttestationTests(unittest.TestCase):
                 self.assertEqual(block["engine"], {"reflex_engine_crate_version": "0.2.0", "image_digest": "sha256:feed", "compliance_bundle": True})
                 self.assertEqual(block["gpu"], "NVIDIA GeForce RTX 4090")
                 self.assertEqual(block["job"]["endpoint"], {"chat": "chat", "classify": "classify", "embed": "embed"}[name])
-                self.assertEqual(block["job"]["usage"], EXPECTED_OFF[name][0]["usage"])
+                if name == "classify":
+                    self.assertNotIn("usage", block["job"], "a classify response has no usage to copy")
+                else:
+                    self.assertEqual(block["job"]["usage"], EXPECTED_OFF[name][0]["usage"])
                 self.assertGreaterEqual(block["job"]["wall_time_ms"], 0)
 
     def test_stream_ends_with_an_attestation_event(self):
@@ -445,6 +451,8 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(lines[4]["error_class"], "http_400")
         self.assertEqual(lines[0]["usage"], CHAT["usage"])
         self.assertEqual(lines[1]["stream_chunks"], 2)
+        self.assertNotIn("usage", lines[2])
+        self.assertEqual(lines[3]["usage"], EMBED["usage"])
         for line in lines:
             self.assertEqual(line["schema"], compliance.AUDIT_SCHEMA)
             self.assertEqual(line["model_sha256"], "cd" * 32)

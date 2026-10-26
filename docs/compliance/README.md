@@ -12,8 +12,8 @@ as without them. Nothing here runs on the engine's cold-start path.
 | --- | --- | --- |
 | Supply chain | CycloneDX SBOMs of the engine and the OpenAI adapter, the license text of every Rust dependency, and (in an image) the pip and apt package lists and base image names | [Build the bundle](#the-compliance-bundle) |
 | Model provenance | A GGUF's `general.*` metadata (name, license, source, quantizer, ...), architecture, quantization and sha256 | `reflex model-info <gguf> [--sha256] [--json]` ([reference](../reference.md#reflex-model-info)) |
-| Per-job attestation | Which model file (sha256, license) and engine served a job, on which GPU, with its token counts and wall time | Runpod Hub worker, `COMPLIANCE=on` |
-| Audit log | One JSON line per job: id, time, endpoint, model sha256, status, token counts, latency, and optionally the prompt and answer (hashed or in full) | Runpod Hub worker, `AUDIT_LOG=stdout` or `volume` |
+| Per-job attestation | Which model file (sha256, license) and engine served a job, on which GPU, with its token counts (chat and embedding jobs; a stream's chunk count; none for classify) and wall time | Runpod Hub worker, `COMPLIANCE=on` |
+| Audit log | One JSON line per job: id, time, endpoint, model sha256, status, token counts (as in the attestation), latency, and optionally the prompt and answer (hashed or in full) | Runpod Hub worker, `AUDIT_LOG=stdout` or `volume` |
 
 The Hub options are described in [.runpod/README.md](../../.runpod/README.md#compliance-records-and-audit-log).
 
