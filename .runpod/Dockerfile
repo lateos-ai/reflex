@@ -94,7 +94,7 @@ RUN cargo install --locked cargo-cyclonedx@0.5.9 \
     && cargo install --locked --features cli cargo-about@0.9.2 \
     && sh scripts/compliance-bundle.sh /compliance \
     && cp docs/compliance/data-handling.md /compliance/ \
-    && sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1 > /compliance/reflex-engine-version \
+    && sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1 > /compliance/reflex-engine-version \
     && rustc --version > /compliance/rustc-version
 
 FROM ${REFLEX_RUNTIME_BASE} AS runtime

@@ -120,7 +120,7 @@ RUN cargo install --locked cargo-cyclonedx@0.5.9 \
     && sh scripts/compliance-bundle.sh /compliance \
     && cp docs/compliance/data-handling.md /compliance/ \
     && printf '{\n  "reflex_engine_crate_version": "%s",\n  "rustc": "%s",\n  "base_images": {"builder": "nvidia/cuda:12.4.1-devel-ubuntu22.04", "runtime": "%s"}\n}\n' \
-        "$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)" "$(rustc --version)" "$REFLEX_RUNTIME_BASE" \
+        "$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)" "$(rustc --version)" "$REFLEX_RUNTIME_BASE" \
         > /compliance/build.json
 
 FROM runtime AS runtime-packages
