@@ -164,6 +164,30 @@ intentional: the point of the project is to measure real cold-start behavior. GP
 tests are marked `#[ignore]`; run them with `cargo test --release -- --ignored` on a GPU
 machine, or see [gpu-ci.md](gpu-ci.md) for the nightly GPU workflow.
 
+## Proposing a change
+
+Every pull request answers the questions in
+[the PR template](../.github/PULL_REQUEST_TEMPLATE.md). In short:
+
+1. **What does it do to cold start?** Give `reflex system1` and/or `reflex generate` p50
+   before and after on a representative small model (Qwen3-0.6B-Q4_K_M), with the run
+   count and GPU. `scripts/prove_it.sh` times five cold `system1` runs and prints p50 per
+   phase; `scripts/bench_cold_start_phases_system1.sh <gguf> 10` does more runs. Add
+   energy if you have NVML (a `--features nvml` build run with `REFLEX_ENERGY=1`, or
+   `scripts/bench_cold_energy.sh`). A change that can't touch the engine's cold path
+   (docs, tests, scripts, the sidecar) says so instead. A change that makes cold start
+   slower needs a reason that outweighs it.
+2. **Does it stay inside the [Non-goals](#non-goals)?** No batching, queue, scheduler,
+   thread pool, in-core network listener, multi-prefix cache or multi-tenant routing.
+   Raise an issue first if you're unsure.
+3. **Is it still correct?** The CPU checks CI runs (`cargo fmt --check`,
+   `cargo clippy --all-targets --features ipc -- -D warnings`, `cargo test --features
+   ipc`, and the same for `sidecar/openai-adapter` if it changed). If the forward pass,
+   a kernel, weight handling or the tokenizer changed, also run `reflex check` on a GPU
+   (token ids must match; logit checksums too for a change meant to be exact) and the
+   `#[ignore]`d GPU tests. If you don't have a GPU, say so in the PR and a maintainer
+   will run them.
+
 ## Model loading: weights stay on the GPU
 
 `Model::load` dequantizes every weight tensor once and uploads it once, as a
