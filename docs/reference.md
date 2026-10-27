@@ -269,10 +269,11 @@ objects also carry a **`schema_version`** field so a consumer can detect a shape
 `REFLEX_GENERATE_OK`/`REFLEX_SYSTEM1_OK` line: the run's timings next to what is needed
 to compare them with someone else's (GPU, driver, kernel image, weight mode, model file).
 It adds a line and changes none: the `REFLEX_*_OK` and `REFLEX_PHASE_OK` lines are
-byte-for-byte what they were. Paste this line with a bug report or a benchmark.
+byte-for-byte what they were. Paste this line with a bug report or a benchmark. A cold
+`system1` on a T4 (AWS g4dn.xlarge, `REFLEX_CUDA_ARCH=sm_75`, `--features ipc,nvml`):
 
 ```
-REFLEX_RUN_REPORT schema_version=1.5.0 command=system1 process_start_to_first_result_ms=... gguf_open_ms=... cuda_init_ms=... model_load_ms=... prompt_eval_ms=... gpu_name="Tesla T4" compute_capability=7.5 vram_total_mib=... cuda_driver_version=... driver_version=... kernel_format=fatbin kernel_image=native kernel_image_arch=sm_75 compiled_archs=... weights=qr weights_dtype=f16 kv_cache=f32 arch="qwen3" model_file="Qwen3-0.6B-Q4_K_M.gguf" model_bytes=... energy_joules=... energy_method=...
+REFLEX_RUN_REPORT schema_version=1.5.0 command=system1 process_start_to_first_result_ms=379.854 gguf_open_ms=61.407 cuda_init_ms=145.820 model_load_ms=160.944 prompt_eval_ms=7.851 gpu_name="Tesla T4" compute_capability=7.5 vram_total_mib=14912 cuda_driver_version=13.2 driver_version=595.91.07 kernel_format=cubin kernel_image=native kernel_image_arch=sm_75 weights=qr weights_dtype=f16 kv_cache=f32 arch="qwen3" model_file="Qwen3-0.6B-Q4_K_M.gguf" model_bytes=396705472 energy_joules=13.511 energy_method=total_energy_counter
 ```
 
 A field that couldn't be read is left out, as the energy fields already are. Every value
