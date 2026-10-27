@@ -363,7 +363,7 @@ impl Model {
             pipeline.keep_fill_workers = true;
             init.no_prefetch();
         } else {
-            pipeline.prefetch_from(file, &init);
+            pipeline.prefetch_from(file, &init)?;
         }
         if profile_on {
             pipeline.profile = Some(LoadProfile::default());

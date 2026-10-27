@@ -173,7 +173,7 @@ impl Model {
 
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
-        pipeline.prefetch_from(file, &init);
+        pipeline.prefetch_from(file, &init)?;
         if profile_on {
             pipeline.profile = Some(LoadProfile::default());
         }

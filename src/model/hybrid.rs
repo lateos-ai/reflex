@@ -426,7 +426,7 @@ impl Model {
             .ok_or_else(|| ReflexError::Other("missing gdn_delta_rows_kernel".to_string()))?;
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
-        pipeline.prefetch_from(file, &init);
+        pipeline.prefetch_from(file, &init)?;
 
         let mut load_weight = |name: &str| -> Result<Weight, ReflexError> {
             load_weight_device(&mut pipeline, &dequant_kernels, policy, file, name)

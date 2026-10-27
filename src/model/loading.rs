@@ -453,7 +453,8 @@ fn load_init_wait_enabled() -> bool {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GateState {
-    /// The loader hasn't said yet whether this load prefetches.
+    /// The loader hasn't said yet whether this load prefetches (and is
+    /// still preparing the pinned slots, see `prefetch_from`).
     Pending,
     /// Prefetch readers are expected or running.
     Closed,
@@ -1282,6 +1283,14 @@ impl PinnedHostBuffer {
         Ok(())
     }
 
+    /// Writes one byte per page, so the fill never takes this buffer's
+    /// first-touch faults (see [`WeightLoadPipeline::prefetch_from`]).
+    fn touch(&mut self) {
+        for i in (0..self.cap).step_by(4096) {
+            unsafe { self.ptr.add(i).write_volatile(0) };
+        }
+    }
+
     /// Borrows this buffer's first `len` bytes (`len <= self.cap`).
     pub(super) fn as_slice(&self, len: usize) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, len) }
@@ -1866,18 +1875,50 @@ impl WeightLoadPipeline {
     /// threads fault pages in themselves. `init`'s cuBLAS half waits for the
     /// readers if this load is expected to start them: some tensor besides the
     /// host-resident `token_embd` is big enough for a parallel fill.
-    pub(super) fn prefetch_from(&mut self, file: &GgufFile, init: &LoadInit<'_>) {
+    ///
+    /// First it sizes both pinned slots for the largest chunk the load stages
+    /// (`token_embd` aside) and touches every page, with `init`'s cuBLAS half
+    /// still held back. A first touch of fresh `cuMemHostAlloc` memory while
+    /// `CudaBlas::new` ran on the init thread could block until it returned:
+    /// one 10 MB fill took ~78 ms instead of ~1.3 ms in 13 of 20 Qwen3-1.7B
+    /// loads on a T4, once the tokenizer got fast enough for cuBLAS to start
+    /// while the slots were still growing (8 allocations, <1 to 10 MB).
+    pub(super) fn prefetch_from(
+        &mut self,
+        file: &GgufFile,
+        init: &LoadInit<'_>,
+    ) -> Result<(), ReflexError> {
         self.prefetch_source = Some(file.data_section_shared());
+        let mut largest = 0;
+        for t in file
+            .tensors
+            .iter()
+            .filter(|t| t.name != "token_embd.weight")
+        {
+            if let Ok(b) = file.tensor_bytes(t) {
+                largest = largest.max(b.len());
+            }
+        }
+        let t = std::time::Instant::now();
+        let slot_bytes = largest.min(STAGE_CHUNK_BYTES);
+        debug_assert!(!self.pinned_used.contains(&true));
+        for slot in &mut self.pinned {
+            unsafe { slot.ensure_capacity(slot_bytes)? };
+            slot.touch();
+        }
+        if load_profile_enabled() {
+            eprintln!(
+                "\nREFLEX_LOAD_SLOTS slot_mb={:.1} prep_ms={:.2}",
+                slot_bytes as f64 / 1e6,
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let readers_expected = load_init_wait_enabled()
             && self.reader_threads > 0
-            && file.tensors.iter().any(|t| {
-                t.name != "token_embd.weight"
-                    && file
-                        .tensor_bytes(t)
-                        .is_ok_and(|b| b.len() >= PARALLEL_FILL_MIN_BYTES)
-            });
+            && largest >= PARALLEL_FILL_MIN_BYTES;
         init.gate.0.decide(readers_expected);
         self.init_gate = Some(init.gate.0.clone());
+        Ok(())
     }
 
     /// Grows slot `slot`'s device-side staging buffer to hold at least
