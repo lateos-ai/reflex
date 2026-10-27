@@ -5,6 +5,16 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Faster first constrained request.** The JSON Schema vocabulary index, built on a
+  process's first `json_schema` request, now takes fewer passes and allocations: token
+  bytes go into one buffer, the sort is on integer keys, and one pass builds the trie.
+  It gives the same index (checked against the old build on all 45 tokenizers in
+  `test-data/`) and is still built lazily. T4, Qwen3-0.6B: build 65 → 31 ms, and a
+  schema's extra first-token cost on a fresh process +57 → +23 ms. Outputs, `reflex check`,
+  unconstrained cold start and the T4 GPU test suite are unchanged.
+  `REFLEX_GRAMMAR_PROFILE=1` prints the build time on its own. Cold and warm numbers:
+  [docs/design/agent-relay.md](docs/design/agent-relay.md), phase C.
+
 - **Faster cold start: shorter load-init path.** The load's one background thread builds
   the tokenizer and then the cuBLAS handle. The load thread now builds cuBLAS itself if
   it finishes its weights first. The tokenizer builds its vocab and merge lookups as

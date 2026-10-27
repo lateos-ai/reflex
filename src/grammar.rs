@@ -1496,7 +1496,7 @@ impl Dfa {
 /// `depth[i]` (1-based) of every token below it; `skip[i]` is the first node after
 /// its subtree; `toks[tok_start[i]..tok_start[i + 1]]` are the tokens whose bytes end
 /// exactly there. Each token's bytes are what it adds to the decoded text
-/// (`Tokenizer::token_text_bytes`). Control, unknown and unused tokens are left out
+/// (`Tokenizer::push_token_text_bytes`). Control, unknown and unused tokens are left out
 /// (never allowed), and EOS is allowed only when the value is complete.
 pub struct TokenIndex {
     byte: Vec<u8>,
@@ -1527,56 +1527,64 @@ impl TokenIndex {
         off.push(0u32);
         for id in 0..vocab as u32 {
             if tok.is_text_token(id) && Some(id) != tok.eos_token_id {
-                token_bytes.extend(tok.token_text_bytes(id));
+                tok.push_token_text_bytes(id, &mut token_bytes);
             }
             off.push(token_bytes.len() as u32);
         }
         let bytes_of =
             |id: u32| &token_bytes[off[id as usize] as usize..off[id as usize + 1] as usize];
-        let mut order: Vec<u32> = (0..vocab as u32)
-            .filter(|&id| !bytes_of(id).is_empty())
+        // Tokens by bytes, then id. An integer sort on each token's first 8 bytes
+        // (big-endian and zero-padded, so it agrees with byte order) does most of it;
+        // only runs that share those 8 bytes are compared byte by byte.
+        let mut keys: Vec<(u64, u32)> = (0..vocab as u32)
+            .filter_map(|id| {
+                let b = bytes_of(id);
+                (!b.is_empty()).then(|| (prefix8(b), id))
+            })
             .collect();
-        order.sort_unstable_by(|&a, &b| bytes_of(a).cmp(bytes_of(b)));
+        keys.sort_unstable();
+        let mut order: Vec<u32> = keys.iter().map(|&(_, id)| id).collect();
+        let mut i = 0;
+        while i < keys.len() {
+            let mut j = i + 1;
+            while j < keys.len() && keys[j].0 == keys[i].0 {
+                j += 1;
+            }
+            if j - i > 1 {
+                order[i..j].sort_unstable_by(|&a, &b| bytes_of(a).cmp(bytes_of(b)).then(a.cmp(&b)));
+            }
+            i = j;
+        }
 
-        let (mut byte, mut depth, mut node_of_tok) = (Vec::new(), Vec::new(), Vec::new());
+        // One pass in that order. A token's node is always the newest one: either it
+        // was just made, or the token has the same bytes as the one before. So tokens
+        // arrive grouped by node, in node order, and a node's subtree ends where the
+        // next node at its depth or shallower is made.
+        let (mut byte, mut depth, mut skip, mut tok_start) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut toks = Vec::with_capacity(order.len());
         let mut path: Vec<u32> = Vec::new(); // node index per depth of the current token
         let mut prev: &[u8] = &[];
         for &id in &order {
             let cur = bytes_of(id);
             let common = prev.iter().zip(cur).take_while(|(a, b)| a == b).count();
+            for &p in &path[common..] {
+                skip[p as usize] = byte.len() as u32;
+            }
             path.truncate(common);
             for (d, &b) in cur.iter().enumerate().skip(common) {
                 path.push(byte.len() as u32);
                 byte.push(b);
                 depth.push((d + 1) as u16);
+                skip.push(0);
+                tok_start.push(toks.len() as u32);
             }
-            node_of_tok.push((*path.last().expect("non-empty token"), id));
+            toks.push(id);
             prev = cur;
         }
         let n = byte.len();
-        let mut skip = vec![n as u32; n];
-        let mut open: Vec<usize> = Vec::new();
-        for i in 0..n {
-            while let Some(&j) = open.last() {
-                if depth[j] >= depth[i] {
-                    skip[j] = i as u32;
-                    open.pop();
-                } else {
-                    break;
-                }
-            }
-            open.push(i);
-        }
-        // `order` is sorted by bytes, so tokens arrive grouped by node, in node order.
-        let mut tok_start = Vec::with_capacity(n + 1);
-        let mut toks = Vec::with_capacity(node_of_tok.len());
-        let mut k = 0;
-        for i in 0..n {
-            tok_start.push(toks.len() as u32);
-            while k < node_of_tok.len() && node_of_tok[k].0 == i as u32 {
-                toks.push(node_of_tok[k].1);
-                k += 1;
-            }
+        for &p in &path {
+            skip[p as usize] = n as u32;
         }
         tok_start.push(toks.len() as u32);
         let max_depth = depth.iter().copied().max().unwrap_or(0) as usize;
@@ -1596,6 +1604,21 @@ impl TokenIndex {
         }
     }
 
+    /// The index as a tuple of its arrays, for comparing two builds in tests.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    fn arrays(&self) -> (&[u8], &[u16], &[u32], &[u32], &[u32], &[u32], &[u8]) {
+        (
+            &self.byte,
+            &self.depth,
+            &self.skip,
+            &self.tok_start,
+            &self.toks,
+            &self.off,
+            &self.token_bytes,
+        )
+    }
+
     fn bytes_of(&self, id: u32) -> &[u8] {
         match self.off.get(id as usize..id as usize + 2) {
             Some(w) => &self.token_bytes[w[0] as usize..w[1] as usize],
@@ -1607,6 +1630,15 @@ impl TokenIndex {
     pub fn node_count(&self) -> usize {
         self.byte.len()
     }
+}
+
+/// The first 8 bytes of `b` as a big-endian integer, zero-padded: `a < b` implies
+/// `prefix8(a) <= prefix8(b)`.
+fn prefix8(b: &[u8]) -> u64 {
+    let mut p = [0u8; 8];
+    let n = b.len().min(8);
+    p[..n].copy_from_slice(&b[..n]);
+    u64::from_be_bytes(p)
 }
 
 // ---------------------------------------------------------------------------

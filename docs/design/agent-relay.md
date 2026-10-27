@@ -461,8 +461,9 @@ already conforms, the constrained output is identical, token for token.
   out of range.
 
 **The index is built lazily.** The first constrained request in a process builds it
-and keeps it on the `Model`. That takes 66 ms for Qwen3's 152K-token vocabulary
-(333,054 trie nodes) on the T4 host. Cold start and unconstrained requests never
+and keeps it on the `Model`. That takes 31 ms for Qwen3's 152K-token vocabulary
+(333,054 trie nodes) on the T4 host (65 ms before the faster build in "Cold and warm
+cost of a constrained request", below). Cold start and unconstrained requests never
 build it.
 
 ### Errors and timings
@@ -597,6 +598,86 @@ files", above), the tests compare ids, and the constrained hop test checks
 
 Raw data: `bench-results/agent-relay-t4-phase-c/` (not committed; `run4` has the
 numbers above, `run1` to `run3` the first version's).
+
+### Cold and warm cost of a constrained request (Tesla T4, 2026-10-26)
+
+`REFLEX_GRAMMAR_PROFILE=1` prints the index build on its own
+(`REFLEX_GRAMMAR_PROFILE index_build_ms=... nodes=...` on stderr), since
+`mask_ms_total` leaves it out. `reflex generate` also prints `mask_ms_total` there.
+
+Setup: Qwen3-0.6B Q4_K_M, `scripts/relay_handoff_schema.json`, the bench's first-hop
+prompt with `--json-prompt` (458 characters), `max_tokens` 64, greedy. Driver
+595.91.07, `sm_75`. n=10 per row, the rows interleaved, p50 (min-max) in ms. "Cold
+`stdio`" is a fresh `reflex stdio` process sending one request. "Warm" is
+`agent_relay_bench.py stdio --hops 5 --warmup 0`: the first request of each
+process, then hops 2 to 5 (n=40).
+
+| | first token | request (`model_ms`), or last token | index build | `mask_ms_total` | tokens |
+|---|---:|---:|---:|---:|---:|
+| cold `reflex generate`, free | 388.99 (382.69-393.08) | 702.07 (692.52-707.38) | | | 64 |
+| cold `reflex generate`, schema | 444.74 (440.21-447.36) | 580.01 (575.02-582.98) | 64.73 (64.61-64.95) | 7.74 (7.60-7.97) | 27 |
+| cold `stdio`, free | 50.91 (50.57-52.60) | 363.57 (361.65-366.57) | | | 64 |
+| cold `stdio`, schema | 107.17 (106.96-108.19) | 242.55 (241.94-243.53) | 64.96 (64.69-65.81) | 7.80 (7.62-8.24) | 27 |
+| warm, first request, free | 50.82 (50.61-51.15) | 363.08 (361.51-366.23) | | | 64 |
+| warm, first request, schema | 107.09 (106.35-109.03) | 242.37 (241.02-243.90) | (built here) | 7.75 (7.56-7.87) | 27 |
+| warm, later requests, free | 21.98 (21.61-22.42) | 339.42 (336.69-342.55) | | | 64 |
+| warm, later requests, schema | 15.85 (15.28-16.37) | 172.90 (156.02-188.53) | 0 (kept) | 8.12 (7.64-8.67) | 31 (28-34) |
+
+- **The index build is the whole first-token cost of a schema.** A process's first
+  constrained request reaches its first token 56 ms later than an unconstrained one
+  (+55.8 ms on `reflex generate`, +56.3 ms on `stdio`). That is the 65 ms build minus
+  the part that overlaps the prefill still running on the GPU.
+- **Later requests don't pay it.** The index stays on the `Model`, and masking is
+  0.26 to 0.29 ms per token. The later-request rows aren't a like-for-like pair, since
+  each hop's prompt carries the previous output and the constrained outputs are
+  shorter.
+- **The whole request is shorter with a schema** (580 vs 702 ms cold): generation
+  stops once the value closes, after 27 tokens, while the free output runs to
+  `max_tokens`.
+- A process's first request is ~29 ms slower to its first token than later ones even
+  without a schema (50.8 vs 22.0 ms). That is the first request, not the schema.
+- All 10 cold and 50 warm constrained outputs parse as JSON, and they're the same
+  on every run.
+
+**A faster build.** The index now takes fewer passes and allocations, and it gives
+the same arrays:
+- each token's bytes go straight into one buffer, with no `Vec` per token and a flat
+  table instead of a hash lookup per gpt2 character;
+- the sort is on integer keys (the first 8 bytes, then the id), and only tokens that
+  share those 8 bytes are compared byte by byte;
+- one pass builds the trie, the skip pointers and each node's token range.
+
+It is still built lazily. `index_build_matches_reference` (`src/grammar/tests.rs`)
+checks the arrays against the old build on the Qwen3, TinyLlama and Gemma 4 tokenizers;
+`REFLEX_INDEX_REF_ALL=1` checks every tokenizer in `test-data/` (45, all identical).
+
+Same T4 and setup, the old build ("before") and the new one interleaved, n=10, p50
+(min-max) in ms:
+
+| | before | after |
+|---|---:|---:|
+| index build (cold `stdio`) | 65.13 (64.70-66.05) | **31.02** (30.07-32.32) |
+| cold `reflex generate`, schema, first token | 440.74 (436.83-450.92) | **409.37** (402.38-420.67) |
+| cold `reflex generate`, free, first token | 388.85 (379.83-398.61) | 384.41 (378.84-393.35) |
+| cold `stdio`, schema, first token | 107.74 (107.08-108.86) | **73.74** (72.15-75.65) |
+| cold `stdio`, free, first token | 50.93 (50.68-52.10) | 51.04 (50.49-51.39) |
+| warm, first request, schema, first token | 107.22 (106.85-108.83) | **73.37** (72.23-75.33) |
+| warm, first request, free, first token | 51.21 (50.61-52.43) | 51.03 (50.53-51.32) |
+| warm, later requests, schema, first token | 15.80 (15.15-16.57) | 15.84 (15.30-16.45) |
+| `mask_ms_total` per request (cold `stdio`) | 7.86 (7.73-8.23) | 7.70 (7.46-8.04) |
+
+- **A schema's extra first-token cost on a fresh process** went from +51.9 to
+  +25.0 ms on `reflex generate`, and from +56.8 to +22.7 ms on `stdio` (cold) and
+  +56.0 to +22.3 ms (warm, first request). Later requests were already unaffected.
+- **Outputs are unchanged.** Every constrained and unconstrained output in this run
+  is the same before and after. So are `reflex generate --json-schema` runs on
+  Qwen3-0.6B, Qwen3-1.7B, TinyLlama and Qwen3.5-0.8B (two schemas, two prompts each,
+  16 of 16 identical, including the five that ran out of tokens).
+- **Unconstrained cold start is unchanged** (no index is built). `system1` p50, master
+  vs this build: 348.38 vs 348.75 ms; `generate` first token 380.34 vs 375.46 ms.
+- The build is still above 20 ms on the T4. Building only the parts of the trie a
+  schema can reach would cut it further, but it would make the index depend on the
+  schema, so it can't be kept on the `Model` and shared by every later request.
 
 ## Multi-process chains (phase D)
 
