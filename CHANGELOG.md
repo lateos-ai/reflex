@@ -5,6 +5,18 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Faster cold start: shorter load-init path.** The load's one background thread builds
+  the tokenizer and then the cuBLAS handle. The load thread now builds cuBLAS itself if
+  it finishes its weights first. The tokenizer builds its vocab and merge lookups as
+  open-addressing indexes over one byte buffer: same token ids, checked on 63.46M ids.
+  cuBLAS setup waits for the prefetch readers and for both pinned staging slots to be
+  allocated and touched. A first touch of a fresh pinned slot during `CudaBlas::new`
+  could stall one fill for ~78 ms. Still one extra thread per load.
+  `REFLEX_LOAD_PROFILE=1` adds `REFLEX_LOAD_INIT`, `REFLEX_LOAD_CUBLAS` and
+  `REFLEX_LOAD_SLOTS` lines. `system1` p50, n=10, interleaved with the previous master:
+  T4: Qwen3-0.6B 413 → 342 ms, Qwen3-1.7B 459 → 414 ms, Mistral 7B 1285 → 1150 ms.
+  A10G: 431 → 376, 488 → 406, 935 → 818 ms. `reflex check` output identical on both
+  GPUs, and the T4 GPU test suite gives the same results as master.
 - **Opt-in compliance records.** `reflex model-info <gguf>` prints a GGUF's
   provenance metadata (license, source, size, optional sha256), no GPU needed. The
   Runpod Hub worker gains three deploy fields, all off by default: `COMPLIANCE=on`
