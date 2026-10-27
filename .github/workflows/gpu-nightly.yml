@@ -24,6 +24,12 @@ on:
       bench_runs:
         description: "Cold-start bench runs (n)"
         default: "10"
+      relay_threshold_pct:
+        description: "Fail if a relay hop's gated p50 regresses by more than this percent (and by 3 ms)"
+        default: "15"
+      relay_hops:
+        description: "Relay bench hops per hop kind (n)"
+        default: "20"
 
 permissions:
   contents: read
@@ -160,6 +166,25 @@ jobs:
           python3 scripts/bench_compare.py bench-results/bench-output.txt \
             --baseline bench/baseline-t4.json \
             --threshold-pct "${{ inputs.threshold_pct || '15' }}" \
+            --summary-file "$GITHUB_STEP_SUMMARY"
+
+      # Warm agent-relay hops on one `reflex stdio`: pinned prefix, System-1
+      # `candidates`, json_schema (scripts/bench_relay_nightly.sh).
+      - name: Relay hop bench
+        if: always() && steps.tests.outcome != 'skipped'
+        run: |
+          set -o pipefail
+          mkdir -p bench-results
+          bash scripts/bench_relay_nightly.sh \
+            "$MODELS_DIR/$DENSE_FILE" "${{ inputs.relay_hops || '20' }}" bench-results \
+            | tee bench-results/relay-output.txt
+
+      - name: Compare relay against baseline
+        if: always() && hashFiles('bench-results/relay-output.txt') != ''
+        run: |
+          python3 scripts/bench_compare.py bench-results/relay-output.txt --relay \
+            --baseline bench/baseline-relay-t4.json \
+            --threshold-pct "${{ inputs.relay_threshold_pct || '15' }}" \
             --summary-file "$GITHUB_STEP_SUMMARY"
 
       # Whole-process energy, net of the GPU's idle draw (src/bin/reflex-energy.rs).

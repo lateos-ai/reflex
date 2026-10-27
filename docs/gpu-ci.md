@@ -10,11 +10,17 @@
    `reflex system1` on Qwen3-0.6B-Q4_K_M, n=10), compared with
    `scripts/bench_compare.py` against `bench/baseline-t4.json`. The job fails if total
    p50 regresses by more than 15%.
-3. **Whole-process energy** (`scripts/bench_cold_energy.sh`, `reflex system1` under
+3. **The warm agent-relay hops** (`scripts/bench_relay_nightly.sh`): one `reflex stdio`
+   on the same model with the shared system prompt pinned, 20 hops of each kind with
+   fixed prompts and greedy decoding: a generate hop resumed from the pinned prefix, a
+   System-1 `candidates` hop, and a `json_schema` hop. Compared with
+   `scripts/bench_compare.py --relay` against `bench/baseline-relay-t4.json` (see
+   [The relay baseline](#the-relay-baseline)).
+4. **Whole-process energy** (`scripts/bench_cold_energy.sh`, `reflex system1` under
    `reflex-energy`): gross energy, idle baseline and net energy, p50/p95. Reported in
    the run summary only; it does not gate the job.
 
-Both results go to the run's summary page. The raw logs (per-test logs, per-run
+All results go to the run's summary page. The raw logs (per-test logs, per-run
 `/usr/bin/time -v` output, bench stdout) are uploaded as an artifact kept for 30 days.
 
 GitHub-hosted runners have no GPU, so the workflow starts an **ephemeral self-hosted
@@ -149,6 +155,31 @@ gate on.
 
 The threshold (default 15%) and bench run count (default 10) can be changed per run
 with the manual-dispatch inputs.
+
+## The relay baseline
+
+`bench/baseline-relay-t4.json` holds one gated p50 per hop kind: the round trip of the
+pinned generate hop, the round trip of the `candidates` hop, and the round trip of the
+`json_schema` hop, plus that hop's count of valid JSON outputs. A hop kind regresses
+when its p50 grows by more than the threshold (default 15%) **and** by at least 3 ms
+(`--min-delta-ms`): a warm hop is short enough for a few ms of jitter to be a large
+percentage. Fewer valid JSON outputs than the baseline also count as a regression. The
+other p50s (first token, prefix copy, decode per token, masking) are in the report for
+diagnosis only. If a hop's token count differs from the baseline's, the report says the
+comparison is not like-for-like: the round trips then include different decode work.
+
+The baseline stays **provisional until two scheduled runs exist**, so until then a
+regression is a warning. A value of `"TBD"` means nothing was measured yet; the report
+says so and the step passes. To write one from a run's `relay-output.txt`:
+
+```
+python3 scripts/bench_compare.py relay-output.txt --relay \
+  --write-baseline bench/baseline-relay-t4.json [--provisional] \
+  --source "GPU nightly run https://github.com/<org>/<repo>/actions/runs/<id>"
+```
+
+The relay threshold and hop count can be changed per run with the manual-dispatch
+inputs.
 
 ## Cost
 

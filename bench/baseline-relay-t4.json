@@ -1,0 +1,44 @@
+{
+  "provisional": true,
+  "provisional_reason": "until two scheduled nightly runs exist",
+  "source": "TBD: not measured yet",
+  "recorded": "TBD",
+  "gpu": "Tesla T4",
+  "model": "Qwen3-0.6B-Q4_K_M.gguf",
+  "target": "stdio",
+  "hops": 20,
+  "warmup": 3,
+  "max_tokens": 32,
+  "fixed_notes": 1,
+  "sampling": "greedy",
+  "hop_kinds": {
+    "pinned": {
+      "gate": "rtt_ms",
+      "metrics": {
+        "rtt_ms": {"p50": "TBD", "p95": "TBD"},
+        "first_token_ms": {"p50": "TBD", "p95": "TBD"},
+        "kv_io_ms": {"p50": "TBD", "p95": "TBD"},
+        "decode_ms_per_token": {"p50": "TBD", "p95": "TBD"},
+        "tokens": {"p50": "TBD", "p95": "TBD"}
+      }
+    },
+    "candidates": {
+      "gate": "s1_rtt_ms",
+      "metrics": {
+        "s1_rtt_ms": {"p50": "TBD", "p95": "TBD"},
+        "s1_model_ms": {"p50": "TBD", "p95": "TBD"},
+        "s1_kv_io_ms": {"p50": "TBD", "p95": "TBD"}
+      }
+    },
+    "constrained": {
+      "gate": "rtt_ms",
+      "metrics": {
+        "rtt_ms": {"p50": "TBD", "p95": "TBD"},
+        "first_token_ms": {"p50": "TBD", "p95": "TBD"},
+        "mask_ms": {"p50": "TBD", "p95": "TBD"},
+        "tokens": {"p50": "TBD", "p95": "TBD"}
+      },
+      "valid": {"count": "TBD", "of": 20}
+    }
+  }
+}
