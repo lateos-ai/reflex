@@ -439,6 +439,179 @@ pub(super) fn load_profile_enabled() -> bool {
     std::env::var("REFLEX_LOAD_PROFILE").is_ok_and(|v| v == "1")
 }
 
+/// `REFLEX_LOAD_INIT_SHARE=0` keeps the whole init on the init thread (see
+/// [`LoadInit::join`]), for A/B runs.
+fn load_init_share_enabled() -> bool {
+    std::env::var("REFLEX_LOAD_INIT_SHARE").map_or(true, |v| v != "0")
+}
+
+/// `REFLEX_LOAD_INIT_WAIT=0` lets the init thread build cuBLAS while the
+/// prefetch readers run (see [`ReaderGate`]), for A/B runs.
+fn load_init_wait_enabled() -> bool {
+    std::env::var("REFLEX_LOAD_INIT_WAIT").map_or(true, |v| v != "0")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GateState {
+    /// The loader hasn't said yet whether this load prefetches (and is
+    /// still preparing the pinned slots, see `prefetch_from`).
+    Pending,
+    /// Prefetch readers are expected or running.
+    Closed,
+    Open,
+}
+
+/// Holds the init thread's cuBLAS half back until the prefetch readers have
+/// faulted the whole file in. Building the handle (library and driver setup,
+/// ~80 ms on a T4) while the readers run slowed the pinned fill from 5.7 to
+/// 3.8 GB/s on Qwen3-1.7B (+75 ms), but not at all with the readers off. Once
+/// the readers are done the rest of the fill still hides the build. Every
+/// path out of a load opens it: the readers finishing, `end_load`,
+/// [`LoadInit::join`], or `LoadInit` being dropped on an error.
+pub(super) struct ReaderGate {
+    state: std::sync::Mutex<GateState>,
+    cvar: std::sync::Condvar,
+}
+
+impl ReaderGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(GateState::Pending),
+            cvar: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Decides a pending gate; never closes it again once open.
+    fn decide(&self, readers_expected: bool) {
+        if let Ok(mut st) = self.state.lock() {
+            if *st == GateState::Pending {
+                *st = if readers_expected {
+                    GateState::Closed
+                } else {
+                    GateState::Open
+                };
+            }
+        }
+        self.cvar.notify_all();
+    }
+
+    fn open(&self) {
+        if let Ok(mut st) = self.state.lock() {
+            *st = GateState::Open;
+        }
+        self.cvar.notify_all();
+    }
+
+    fn wait(&self) {
+        let Ok(mut st) = self.state.lock() else {
+            return;
+        };
+        while *st != GateState::Open {
+            st = match self.cvar.wait(st) {
+                Ok(st) => st,
+                Err(_) => return,
+            };
+        }
+    }
+}
+
+/// Opens the gate when the `LoadInit` holding it goes away, so an early
+/// error return can't leave the init thread waiting (the scope joins it).
+struct GateGuard(Arc<ReaderGate>);
+
+impl Drop for GateGuard {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// The one scoped thread a load spawns for its host/driver setup (the
+/// tokenizer, then the cuBLAS handle), so that setup overlaps the weight load
+/// instead of sitting on the serial path. Still exactly one extra thread per
+/// load (see `docs/DEVELOPMENT.md`'s Non-goals): what changed is that the load
+/// thread, once its weight loop is done, takes the cuBLAS half itself if the
+/// init thread hasn't started it yet, instead of waiting idle in `join`. A
+/// short weight loop (Qwen3-0.6B: ~73 ms on a T4) used to wait ~136 ms for
+/// both halves in sequence; a long one (Mistral 7B) finds both already done.
+pub(super) struct LoadInit<'scope> {
+    handle: ScopedJoinHandle<'scope, Result<(Tokenizer, Option<CudaBlas>), ReflexError>>,
+    /// Set by whichever thread starts on the cuBLAS handle first.
+    cublas_claimed: Arc<AtomicBool>,
+    device: Arc<CudaDevice>,
+    weights: WeightsDtype,
+    gate: GateGuard,
+}
+
+impl<'scope> LoadInit<'scope> {
+    pub(super) fn spawn<'env>(
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        file: &'env GgufFile,
+        device: Arc<CudaDevice>,
+        weights: WeightsDtype,
+    ) -> Self {
+        let cublas_claimed = Arc::new(AtomicBool::new(false));
+        let claimed = cublas_claimed.clone();
+        let init_device = device.clone();
+        let gate = ReaderGate::new();
+        let init_gate = gate.clone();
+        let handle = scope.spawn(move || {
+            let t = std::time::Instant::now();
+            let tokenizer = Tokenizer::from_gguf(file)?;
+            let tokenizer_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
+            init_gate.wait();
+            if load_profile_enabled() {
+                // Leading newline: the progress line on stderr has none.
+                eprintln!(
+                    "\nREFLEX_LOAD_INIT tokenizer_ms={tokenizer_ms:.2} reader_wait_ms={:.2}",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            let cublas = if claimed.swap(true, Ordering::AcqRel) {
+                None
+            } else {
+                Some(Model::build_cublas(&init_device, weights, "init")?)
+            };
+            Ok((tokenizer, cublas))
+        });
+        Self {
+            handle,
+            cublas_claimed,
+            device,
+            weights,
+            gate: GateGuard(gate),
+        }
+    }
+
+    /// Prefetch readers aren't coming (the loader skips prefetching): lets
+    /// the init thread start on cuBLAS.
+    pub(super) fn no_prefetch(&self) {
+        self.gate.0.decide(false);
+    }
+
+    /// Waits for the init thread. If it hasn't started on the cuBLAS handle
+    /// yet, builds the handle on this thread meanwhile (unless
+    /// `REFLEX_LOAD_INIT_SHARE=0`). A tokenizer error wins over a cuBLAS one.
+    pub(super) fn join(self) -> Result<(Tokenizer, CudaBlas), ReflexError> {
+        self.gate.0.open();
+        let mine = (load_init_share_enabled() && !self.cublas_claimed.swap(true, Ordering::AcqRel))
+            .then(|| Model::build_cublas(&self.device, self.weights, "load"));
+        let (tokenizer, theirs) = self.handle.join().map_err(|_| {
+            ReflexError::Other("background load-init thread panicked".to_string())
+        })??;
+        let cublas = match (mine, theirs) {
+            (Some(mine), _) => mine?,
+            (None, Some(theirs)) => theirs,
+            (None, None) => {
+                return Err(ReflexError::Other(
+                    "load init: no thread built the cuBLAS handle".to_string(),
+                ))
+            }
+        };
+        Ok((tokenizer, cublas))
+    }
+}
+
 /// The loader's own wall-time parts of `model_load_ms`, for
 /// [`report_load_profile`].
 pub(super) struct LoadTimes {
@@ -1110,6 +1283,14 @@ impl PinnedHostBuffer {
         Ok(())
     }
 
+    /// Writes one byte per page, so the fill never takes this buffer's
+    /// first-touch faults (see [`WeightLoadPipeline::prefetch_from`]).
+    fn touch(&mut self) {
+        for i in (0..self.cap).step_by(4096) {
+            unsafe { self.ptr.add(i).write_volatile(0) };
+        }
+    }
+
     /// Borrows this buffer's first `len` bytes (`len <= self.cap`).
     pub(super) fn as_slice(&self, len: usize) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, len) }
@@ -1206,6 +1387,8 @@ fn reader_thread_count() -> usize {
 struct PrefetchState {
     cursor: usize,
     frontier: usize,
+    /// Readers touching a block right now.
+    active: usize,
     stop: bool,
 }
 
@@ -1233,7 +1416,8 @@ struct Prefetcher {
 impl Prefetcher {
     /// Spawns up to `n` readers over `data` (which they keep alive: for a
     /// GGUF, its shared mapping).
-    fn spawn<D>(data: D, n: usize) -> Option<Self>
+    /// Opens `gate` once they have touched the data's last block.
+    fn spawn<D>(data: D, n: usize, gate: Option<Arc<ReaderGate>>) -> Option<Self>
     where
         D: std::ops::Deref<Target = [u8]> + Send + Sync + 'static,
     {
@@ -1244,6 +1428,7 @@ impl Prefetcher {
             std::sync::Mutex::new(PrefetchState {
                 cursor: 0,
                 frontier: 0,
+                active: 0,
                 stop: false,
             }),
             std::sync::Condvar::new(),
@@ -1252,10 +1437,11 @@ impl Prefetcher {
         let mut readers = Vec::with_capacity(n);
         for i in 0..n {
             let (data, shared, touched) = (data.clone(), shared.clone(), touched.clone());
+            let gate = gate.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("reflex-prefetch-{i}"))
                 .stack_size(64 << 10)
-                .spawn(move || Self::reader::<D>(&data, &shared, &touched));
+                .spawn(move || Self::reader::<D>(&data, &shared, &touched, gate.as_deref()));
             match spawned {
                 Ok(h) => readers.push(h),
                 Err(_) => break,
@@ -1277,11 +1463,21 @@ impl Prefetcher {
         data: &D,
         shared: &(std::sync::Mutex<PrefetchState>, std::sync::Condvar),
         touched: &std::sync::atomic::AtomicUsize,
+        gate: Option<&ReaderGate>,
     ) {
         let (lock, cvar) = shared;
+        let mut busy = false;
         loop {
             let (start, end) = {
                 let Ok(mut st) = lock.lock() else { return };
+                if busy {
+                    st.active -= 1;
+                    if st.active == 0 && st.cursor >= data.len() {
+                        if let Some(gate) = gate {
+                            gate.open();
+                        }
+                    }
+                }
                 loop {
                     if st.stop {
                         return;
@@ -1297,6 +1493,8 @@ impl Prefetcher {
                 let start = st.cursor;
                 let end = (start + PREFETCH_BLOCK_BYTES).min(st.frontier);
                 st.cursor = end;
+                st.active += 1;
+                busy = true;
                 (start, end)
             };
             let mut acc = 0u8;
@@ -1565,6 +1763,9 @@ pub(super) struct WeightLoadPipeline {
     prefetch_source: Option<crate::gguf::SharedBytes>,
     reader_threads: usize,
     prefetcher: Option<Prefetcher>,
+    /// The load-init thread's [`ReaderGate`], set by [`Self::prefetch_from`],
+    /// opened by the readers when done or by `end_load`.
+    init_gate: Option<Arc<ReaderGate>>,
     /// `REFLEX_LOAD_PROFILE` accumulators; `None` (the default) adds no work.
     pub(super) profile: Option<LoadProfile>,
 }
@@ -1645,6 +1846,7 @@ impl WeightLoadPipeline {
             prefetch_source: None,
             reader_threads: reader_thread_count(),
             prefetcher: None,
+            init_gate: None,
             profile: None,
         })
     }
@@ -1663,13 +1865,60 @@ impl WeightLoadPipeline {
         }
         self.prefetcher = None;
         self.prefetch_source = None;
+        if let Some(gate) = self.init_gate.take() {
+            gate.open();
+        }
     }
 
     /// Lets this load prefetch `file`'s tensor data ahead of the fill (see
     /// [`Prefetcher`]). Without it (tests, the post-load LM head) the fill
-    /// threads fault pages in themselves.
-    pub(super) fn prefetch_from(&mut self, file: &GgufFile) {
+    /// threads fault pages in themselves. `init`'s cuBLAS half waits for the
+    /// readers if this load is expected to start them: some tensor besides the
+    /// host-resident `token_embd` is big enough for a parallel fill.
+    ///
+    /// First it sizes both pinned slots for the largest chunk the load stages
+    /// (`token_embd` aside) and touches every page, with `init`'s cuBLAS half
+    /// still held back. A first touch of fresh `cuMemHostAlloc` memory while
+    /// `CudaBlas::new` ran on the init thread could block until it returned:
+    /// one 10 MB fill took ~78 ms instead of ~1.3 ms in 13 of 20 Qwen3-1.7B
+    /// loads on a T4, once the tokenizer got fast enough for cuBLAS to start
+    /// while the slots were still growing (8 allocations, <1 to 10 MB).
+    pub(super) fn prefetch_from(
+        &mut self,
+        file: &GgufFile,
+        init: &LoadInit<'_>,
+    ) -> Result<(), ReflexError> {
         self.prefetch_source = Some(file.data_section_shared());
+        let mut largest = 0;
+        for t in file
+            .tensors
+            .iter()
+            .filter(|t| t.name != "token_embd.weight")
+        {
+            if let Ok(b) = file.tensor_bytes(t) {
+                largest = largest.max(b.len());
+            }
+        }
+        let t = std::time::Instant::now();
+        let slot_bytes = largest.min(STAGE_CHUNK_BYTES);
+        debug_assert!(!self.pinned_used.contains(&true));
+        for slot in &mut self.pinned {
+            unsafe { slot.ensure_capacity(slot_bytes)? };
+            slot.touch();
+        }
+        if load_profile_enabled() {
+            eprintln!(
+                "\nREFLEX_LOAD_SLOTS slot_mb={:.1} prep_ms={:.2}",
+                slot_bytes as f64 / 1e6,
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let readers_expected = load_init_wait_enabled()
+            && self.reader_threads > 0
+            && largest >= PARALLEL_FILL_MIN_BYTES;
+        init.gate.0.decide(readers_expected);
+        self.init_gate = Some(init.gate.0.clone());
+        Ok(())
     }
 
     /// Grows slot `slot`'s device-side staging buffer to hold at least
@@ -1868,7 +2117,8 @@ impl WeightLoadPipeline {
                 && self.reader_threads > 0
             {
                 if let Some(src) = self.prefetch_source.take() {
-                    self.prefetcher = Prefetcher::spawn(src, self.reader_threads);
+                    self.prefetcher =
+                        Prefetcher::spawn(src, self.reader_threads, self.init_gate.clone());
                 }
             }
             if let Some(pf) = &self.prefetcher {
@@ -2540,7 +2790,10 @@ mod tests {
     fn prefetcher_touches_the_window_once_and_only_forward() {
         let len = (24 << 20) + 12345;
         let data = Arc::new(vec![7u8; len]);
-        let pf = Prefetcher::spawn(TestBytes(data.clone()), 4).expect("spawn readers");
+        let gate = ReaderGate::new();
+        gate.decide(true);
+        let pf = Prefetcher::spawn(TestBytes(data.clone()), 4, Some(gate.clone()))
+            .expect("spawn readers");
 
         // Starting at 16 MB: the window (1 GB) reaches the end, so the
         // readers touch exactly [16 MB, len).
@@ -2548,6 +2801,8 @@ mod tests {
         wait_touched(&pf, len - (16 << 20));
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(pf.touched_bytes(), len - (16 << 20));
+        // The readers reached the end of the data: the gate is open.
+        gate.wait();
 
         // Moving back, or to bytes outside the source, adds no work.
         pf.advance(&data[..]);

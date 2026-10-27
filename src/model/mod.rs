@@ -72,6 +72,7 @@ use cudarc::driver::{
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
 
@@ -836,21 +837,21 @@ impl Model {
         }))
     }
 
-    /// Builds the `Tokenizer` and the cuBLAS handle (with `CUBLAS_PEDANTIC_MATH`
-    /// pinned) for the one scoped background thread each `load_*` wrapper spawns,
-    /// so their combined host/driver setup overlaps the GPU-bound weight load
-    /// instead of sitting on the serial path. Both are pure setup needing no loaded
-    /// weights; `CudaBlas::new` binds the primary context to this thread itself
-    /// (`device.bind_to_thread`). Run sequentially on one thread rather than two so
-    /// the load still spawns exactly one extra thread.
-    fn load_background_init(
-        file: &GgufFile,
-        device: Arc<CudaDevice>,
+    /// Builds the cuBLAS handle (with `CUBLAS_PEDANTIC_MATH` pinned) and runs the
+    /// f16 warm-up, on whichever thread [`LoadInit`] gives it to. `CudaBlas::new`
+    /// binds the primary context to the calling thread itself
+    /// (`device.bind_to_thread`). `thread` only labels the profile line.
+    fn build_cublas(
+        device: &Arc<CudaDevice>,
         weights: WeightsDtype,
-    ) -> Result<(Tokenizer, CudaBlas), ReflexError> {
-        let tokenizer = Tokenizer::from_gguf(file)?;
+        thread: &str,
+    ) -> Result<CudaBlas, ReflexError> {
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
+        let t_start = std::time::Instant::now();
         let cublas = CudaBlas::new(device.clone())
             .map_err(|e| crate::gpu_err!(e, "cublas handle: {e:?}"))?;
+        let cublas_new_ms = ms(t_start);
+        let t_math = std::time::Instant::now();
         unsafe {
             cublas_sys::lib()
                 .cublasSetMathMode(
@@ -860,8 +861,15 @@ impl Model {
                 .result()
                 .map_err(|e| crate::gpu_err!(e, "cublasSetMathMode: {e:?}"))?;
         }
-        Self::warm_cublas(&device, &cublas, weights)?;
-        Ok((tokenizer, cublas))
+        let math_mode_ms = ms(t_math);
+        let (warm_gemm_ms, warm_sync_ms) = Self::warm_cublas(device, &cublas, weights)?;
+        if load_profile_enabled() {
+            eprintln!(
+                "\nREFLEX_LOAD_CUBLAS thread={thread} cublas_new_ms={cublas_new_ms:.2} math_mode_ms={math_mode_ms:.2} warm_gemm_ms={warm_gemm_ms:.2} warm_sync_ms={warm_sync_ms:.2} total_ms={:.2}",
+                ms(t_start)
+            );
+        }
+        Ok(cublas)
     }
 
     /// With f16 weights, one tiny `cublasGemmEx` (the call f16 prefill makes), so
@@ -871,14 +879,16 @@ impl Model {
     /// cold `system1` scoring pass went 44.0 -> 9.8 ms for +14 ms of model load.
     /// f32 gets none: a tiny `Sgemm` didn't shorten its 21 ms first call
     /// (scoring 39.1 -> 37.7 ms), so it would only add load time.
+    /// Returns the host time of the setup + GemmEx call and of the final sync, in ms.
     fn warm_cublas(
         device: &Arc<CudaDevice>,
         cublas: &CudaBlas,
         weights: WeightsDtype,
-    ) -> Result<(), ReflexError> {
+    ) -> Result<(f64, f64), ReflexError> {
         if weights != WeightsDtype::F16 {
-            return Ok(());
+            return Ok((0.0, 0.0));
         }
+        let t_gemm = std::time::Instant::now();
         const M: usize = 64;
         const N: usize = 8;
         const K: usize = 64;
@@ -887,9 +897,12 @@ impl Model {
         let x = device.alloc_zeros::<half::f16>(K * N).map_err(alloc_err)?;
         let mut y = device.alloc_zeros::<f32>(M * N).map_err(alloc_err)?;
         kernels::gemm_ex_f16_raw(cublas, *w.device_ptr(), &x, &mut y, M, N, K)?;
+        let gemm_ms = t_gemm.elapsed().as_secs_f64() * 1000.0;
+        let t_sync = std::time::Instant::now();
         device
             .synchronize()
-            .map_err(|e| crate::gpu_err!(e, "warm_cublas sync: {e}"))
+            .map_err(|e| crate::gpu_err!(e, "warm_cublas sync: {e}"))?;
+        Ok((gemm_ms, t_sync.elapsed().as_secs_f64() * 1000.0))
     }
 
     /// Encodes `prompt`, runs it through every layer one position at a time

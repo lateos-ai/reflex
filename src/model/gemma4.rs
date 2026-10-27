@@ -78,9 +78,7 @@ impl Model {
         policy: &WeightPolicy,
     ) -> Result<Self, ReflexError> {
         std::thread::scope(|scope| {
-            let init_device = device.clone();
-            let warm = policy.matrix_dtype;
-            let init = scope.spawn(move || Self::load_background_init(file, init_device, warm));
+            let init = LoadInit::spawn(scope, file, device.clone(), policy.matrix_dtype);
             Self::load_gemma4_inner(device, file, policy, init)
         })
     }
@@ -89,7 +87,7 @@ impl Model {
         device: Arc<CudaDevice>,
         file: &GgufFile,
         policy: &WeightPolicy,
-        init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), ReflexError>>,
+        init: LoadInit<'scope>,
     ) -> Result<Self, ReflexError> {
         let g4_cfg = parse_gemma4_config(file)?;
         let attn_impl = AttnImpl::from_env()?;
@@ -175,7 +173,7 @@ impl Model {
 
         let dequant_kernels = load_dequant_kernels(&device)?;
         let mut pipeline = WeightLoadPipeline::new(&device)?;
-        pipeline.prefetch_from(file);
+        pipeline.prefetch_from(file, &init)?;
         if profile_on {
             pipeline.profile = Some(LoadProfile::default());
         }
@@ -357,9 +355,7 @@ impl Model {
 
         pipeline.end_load();
         let t_join = std::time::Instant::now();
-        let (tokenizer, cublas) = init.join().map_err(|_| {
-            ReflexError::Other("background load-init thread panicked".to_string())
-        })??;
+        let (tokenizer, cublas) = init.join()?;
         let init_join_wait_ms = t_join.elapsed().as_secs_f64() * 1000.0;
         report_load_profile(
             &device,

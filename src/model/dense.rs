@@ -172,9 +172,7 @@ impl Model {
         policy: &WeightPolicy,
     ) -> Result<Self, ReflexError> {
         std::thread::scope(|scope| {
-            let init_device = device.clone();
-            let warm = policy.matrix_dtype;
-            let init = scope.spawn(move || Self::load_background_init(file, init_device, warm));
+            let init = LoadInit::spawn(scope, file, device.clone(), policy.matrix_dtype);
             Self::load_dense_inner(device, file, policy, init)
         })
     }
@@ -183,7 +181,7 @@ impl Model {
         device: Arc<CudaDevice>,
         file: &GgufFile,
         policy: &WeightPolicy,
-        init: ScopedJoinHandle<'scope, Result<(Tokenizer, CudaBlas), ReflexError>>,
+        init: LoadInit<'scope>,
     ) -> Result<Self, ReflexError> {
         let kolibri = match file
             .metadata
@@ -363,8 +361,9 @@ impl Model {
             // The prefetch readers walk the data section in file order, so
             // they would read the expert bytes this load skips.
             pipeline.keep_fill_workers = true;
+            init.no_prefetch();
         } else {
-            pipeline.prefetch_from(file);
+            pipeline.prefetch_from(file, &init)?;
         }
         if profile_on {
             pipeline.profile = Some(LoadProfile::default());
@@ -699,9 +698,7 @@ impl Model {
 
         pipeline.end_load();
         let t_join = std::time::Instant::now();
-        let (tokenizer, cublas) = init.join().map_err(|_| {
-            ReflexError::Other("background load-init thread panicked".to_string())
-        })??;
+        let (tokenizer, cublas) = init.join()?;
         let init_join_wait_ms = t_join.elapsed().as_secs_f64() * 1000.0;
 
         report_load_profile(
