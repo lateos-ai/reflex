@@ -450,6 +450,14 @@ pub fn run(args: Vec<String>) {
     let energy_measurement = sampler.measure();
     let prompt_eval_ms = first_token_ms.unwrap_or(total_ms) - model_ready_ms;
     let read_ms = read_ms.map(|ms| ms + upload_ms.unwrap_or(0.0));
+    if let Some(schema) = &sampling.json_schema {
+        if std::env::var("REFLEX_GRAMMAR_PROFILE").is_ok_and(|v| v == "1") {
+            eprintln!(
+                "REFLEX_GRAMMAR_PROFILE mask_ms_total={:.3}",
+                schema.mask_ms_total()
+            );
+        }
+    }
 
     print_phase_report(
         json,

@@ -502,9 +502,19 @@ impl Model {
         let constraint = match &sampling.json_schema {
             None => None,
             Some(schema) => {
-                let index = self
-                    .grammar_index
-                    .get_or_init(|| crate::grammar::TokenIndex::build(&self.tokenizer));
+                let mut built = false;
+                let index = self.grammar_index.get_or_init(|| {
+                    built = true;
+                    crate::grammar::TokenIndex::build(&self.tokenizer)
+                });
+                // `REFLEX_GRAMMAR_PROFILE=1`: the build isn't in `mask_ms_total`.
+                if built && std::env::var("REFLEX_GRAMMAR_PROFILE").is_ok_and(|v| v == "1") {
+                    eprintln!(
+                        "REFLEX_GRAMMAR_PROFILE index_build_ms={:.3} nodes={}",
+                        index.build_ms,
+                        index.node_count()
+                    );
+                }
                 Some(crate::grammar::Constrained::new(schema, index)?)
             }
         };
