@@ -1266,6 +1266,8 @@ impl Tokenizer {
     /// one difference from `decode` is a `▁` assembled from byte-fallback tokens
     /// across several ids, which `decode` also turns into a space; the grammar keeps
     /// U+2581 out of its strings for these tokenizers, so it never builds one.
+    /// Kept as the reference for [`Self::push_token_text_bytes`] in the grammar tests.
+    #[cfg(test)]
     pub(crate) fn token_text_bytes(&self, id: u32) -> Vec<u8> {
         let bytes = self.token_bytes(id);
         if self.architecture == "gpt2" || parse_byte_fallback(&self.tokens[id as usize]).is_some() {
@@ -1274,6 +1276,33 @@ impl Tokenizer {
         match String::from_utf8(bytes) {
             Ok(s) => s.replace(WORD_BOUNDARY, " ").into_bytes(),
             Err(e) => e.into_bytes(),
+        }
+    }
+
+    /// Appends the bytes token `id` adds to [`Self::decode`]'s output to `out` (no
+    /// bytes for an out-of-range id). The same bytes as the old `Vec`-returning form
+    /// (`token_text_bytes`, now test-only), without an allocation per token or a hash
+    /// lookup per gpt2 character: `crate::grammar::TokenIndex::build` calls it for
+    /// the whole vocabulary on a process's first constrained request.
+    pub(crate) fn push_token_text_bytes(&self, id: u32, out: &mut Vec<u8>) {
+        let Some(tok) = self.tokens.get(id as usize) else {
+            return;
+        };
+        if self.architecture == "gpt2" {
+            let table = gpt2_unicode_to_byte_array();
+            out.extend(
+                tok.chars()
+                    .filter_map(|ch| table.get(ch as usize).copied().flatten()),
+            );
+        } else if let Some(byte) = parse_byte_fallback(tok) {
+            out.push(byte);
+        } else {
+            let mut parts = tok.split(WORD_BOUNDARY);
+            out.extend_from_slice(parts.next().unwrap_or("").as_bytes());
+            for part in parts {
+                out.push(b' ');
+                out.extend_from_slice(part.as_bytes());
+            }
         }
     }
 
@@ -1400,6 +1429,21 @@ fn gpt2_byte_to_unicode_table() -> &'static [char; 256] {
         for b in 0..256usize {
             table[b] = char::from_u32(codepoint[b])
                 .expect("gpt2 byte-to-unicode codepoints are all valid scalar values");
+        }
+        table
+    })
+}
+
+/// [`gpt2_unicode_to_byte_table`] as a flat array indexed by code point (the
+/// highest is U+0143), for [`Tokenizer::push_token_text_bytes`].
+fn gpt2_unicode_to_byte_array() -> &'static [Option<u8>] {
+    static TABLE: std::sync::OnceLock<Vec<Option<u8>>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let chars = gpt2_byte_to_unicode_table();
+        let len = chars.iter().map(|&c| c as usize).max().unwrap_or(0) + 1;
+        let mut table = vec![None; len];
+        for (b, &c) in chars.iter().enumerate() {
+            table[c as usize] = Some(b as u8);
         }
         table
     })

@@ -715,6 +715,121 @@ fn sentencepiece_masks_match_brute_force() {
     assert_masks_match_brute_force(&tok);
 }
 
+/// The index build before the sort and byte buffer were sped up: one `Vec` per
+/// token from `Tokenizer::token_text_bytes` and a byte-slice comparison sort
+/// (equal bytes ordered by id, which the old unstable sort left unspecified).
+fn reference_index(tok: &Tokenizer) -> TokenIndex {
+    let vocab = tok.vocab_size();
+    let mut off = vec![0u32];
+    let mut token_bytes = Vec::new();
+    for id in 0..vocab as u32 {
+        if tok.is_text_token(id) && Some(id) != tok.eos_token_id {
+            token_bytes.extend(tok.token_text_bytes(id));
+        }
+        off.push(token_bytes.len() as u32);
+    }
+    let bytes_of = |id: u32| &token_bytes[off[id as usize] as usize..off[id as usize + 1] as usize];
+    let mut order: Vec<u32> = (0..vocab as u32)
+        .filter(|&id| !bytes_of(id).is_empty())
+        .collect();
+    order.sort_by(|&a, &b| bytes_of(a).cmp(bytes_of(b)).then(a.cmp(&b)));
+    let (mut byte, mut depth, mut node_of_tok) = (Vec::new(), Vec::<u16>::new(), Vec::new());
+    let mut path: Vec<u32> = Vec::new();
+    let mut prev: &[u8] = &[];
+    for &id in &order {
+        let cur = bytes_of(id);
+        let common = prev.iter().zip(cur).take_while(|(a, b)| a == b).count();
+        path.truncate(common);
+        for (d, &b) in cur.iter().enumerate().skip(common) {
+            path.push(byte.len() as u32);
+            byte.push(b);
+            depth.push((d + 1) as u16);
+        }
+        node_of_tok.push((*path.last().unwrap(), id));
+        prev = cur;
+    }
+    let n = byte.len();
+    let mut skip = vec![n as u32; n];
+    for i in 0..n {
+        // Quadratic but obviously right: the first later node at depth <= this one.
+        skip[i] = (i + 1..n).find(|&j| depth[j] <= depth[i]).unwrap_or(n) as u32;
+    }
+    let mut at_node = vec![Vec::new(); n];
+    for (node, id) in node_of_tok {
+        at_node[node as usize].push(id);
+    }
+    let mut tok_start = Vec::new();
+    let mut toks = Vec::new();
+    for ids in at_node {
+        tok_start.push(toks.len() as u32);
+        toks.extend(ids);
+    }
+    tok_start.push(toks.len() as u32);
+    TokenIndex {
+        max_depth: depth.iter().copied().max().unwrap_or(0) as usize,
+        byte,
+        depth,
+        skip,
+        tok_start,
+        toks,
+        off,
+        token_bytes,
+        vocab,
+        eos: tok.eos_token_id,
+        space_marker: tok.architecture != "gpt2",
+        build_ms: 0.0,
+    }
+}
+
+/// The index build gives the same arrays as [`reference_index`] on a gpt2 byte-level
+/// BPE (Qwen3), a SentencePiece (TinyLlama) and the Gemma 4 vocabulary.
+/// `REFLEX_INDEX_REF_ALL=1` checks every GGUF in `test-data/` with a tokenizer instead
+/// (slow in a debug build; use `--release`).
+#[test]
+fn index_build_matches_reference() {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-data");
+    let names: Vec<String> = if std::env::var("REFLEX_INDEX_REF_ALL").is_ok_and(|v| v == "1") {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".gguf"))
+            .collect();
+        names.sort();
+        names
+    } else {
+        [
+            QWEN3_TOKENIZER,
+            TINYLLAMA_TOKENIZER,
+            "gemma4-tokenizer.gguf",
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    let mut checked = 0;
+    for name in names {
+        let Ok(file) = GgufFile::open(dir.join(&name)) else {
+            eprintln!("Skipping: test-data/{name} not present");
+            continue;
+        };
+        let Ok(tok) = Tokenizer::from_gguf(&file) else {
+            continue;
+        };
+        let (new, old) = (TokenIndex::build(&tok), reference_index(&tok));
+        assert!(new.arrays() == old.arrays(), "{name}");
+        assert_eq!(new.max_depth, old.max_depth, "{name}");
+        eprintln!(
+            "{name}: {} tokens, {} nodes, built in {:.1} ms",
+            new.vocab,
+            new.node_count(),
+            new.build_ms
+        );
+        checked += 1;
+    }
+    eprintln!("{checked} tokenizers checked");
+}
+
 fn id_of(tok: &Tokenizer, piece: &str) -> u32 {
     tok.tokens
         .iter()
