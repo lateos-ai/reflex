@@ -394,6 +394,7 @@ impl Model {
             output_norm,
             lm_head,
             weights_dtype: policy.matrix_dtype,
+            quant_resident: false,
             f16_act_stats,
             tokenizer,
             grammar_index: Default::default(),

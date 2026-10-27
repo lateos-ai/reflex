@@ -1,0 +1,6 @@
+REFLEX_PHASE_OK phase=gguf_open duration_ms=1.000 energy_joules=0.100 energy_method=total_energy_counter
+REFLEX_PHASE_OK phase=cuda_init duration_ms=2.000 energy_joules=0.200 energy_method=total_energy_counter
+REFLEX_PHASE_OK phase=model_load duration_ms=3.000 energy_joules=0.300 energy_method=total_energy_counter
+REFLEX_PHASE_OK phase=prompt_eval duration_ms=4.000 energy_joules=0.400 energy_method=total_energy_counter
+REFLEX_GENERATE_OK process_start_to_first_token_ms=10.000 process_start_to_last_token_ms=12.000 gguf_open_ms=1.000 cuda_init_ms=2.000 model_load_ms=3.000 prompt_eval_ms=4.000 num_generated=1 token_id=264 token_ids=[264] token_text=" a" joules=1.000 energy_method=total_energy_counter weights_dtype=f16
+REFLEX_RUN_REPORT schema_version=1.5.0 command=generate process_start_to_first_result_ms=10.000 process_start_to_last_result_ms=12.000 gguf_open_ms=1.000 cuda_init_ms=2.000 model_load_ms=3.000 prompt_eval_ms=4.000 gpu_name="Example GPU" compute_capability=7.5 vram_total_mib=1000 cuda_driver_version=13.0 driver_version=1.2.3 kernel_format=cubin kernel_image=native kernel_image_arch=sm_75 weights=qr weights_dtype=f16 kv_cache=f32 arch="qwen3" model_file="model.gguf" model_bytes=1000 energy_joules=1.000 energy_method=total_energy_counter

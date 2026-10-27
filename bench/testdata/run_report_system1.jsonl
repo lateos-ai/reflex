@@ -1,0 +1,8 @@
+{"idx":0,"text":" worker","token_ids":[11125],"score":-0.5,"probability":0.6}
+{"idx":1,"text":" reviewer","token_ids":[55514],"score":-0.9,"probability":0.4}
+{"schema_version":"1.5.0","phase":"gguf_open","duration_ms":1.0}
+{"schema_version":"1.5.0","phase":"cuda_init","duration_ms":2.0}
+{"schema_version":"1.5.0","phase":"model_load","duration_ms":3.0}
+{"schema_version":"1.5.0","phase":"prompt_eval","duration_ms":4.0}
+{"schema_version":"1.5.0","process_start_to_result_ms":10.0,"gguf_open_ms":1.0,"cuda_init_ms":2.0,"model_load_ms":3.0,"prompt_eval_ms":4.0,"num_candidates":2,"best_idx":0,"best_text":" worker","entropy":0.673012,"weights_dtype":"f16"}
+{"schema_version":"1.5.0","report":"run","command":"system1","process_start_to_first_result_ms":10.0,"phases_ms":{"gguf_open":1.0,"cuda_init":2.0,"model_load":3.0,"prompt_eval":4.0},"gpu":{"name":"Example GPU","compute_capability":"7.5","vram_total_mib":1000,"cuda_driver_version":"13.0"},"kernels":{"format":"cubin","image":"native","image_arch":"sm_75"},"weights":{"mode":"qr","dtype":"f16"},"kv_cache":"f32","model":{"arch":"qwen3","file":"model.gguf","bytes":1000}}

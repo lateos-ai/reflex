@@ -18,7 +18,7 @@
 //!
 //! **Versioning**: the versioned result objects ([`GenerateResultJson`],
 //! [`System1ResultJson`], [`SmokeResultJson`], [`PhaseTimingJson`],
-//! [`ModelInfoJson`]) also carry
+//! [`ModelInfoJson`], [`RunReportJson`]) also carry
 //! a `schema_version` field (the current [`SCHEMA_VERSION`]) -- the one field
 //! with no plain-text `key=value` counterpart, added so a JSON consumer can
 //! detect a shape change. It's additive; readers that ignore unknown fields
@@ -50,14 +50,14 @@ use std::collections::BTreeMap;
 
 /// Version of the `--json` output contract, emitted as the `schema_version`
 /// field on the versioned result objects ([`GenerateResultJson`],
-/// [`System1ResultJson`], [`SmokeResultJson`], [`PhaseTimingJson`] and
-/// [`ModelInfoJson`]).
+/// [`System1ResultJson`], [`SmokeResultJson`], [`PhaseTimingJson`],
+/// [`ModelInfoJson`] and [`RunReportJson`]).
 ///
 /// Additive/forward-compatible: `serde` readers that ignore unknown fields
 /// keep working across a minor bump, so a *major* bump is the signal that an
 /// existing field changed meaning or was removed. Keep in sync with the
 /// docs/reference.md's "`--json` output contract" section.
-pub const SCHEMA_VERSION: &str = "1.4.0";
+pub const SCHEMA_VERSION: &str = "1.5.0";
 
 /// Serializes `value` as one line of JSON to stdout, matching `src/ipc.rs`'s
 /// `write_json_line` discipline (flushed immediately) but deliberately not
@@ -201,6 +201,103 @@ pub struct PhaseTimingJson {
     pub energy_method: Option<&'static str>,
 }
 
+/// `REFLEX_RUN_REPORT`: the run's context, printed last by `generate` and
+/// `system1`. Unlike the other objects its fields are grouped (`gpu`,
+/// `kernels`, ...), so no top-level key repeats one of the result objects'
+/// keys (`token_text`, `best_idx`, `phase`, `gguf_open_ms`, ...) for a reader
+/// that picks "the last line with key X". docs/reference.md's "Run report"
+/// section maps each field to its plain-text key.
+#[derive(Serialize)]
+pub struct RunReportJson {
+    pub schema_version: &'static str,
+    /// Always `"run"`.
+    pub report: &'static str,
+    /// `"generate"` or `"system1"`.
+    pub command: &'static str,
+    pub process_start_to_first_result_ms: f64,
+    /// `generate` only: the last generated token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_start_to_last_result_ms: Option<f64>,
+    pub phases_ms: RunPhasesJson,
+    pub gpu: RunGpuJson,
+    pub kernels: RunKernelsJson,
+    pub weights: RunWeightsJson,
+    /// `f32` or `f16`.
+    pub kv_cache: &'static str,
+    pub model: RunModelJson,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub energy: Option<RunEnergyJson>,
+}
+
+/// [`RunReportJson::phases_ms`]: the same values as the `REFLEX_PHASE_OK` lines.
+#[derive(Serialize)]
+pub struct RunPhasesJson {
+    pub gguf_open: f64,
+    pub cuda_init: f64,
+    pub model_load: f64,
+    pub prompt_eval: f64,
+}
+
+/// [`RunReportJson::gpu`]. Every field is absent when it couldn't be read.
+#[derive(Serialize)]
+pub struct RunGpuJson {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `"major.minor"`, e.g. `"7.5"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute_capability: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vram_total_mib: Option<usize>,
+    /// `cuDriverGetVersion` as `"major.minor"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cuda_driver_version: Option<String>,
+    /// The driver release from NVML (`nvml` builds only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver_version: Option<String>,
+}
+
+/// [`RunReportJson::kernels`].
+#[derive(Serialize)]
+pub struct RunKernelsJson {
+    /// `ptx`, `cubin` or `fatbin`.
+    pub format: &'static str,
+    /// `native`, `ptx_jit` or `unsupported`; absent without a compute capability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_arch: Option<String>,
+    /// Fatbin builds only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compiled_archs: Option<Vec<String>>,
+}
+
+/// [`RunReportJson::weights`].
+#[derive(Serialize)]
+pub struct RunWeightsJson {
+    /// `qr` (quantized-resident), `f16` or `f32`.
+    pub mode: &'static str,
+    /// The result objects' `weights_dtype`.
+    pub dtype: &'static str,
+}
+
+/// [`RunReportJson::model`].
+#[derive(Serialize)]
+pub struct RunModelJson {
+    /// `general.architecture`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    /// The GGUF's file name, without its directory.
+    pub file: String,
+    pub bytes: u64,
+}
+
+/// [`RunReportJson::energy`]: the result object's `joules`/`energy_method`.
+#[derive(Serialize)]
+pub struct RunEnergyJson {
+    pub joules: f64,
+    pub method: &'static str,
+}
+
 /// `REFLEX_BENCH_VRAM_OK`.
 #[derive(Serialize)]
 pub struct BenchVramJson {
@@ -336,7 +433,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"schema_version":"1.4.0","process_start_to_first_result_ms":1.0}"#
+            r#"{"schema_version":"1.5.0","process_start_to_first_result_ms":1.0}"#
         );
     }
 
@@ -352,7 +449,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             json,
-            r#"{"schema_version":"1.4.0","phase":"prompt_eval","duration_ms":1.0}"#
+            r#"{"schema_version":"1.5.0","phase":"prompt_eval","duration_ms":1.0}"#
         );
     }
 

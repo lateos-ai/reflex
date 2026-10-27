@@ -190,18 +190,83 @@ pub fn fatbin_coverage(compiled: &[(i32, i32)], device: (i32, i32)) -> FatbinCov
 /// `REFLEX_CUDA_ARCHS` parsed into `(major, minor)` pairs. Errs if it's empty, i.e. this
 /// isn't a fatbin build.
 pub fn compiled_archs() -> Result<Vec<(i32, i32)>, ReflexError> {
-    let archs = COMPILED_ARCHS
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(parse_arch)
-        .collect::<Result<Vec<_>, _>>()?;
+    let archs = parse_arch_list(COMPILED_ARCHS)?;
     if archs.is_empty() {
         return Err(ReflexError::Cuda(
             "not a fatbin build: REFLEX_CUDA_ARCHS was empty at build time".to_string(),
         ));
     }
     Ok(archs)
+}
+
+fn parse_arch_list(list: &str) -> Result<Vec<(i32, i32)>, ReflexError> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_arch)
+        .collect()
+}
+
+/// `"ptx"`, `"cubin"` or `"fatbin"`: how `build.rs` compiled this binary's kernels.
+pub const KERNEL_FORMAT: &str = env!("REFLEX_KERNEL_FORMAT");
+
+/// Which kernel image the driver loads on a GPU, for the run report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelImage {
+    /// `"native"` (a SASS image for this GPU, no JIT), `"ptx_jit"` (the driver
+    /// compiles PTX at load; a warm driver JIT cache can hide that cost) or
+    /// `"unsupported"` (no image runs on this GPU).
+    pub mode: &'static str,
+    /// `sm_XY` for a native image, `compute_XY` for a fatbin's PTX. `None` for a
+    /// portable-PTX build, where each kernel file names its own PTX target.
+    pub arch: Option<String>,
+}
+
+/// Pure decision behind [`kernel_image_for`]: `format`, `compiled_arch` and
+/// `compiled_archs` are the build-time `REFLEX_KERNEL_FORMAT`, `REFLEX_CUDA_ARCH`
+/// and `REFLEX_CUDA_ARCHS` values; `device` is the GPU's compute capability.
+pub fn kernel_image(
+    format: &str,
+    compiled_arch: &str,
+    compiled_archs: &str,
+    device: (i32, i32),
+) -> KernelImage {
+    let image = |mode, arch: Option<String>| KernelImage { mode, arch };
+    match format {
+        "cubin" => match parse_arch(compiled_arch) {
+            Ok(a) if a == device => image("native", Some(format!("sm_{}{}", a.0, a.1))),
+            _ => image("unsupported", None),
+        },
+        "fatbin" => match parse_arch_list(compiled_archs) {
+            Ok(archs) if !archs.is_empty() => match fatbin_coverage(&archs, device) {
+                FatbinCoverage::Native { image: (ma, mi) } => {
+                    image("native", Some(format!("sm_{ma}{mi}")))
+                }
+                FatbinCoverage::PtxJit { ptx: (ma, mi) } => {
+                    image("ptx_jit", Some(format!("compute_{ma}{mi}")))
+                }
+                FatbinCoverage::Unsupported { .. } => image("unsupported", None),
+            },
+            _ => image("unsupported", None),
+        },
+        _ => image("ptx_jit", None),
+    }
+}
+
+/// [`kernel_image`] for this binary's build on a GPU of compute capability
+/// `device`. No driver call.
+pub fn kernel_image_for(device: (i32, i32)) -> KernelImage {
+    kernel_image(KERNEL_FORMAT, COMPILED_ARCH, COMPILED_ARCHS, device)
+}
+
+/// The CUDA driver API version (`cuDriverGetVersion`, e.g. `(13, 0)`): the newest
+/// CUDA the installed driver supports, not the driver's release number (only
+/// NVML reports that). One driver call; call it only after `CudaDevice::new`
+/// succeeded, since the driver library is then known to be loaded.
+pub fn cuda_driver_version() -> Option<(i32, i32)> {
+    let mut v: std::ffi::c_int = 0;
+    let r = unsafe { cudarc::driver::sys::lib().cuDriverGetVersion(&mut v) };
+    (r == CUresult::CUDA_SUCCESS).then_some((v / 1000, (v % 1000) / 10))
 }
 
 /// [`fatbin_coverage`] for the detected GPU. Only meaningful in fatbin mode -- a
@@ -241,7 +306,7 @@ fn explain_driver_error(ordinal: usize, e: &DriverError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fatbin_coverage, parse_arch, FatbinCoverage};
+    use super::{fatbin_coverage, kernel_image, parse_arch, FatbinCoverage, KernelImage};
 
     /// The default multi-arch list the README suggests.
     const DEFAULT_LIST: [(i32, i32); 5] = [(7, 5), (8, 0), (8, 6), (8, 9), (9, 0)];
@@ -294,6 +359,52 @@ mod tests {
                 oldest: (8, 6),
                 ptx: (9, 0)
             }
+        );
+    }
+
+    fn image(mode: &'static str, arch: Option<&str>) -> KernelImage {
+        KernelImage {
+            mode,
+            arch: arch.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn kernel_image_portable_ptx_always_jits() {
+        assert_eq!(kernel_image("ptx", "", "", (7, 5)), image("ptx_jit", None));
+    }
+
+    #[test]
+    fn kernel_image_cubin_is_native_on_its_arch_only() {
+        assert_eq!(
+            kernel_image("cubin", "sm_75", "", (7, 5)),
+            image("native", Some("sm_75"))
+        );
+        // Model::load refuses this case; the report still says so if asked.
+        assert_eq!(
+            kernel_image("cubin", "sm_86", "", (7, 5)),
+            image("unsupported", None)
+        );
+    }
+
+    #[test]
+    fn kernel_image_fatbin_follows_coverage() {
+        let list = "sm_75,sm_80,sm_86,sm_89,sm_90";
+        assert_eq!(
+            kernel_image("fatbin", "", list, (7, 5)),
+            image("native", Some("sm_75"))
+        );
+        assert_eq!(
+            kernel_image("fatbin", "", list, (8, 7)),
+            image("native", Some("sm_86"))
+        );
+        assert_eq!(
+            kernel_image("fatbin", "", list, (12, 0)),
+            image("ptx_jit", Some("compute_90"))
+        );
+        assert_eq!(
+            kernel_image("fatbin", "", "sm_80,sm_86", (7, 5)),
+            image("unsupported", None)
         );
     }
 

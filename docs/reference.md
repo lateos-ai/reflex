@@ -7,6 +7,7 @@ measurements; [DEVELOPMENT.md](DEVELOPMENT.md) is for contributors.
 Contents: [Subcommands](#subcommands) · [Build features](#build-features) ·
 [Kernel build modes](#kernel-build-modes) · [Weight storage](#weight-storage) · [Examples](#examples) ·
 [Context-length limit](#context-length-limit) · [`--json` output contract](#--json-output-contract) ·
+[Run report](#run-report) ·
 [JSON Schema output](#json-schema-output) · [KV cache files](#kv-cache-files) ·
 [Error categories](#error-categories) · [Host-side building blocks](#host-side-building-blocks) ·
 [`reflex model-info`](#reflex-model-info) · [Docker](#docker) · [Runpod](#runpod) ·
@@ -236,7 +237,7 @@ objects also carry a **`schema_version`** field so a consumer can detect a shape
 {"schema_version":"1.0.0","process_start_to_first_token_ms":456.4,"gguf_open_ms":37.3,...}
 ```
 
-- **Current version: `1.4.0`** (`SCHEMA_VERSION` in `src/cli_output.rs`). 1.1.0 added
+- **Current version: `1.5.0`** (`SCHEMA_VERSION` in `src/cli_output.rs`). 1.1.0 added
   `weights_dtype` to the `generate`, `system1`, `bench` and `check` result objects.
   1.2.0 added `kv_io_ms` to `generate`'s result: the time spent reading the
   `--import-kv` file or writing the `--export-kv` file, present only with one of them
@@ -244,7 +245,9 @@ objects also carry a **`schema_version`** field so a consumer can detect a shape
   the file into the model's cache (see [KV cache files](#kv-cache-files)).
   1.3.0 added `embed`'s `REFLEX_EMBED_OK` result (with the vector in `embedding`).
   1.4.0 added `model-info`'s result (see [`reflex model-info`](#reflex-model-info)).
-- The six versioned objects (with `embed`'s and `model-info`'s results) are `generate`'s `REFLEX_GENERATE_OK` result, `system1`'s
+  1.5.0 added the `REFLEX_RUN_REPORT` object `generate` and `system1` print last (see
+  [Run report](#run-report)).
+- The seven versioned objects (with `embed`'s, `model-info`'s and the run report) are `generate`'s `REFLEX_GENERATE_OK` result, `system1`'s
   `REFLEX_SYSTEM1_OK` result, `smoke`'s `REFLEX_SMOKE_OK` result, and each additive
   `REFLEX_PHASE_OK` phase object. Per-item lines (`REFLEX_SYSTEM1_CANDIDATE_OK`,
   `REFLEX_LORA_OK`, `REFLEX_DOCTOR_CHECK`) and the other subcommands' result structs
@@ -259,6 +262,54 @@ objects also carry a **`schema_version`** field so a consumer can detect a shape
   changed meaning or was removed.
 - Plain-text output (no `--json`) is byte-for-byte unchanged by this contract, and the
   existing `REFLEX_*_OK` fields are unchanged by a `schema_version` bump.
+
+## Run report
+
+`generate` and `system1` end with one `REFLEX_RUN_REPORT` line, after the
+`REFLEX_GENERATE_OK`/`REFLEX_SYSTEM1_OK` line: the run's timings next to what is needed
+to compare them with someone else's (GPU, driver, kernel image, weight mode, model file).
+It adds a line and changes none: the `REFLEX_*_OK` and `REFLEX_PHASE_OK` lines are
+byte-for-byte what they were. Paste this line with a bug report or a benchmark.
+
+```
+REFLEX_RUN_REPORT schema_version=1.5.0 command=system1 process_start_to_first_result_ms=... gguf_open_ms=... cuda_init_ms=... model_load_ms=... prompt_eval_ms=... gpu_name="Tesla T4" compute_capability=7.5 vram_total_mib=... cuda_driver_version=... driver_version=... kernel_format=fatbin kernel_image=native kernel_image_arch=sm_75 compiled_archs=... weights=qr weights_dtype=f16 kv_cache=f32 arch="qwen3" model_file="Qwen3-0.6B-Q4_K_M.gguf" model_bytes=... energy_joules=... energy_method=...
+```
+
+A field that couldn't be read is left out, as the energy fields already are. Every value
+is gathered after the last timer has stopped and the result line is printed, from what the
+run already has (the GPU probe it prints to stderr, build-time constants, the loaded model,
+the GGUF mapping). The only new calls are `cuDriverGetVersion` and, in `nvml` builds, one
+NVML driver query on the energy sampler's open handle, so no reported phase changes.
+
+| Key | `--json` field | Meaning |
+|---|---|---|
+| `schema_version` | `schema_version` | The `--json` contract version above. |
+| `command` | `command` | `generate` or `system1`. |
+| `process_start_to_first_result_ms` | same | `generate`: the first token; `system1`: the scored result. Same value as the result line's `process_start_to_first_token_ms`/`process_start_to_result_ms`. |
+| `process_start_to_last_result_ms` | same | `generate` only: the last token (`process_start_to_last_token_ms`). Absent on `--export-kv`. |
+| `gguf_open_ms` ... `prompt_eval_ms` | `phases_ms.gguf_open` ... `.prompt_eval` | The four phases, same values as the `REFLEX_PHASE_OK` lines. |
+| `gpu_name` | `gpu.name` | `cuDeviceGetName`, quoted. |
+| `compute_capability` | `gpu.compute_capability` | `major.minor`, e.g. `7.5`. |
+| `vram_total_mib` | `gpu.vram_total_mib` | Total device memory. |
+| `cuda_driver_version` | `gpu.cuda_driver_version` | `cuDriverGetVersion`: the newest CUDA the driver supports, not its release. |
+| `driver_version` | `gpu.driver_version` | The driver release from NVML, e.g. `595.91.07`. `nvml` builds only. |
+| `kernel_format` | `kernels.format` | `ptx`, `cubin` or `fatbin` ([Kernel build modes](#kernel-build-modes)). |
+| `kernel_image` | `kernels.image` | `native` (a SASS image for this GPU, no JIT) or `ptx_jit` (the driver compiles PTX at load). Always `ptx_jit` for a portable-PTX build; a warm driver JIT cache can hide that cost, and the report can't tell whether it was warm. |
+| `kernel_image_arch` | `kernels.image_arch` | The image loaded: `sm_XY`, or a fatbin's `compute_XY` PTX. Absent for portable PTX, where each kernel file names its own target. |
+| `compiled_archs` | `kernels.compiled_archs` | `REFLEX_CUDA_ARCHS`, fatbin builds only (a list in JSON). |
+| `weights` | `weights.mode` | `qr` if the matrix weights loaded quantized-resident, else `f16` or `f32` ([Weight storage](#weight-storage)). Paths without QR report their dtype even when `REFLEX_QUANT_RESIDENT` is on. |
+| `weights_dtype` | `weights.dtype` | The result line's `weights_dtype` (for `qr`, the type dequantized prefill scratch uses). |
+| `kv_cache` | `kv_cache` | `f32`, or `f16` with `REFLEX_KV_CACHE=f16`. |
+| `arch` | `model.arch` | The GGUF's `general.architecture`, quoted. |
+| `model_file` | `model.file` | The GGUF's file name without its directory, quoted. |
+| `model_bytes` | `model.bytes` | The GGUF's size. |
+| `energy_joules`, `energy_method` | `energy.joules`, `energy.method` | The result line's `joules`/`energy_method`. `nvml` builds only. |
+
+Keys the line shares with the result line carry the same value in the same format, so a
+script that takes the first (or last) `gguf_open_ms=` in the output gets the same number
+either way. The `--json` object groups its fields instead (`gpu`, `kernels`, ...) and has
+`"report":"run"`, so none of its top-level keys (`token_text`, `best_idx`, `phase`, ...)
+match a result object's for a reader that picks "the last line with key X".
 
 ## JSON Schema output
 
@@ -514,10 +565,10 @@ REFLEX_MODEL_INFO_OK path="model.gguf" size_bytes=366195616 gguf_version=3 tenso
 ```
 
 `--json` (needs `--features json-output`; the adapter images have it) prints one
-object instead (`ModelInfoJson`, schema 1.4.0):
+object instead (`ModelInfoJson`, added in schema 1.4.0):
 
 ```json
-{"schema_version":"1.4.0","path":"model.gguf","size_bytes":366195616,"gguf_version":3,
+{"schema_version":"1.5.0","path":"model.gguf","size_bytes":366195616,"gguf_version":3,
  "tensor_count":402,"architecture":"granitehybrid","file_type":7,"file_type_name":"Q8_0",
  "general":{"license":"apache-2.0","base_model.0.organization":"Ibm Granite",...},
  "sha256":"c7d98736..."}
