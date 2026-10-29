@@ -5,6 +5,15 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Run report.** `generate` and `system1` end with one `REFLEX_RUN_REPORT` line (and a
+  `--json` object): the phase timings plus the GPU name and compute capability, driver
+  versions, kernel image (PTX/cubin/fatbin, native or PTX JIT), weight mode
+  (quantized-resident/f16/f32), KV cache type, model file name and size, and energy when
+  measured, so a pasted run can be compared with published numbers. Collected after the
+  timed work from what the run already has; existing `REFLEX_*_OK` and `REFLEX_PHASE_OK`
+  lines are unchanged. `--json` schema 1.5.0. Fields:
+  [docs/reference.md](docs/reference.md#run-report).
+
 - **Energy in the Docker images.** Every image (`Dockerfile`'s `reflex`, `adapter` and
   `runpod-lb` targets, `.runpod/Dockerfile`, `.modal/Dockerfile`) is now built with the
   `nvml` feature, so `reflex generate`/`system1`/`smoke` in a container print `joules=`

@@ -28,6 +28,11 @@
 //! comment for the per-phase (delta-from-cumulative) semantics and the
 //! counter-vs-polled granularity caveat.
 //!
+//! One `REFLEX_RUN_REPORT` line follows the `REFLEX_GENERATE_OK` line: the run's context
+//! (GPU, driver, kernel image, weight mode, model file) next to its timings,
+//! collected after the timed work (`crate::phase::RunReport`; fields in
+//! docs/reference.md's "Run report").
+//!
 //! Exits via `reflex_engine::fast_exit` after printing the result instead
 //! of returning from `run` normally -- see that function's doc comment for
 //! why a graceful return costs several extra seconds of CUDA-context-
@@ -84,7 +89,7 @@
 
 #[cfg(not(feature = "json-output"))]
 use crate::phase::json_output_unavailable;
-use crate::phase::{energy_suffix, print_phase_report};
+use crate::phase::{energy_suffix, print_phase_report, print_run_report, Phases, RunReport};
 use reflex_engine::diagnostics;
 use reflex_engine::energy;
 use reflex_engine::gguf::GgufFile;
@@ -288,7 +293,8 @@ pub fn run(args: Vec<String>) {
     let device = diagnostics::init_device_with_diagnostics(0).unwrap_or_else(|e| panic!("{e}"));
     let cuda_init_ms = t0.elapsed().as_secs_f64() * 1000.0 - gguf_open_ms;
     let e_cuda_init = sampler.measure();
-    if let Ok(diag) = diagnostics::probe(&device) {
+    let gpu = diagnostics::probe(&device).ok();
+    if let Some(diag) = &gpu {
         eprintln!("{diag}");
     }
     let mut model = crate::load_model(
@@ -397,6 +403,24 @@ pub fn run(args: Vec<String>) {
                 energy_suffix(energy_measurement.as_ref()),
             );
         }
+        let report = RunReport::collect(
+            "generate",
+            process_start_to_first_token_ms,
+            None,
+            Phases {
+                gguf_open_ms,
+                cuda_init_ms,
+                model_load_ms,
+                prompt_eval_ms,
+            },
+            gpu.as_ref(),
+            &sampler,
+            &model,
+            &file,
+            &gguf_path,
+            energy_measurement.as_ref(),
+        );
+        print_run_report(json, &report);
         crate::report_f16_activation_stats(&model);
         crate::report_lazy_experts(&model);
         reflex_engine::fast_exit(0);
@@ -507,6 +531,24 @@ pub fn run(args: Vec<String>) {
             read_ms.map_or(String::new(), |ms| format!(" kv_io_ms={ms:.3}")),
         );
     }
+    let report = RunReport::collect(
+        "generate",
+        first_token_ms.unwrap_or(total_ms),
+        Some(total_ms),
+        Phases {
+            gguf_open_ms,
+            cuda_init_ms,
+            model_load_ms,
+            prompt_eval_ms,
+        },
+        gpu.as_ref(),
+        &sampler,
+        &model,
+        &file,
+        &gguf_path,
+        energy_measurement.as_ref(),
+    );
+    print_run_report(json, &report);
     crate::report_f16_activation_stats(&model);
     crate::report_lazy_experts(&model);
     reflex_engine::fast_exit(0);

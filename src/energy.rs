@@ -116,7 +116,10 @@ enum Inner {
         device_index: u32,
         start_mj: u64,
     },
+    /// `nvml` is the start-up handshake's handle, kept only so
+    /// [`EnergySampler::driver_version`] needs no second `Nvml::init()`.
     Polled {
+        nvml: Box<nvml_wrapper::Nvml>,
         joules: Arc<Mutex<f64>>,
     },
     Unavailable,
@@ -257,14 +260,16 @@ impl EnergySampler {
                 };
             }
         }
-        // This handshake's `nvml`/`device` are dropped here; the polling
-        // thread does its own fresh `Nvml::init()` instead of borrowing
-        // these, so `Inner` never has to name a borrowed `Device<'_>`'s
-        // lifetime.
+        // The polling thread does its own fresh `Nvml::init()` instead of
+        // borrowing this handshake's `nvml`/`device`, so `Inner` never has to
+        // name a borrowed `Device<'_>`'s lifetime.
         let joules = Arc::new(Mutex::new(0.0));
         let joules_thread = joules.clone();
         std::thread::spawn(move || poll_power(joules_thread, device_index));
-        Inner::Polled { joules }
+        Inner::Polled {
+            nvml: Box::new(nvml),
+            joules,
+        }
     }
 
     /// Snapshot at the checkpoint a subcommand wants to report (e.g. "first
@@ -289,12 +294,34 @@ impl EnergySampler {
                         method: EnergyMethod::TotalEnergyCounter,
                     })
                 }
-                Inner::Polled { joules } => {
+                Inner::Polled { joules, .. } => {
                     let joules = *joules.lock().ok()?;
                     Some(EnergyMeasurement {
                         joules,
                         method: EnergyMethod::PolledPower,
                     })
+                }
+                Inner::Unavailable => None,
+            }
+        }
+        #[cfg(not(feature = "nvml"))]
+        {
+            None
+        }
+    }
+}
+
+impl EnergySampler {
+    /// The NVIDIA driver's release (e.g. `"595.91.07"`), read through the NVML
+    /// handle [`Self::start`] already opened. `None` when that handle doesn't
+    /// exist (no `nvml` feature, `REFLEX_ENERGY` unset, or NVML unavailable);
+    /// never initializes NVML.
+    pub fn driver_version(&self) -> Option<String> {
+        #[cfg(feature = "nvml")]
+        {
+            match &self.inner {
+                Inner::Counter { nvml, .. } | Inner::Polled { nvml, .. } => {
+                    nvml.sys_driver_version().ok()
                 }
                 Inner::Unavailable => None,
             }

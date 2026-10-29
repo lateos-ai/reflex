@@ -192,6 +192,11 @@ pub struct GgufFile {
 }
 
 impl GgufFile {
+    /// The file's size in bytes (the length of its mapping).
+    pub fn file_len(&self) -> usize {
+        self.mmap.len()
+    }
+
     /// Open and parse a GGUF file, mmap'ing its contents.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, ReflexError> {
         let file = File::open(path.as_ref())

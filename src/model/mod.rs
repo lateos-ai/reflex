@@ -347,6 +347,9 @@ pub struct Model {
     /// Element type of the matrix weights (`LoadOptions::weights`). The tied
     /// LM head's lazy upload and System1's compact row gather follow it too.
     weights_dtype: WeightsDtype,
+    /// Whether matrix weights loaded quantized-resident (`WeightData::Quant`
+    /// in an arena). False for paths without QR or with `REFLEX_QUANT_RESIDENT=0`.
+    quant_resident: bool,
     /// Two `u32`s the f16 activation cast folds into: max |x| (as f32 bits)
     /// and the saturated-element count. See [`Self::f16_activation_stats`].
     f16_act_stats: CudaSlice<u32>,
@@ -826,6 +829,12 @@ impl Model {
     /// The element type this model's matrix weights are stored in.
     pub fn weights_dtype(&self) -> WeightsDtype {
         self.weights_dtype
+    }
+
+    /// Whether this load kept its matrix weights quantized-resident, the
+    /// same value `REFLEX_LOAD_PROFILE` prints as `quant_resident`.
+    pub fn quant_resident(&self) -> bool {
+        self.quant_resident
     }
 
     /// The range of every prefill activation cast to f16 for a GEMM since
