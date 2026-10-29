@@ -20,8 +20,9 @@ What has been built, in order. Measurements live in
   counter at every phase boundary happened inside the timed window and added about 30 ms
   to cold start on a T4 (`smoke` p50 144.2 vs 177.2 ms, `system1` 354.3 vs 384.6 ms,
   n=10, interleaved). Set `REFLEX_ENERGY=1` to get `joules=` and the per-phase energy
-  fields back. `reflex doctor` and `reflex-energy` work as before. Cold-start effect with
-  the flag unset (T4, `smoke` and `system1` p50, n=10, interleaved): TBD.
+  fields back. `reflex doctor` and `reflex-energy` work as before. With the flag unset
+  the `nvml` image is back at the image without `nvml` (T4, p50, n=10, interleaved:
+  `smoke` 144.1 vs 145.5 ms, `system1` 350.9 vs 354.2 ms).
 
 - **Faster first constrained request.** The JSON Schema vocabulary index, built on a
   process's first `json_schema` request, now takes fewer passes and allocations: token
