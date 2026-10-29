@@ -5,6 +5,16 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Energy in the Docker images.** Every image (`Dockerfile`'s `reflex`, `adapter` and
+  `runpod-lb` targets, `.runpod/Dockerfile`, `.modal/Dockerfile`) is now built with the
+  `nvml` feature, so `reflex generate`/`system1`/`smoke` in a container print `joules=`
+  and `energy_method=`. The `reflex` image also contains `reflex-energy`.
+  `REFLEX_FEATURES` now defaults to `nvml`; pass `ipc,nvml` where you passed `ipc`. NVML
+  comes from the host driver through the CUDA base images' `utility` capability; without
+  it the binary runs as before, without the energy fields, and `reflex doctor` warns.
+  Served responses (sidecar, Runpod handler) are unchanged and carry no energy figures.
+  Cold-start effect (T4, `smoke` and `system1` p50, n=10, interleaved): TBD.
+
 - **Faster first constrained request.** The JSON Schema vocabulary index, built on a
   process's first `json_schema` request, now takes fewer passes and allocations: token
   bytes go into one buffer, the sort is on integer keys, and one pass builds the trie.

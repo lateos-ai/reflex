@@ -48,7 +48,7 @@ The bundle is built from the lockfiles, so it needs no GPU or CUDA toolkit:
 
 | File | Contents |
 | --- | --- |
-| `reflex.cdx.json` | CycloneDX 1.5 SBOM of the engine crate with the `ipc` feature (what the adapter images ship) |
+| `reflex.cdx.json` | CycloneDX 1.5 SBOM of the engine crate with the `ipc` and `nvml` features (what the adapter images ship) |
 | `reflex-openai-adapter.cdx.json` | CycloneDX 1.5 SBOM of `sidecar/openai-adapter` |
 | `THIRD_PARTY_LICENSES.html`, `THIRD_PARTY_LICENSES-adapter.html` | License text of every crate in each lockfile, all optional features included |
 | `build.json` (image only) | Engine crate version, `rustc` version, base images; on the Hub image, the baked model and its sha256 |

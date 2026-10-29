@@ -71,10 +71,12 @@ COPY . .
 
 # Kernel build mode, same args and precedence as the root Dockerfile: a non-empty
 # REFLEX_CUDA_ARCH (one cubin) wins; otherwise REFLEX_CUDA_ARCHS (fatbin, the
-# default); both empty = portable PTX.
+# default); both empty = portable PTX. Features match the root Dockerfile's adapter
+# images: `ipc` for `reflex stdio`, `nvml` for energy readings from the bundled CLI
+# (`reflex doctor`/`system1` run in the worker; libnvidia-ml is dlopen'd at run time).
 ARG REFLEX_CUDA_ARCH=""
 ARG REFLEX_CUDA_ARCHS="sm_75,sm_80,sm_86,sm_89,sm_90"
-RUN set -- --release --bin reflex --features ipc; \
+RUN set -- --release --bin reflex --features ipc,nvml; \
     if [ -n "$REFLEX_CUDA_ARCH" ]; then \
         env -u REFLEX_CUDA_ARCHS REFLEX_CUDA_ARCH="$REFLEX_CUDA_ARCH" cargo build "$@"; \
     elif [ -n "$REFLEX_CUDA_ARCHS" ]; then \
@@ -100,7 +102,8 @@ RUN cargo install --locked cargo-cyclonedx@0.5.9 \
 FROM ${REFLEX_RUNTIME_BASE} AS runtime
 
 # The only CUDA library these binaries load besides the driver: cuBLAS
-# (libcublas.so.12 + libcublasLt.so.12).
+# (libcublas.so.12 + libcublasLt.so.12). libnvidia-ml.so.1 (energy) comes from the
+# host driver through the base image's NVIDIA_DRIVER_CAPABILITIES=compute,utility.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libcublas-12-4 \
     && rm -rf /var/lib/apt/lists/*

@@ -2,7 +2,7 @@
 # Writes the Rust side of the compliance bundle (see docs/compliance/README.md) to
 # <out-dir>:
 #
-#   reflex.cdx.json                    CycloneDX SBOM of the engine crate (features: ipc,
+#   reflex.cdx.json                    CycloneDX SBOM of the engine crate (features: ipc,nvml,
 #                                      what the adapter images ship)
 #   reflex-openai-adapter.cdx.json     CycloneDX SBOM of sidecar/openai-adapter
 #   THIRD_PARTY_LICENSES.html          license text of every crate in both lockfiles
@@ -19,7 +19,7 @@ out=${1:?usage: sh scripts/compliance-bundle.sh <out-dir>}
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 
-cargo cyclonedx --format json --features ipc --spec-version 1.5 --override-filename reflex.cdx
+cargo cyclonedx --format json --features ipc,nvml --spec-version 1.5 --override-filename reflex.cdx
 mv reflex.cdx.json "$out/reflex.cdx.json"
 (
     cd sidecar/openai-adapter

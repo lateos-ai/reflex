@@ -9,7 +9,7 @@ GPU, 2026-09-27.**
 ## What this is
 
 - **`Dockerfile`**: same builder recipe and slim runtime stage as the root `Dockerfile`
-  (compile `reflex --features ipc` and `sidecar/openai-adapter` in one
+  (compile `reflex --features ipc,nvml` and `sidecar/openai-adapter` in one
   `nvidia/cuda:12.4.1-devel` stage, copy both binaries plus the baked-in model into the
   slim `nvidia/cuda:12.4.1-base` + `libcublas-12-4` stage). **One deliberate difference:**
   `REFLEX_CUDA_ARCH` defaults to `sm_89` (Ada Lovelace) -- a pinned cubin, not the root
