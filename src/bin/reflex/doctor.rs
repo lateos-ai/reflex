@@ -211,18 +211,24 @@ pub fn run(args: Vec<String>) {
     }
 
     match energy::probe_availability(0) {
-        Ok(method) => checks.push(Check {
-            name: "nvml_energy",
-            status: Status::Pass,
-            detail: if energy::force_polled_requested() {
+        Ok(method) => {
+            let mut detail = if energy::force_polled_requested() {
                 format!(
                     "method={} (forced by REFLEX_NVML_FORCE_POLLED; the total-energy counter would otherwise be preferred)",
                     method.as_str()
                 )
             } else {
                 format!("method={}", method.as_str())
-            },
-        }),
+            };
+            if !energy::energy_requested() {
+                detail.push_str("; off by default, set REFLEX_ENERGY=1 to report joules");
+            }
+            checks.push(Check {
+                name: "nvml_energy",
+                status: Status::Pass,
+                detail,
+            })
+        }
         Err(reason) => checks.push(Check {
             name: "nvml_energy",
             status: Status::Warn,

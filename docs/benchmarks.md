@@ -520,9 +520,10 @@ behind the optional `nvml` Cargo feature — never linked at build time), prefer
 Volta+ monotonic `nvmlDeviceGetTotalEnergyConsumption` counter and falling back to polling
 `nvmlDeviceGetPowerUsage` and integrating `power_mw * dt_s`. `generate`/`system1`/`smoke`/
 `bench` emit per-phase `REFLEX_PHASE_OK` joules lines plus a total `joules` when available
-(`--features nvml` on a machine that exposes NVML); `doctor` reports the method a real run
-would actually use. These are now real-hardware-verified on a dedicated Tesla T4
-(`g4dn.xlarge`): the cold-start phase table below carries a p50 **joules** column, and the
+(`--features nvml` on a machine that exposes NVML, with `REFLEX_ENERGY=1` set: loading
+NVML and reading its counter inside the timed window add ~30 ms to a T4 cold start, so it
+is off by default); `doctor` reports the method a real run would actually use. These are
+now real-hardware-verified on a dedicated Tesla T4 (`g4dn.xlarge`): the cold-start phase table below carries a p50 **joules** column, and the
 `polled_power` fallback — previously never exercised on real hardware, because that T4
 always had the counter — is forceable with `REFLEX_NVML_FORCE_POLLED=1` and shown below
 turning short-phase deltas non-zero. Two caveats are carried openly and were both observed:

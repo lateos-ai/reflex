@@ -56,7 +56,8 @@ fi
 
 # A missing field yields an empty string, never a failure: under `set -euo pipefail` a
 # failed grep inside `v=$(extract_...)` would abort the whole script mid-table. Energy
-# fields are only present when the binary was built with `--features nvml`.
+# fields are only present when the binary was built with `--features nvml` and run
+# with REFLEX_ENERGY=1, which adds NVML's own cost (~30 ms on a T4) to the timings.
 extract_field() {
   # $1 = file, $2 = field name (as it appears "field=value" in the line)
   grep -o "$2=[0-9.]*" "$1" | head -1 | cut -d= -f2 || true

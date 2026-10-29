@@ -8,12 +8,20 @@ What has been built, in order. Measurements live in
 - **Energy in the Docker images.** Every image (`Dockerfile`'s `reflex`, `adapter` and
   `runpod-lb` targets, `.runpod/Dockerfile`, `.modal/Dockerfile`) is now built with the
   `nvml` feature, so `reflex generate`/`system1`/`smoke` in a container print `joules=`
-  and `energy_method=`. The `reflex` image also contains `reflex-energy`.
+  and `energy_method=` when run with `-e REFLEX_ENERGY=1`. The `reflex` image also
+  contains `reflex-energy`.
   `REFLEX_FEATURES` now defaults to `nvml`; pass `ipc,nvml` where you passed `ipc`. NVML
   comes from the host driver through the CUDA base images' `utility` capability; without
   it the binary runs as before, without the energy fields, and `reflex doctor` warns.
   Served responses (sidecar, Runpod handler) are unchanged and carry no energy figures.
-  Cold-start effect (T4, `smoke` and `system1` p50, n=10, interleaved): TBD.
+
+- **In-process energy is opt-in: `REFLEX_ENERGY=1`.** A binary built with `nvml` no
+  longer loads NVML unless `REFLEX_ENERGY=1` is set. Starting NVML and reading its
+  counter at every phase boundary happened inside the timed window and added about 30 ms
+  to cold start on a T4 (`smoke` p50 144.2 vs 177.2 ms, `system1` 354.3 vs 384.6 ms,
+  n=10, interleaved). Set `REFLEX_ENERGY=1` to get `joules=` and the per-phase energy
+  fields back. `reflex doctor` and `reflex-energy` work as before. Cold-start effect with
+  the flag unset (T4, `smoke` and `system1` p50, n=10, interleaved): TBD.
 
 - **Faster first constrained request.** The JSON Schema vocabulary index, built on a
   process's first `json_schema` request, now takes fewer passes and allocations: token
