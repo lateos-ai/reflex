@@ -163,7 +163,7 @@ pub struct RunReport {
 
 impl RunReport {
     /// Gathers the context. Call it after the run's last timer read: the only
-    /// new work is `cuDriverGetVersion` and, in `nvml` builds, one NVML driver
+    /// new work is `cuDriverGetVersion` and, with `REFLEX_ENERGY=1`, one NVML driver
     /// query on the sampler's existing handle. `gpu` is the probe the run
     /// already printed to stderr; `energy` is the aggregate line's reading.
     #[allow(clippy::too_many_arguments)]

@@ -270,7 +270,8 @@ objects also carry a **`schema_version`** field so a consumer can detect a shape
 to compare them with someone else's (GPU, driver, kernel image, weight mode, model file).
 It adds a line and changes none: the `REFLEX_*_OK` and `REFLEX_PHASE_OK` lines are
 byte-for-byte what they were. Paste this line with a bug report or a benchmark. A cold
-`system1` on a T4 (AWS g4dn.xlarge, `REFLEX_CUDA_ARCH=sm_75`, `--features ipc,nvml`):
+`system1` on a T4 (AWS g4dn.xlarge, `REFLEX_CUDA_ARCH=sm_75`, `--features ipc,nvml`, NVML
+loaded, as `REFLEX_ENERGY=1` does):
 
 ```
 REFLEX_RUN_REPORT schema_version=1.5.0 command=system1 process_start_to_first_result_ms=379.854 gguf_open_ms=61.407 cuda_init_ms=145.820 model_load_ms=160.944 prompt_eval_ms=7.851 gpu_name="Tesla T4" compute_capability=7.5 vram_total_mib=14912 cuda_driver_version=13.2 driver_version=595.91.07 kernel_format=cubin kernel_image=native kernel_image_arch=sm_75 weights=qr weights_dtype=f16 kv_cache=f32 arch="qwen3" model_file="Qwen3-0.6B-Q4_K_M.gguf" model_bytes=396705472 energy_joules=13.511 energy_method=total_energy_counter
@@ -279,8 +280,10 @@ REFLEX_RUN_REPORT schema_version=1.5.0 command=system1 process_start_to_first_re
 A field that couldn't be read is left out, as the energy fields already are. Every value
 is gathered after the last timer has stopped and the result line is printed, from what the
 run already has (the GPU probe it prints to stderr, build-time constants, the loaded model,
-the GGUF mapping). The only new calls are `cuDriverGetVersion` and, in `nvml` builds, one
-NVML driver query on the energy sampler's open handle, so no reported phase changes.
+the GGUF mapping). The only new calls are `cuDriverGetVersion` and, with `REFLEX_ENERGY=1`,
+one NVML driver query on the energy sampler's open handle, so no reported phase changes.
+Without `REFLEX_ENERGY=1` the binary never loads NVML, so `driver_version` and the energy
+fields are left out; `cuda_driver_version` is always there.
 
 | Key | `--json` field | Meaning |
 |---|---|---|
@@ -293,7 +296,7 @@ NVML driver query on the energy sampler's open handle, so no reported phase chan
 | `compute_capability` | `gpu.compute_capability` | `major.minor`, e.g. `7.5`. |
 | `vram_total_mib` | `gpu.vram_total_mib` | Total device memory. |
 | `cuda_driver_version` | `gpu.cuda_driver_version` | `cuDriverGetVersion`: the newest CUDA the driver supports, not its release. |
-| `driver_version` | `gpu.driver_version` | The driver release from NVML, e.g. `595.91.07`. `nvml` builds only. |
+| `driver_version` | `gpu.driver_version` | The driver release from NVML, e.g. `595.91.07`. `nvml` builds with `REFLEX_ENERGY=1` only. |
 | `kernel_format` | `kernels.format` | `ptx`, `cubin` or `fatbin` ([Kernel build modes](#kernel-build-modes)). |
 | `kernel_image` | `kernels.image` | `native` (a SASS image for this GPU, no JIT) or `ptx_jit` (the driver compiles PTX at load). Always `ptx_jit` for a portable-PTX build; a warm driver JIT cache can hide that cost, and the report can't tell whether it was warm. |
 | `kernel_image_arch` | `kernels.image_arch` | The image loaded: `sm_XY`, or a fatbin's `compute_XY` PTX. Absent for portable PTX, where each kernel file names its own target. |
@@ -304,7 +307,7 @@ NVML driver query on the energy sampler's open handle, so no reported phase chan
 | `arch` | `model.arch` | The GGUF's `general.architecture`, quoted. |
 | `model_file` | `model.file` | The GGUF's file name without its directory, quoted. |
 | `model_bytes` | `model.bytes` | The GGUF's size. |
-| `energy_joules`, `energy_method` | `energy.joules`, `energy.method` | The result line's `joules`/`energy_method`. `nvml` builds only. |
+| `energy_joules`, `energy_method` | `energy.joules`, `energy.method` | The result line's `joules`/`energy_method`. `nvml` builds with `REFLEX_ENERGY=1` only. |
 
 Keys the line shares with the result line carry the same value in the same format, so a
 script that takes the first (or last) `gguf_open_ms=` in the output gets the same number

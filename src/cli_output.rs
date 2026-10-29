@@ -251,7 +251,7 @@ pub struct RunGpuJson {
     /// `cuDriverGetVersion` as `"major.minor"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cuda_driver_version: Option<String>,
-    /// The driver release from NVML (`nvml` builds only).
+    /// The driver release from NVML (`nvml` builds with `REFLEX_ENERGY=1`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub driver_version: Option<String>,
 }

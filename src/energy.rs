@@ -314,7 +314,8 @@ impl EnergySampler {
 impl EnergySampler {
     /// The NVIDIA driver's release (e.g. `"595.91.07"`), read through the NVML
     /// handle [`Self::start`] already opened. `None` when that handle doesn't
-    /// exist (no `nvml` feature, or NVML unavailable); never initializes NVML.
+    /// exist (no `nvml` feature, `REFLEX_ENERGY` unset, or NVML unavailable);
+    /// never initializes NVML.
     pub fn driver_version(&self) -> Option<String> {
         #[cfg(feature = "nvml")]
         {
