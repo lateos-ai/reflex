@@ -110,14 +110,14 @@ a T4.
 ## 1. Build and push the sidecar image
 
 The repo's root `Dockerfile` already builds the `reflex` binary and is used unchanged
-by docs/reference.md's Docker/Kubernetes sections. It gained one additive build arg,
-`REFLEX_FEATURES`, specifically for this guide — empty by default (identical image to
-before), set to `ipc` to compile in the `stdio`/`uds` subcommands this pattern needs:
+by docs/reference.md's Docker/Kubernetes sections. Its `REFLEX_FEATURES` build arg
+defaults to `nvml` (energy readings with `REFLEX_ENERGY=1`); set it to `ipc,nvml` to also compile in the
+`stdio`/`uds` subcommands this pattern needs (`ipc` alone drops the energy fields):
 
 ```bash
 docker build \
   --build-arg REFLEX_CUDA_ARCH=sm_75 \
-  --build-arg REFLEX_FEATURES=ipc \
+  --build-arg REFLEX_FEATURES=ipc,nvml \
   -t reflex:ipc .
 
 aws ecr create-repository --repository-name reflex --region "$AWS_REGION" || true

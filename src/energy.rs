@@ -4,6 +4,11 @@
 //! thesis (see docs/DEVELOPMENT.md), currently otherwise completely unmeasured
 //! anywhere in this codebase (only wall-clock ms).
 //!
+//! **Opt-in at run time**: an `nvml` build measures only when
+//! `REFLEX_ENERGY=1` is set (see [`energy_requested`]). Loading NVML and
+//! reading its counter inside the timed window cost ~30 ms of cold start on a
+//! T4, so the default run never touches NVML.
+//!
 //! Unconditional module (like `diagnostics.rs`): every call site
 //! (`generate`/`system1`/`smoke`/`bench`/`doctor`) calls
 //! [`EnergySampler::start`]/[`EnergySampler::measure`] with no `#[cfg]` of
@@ -146,6 +151,29 @@ fn explain_nvml_error(e: &nvml_wrapper::error::NvmlError) -> String {
     }
 }
 
+/// Parses a boolean env flag: unset, empty, or `0`/`false`/`no`/`off`
+/// (case-insensitive) is off, anything else is on.
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Whether `REFLEX_ENERGY` asks this process to measure energy. Default-off:
+/// starting NVML and reading its counter at each phase boundary costs ~30 ms of
+/// cold start on a T4 (`smoke` and `system1` p50), inside the very window this
+/// project measures, so an `nvml` build only pays it when asked. With it off,
+/// [`EnergySampler::start`] never loads NVML and every `measure()` is `None`.
+/// `reflex doctor` still probes NVML either way, and `reflex-energy` measures
+/// from outside the process, so neither reads this flag.
+pub fn energy_requested() -> bool {
+    env_flag("REFLEX_ENERGY")
+}
+
 /// Whether `REFLEX_NVML_FORCE_POLLED` asks this process to skip the
 /// total-energy-counter branch and use [`poll_power`] even when the counter is
 /// available. Default-off (unset, or `0`/`false`/`no`/`off`, case-insensitive)
@@ -155,13 +183,7 @@ fn explain_nvml_error(e: &nvml_wrapper::error::NvmlError) -> String {
 /// doc comment and README's energy section); `reflex doctor` reads it too so
 /// its `nvml_energy` check reports what a real run would actually use.
 pub fn force_polled_requested() -> bool {
-    match std::env::var("REFLEX_NVML_FORCE_POLLED") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "no" | "off"
-        ),
-        Err(_) => false,
-    }
+    env_flag("REFLEX_NVML_FORCE_POLLED")
 }
 
 #[cfg(feature = "nvml")]
@@ -194,9 +216,9 @@ fn poll_power(joules: Arc<Mutex<f64>>, device_index: u32) {
 
 impl EnergySampler {
     /// Starts measuring immediately. Never panics -- a fully-degraded
-    /// sampler (compiled without `nvml`, or NVML unavailable on this
-    /// machine) is a valid, cheap value whose `measure()` always returns
-    /// `None`.
+    /// sampler (compiled without `nvml`, `REFLEX_ENERGY` not set, or NVML
+    /// unavailable on this machine) is a valid, cheap value whose `measure()`
+    /// always returns `None`.
     pub fn start(device_ordinal: usize) -> EnergySampler {
         let _start = Instant::now();
         #[cfg(feature = "nvml")]
@@ -213,6 +235,9 @@ impl EnergySampler {
 
     #[cfg(feature = "nvml")]
     fn start_inner(device_index: u32) -> Inner {
+        if !energy_requested() {
+            return Inner::Unavailable;
+        }
         let nvml = match nvml_wrapper::Nvml::init() {
             Ok(n) => n,
             Err(_) => return Inner::Unavailable,
@@ -359,6 +384,28 @@ impl ExternalEnergy {
             self.idle_baseline_mj(),
             self.net_mj()
         )
+    }
+}
+
+#[cfg(test)]
+mod env_flag_tests {
+    use super::env_flag;
+
+    #[test]
+    fn env_flag_parses_off_and_on_values() {
+        // A name no other test or code path reads, so setting it can't race.
+        let name = "REFLEX_ENERGY_ENV_FLAG_TEST";
+        std::env::remove_var(name);
+        assert!(!env_flag(name));
+        for off in ["", "0", "false", "No", " OFF "] {
+            std::env::set_var(name, off);
+            assert!(!env_flag(name), "{off:?} should be off");
+        }
+        for on in ["1", "true", "yes", "on"] {
+            std::env::set_var(name, on);
+            assert!(env_flag(name), "{on:?} should be on");
+        }
+        std::env::remove_var(name);
     }
 }
 

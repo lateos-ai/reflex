@@ -29,6 +29,13 @@ an internal queue/scheduler, and this handler doesn't change that. The queue her
 own platform queue, external to the engine, exactly like `serverless/runpod/`'s load balancer
 is also external to the engine.
 
+The image's `reflex` is built with `--features ipc,nvml`. Job responses carry no energy
+figures (the handler and the adapter don't report any); `nvml` is for running the CLI
+inside a worker, where `reflex doctor` reports the NVML method and `reflex system1`/
+`generate` print `joules=` when `REFLEX_ENERGY=1` is set (it's off by default because it
+adds about 30 ms to cold start). Where the platform doesn't expose NVML the binary runs the
+same, without those fields.
+
 ## Job input and output
 
 The job `input` is an OpenAI chat-completions request body (`messages`, `max_tokens`,

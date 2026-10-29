@@ -86,17 +86,24 @@ RUN printf '%s\n' \
 
 # ---- `reflex` for the CLI image ------------------------------------------------------
 FROM toolchain AS build-reflex
-# Optional Cargo features for the CLI image, comma-separated as Cargo takes them. Empty
-# by default (the core footprint). `ipc` adds `reflex stdio`/`reflex uds`, needed by
-# docs/aws-deployment.md's sidecar-over-UDS pattern.
-ARG REFLEX_FEATURES=""
+# Optional Cargo features for the CLI image, comma-separated as Cargo takes them.
+# Default `nvml`: GPU energy (`joules=`/`energy_method=` and the REFLEX_PHASE_OK energy
+# fields), with libnvidia-ml dlopen'd at run time, so no build dependency and no failure
+# where it is missing. With `nvml` the `reflex-energy` whole-process meter is built too.
+# `ipc` adds `reflex stdio`/`reflex uds`, needed by docs/aws-deployment.md's
+# sidecar-over-UDS pattern (pass `ipc,nvml` to keep energy). Empty = the core footprint.
+ARG REFLEX_FEATURES="nvml"
 RUN set -- --release --bin reflex; \
+    case ",$REFLEX_FEATURES," in *,nvml,*) set -- "$@" --bin reflex-energy ;; esac; \
     if [ -n "$REFLEX_FEATURES" ]; then set -- "$@" --features "$REFLEX_FEATURES"; fi; \
-    build-reflex "$@"
+    build-reflex "$@" \
+    && mkdir -p /out \
+    && cp target/release/reflex /out/ \
+    && if [ -f target/release/reflex-energy ]; then cp target/release/reflex-energy /out/; fi
 
 # ---- `reflex` (ipc) + the sidecar for the adapter images -----------------------------
 FROM toolchain AS build-adapter
-RUN build-reflex --release --bin reflex --features ipc
+RUN build-reflex --release --bin reflex --features ipc,nvml
 # Built in this same devel image, not a separate plain `rust:*` stage, to avoid a
 # glibc-version skew against the ubuntu22.04 runtime. The sidecar needs no CUDA.
 RUN cd sidecar/openai-adapter && cargo build --release
@@ -105,6 +112,9 @@ RUN cd sidecar/openai-adapter && cargo build --release
 FROM ${REFLEX_RUNTIME_BASE} AS runtime
 # libcublas-12-4 brings libcublas.so.12 and libcublasLt.so.12. On a `-runtime-` base
 # override this is already present and the install is a no-op.
+# The nvidia/cuda bases set NVIDIA_DRIVER_CAPABILITIES=compute,utility; `utility` is what
+# makes the container toolkit mount libnvidia-ml.so.1 for energy readings. A base that
+# doesn't set it still runs, without joules (`reflex doctor` warns).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libcublas-12-4 \
     && rm -rf /var/lib/apt/lists/*
@@ -167,5 +177,6 @@ CMD []
 # ---- target: reflex (default: keep this stage last) ----------------------------------
 FROM runtime AS reflex
 COPY --from=bundle-files / /
-COPY --from=build-reflex /build/target/release/reflex /usr/local/bin/reflex
+# `reflex`, plus `reflex-energy` when REFLEX_FEATURES includes `nvml`.
+COPY --from=build-reflex /out/ /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/reflex", "generate"]

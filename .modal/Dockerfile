@@ -45,7 +45,9 @@ ARG REFLEX_CUDA_ARCH="sm_89"
 # Multi-arch fatbin (comma-separated sm_XX list + embedded PTX fallback), mutually
 # exclusive with REFLEX_CUDA_ARCH -- see build.rs / README's fatbin section.
 ARG REFLEX_CUDA_ARCHS=""
-RUN set -- --release --bin reflex --features ipc; \
+# Same features as the root Dockerfile's adapter images: `ipc` and `nvml` (energy,
+# libnvidia-ml dlopen'd at run time).
+RUN set -- --release --bin reflex --features ipc,nvml; \
     if [ -n "$REFLEX_CUDA_ARCHS" ]; then \
         unset REFLEX_CUDA_ARCH; \
         REFLEX_CUDA_ARCHS=$REFLEX_CUDA_ARCHS cargo build "$@"; \

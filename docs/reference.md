@@ -56,10 +56,13 @@ for the `download` feature specifically:
 sudo apt-get install -y libssl-dev pkg-config
 ```
 
-Every Dockerfile in this repo builds an explicit, minimal feature set (`--features ipc`
-for the sidecar/Runpod/Modal images, feature-less for the root image) precisely so the
-released artifacts never pay for `download`/`python` they don't use — see each
-Dockerfile's `REFLEX_FEATURES`/`--features` line rather than assuming `--all-features`.
+Every Dockerfile in this repo builds an explicit, minimal feature set (`--features
+ipc,nvml` for the sidecar/Runpod/Modal images, `nvml` for the root image's CLI target,
+which also ships `reflex-energy`) precisely so the released artifacts never pay for
+`download`/`python` they don't use — see each Dockerfile's `REFLEX_FEATURES`/`--features`
+line rather than assuming `--all-features`. `nvml` adds no build dependency and no
+runtime requirement, and costs nothing unless `REFLEX_ENERGY=1` is set; where
+`libnvidia-ml` is missing the binary runs without energy figures (see [Docker](#docker)).
 
 **Binary size.** The core build stays small by design: the Rust binary itself is on the
 order of a few MB, and the AOT kernel bytes it embeds are tiny (the full `src/kernels_cuda/`
@@ -558,6 +561,30 @@ docker run --rm --gpus all -v /path/to/models:/models \
   --entrypoint /usr/local/bin/reflex reflex \
   system1 /models/Qwen3-0.6B-Q4_K_M.gguf "Q: ...? A:" --candidate " Yes" --candidate " No"
 ```
+
+**Energy.** Every image is built with the `nvml` feature. Energy is off by default:
+with `-e REFLEX_ENERGY=1`, `generate`/`system1`/`smoke`/`bench`/`embed` print `joules=`
+and `energy_method=` (and the `REFLEX_PHASE_OK` lines carry `energy_joules=`/
+`energy_method=`). Without it the binary never loads NVML, because starting NVML and
+reading its counter inside the timed window adds about 30 ms to a T4 cold start. NVML is
+the host driver's `libnvidia-ml.so.1`, mounted by nvidia-container-toolkit for the
+`utility` driver capability, which the `nvidia/cuda` base images set
+(`NVIDIA_DRIVER_CAPABILITIES=compute,utility`), so `--gpus all` is enough. Where NVML
+isn't mounted (another base image, or a platform that doesn't provide it) the binary runs
+normally and leaves the energy fields out, and `reflex doctor`'s `nvml_energy` check warns
+instead of failing. NVML's counter is device-wide, so the figures need a dedicated GPU. The `reflex` image also contains
+`reflex-energy`, which measures a whole process from outside, net of the GPU's idle draw
+(see [benchmarks](benchmarks.md#energy)):
+
+```
+docker run --rm --gpus all -v /path/to/models:/models \
+  --entrypoint /usr/local/bin/reflex-energy reflex \
+  -- /usr/local/bin/reflex system1 /models/Qwen3-0.6B-Q4_K_M.gguf "Q: ...? A:" \
+  --candidate " Yes" --candidate " No"
+```
+
+Build with `--build-arg REFLEX_FEATURES=` (empty) for the image without energy, or
+`REFLEX_FEATURES=ipc,nvml` to add `stdio`/`uds` and keep it.
 
 `--build-arg COMPLIANCE_BUNDLE=1` (any target) adds the SBOMs, third-party licenses,
 apt package list and base image names under `/usr/share/reflex/compliance/`; the
