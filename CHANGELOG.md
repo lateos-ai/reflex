@@ -5,6 +5,16 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Comparison table on the current default.** README's "How it compares" now measures
+  Reflex with quantized-resident weights: on a T4 (2026-10-30, `n=30` each, interleaved),
+  `reflex generate` reaches its first token in 0.47 s p50 against `llama-simple`'s
+  0.965 s (2.05x) and `llama-cli`'s 1.57 s (3.3x). Every row now names its date, GPU and
+  weight mode; the Ollama, vLLM, Runpod and Jev rows were not re-measured and say so. The
+  2026-09-29 `f32` rows moved to the history part of
+  [docs/benchmarks.md](docs/benchmarks.md#cold-start-vs-other-engines). The 10B+ models in
+  the supported-models table are marked as supported for completeness on 48–80 GB cards.
+  No engine change.
+
 - **`scripts/prove_it.sh`.** One command from a clone to "my numbers vs the published
   numbers": builds, runs `reflex doctor` and `reflex smoke`, times five cold
   `reflex system1` processes on `Qwen3-0.6B-Q4_K_M` (printing the download command if it

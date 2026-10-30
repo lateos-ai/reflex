@@ -64,13 +64,69 @@ warm/steady-state joules-per-token, not full-lifecycle cold-start cost.
 All comparisons are cold-start (process launch to first token/result), external
 wall-clock (`/usr/bin/time -v` — process launch to exit, not just Reflex's own internal
 timer), except the TypeSafe Jev *warm* rows below, which use a different,
-explicitly-disclosed methodology. The `llama-simple`/`llama-cli`/Ollama/vLLM rows were
-refreshed on 2026-09-29 on a dedicated AWS EC2 `g4dn.xlarge` (**Tesla T4**, driver
-595.91.07 / CUDA 13.2), `n=30` per engine (`n=3` per Ollama scenario, `n=3` for vLLM),
-single session, same `Qwen3-0.6B-Q4_K_M.gguf` and same prompt (`"Once upon a time"`) on
-both sides; the TypeSafe Jev rows are unchanged from their own earlier measurements.
-Raw per-run logs are kept under `bench-results/` on the machine that ran them; the
-scripts that produce every number are in `scripts/bench_cold_*.sh`.
+explicitly-disclosed methodology. Every engine gets the same `Qwen3-0.6B-Q4_K_M.gguf`
+(`unsloth/Qwen3-0.6B-GGUF`, sha256 `ac2d9771...d524a`) and the same prompt
+(`"Once upon a time"`). Raw per-run logs are kept under `bench-results/` on the machine
+that ran them; the scripts that produce every number are in `scripts/bench_cold_*.sh`.
+
+Commands (all through `scripts/bench_cold_common.sh`):
+
+- Reflex: `reflex generate <gguf> "Once upon a time" --max-tokens 1`
+- llama.cpp `examples/simple` (true prompt-in/token-out):
+  `llama-simple -m <gguf> -n 1 -ngl 99 --no-warmup "Once upon a time"`
+- llama.cpp `llama-cli` (applies the chat template even with `-p`):
+  `llama-cli -m <gguf> -p "Once upon a time" -n 1 --temp 0 -ngl 99 --no-warmup -st --simple-io`
+
+These compare a *cold* local process launch (Reflex) against llama.cpp's front-ends,
+Ollama, and vLLM. Note the AOT truth before reading the "avoids runtime JIT" claim into
+every row: `llama-simple`/`llama-cli` and Ollama's bundled `llama-server` are, like
+Reflex, compiled ahead-of-time by `nvcc` at *build* time — none pays a runtime CUDA JIT
+tax, so those rows measure *other* cold-start overheads (model load, packaging, GPU
+discovery), and only the vLLM row actually exercises Reflex's no-runtime-JIT bet.
+
+### Current default: QR on a T4 (2026-10-30)
+
+Reflex with quantized-resident weights (the default since 2026-10-20) against llama.cpp,
+on a dedicated AWS EC2 `g4dn.xlarge` (**Tesla T4**, driver 595.91.07 / CUDA 13.2), one
+session. Reflex at `83fca74`, `REFLEX_CUDA_ARCH=sm_75` cubin, default
+features (no in-process energy reading). llama.cpp `22bdcc4` (2026-09-30), built with
+`-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DCMAKE_BUILD_TYPE=Release`. All binaries
+were built before timing started. The GGUF was read into the page cache and each engine
+ran three warm-ups first; then 30 rounds of one run per engine, with the order rotated
+every round (Reflex/simple/cli, simple/cli/Reflex, cli/Reflex/simple). `n=30` per engine,
+no failed runs, nothing discarded. `/usr/bin/time` reports wall clock in 10 ms steps.
+
+| engine | p50 | p95 | min–max | peak RSS |
+|---|---|---|---|---|
+| **Reflex** (`generate`, 1 token, QR) | **0.47 s** | **0.48 s** | 0.46–0.48 s | 750 MB |
+| llama.cpp `llama-simple` | 0.965 s | 0.99 s | 0.93–0.99 s | 734 MB |
+| llama.cpp `llama-cli` | 1.57 s | 1.77 s | 1.56–1.78 s | 746 MB |
+
+- **Ratios (p50):** Reflex **2.05x faster than `llama-simple`** and **3.3x faster than
+  `llama-cli`**. At p95: 2.06x and 3.7x.
+- **Reflex's internal first token** (`process_start_to_first_token_ms`, the engine's own
+  timer): p50 **379.2 ms**, p95 387.3 ms, 374.3–388.5 ms. Phase p50s: GGUF open 35.2 ms,
+  CUDA init 139.7 ms, model load 162.7 ms, prompt eval 41.5 ms. The ~90 ms between that
+  and the wall clock is process launch before `main` plus exit.
+- **Output:** all 30 Reflex runs emitted token 11 (`","`), and all 30 `llama-simple` runs
+  printed `,` as their token. As in the historical rows, `llama-simple` takes
+  `--no-warmup` as part of its prompt (it echoes `--no-warmup Once upon a time,`), so its
+  prompt is longer than Reflex's. `llama-cli` wraps the prompt in the chat template and
+  prints no generated text with `-n 1`, so its first token was not checked.
+- **`llama-cli` spread:** 6 of its 30 runs took 1.77–1.78 s and the rest 1.56–1.59 s. The
+  slow runs are spread across the session, not grouped.
+- **Against the f32 rows below** (same T4 instance type, driver, build mode and
+  commands, different session): Reflex went from 0.83 s to 0.47 s while `llama-simple`
+  went from 0.94 s (`a6ea155`) to 0.965 s (`22bdcc4`), so the change is on Reflex's side.
+
+### Historical: f32 on a T4 (2026-09-29)
+
+Reflex rows in this subsection are `f32` weights, before `f16` (2026-10-02) and QR
+(2026-10-20) became the default. Ollama and vLLM were not re-measured since, so the
+README still cites their rows from here, labelled with this date and weight mode. The
+rows were refreshed on 2026-09-29 on a dedicated AWS EC2 `g4dn.xlarge` (**Tesla T4**,
+driver 595.91.07 / CUDA 13.2), `n=30` per engine (`n=3` per Ollama scenario, `n=3` for
+vLLM), single session; Reflex `REFLEX_CUDA_ARCH=sm_75` cubin, llama.cpp `a6ea155`.
 
 **Device-comparability caveat (disclosed, not buried).** This refresh could not run on
 the published table's ThunderCompute A6000 — that GPU was unavailable — so it uses the
@@ -86,17 +142,10 @@ comparable to the old A6000 table. The harness was re-validated first (same
 because the virtualized-teardown tax it used to pay is gone — a host-class difference,
 diagnosed before any number was trusted, not a harness change.
 
-These compare a *cold* local process launch (Reflex) against llama.cpp's front-ends,
-Ollama, and vLLM. Note the AOT truth before reading the "avoids runtime JIT" claim into
-every row: `llama-simple`/`llama-cli` and Ollama's bundled `llama-server` are, like
-Reflex, compiled ahead-of-time by `nvcc` at *build* time — none pays a runtime CUDA JIT
-tax, so those rows measure *other* cold-start overheads (model load, packaging, GPU
-discovery), and only the vLLM row actually exercises Reflex's no-runtime-JIT bet.
+Reflex's own number on this device (`reflex generate`, `f32` weights, `n=30`): **p50
+0.83s / p95 0.84s**, peak RSS 982 MB.
 
-Reflex's own number on this device (`reflex generate`, `n=30`): **p50 0.83s / p95 0.84s**,
-peak RSS 982 MB.
-
-| vs. (cold process launch, Tesla T4, `n=30`) | Result (p50; p95 in parens) | Caveat |
+| vs. (cold process launch, Tesla T4, Reflex `f32`, `n=30`) | Result (p50; p95 in parens) | Caveat |
 |---|---|---|
 | **llama.cpp `llama-simple`** (true prompt-in/token-out) | **Reflex ~1.13x faster** (0.83s [0.84s] vs. 0.94s [0.96s]) | Both AOT-compiled. On this dedicated T4 the win is Reflex's optimized cold load, *not* the `fast_exit` teardown fix — that only mattered on ThunderCompute's virtualized A6000; doesn't exercise the JIT-tax claim |
 | **llama.cpp `llama-cli`** | **Reflex ~1.9x faster** (0.83s vs. 1.58s [1.59s]) | `llama-cli` always applies the model's chat template even with `-p` (a documented gotcha), so `llama-simple` is the true prompt-in/token-out row; kept for continuity with the published table |
@@ -105,13 +154,17 @@ peak RSS 982 MB.
 
 ![Cold-start: process launch to first token on a Tesla T4 — Reflex vs llama.cpp / Ollama / vLLM, with Reflex's phase breakdown](cold-start-t4.png)
 
-*Figure: cold start = process launch → first token, external wall clock, Tesla T4,
-`Qwen3-0.6B-Q4_K_M`, `n=30` (`n=3` Ollama/vLLM). Left: Reflex vs the other engines on a
+*Figure (historical, 2026-09-29, Reflex `f32` weights): cold start = process launch →
+first token, external wall clock, Tesla T4, `Qwen3-0.6B-Q4_K_M`, `n=30` (`n=3`
+Ollama/vLLM). Left: Reflex vs the other engines on a
 log axis, so vLLM stays visible. Right: where Reflex's 0.83s goes. Editable vector source:
 [`docs/cold-start-t4.svg`](cold-start-t4.svg).*
 
+### Other models
+
 **Qwen2.5-0.5B-Instruct (`qwen2`), 2026-10-13.** Same harness and commands, on a Runpod
-RTX 3090 (community), `n=30`, with Qwen3-0.6B re-measured on the same pod for reference:
+RTX 3090 (community), `n=30`, before QR became the default, with Qwen3-0.6B re-measured
+on the same pod for reference:
 
 | Model | Reflex p50 / p95 | `llama-simple` p50 / p95 | Ratio (p50) |
 |---|---|---|---|
@@ -122,7 +175,8 @@ Not comparable to the T4 table above (different card and host). See
 [design/qwen2.md](design/qwen2.md#results-2026-10-13).
 
 **GigaChat3.1-10B-A1.8B (`deepseek2`, MLA + sigmoid-routed MoE), 2026-10-13.** Same
-harness and commands, on a Runpod A100-SXM4-80GB (secure cloud), `n=30`, page cache warm:
+harness and commands, on a Runpod A100-SXM4-80GB (secure cloud), `n=30`, page cache warm,
+Reflex `f16` weights (the MLA path has no QR mode):
 
 | Model | Reflex p50 / p95 | `llama-simple` p50 / p95 | Ratio (p50) |
 |---|---|---|---|
