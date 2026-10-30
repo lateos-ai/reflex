@@ -1,0 +1,4 @@
+REFLEX_PHASE_OK phase=cuda_init duration_ms=139.546
+REFLEX_PHASE_OK phase=kernel_load duration_ms=0.179
+REFLEX_PHASE_OK phase=kernel_launch duration_ms=11.164
+REFLEX_SMOKE_OK process_start_to_first_result_ms=150.889

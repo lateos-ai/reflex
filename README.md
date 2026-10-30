@@ -60,6 +60,14 @@ cargo run --release --bin reflex -- generate model.gguf "Once upon a time" --max
 cargo run --release --bin reflex -- embed nemotron-embed.gguf "query: What is NeMo?"
 ```
 
+To compare your GPU with the published numbers in one command, run
+[`scripts/prove_it.sh`](scripts/prove_it.sh). It builds Reflex, runs `reflex doctor` and
+`reflex smoke`, times five cold `reflex system1` processes on `Qwen3-0.6B-Q4_K_M` (it
+prints the download command if the file is missing), and prints p50 per phase next to
+the reference row for the closest GPU in `bench/baseline-*.json`, with what differs
+between the two setups (GPU, kernel image, weight mode). It exits non-zero only when
+something fails, never for being slower.
+
 `reflex <subcommand>` with no arguments prints that subcommand's usage. All subcommands,
 build options and output formats: [docs/reference.md](docs/reference.md).
 

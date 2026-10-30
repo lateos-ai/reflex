@@ -5,6 +5,15 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **`scripts/prove_it.sh`.** One command from a clone to "my numbers vs the published
+  numbers": builds, runs `reflex doctor` and `reflex smoke`, times five cold
+  `reflex system1` processes on `Qwen3-0.6B-Q4_K_M` (printing the download command if it
+  is missing), and prints p50 per phase from each run's `REFLEX_RUN_REPORT` next to the
+  reference row for the closest GPU in `bench/baseline-*.json`, with what differs (GPU,
+  kernel image, weight mode). Exits non-zero only on a real failure, not on being slower.
+  New reference `bench/baseline-a10g.json` (the published 2026-10-20 A10G run); the T4
+  file now says it is the historical `f32` row. No engine change.
+
 - **Run report.** `generate` and `system1` end with one `REFLEX_RUN_REPORT` line (and a
   `--json` object): the phase timings plus the GPU name and compute capability, driver
   versions, kernel image (PTX/cubin/fatbin, native or PTX JIT), weight mode
