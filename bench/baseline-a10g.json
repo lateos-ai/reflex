@@ -1,0 +1,26 @@
+{
+  "provisional": true,
+  "source": "docs/benchmarks.md 'Current default: QR on an A10G' (dedicated AWS g5.xlarge, manual run 2026-10-20, driver 595.91.07 / CUDA 13.2, REFLEX_CUDA_ARCH=sm_86); round 1 of 2, round 2: total 445.4, model load 246.1, scoring pass 23.0 ms",
+  "recorded": "2026-10-20",
+  "gpu": "NVIDIA A10G",
+  "compute_capability": "8.6",
+  "kernel_image": "cubin native sm_86",
+  "weights": "qr",
+  "kv_cache": "f32",
+  "subcommand": "system1",
+  "model": "Qwen3-0.6B-Q4_K_M.gguf",
+  "n_runs": 10,
+  "published": "docs/design/quantized-resident-weights.md#qr-as-the-default-2026-10-20",
+  "note": "only total, model load and the scoring pass were published for this run",
+  "phases": {
+    "model_load": {
+      "p50_ms": 251.1
+    },
+    "prompt_eval": {
+      "p50_ms": 23.1
+    },
+    "total": {
+      "p50_ms": 451.4
+    }
+  }
+}

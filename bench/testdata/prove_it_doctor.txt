@@ -1,0 +1,5 @@
+REFLEX_DOCTOR_CHECK name=gpu_probe status=pass detail="GPU: Tesla T4 (sm_75), VRAM: 14807/14912 MiB free"
+REFLEX_DOCTOR_CHECK name=compute_capability status=pass detail="kernel_format=cubin compiled_arch=sm_75 matches detected GPU"
+REFLEX_DOCTOR_CHECK name=aot_kernel_launch status=pass detail="kernel_format=cubin: loaded and launched the AOT smoke kernel, result correct"
+REFLEX_DOCTOR_CHECK name=nvml_energy status=warn detail="this binary was built without the `nvml` Cargo feature (rebuild with --features nvml)"
+REFLEX_DOCTOR_OK checks_passed=3 checks_warned=1 checks_failed=0

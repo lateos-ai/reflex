@@ -117,8 +117,10 @@ Then replace the provisional baseline (next section).
 
 ## The baseline
 
-`bench/baseline-t4.json` starts out **provisional**: its numbers come from the README's
-manually measured T4 table, not from this workflow's own environment. While
+`bench/baseline-t4.json` starts out **provisional**: its numbers come from the historical
+manually measured T4 table in [benchmarks.md](benchmarks.md#cold-start-phase-breakdown)
+(`f32` weights, before quantized-resident weights became the default), not from this
+workflow's own environment. While
 `"provisional": true`, a regression is reported as a **warning** and the job still
 passes, so small environment differences (a newer DLAMI driver, a different AZ's host)
 can't turn the first nightly red. `bench_compare.py --strict` overrides that.
@@ -135,7 +137,10 @@ feature that legitimately makes model load slower:
      --source "GPU nightly run https://github.com/<org>/<repo>/actions/runs/<id>"
    ```
 
-   This writes `"provisional": false`, so later regressions fail the job.
+   This writes `"provisional": false`, so later regressions fail the job. It writes only
+   the phases and the run's provenance: copy the descriptive fields
+   (`compute_capability`, `kernel_image`, `weights`, `kv_cache`, `published`, `note`)
+   over from the old file, since `scripts/prove_it.sh` prints them.
 3. Commit it with a message that says why the baseline moved.
 
 Single nightly runs are noisy at the level of individual phases. The gate is on

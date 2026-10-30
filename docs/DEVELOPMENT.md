@@ -121,7 +121,17 @@ REFLEX_CUDA_ARCH=sm_86 cargo build --release    # one cubin for one GPU architec
 cargo run --release --bin reflex -- smoke       # first thing to run on a new GPU machine
 cargo run --release --bin reflex -- generate <model.gguf> "prompt"
 cargo test                                      # host-side unit tests
+scripts/prove_it.sh [model.gguf]                # doctor + smoke + n=5 cold system1 vs bench/baseline-*.json
 ```
+
+`scripts/prove_it.sh` reads each run's `REFLEX_RUN_REPORT` line
+([Run report](reference.md#run-report)) and compares p50 per phase with the reference
+for the same GPU, else the nearest compute capability. A reference is a
+`bench/baseline-<gpu>.json` file; besides `phases`, the script reads `gpu`,
+`compute_capability`, `kernel_image`, `weights`, `kv_cache`, `subcommand`, `model`,
+`n_runs`, `recorded`, `published` and `note`, so a new one needs those too and only
+numbers that were measured and published (leave out a phase that wasn't).
+`PROVE_IT_RUNS` sets the run count, `REFLEX_BIN` skips the build.
 
 Optional features (`ipc`, `json-output`, `download`, `nvml`, `python`) and their extra
 host dependencies are listed in the reference's

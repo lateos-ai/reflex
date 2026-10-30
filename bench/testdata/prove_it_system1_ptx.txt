@@ -1,0 +1,8 @@
+REFLEX_SYSTEM1_CANDIDATE_OK idx=0 text=" True" token_ids=[3007] score=9.901295 probability=0.351594
+REFLEX_SYSTEM1_CANDIDATE_OK idx=1 text=" False" token_ids=[3557] score=10.513334 probability=0.648406
+REFLEX_PHASE_OK phase=gguf_open duration_ms=35.448
+REFLEX_PHASE_OK phase=cuda_init duration_ms=139.211
+REFLEX_PHASE_OK phase=model_load duration_ms=164.650
+REFLEX_PHASE_OK phase=prompt_eval duration_ms=12.076
+REFLEX_SYSTEM1_OK process_start_to_result_ms=351.420 gguf_open_ms=35.448 cuda_init_ms=139.211 model_load_ms=164.650 prompt_eval_ms=12.076 num_candidates=2 best_idx=1 best_text=" False" entropy=0.935484 weights_dtype=f16
+REFLEX_RUN_REPORT schema_version=1.5.0 command=system1 process_start_to_first_result_ms=351.420 gguf_open_ms=35.448 cuda_init_ms=139.211 model_load_ms=164.650 prompt_eval_ms=12.076 gpu_name="Tesla T4" compute_capability=7.5 vram_total_mib=14912 cuda_driver_version=13.2 kernel_format=ptx kernel_image=ptx_jit weights=qr weights_dtype=f16 kv_cache=f32 arch="qwen3" model_file="Qwen3-0.6B-Q4_K_M.gguf" model_bytes=396705472
