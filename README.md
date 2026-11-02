@@ -84,13 +84,17 @@ with optional retrieval over your own documents ([RAG](.runpod/README.md#optiona
 | Dense Qwen2 / Qwen2.5, incl. Math and Coder (`qwen2`) | Qwen2.5-0.5B-Instruct; a synthetic fixture. YaRN long-context scaling and `qwen2moe` are not supported |
 | Qwen3-MoE (`qwen3moe`) | synthetic fixtures (real `qwen3moe` tensor layout, top-k routing) |
 | Llama / Mistral (`llama`) | TinyLlama-1.1B |
-| Qwen3.5 hybrid Gated DeltaNet (`qwen35`, `qwen35moe`) | Qwen3.5-0.8B; Qwen3.8-27B `Q8_0` (f16 weights, 80 GB GPU); a random-weight `qwen35moe` checkpoint. MTP/NextN heads are not supported, so use a `--no-mtp` conversion or a non-MTP `Q4_K_M` file (the official `Q8_0`/`BF16`/`Q4_0` are rejected) |
-| DeepSeek-V2/V3 MLA (`deepseek2`) | DeepSeek-V2-Lite, DeepSeek-Coder-V2-Lite-Instruct, GigaChat3.1-10B-A1.8B, GLM-4.7-Flash (f16 weights, 80 GB GPU); two synthetic fixtures. Group-limited routing (the 671B V3/R1), MTP heads, Moonlight (`kimi-k2` tokenizer) and Kanana-2 (`kanana2`) are not supported |
+| Qwen3.5 hybrid Gated DeltaNet (`qwen35`, `qwen35moe`) | Qwen3.5-0.8B; Qwen3.8-27B `Q8_0` (f16 weights, 80 GB GPU)†; a random-weight `qwen35moe` checkpoint. MTP/NextN heads are not supported, so use a `--no-mtp` conversion or a non-MTP `Q4_K_M` file (the official `Q8_0`/`BF16`/`Q4_0` are rejected) |
+| DeepSeek-V2/V3 MLA (`deepseek2`) | DeepSeek-V2-Lite, DeepSeek-Coder-V2-Lite-Instruct, GigaChat3.1-10B-A1.8B, GLM-4.7-Flash (f16 weights, 80 GB GPU)†; two synthetic fixtures. Group-limited routing (the 671B V3/R1), MTP heads, Moonlight (`kimi-k2` tokenizer) and Kanana-2 (`kanana2`) are not supported |
 | Granite 4.0-H Mamba-2 hybrid (`granitehybrid`) | Granite 4.0-H 350M and 1B `Q8_0`; a synthetic fixture. MoE variants (Tiny, Small), Falcon-H1, Nemotron-H, Jamba and pure Mamba-2 are not supported |
-| Kolibri-1 MoE (`kolibri1`) | Aleph Alpha's Kolibri-1 78B, `Q4_K_M`; a synthetic fixture |
-| Gemma 4 dense, text only (`gemma4`) | Gemma 4 12B-it and 31B-it `Q8_0` (31B runs on a 48 GB card with QR; the `f16` opt-out needs ~80 GB); a synthetic fixture. E2B/E4B and 26B-A4B are not supported |
+| Kolibri-1 MoE (`kolibri1`) | Aleph Alpha's Kolibri-1 78B, `Q4_K_M`†; a synthetic fixture |
+| Gemma 4 dense, text only (`gemma4`) | Gemma 4 12B-it and 31B-it `Q8_0` (31B runs on a 48 GB card with QR; the `f16` opt-out needs ~80 GB)†; a synthetic fixture. E2B/E4B and 26B-A4B are not supported |
 | Text embeddings: Nemotron-3.5-Embed (`mistral3`, bidirectional) | Nemotron-3.5-Embed-1B `BF16`/`Q8_0`/`Q4_K_M` (vs HF `transformers`); a synthetic fixture. Images (the `mmproj` file), pooling other than mean and Ministral 3 chat models are not supported. See [docs/reference.md](docs/reference.md#embeddings) |
 | Decision models: lev, OpenJev (`qwen35` with `decision.type` `lev`/`openjev`) | ggml-org's lev `Q8_0` (f16 weights) and llama.cpp's tiny OpenJev test model, vs llama.cpp's `/v1/systemone`. Text only; `kev` and `laya` models are not supported. Served by the sidecar's `POST /v1/systemone`; see [docs/reference.md](docs/reference.md#decision-models) |
+
+† Supported for completeness on 48–80 GB cards (Gemma 4 12B also fits 24 GB with QR).
+Reflex is built for small models that cold-start in under a second; every cold-start
+number in this README is Qwen3-0.6B unless it says otherwise.
 
 Each architecture counted as supported only after its generated tokens matched an
 independent implementation (llama.cpp, or a CPU reference) on real hardware;
@@ -109,23 +113,25 @@ embeddings were compared with HF `transformers` by cosine similarity.
 
 ## How it compares
 
-Cold starts measured from outside the process, Tesla T4, `Qwen3-0.6B-Q4_K_M`, unless
-noted. The engine-vs-engine rows time `reflex generate` to its first token (0.83 s p50,
-`n=30`), the metric every engine shares; the headline above times `system1` scoring.
-Every Reflex figure in this table is the historical `f32`-weights T4 measurement, taken
-before `f16` and then QR became the default; the headline above is the current QR/A10G
-measurement. In a same-session f16-era comparison, `f16`'s first token was 8% sooner
-([f16 weight storage](docs/benchmarks.md#f16-weight-storage)).
+Cold starts measured from outside the process (process launch to exit),
+`Qwen3-0.6B-Q4_K_M`. Each row gives its own date, GPU and Reflex weight mode; rows from
+different dates or GPUs don't compare with each other. The llama.cpp, Ollama and vLLM
+rows time `reflex generate` to its first token, the metric every engine shares; the
+headline above times `system1` scoring.
 
-| vs. | Result | Caveat |
-|---|---|---|
-| llama.cpp `llama-simple` | Reflex **1.13x faster** (0.83 s vs. 0.94 s) | Both precompile their kernels; this is model-load work |
-| llama.cpp `llama-cli` | Reflex **1.9x faster** (0.83 s vs. 1.58 s) | `llama-cli` always applies the chat template |
-| Ollama | Reflex **2.6x faster** (0.83 s vs. ~2.1 s) | Cold daemon plus cold model |
-| vLLM | Reflex **48–150x faster** (0.83 s vs. 39.8–127.3 s) | CUDA-graph capture and `torch.compile` at startup; ran from safetensors |
-| vLLM on Runpod serverless | Reflex **~3.4x faster** (42–44 s vs. ~150 s) | Mostly platform provisioning; vLLM also downloaded `bf16` weights |
-| llama.cpp server on Runpod serverless | Engine load **~1.9x faster** (0.49 s vs. 0.95 s on an L4, n=5 each); end-to-end inconclusive | Platform overhead (24–73 s even for Reflex) swamps the difference; [details](docs/runpod-llamacpp-comparison.md#results) |
-| TypeSafe Jev (managed API) | Reflex **1.1–2.0x slower** (0.63 s vs. 0.31–0.57 s) | Jev is always warm; Reflex starts a process each time |
+| vs. | Result | Measured | Caveat |
+|---|---|---|---|
+| llama.cpp `llama-simple` | Reflex **2.05x faster** (0.47 s vs. 0.965 s p50, n=30 each) | 2026-10-30, T4, QR | Both precompile their kernels; this is model-load work |
+| llama.cpp `llama-cli` | Reflex **3.3x faster** (0.47 s vs. 1.57 s p50, n=30 each) | 2026-10-30, T4, QR | `llama-cli` always applies the chat template |
+| Ollama | Reflex **2.6x faster** (0.83 s vs. ~2.1 s) | 2026-09-29, T4, `f32` | Cold daemon plus cold model; not re-measured on QR |
+| vLLM | Reflex **48–150x faster** (0.83 s vs. 39.8–127.3 s) | 2026-09-29, T4, `f32` | CUDA-graph capture and `torch.compile` at startup; ran from safetensors; not re-measured on QR |
+| vLLM on Runpod serverless | Reflex **~3.4x faster** (42–44 s vs. ~150 s) | 2026-09-26, RTX A4500, `f32` | Mostly platform provisioning; vLLM also downloaded `bf16` weights |
+| llama.cpp server on Runpod serverless | Engine load **~1.9x faster** (0.49 s vs. 0.95 s, n=5 each); end-to-end inconclusive | 2026-10-01/02, L4, `f32` | Platform overhead (24–73 s even for Reflex) swamps the difference; [details](docs/runpod-llamacpp-comparison.md#results) |
+| TypeSafe Jev (managed API) | Reflex **1.1–2.0x slower** (0.63 s vs. 0.31–0.57 s) | 2026-10-01, T4, `f32`, `system1` | Jev is always warm; Reflex starts a process each time |
+
+In the 2026-10-30 session Reflex's own first-token timer read 379 ms p50; the rest of
+the 0.47 s is process launch and exit. On the same T4 setup Reflex's figure was 0.83 s
+with `f32` weights on 2026-09-29, while `llama-simple` moved only from 0.94 s to 0.965 s.
 
 Methodology, per-run numbers and every caveat: [docs/benchmarks.md](docs/benchmarks.md).
 
