@@ -1857,7 +1857,7 @@ impl Model {
                 }
                 if cache.k_caches.len() != self.layers.len() {
                     return Err(crate::reflex_err!(
-                        Other,
+                        KvCache,
                         "imported KV cache has {} layers, model has {}",
                         cache.k_caches.len(),
                         self.layers.len()

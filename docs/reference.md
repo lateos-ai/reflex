@@ -452,8 +452,8 @@ design and results: [design/decision-models.md](design/decision-models.md).
 `reflex generate --export-kv <file>` (IPC `export_kv`) writes the model's state after
 the prompt; `--import-kv <file>` (IPC `import_kv`) resumes from it. The format is a
 small header (`CSKV` magic, a version, the shape) followed by the values, little
-endian. It's home-grown and versioned, not a stable public spec. Every version below
-still imports.
+endian. Every version below still imports. The byte layout, the errors and what an
+orchestrator can rely on are in [kv-cache-format.md](kv-cache-format.md).
 
 | version | layout | values |
 |---:|---|---|

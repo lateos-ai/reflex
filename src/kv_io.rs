@@ -16,8 +16,10 @@
 //! engine stays ignorant of where the file lives (NVMe, S3-backed FUSE,
 //! tmpfs) -- see docs/DEVELOPMENT.md's Non-goals.
 //!
-//! File format is a flat, home-grown binary layout, not a stable public
-//! spec: magic + version-gated, so the version-1 dense/MoE-only layout
+//! File format is a flat, home-grown binary layout, specified for callers in
+//! docs/kv-cache-format.md (keep the two in step; the
+//! `hand_built_files_match_the_documented_layout` test pins it). It is
+//! magic + version-gated, so the version-1 dense/MoE-only layout
 //! round-1 shipped stays readable unchanged while version 2 adds the hybrid
 //! layout and version 3 the MLA layout alongside it -- [`import_kv`]
 //! dispatches on the version field to pick between them.
@@ -1390,5 +1392,135 @@ mod tests {
         assert_eq!(err.code(), crate::error::ReflexErrorCode::KvCache, "{err}");
         drop(c);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// `CSKV`, the version, then `fields` as u32 LE: the start of every header.
+    fn header(version: u32, fields: &[u32]) -> Vec<u8> {
+        let mut b = MAGIC.to_vec();
+        for v in std::iter::once(version).chain(fields.iter().copied()) {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    fn push_f32(b: &mut Vec<u8>, xs: &[f32]) {
+        xs.iter()
+            .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+    }
+
+    fn push_f16(b: &mut Vec<u8>, xs: &[f32]) {
+        xs.iter()
+            .for_each(|&x| b.extend_from_slice(&half::f16::from_f32(x).to_le_bytes()));
+    }
+
+    /// Imports `bytes`, runs `check` on the result, and re-exports it: the
+    /// exporter writes the header fresh, so equal bytes pin its layout too.
+    fn import_check_reexport(name: &str, bytes: &[u8], check: impl FnOnce(&ImportedKv)) {
+        let path = tmp(name);
+        std::fs::write(&path, bytes).unwrap();
+        let kv = import_kv(path.to_str().unwrap()).expect(name);
+        check(&kv);
+        let copy = tmp(&format!("{name}_copy"));
+        export_kv(copy.to_str().unwrap(), &kv).unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), bytes, "{name}: re-export");
+        drop(kv);
+        std::fs::remove_file(&copy).ok();
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The byte layout of every version the exporters write (2 to 7), built by
+    /// hand from docs/kv-cache-format.md rather than by the writer, so a change
+    /// to the reader and writer together can't silently move the format.
+    /// Version 1 is covered by `import_reads_version_1_dense_files`. Every
+    /// value is exact in f16, so f16 files widen back to the same numbers.
+    #[test]
+    fn hand_built_files_match_the_documented_layout() {
+        // Versions 4 and 5, dense/MoE: 1 layer, seq_len 1, 1 KV head, head_dim 2,
+        // then the space_prefix_next byte, then K and V.
+        for (version, flag, f16) in [(4, 1u8, false), (5, 0u8, true)] {
+            let mut b = header(version, &[1, 1, 1, 2]);
+            b.push(flag);
+            let push = if f16 { push_f16 } else { push_f32 };
+            push(&mut b, &[1.5, -2.0]);
+            push(&mut b, &[0.25, 4.0]);
+            assert_eq!(b.len(), 25 + 4 * if f16 { 2 } else { 4 });
+            import_check_reexport(&format!("v{version}"), &b, |kv| {
+                let ImportedKv::Dense(c) = kv else {
+                    panic!("v{version}: not dense")
+                };
+                assert_eq!((c.seq_len, c.num_kv_heads, c.head_dim), (1, 1, 2));
+                assert_eq!(c.space_prefix_next, Some(flag == 1));
+                assert_eq!(f32s(&c.k_caches), vec![vec![1.5, -2.0]]);
+                assert_eq!(f32s(&c.v_caches), vec![vec![0.25, 4.0]]);
+            });
+        }
+
+        // Versions 2 and 6, hybrid: 2 layers (GatedDeltaNet, then attention),
+        // seq_len 1, 1 KV head, head_dim 2, conv state 1 value, recurrent 2;
+        // the kind bytes, then each layer's buffers. Version 6 rounds only K/V.
+        for (version, f16) in [(2, false), (6, true)] {
+            let mut b = header(version, &[2, 1, 1, 2, 1, 2]);
+            b.extend_from_slice(&[1, 0]);
+            push_f32(&mut b, &[0.5]);
+            push_f32(&mut b, &[1.0, 2.0]);
+            let push = if f16 { push_f16 } else { push_f32 };
+            push(&mut b, &[3.0, 4.0]);
+            push(&mut b, &[5.0, 6.0]);
+            import_check_reexport(&format!("v{version}"), &b, |kv| {
+                let ImportedKv::Hybrid(c) = kv else {
+                    panic!("v{version}: not hybrid")
+                };
+                assert_eq!((c.seq_len, c.attn_num_kv_heads, c.attn_head_dim), (1, 1, 2));
+                assert_eq!((c.gdn_conv_state_len, c.gdn_recurrent_len), (1, 2));
+                let HybridLayerCacheData::Gdn {
+                    conv_state,
+                    recurrent,
+                } = &c.layers[0]
+                else {
+                    panic!("v{version}: layer 0 kind")
+                };
+                assert_eq!(conv_state.dtype(), KvDtype::F32);
+                assert_eq!(conv_state.to_f32().unwrap(), vec![0.5]);
+                assert_eq!(recurrent.to_f32().unwrap(), vec![1.0, 2.0]);
+                let HybridLayerCacheData::Attn { k_cache, v_cache } = &c.layers[1] else {
+                    panic!("v{version}: layer 1 kind")
+                };
+                assert_eq!(k_cache.to_f32().unwrap(), vec![3.0, 4.0]);
+                assert_eq!(v_cache.to_f32().unwrap(), vec![5.0, 6.0]);
+            });
+        }
+
+        // Versions 3 and 7, MLA: 1 layer, seq_len 2, qk_dim 2, one latent buffer.
+        for (version, f16) in [(3, false), (7, true)] {
+            let mut b = header(version, &[1, 2, 2]);
+            let push = if f16 { push_f16 } else { push_f32 };
+            push(&mut b, &[0.125, -1.0, 8.0, 0.0]);
+            import_check_reexport(&format!("v{version}"), &b, |kv| {
+                let ImportedKv::Mla(c) = kv else {
+                    panic!("v{version}: not MLA")
+                };
+                assert_eq!((c.seq_len, c.qk_dim), (2, 2));
+                assert_eq!(f32s(&c.kv_caches), vec![vec![0.125, -1.0, 8.0, 0.0]]);
+            });
+        }
+    }
+
+    /// The version numbers and magic are part of the file format: orchestrators
+    /// keep files between engine releases, so these never change meaning.
+    #[test]
+    fn version_numbers_are_stable() {
+        let pairs = [
+            (VERSION_DENSE, 1),
+            (VERSION_HYBRID, 2),
+            (VERSION_MLA, 3),
+            (VERSION_DENSE_V4, 4),
+            (VERSION_DENSE_F16, 5),
+            (VERSION_HYBRID_F16, 6),
+            (VERSION_MLA_F16, 7),
+        ];
+        for (constant, documented) in pairs {
+            assert_eq!(constant, documented);
+        }
+        assert_eq!(MAGIC, b"CSKV");
     }
 }

@@ -2000,7 +2000,7 @@ impl Model {
                 }
                 if cache.layers.len() != h.layers.len() {
                     return Err(crate::reflex_err!(
-                        Other,
+                        KvCache,
                         "imported hybrid KV cache has {} layers, model has {}",
                         cache.layers.len(),
                         h.layers.len()
