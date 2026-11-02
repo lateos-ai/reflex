@@ -5,6 +5,17 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Multi-token `system1` candidates on Qwen3.5 and Granite 4.0-H.** The recurrent
+  hybrids no longer reject a candidate that tokenizes to more than one token (CLI,
+  IPC `candidates`, FFI, sidecar `/v1/classify`), on a fresh prompt and, on Qwen3.5,
+  after a pinned prefix or cache file. Each multi-token candidate is teacher-forced
+  from a device copy of the recurrent state right after the prompt (Gated DeltaNet
+  conv + recurrent, Mamba-2 conv + SSM), taken only when two or more candidates are
+  multi-token. On a T4 the scores equal independent per-candidate prefills exactly on
+  Qwen3.5-0.8B, the Qwen3.5-MoE fixture and the Granite fixture; single-token scores
+  are byte-identical to before, and one-candidate cold `system1` is unchanged (p50
+  n=30 interleaved: Qwen3.5-0.8B 683.5 vs 687.7 ms, Qwen3-0.6B 338.4 vs 338.9 ms).
+
 - **Removed the Python bindings.** The `python` Cargo feature (PyO3, `src/python.rs`)
   had not compiled for some time, so it is gone rather than left half-supported. From
   Python, drive `reflex stdio` or `reflex uds` (one JSON request per line, no client

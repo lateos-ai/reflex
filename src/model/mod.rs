@@ -142,6 +142,8 @@ mod granite_hybrid_tests;
 #[cfg(test)]
 mod hybrid_batching_tests;
 #[cfg(test)]
+mod hybrid_system1_tests;
+#[cfg(test)]
 mod iq_dequant_host_vs_device_tests;
 #[cfg(test)]
 mod kolibri_config_tests;
@@ -1101,7 +1103,7 @@ impl Model {
     /// batched gather-GEMV covers all of them, `Self::gemv_gather`), and
     /// only a short teacher-forced continuation for multi-token ones
     /// (feeding each candidate's own known next token, never a sampled
-    /// one) where that's supported -- see [`Self::system1_evaluate_dense`]/
+    /// one) -- see [`Self::system1_evaluate_dense`]/
     /// [`Self::system1_evaluate_hybrid`]/[`Self::system1_evaluate_mla`],
     /// dispatched to here exactly the way `forward_prompt`/`generate`
     /// dispatch to their own `_dense`/`_hybrid`/`_mla` impls.

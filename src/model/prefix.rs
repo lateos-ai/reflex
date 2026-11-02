@@ -578,10 +578,8 @@ impl Model {
     /// added). Pinned prefixes and cache files share one path, as for
     /// [`Model::generate_resumed`]. Also returns the time spent copying a pinned
     /// prefix (`None` otherwise). A resumed `prompt` must still add at least one
-    /// token: the scores come from its last position. On the Qwen3.5 hybrid each
-    /// candidate must be a single token, as for a fresh prompt; Gemma 4 and
-    /// granitehybrid return `UnsupportedArchitecture` for anything but
-    /// [`Resume::Fresh`].
+    /// token: the scores come from its last position. Gemma 4 and granitehybrid
+    /// return `UnsupportedArchitecture` for anything but [`Resume::Fresh`].
     pub fn system1_evaluate_resumed(
         &self,
         prompt: &str,

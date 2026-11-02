@@ -127,8 +127,10 @@ In:
   `n_group = 1`; the fixture uses 2, so the group mapping is tested too.
 - Granite's muP scales: `embedding_scale`, `residual_scale`, `attention.scale`,
   `logit_scale`. Each one is skipped when absent or 0, like llama.cpp's `if (scale)`.
-- `--weights f32|f16` and `system1` with single-token candidates only, for the same
-  reason the Qwen3.5 hybrid path has: SSM state is a running accumulator.
+- `--weights f32|f16` and `system1` with single- and multi-token candidates. The conv and
+  SSM states are running accumulators, so when two or more candidates are multi-token
+  they are copied on the device after the prefill and restored before each
+  continuation but the first, as on the Qwen3.5 hybrid path.
 - Pre type `dbrx`.
 
 Out, rejected at load with an error naming the key or tensor and its value:
@@ -392,7 +394,8 @@ GPU (`#[ignore]`d; `scripts/gpu_nightly_tests.sh` has a rule for each):
   - first-step logits within 2e-3
   - batched vs sequential prefill, in f32 and f16
   - the f16 first token on prompts with a clear top-1
-  - system1 scores equal to the full logits, and multi-token candidates rejected
+  - system1 scores equal to the full logits; multi-token scores equal to independent
+    per-candidate prefills plus teacher-forced continuations
   - LoRA and KV export rejected
 - `granite_real_model_batched_prefill_matches_sequential` (`GRANITE_GGUF`).
 

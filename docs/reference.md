@@ -169,8 +169,10 @@ current numbers.)
 
 `probability` is relative to this candidate set only, not a vocab-wide probability —
 see `Model::system1_evaluate`'s doc comment in `src/model/mod.rs`. `system1` supports
-every architecture; on the Qwen3.5 hybrid models each candidate must be a single token
-(multi-token candidates are rejected with an `invalid_input` error).
+every architecture, with single- and multi-token candidates. On the recurrent hybrids
+(Qwen3.5, Granite 4.0-H) each multi-token candidate's continuation starts from a
+device copy of the state right after the prompt, taken only when two or more candidates
+are multi-token.
 
 Over IPC (`reflex stdio`/`uds`), a request with `"candidates": [...]` runs the same
 scoring. Its response lists each candidate's `token_ids`, `score` and `probability`,

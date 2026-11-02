@@ -106,8 +106,7 @@ embeddings were compared with HF `transformers` by cosine similarity.
    `f32` in both modes. `reflex check` defaults to `f32`.
 - **Context**: up to 65,535 positions per sequence (prompt + generated tokens + any
   imported KV cache); longer requests fail with a clear `context_overflow` error.
-- **`system1`** works on every architecture; on the Qwen3.5 hybrid models each candidate
-  must be a single token.
+- **`system1`** works on every architecture, with single- and multi-token candidates.
 - **QR off**: `REFLEX_QUANT_RESIDENT=0` loads matrix weights as `f16` (about 2 bytes per parameter). This makes short warm prompts and `system1` faster on the smallest model (Qwen3-0.6B), at the cost of 2–3.4x the resident VRAM and slower decode (measured ~8–10% on Qwen3-0.6B, ~30–40% on Qwen3-1.7B/TinyLlama, ~2x on Mistral 7B). On a 24 GB card it does not fit Gemma 4 12B for `generate`.
 - DeepSeek's MTP heads and group-limited expert routing are not supported.
 

@@ -286,7 +286,7 @@ Request fields:
 - `labels`: 1 to 64 non-empty strings. Each is scored as the literal text that follows
   the prompt, so it usually wants a leading space (`" urgent"`, not `"urgent"`). A label
   that doesn't tokenize as a clean continuation of the prompt fails the request with
-  `400` `invalid_input`. On the Qwen3.5 hybrid models every label must be one token.
+  `400` `invalid_input`.
 - `temperature` (optional, positive, default `1.0`): softmax temperature over the label
   scores. It sharpens or flattens `probability` without changing the ranking.
 - `model` (optional): echoed back, as on the chat endpoint.

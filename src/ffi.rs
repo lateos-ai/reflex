@@ -386,9 +386,7 @@ pub struct ReflexSystem1Result {
 /// for each of `num_candidates` candidate strings in `candidate_texts`. No
 /// argmax-then-feedback decode loop runs -- single-token candidates are
 /// scored in one batched gather-GEMV, multi-token candidates via a short
-/// teacher-forced continuation. Every architecture is supported; on the Qwen3.5
-/// hybrid models each candidate must be a single token (multi-token candidates
-/// fail with `REFLEX_ERROR_CODE_INVALID_INPUT`).
+/// teacher-forced continuation. Every architecture is supported.
 ///
 /// `handle` must come from `reflex_load` and not have been freed yet.
 /// `prompt` must be a non-NULL, NUL-terminated UTF-8 C string. `candidate_texts`
