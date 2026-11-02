@@ -5,6 +5,11 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Removed the Python bindings.** The `python` Cargo feature (PyO3, `src/python.rs`)
+  had not compiled for some time, so it is gone rather than left half-supported. From
+  Python, drive `reflex stdio` or `reflex uds` (one JSON request per line, no client
+  library); the C FFI is the in-process option.
+
 - **Comparison table on the current default.** README's "How it compares" now measures
   Reflex with quantized-resident weights: on a T4 (2026-10-30, `n=30` each, interleaved),
   `reflex generate` reaches its first token in 0.47 s p50 against `llama-simple`'s

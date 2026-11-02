@@ -305,7 +305,7 @@ two genuinely different things — don't conflate them.
 
 Any process **on the same instance** that can reach `/tmp/reflex-ipc/reflex.sock` can
 speak the one-JSON-request-per-line protocol defined in
-[`src/ipc.rs`](../src/ipc.rs). No PyO3, no special client library — plain sockets in
+[`src/ipc.rs`](../src/ipc.rs). No special client library — plain sockets in
 any language. Minimal Python example (stdlib only):
 
 ```python
@@ -337,13 +337,12 @@ TCP to the UDS path — an explicit, external add-on you choose to run, never so
 Reflex grows on its own (per the Non-goals' "core engine never grows a network
 socket").
 
-### Pattern B — PyO3 / C FFI in-process embedding
+### Pattern B — C FFI in-process embedding
 
-This is a different **architecture**, not a client of the sidecar above. The PyO3
-bindings (`src/python.rs`, built via `maturin build --features python`) and the C FFI
+This is a different **architecture**, not a client of the sidecar above. The C FFI
 (`src/ffi.rs`, `include/reflex_engine.h`, with a real working example at
-[`ffi-test/smoke_test.c`](../ffi-test/smoke_test.c)) load the model **into the same
-process** as your Python or C/C++ application — there is no socket, no sidecar
+[`ffi-test/smoke_test.c`](../ffi-test/smoke_test.c)) loads the model **into the same
+process** as your C/C++ application — there is no socket, no sidecar
 container, and no network hop at all. Use this pattern when your application can run
 directly on the GPU instance in the same process as the engine; use Pattern A when you
 want the engine isolated in its own container, reachable by one or more sibling

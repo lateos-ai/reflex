@@ -47,11 +47,9 @@ feature matrix*, not a release build — see the table for what it drags in.
 | `json-output` | `--json` on `generate`/`system1`/`bench`/`smoke`/`check`/`doctor`/`model-info` | none |
 | `download` | `--model <org/repo:file.gguf>` / `--quickstart` (HF downloader via `hf-hub`) | `libssl-dev` + `pkg-config` on Linux (**not** Windows/macOS, where `hf-hub` uses a different TLS backend) |
 | `nvml` | `reflex` energy instrumentation and the `reflex-energy` whole-process meter (dlopen'd `libnvidia-ml`, never linked) | none |
-| `python` | PyO3 bindings (`src/python.rs`) | a Python 3.8+ interpreter on the build host (`pyo3-build-config` probes for it) |
 
-The host-dependency story in one line: **only `download` (Linux) and `python` ever
-need anything the core build doesn't**, and both are off by default. On Ubuntu/Debian
-for the `download` feature specifically:
+The host-dependency story in one line: **only `download` (on Linux) ever needs
+anything the core build doesn't**, and it is off by default. On Ubuntu/Debian:
 
 ```
 sudo apt-get install -y libssl-dev pkg-config
@@ -60,7 +58,7 @@ sudo apt-get install -y libssl-dev pkg-config
 Every Dockerfile in this repo builds an explicit, minimal feature set (`--features
 ipc,nvml` for the sidecar/Runpod/Modal images, `nvml` for the root image's CLI target,
 which also ships `reflex-energy`) precisely so the released artifacts never pay for
-`download`/`python` they don't use — see each Dockerfile's `REFLEX_FEATURES`/`--features`
+`download` they don't use — see each Dockerfile's `REFLEX_FEATURES`/`--features`
 line rather than assuming `--all-features`. `nvml` adds no build dependency and no
 runtime requirement, and costs nothing unless `REFLEX_ENERGY=1` is set; where
 `libnvidia-ml` is missing the binary runs without energy figures (see [Docker](#docker)).
@@ -114,8 +112,7 @@ routers, activations and the KV cache are `f32` either way.
 | how | applies to |
 |---|---|
 | `--weights f16` / `--weights f32` | `generate`, `system1`, `bench`, `check`, `stdio`, `uds`; wins over the env var |
-| `REFLEX_WEIGHTS=f16` / `f32` | the same subcommands, the C FFI's `reflex_load` and Python's `PyModel` |
-| `PyModel(path, weights="f32")` | the Python bindings |
+| `REFLEX_WEIGHTS=f16` / `f32` | the same subcommands and the C FFI's `reflex_load` |
 | `--weights` on `reflex-openai-adapter` | passed through to its `reflex stdio` child |
 
 With neither set the default is `f16`, except `reflex check`, which defaults to `f32`

@@ -32,7 +32,7 @@ Runpod Hub worker (`.runpod/`) as shipped in this repository.
 ## Network
 
 - **The engine has no network socket.** It is reached only through local IPC (`reflex
-  stdio`, `reflex uds`), its C/Python bindings or its CLI.
+  stdio`, `reflex uds`), its C FFI or its CLI.
 - **The adapter listens on HTTP.** On the Hub worker it binds `127.0.0.1` only, and
   the worker's handler is its only client.
 - **Downloads happen only at worker start.** The Hub worker fetches the selected model

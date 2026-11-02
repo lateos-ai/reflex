@@ -37,7 +37,7 @@ rationale [below](#the-full-rationale):
   separate [`sidecar/openai-adapter`](../sidecar/openai-adapter/README.md) crate, which
   talks to the engine over local IPC. The engine itself may only grow sequential,
   non-network interfaces (`reflex stdio`, `reflex uds`) and in-process bindings (the C
-  FFI, the PyO3 module). These always target GPU 0.
+  FFI). These always target GPU 0.
 - **Agents are composed outside the engine.** Routing, envelopes, carry text and
   handoff files belong to the orchestrator; the engine only reports each request's
   facts (see [design/agent-relay.md](design/agent-relay.md#composing-agents-phase-h)).
@@ -133,7 +133,7 @@ for the same GPU, else the nearest compute capability. A reference is a
 numbers that were measured and published (leave out a phase that wasn't).
 `PROVE_IT_RUNS` sets the run count, `REFLEX_BIN` skips the build.
 
-Optional features (`ipc`, `json-output`, `download`, `nvml`, `python`) and their extra
+Optional features (`ipc`, `json-output`, `download`, `nvml`) and their extra
 host dependencies are listed in the reference's
 [Build features](reference.md#build-features) section.
 

@@ -25,8 +25,6 @@ pub mod limits;
 pub mod lora;
 pub mod model;
 pub mod moe;
-#[cfg(feature = "python")]
-pub mod python;
 pub mod sampling;
 pub mod tokenizer;
 mod tokenizer_unicode;
