@@ -5,12 +5,10 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
-- **KV cache file spec.** [docs/kv-cache-format.md](docs/kv-cache-format.md) documents
-  the byte layout of all seven cache-file versions and what orchestrators can rely on.
-  New tests build each version by hand and check it imports and re-exports
-  byte-identically. A file whose layer count doesn't match the model, or an MLA file
-  with the wrong `qk_dim`, now reports the `kv_cache` error category instead of
-  `other` (same message).
+- **Removed the Python bindings.** The `python` Cargo feature (PyO3, `src/python.rs`)
+  had not compiled for some time, so it is gone rather than left half-supported. From
+  Python, drive `reflex stdio` or `reflex uds` (one JSON request per line, no client
+  library); the C FFI is the in-process option.
 
 - **Comparison table on the current default.** README's "How it compares" now measures
   Reflex with quantized-resident weights: on a T4 (2026-10-30, `n=30` each, interleaved),
