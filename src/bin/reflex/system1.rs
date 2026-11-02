@@ -45,11 +45,10 @@
 //!
 //! Supports dense/MoE Qwen3, Qwen3.5 hybrid Gated DeltaNet, and DeepSeek-V2/V3
 //! MLA models (see `Model::system1_evaluate`'s doc comment for how each
-//! architecture is dispatched). **Hybrid models currently only support
-//! single-token candidates** -- a multi-token `--candidate` on a hybrid
-//! model is rejected with a clear error (see
-//! `Model::system1_evaluate_hybrid`'s doc comment for why); dense/MoE and
-//! MLA support both single- and multi-token candidates.
+//! architecture is dispatched). Every architecture supports both single- and
+//! multi-token candidates; on the recurrent hybrids (Qwen3.5, Granite 4.0-H)
+//! a multi-token candidate's continuation starts from a copy of the
+//! post-prompt state (see `Model::system1_evaluate_hybrid`'s doc comment).
 
 #[cfg(not(feature = "json-output"))]
 use crate::phase::json_output_unavailable;

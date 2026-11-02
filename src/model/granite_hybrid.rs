@@ -765,11 +765,13 @@ impl Model {
         Ok((generated, text))
     }
 
-    /// System1 for Granite 4.0-H: one batched prefill and every candidate's
-    /// first token from one row gather. **Single-token candidates only**, for
-    /// the reason `system1_evaluate_hybrid` gives: the SSM state is a running
-    /// accumulator, so scoring one multi-token candidate would leave the
-    /// shared post-prompt state advanced for the next.
+    /// System1 for Granite 4.0-H: one batched prefill, every candidate's first
+    /// token from one row gather, and a teacher-forced continuation for
+    /// multi-token candidates. As in `system1_evaluate_hybrid`, the conv and
+    /// SSM states are running accumulators: when more than one candidate
+    /// continues, they are copied on the device after the prefill and copied
+    /// back before every continuation but the first. The attention layers'
+    /// K/V rows are overwritten from the same position each time.
     pub(super) fn system1_evaluate_granite(
         &self,
         m: &GraniteHybridModel,
@@ -786,25 +788,86 @@ impl Model {
             .iter()
             .map(|c| self.resolve_candidate_token_ids(prompt, &c.text, true))
             .collect::<Result<_, _>>()?;
-        if resolved.iter().any(|ids| ids.len() > 1) {
-            return Err(ReflexError::InvalidInput(
-                "system1_evaluate: granitehybrid models currently support single-token candidates only"
-                    .to_string(),
-            ));
-        }
-        let (ids, hidden_batched, _states, _position) = self.prefill_granite(m, prompt, 0)?;
+        let max_len = resolved.iter().map(Vec::len).max().unwrap_or(1);
+        let (ids, hidden_batched, mut states, base_position) =
+            self.prefill_granite(m, prompt, max_len.saturating_sub(1))?;
         let hidden = self.last_row(&hidden_batched, ids.len(), m.cfg.hidden_size)?;
-        let normed = self.rmsnorm(
-            &hidden,
-            self.output_norm.f32()?,
-            1,
-            m.cfg.hidden_size,
-            m.cfg.rmsnorm_eps,
-        )?;
+        let gather = |hidden: &CudaSlice<f32>, tokens: &[u32]| {
+            let normed = self.rmsnorm(
+                hidden,
+                self.output_norm.f32()?,
+                1,
+                m.cfg.hidden_size,
+                m.cfg.rmsnorm_eps,
+            )?;
+            let mut scores = self.gemv_gather_lm_head(&normed, tokens)?;
+            Self::granite_scale_logits(m, &mut scores);
+            Ok::<_, ReflexError>(scores)
+        };
         let first_tokens: Vec<u32> = resolved.iter().map(|ids| ids[0]).collect();
-        let mut scores = self.gemv_gather_lm_head(&normed, &first_tokens)?;
-        Self::granite_scale_logits(m, &mut scores);
+        let mut scores = gather(&hidden, &first_tokens)?;
+
+        let multi: Vec<usize> = (0..resolved.len())
+            .filter(|&i| resolved[i].len() > 1)
+            .collect();
+        let snapshot = if multi.len() > 1 {
+            Some(self.snapshot_ssm_states(&states)?)
+        } else {
+            None
+        };
+        for (n, &i) in multi.iter().enumerate() {
+            if let (true, Some(snapshot)) = (n > 0, &snapshot) {
+                self.restore_ssm_states(snapshot, &mut states)?;
+            }
+            for (position, w) in (base_position..).zip(resolved[i].windows(2)) {
+                let step = self.forward_one_token_granite(m, w[0], position, &mut states)?;
+                scores[i] += gather(&step, &[w[1]])?[0];
+            }
+        }
         Self::finish_system1_response(candidates, resolved, scores, temperature)
+    }
+
+    /// Device copies of every SSM layer's `conv_state` and `ssm_state`
+    /// (`None` for attention layers), for [`Self::restore_ssm_states`].
+    fn snapshot_ssm_states(
+        &self,
+        states: &[GraniteLayerState],
+    ) -> Result<Vec<Option<[CudaSlice<f32>; 2]>>, ReflexError> {
+        states
+            .iter()
+            .map(|s| match s {
+                GraniteLayerState::Attn { .. } => Ok(None),
+                GraniteLayerState::Ssm {
+                    conv_state,
+                    ssm_state,
+                } => Ok(Some([conv_state.try_clone()?, ssm_state.try_clone()?])),
+            })
+            .collect::<Result<_, cudarc::driver::DriverError>>()
+            .map_err(|e| crate::gpu_err!(e, "snapshot granitehybrid state: {e}"))
+    }
+
+    /// Copies a [`Self::snapshot_ssm_states`] snapshot back into `states`.
+    fn restore_ssm_states(
+        &self,
+        snapshot: &[Option<[CudaSlice<f32>; 2]>],
+        states: &mut [GraniteLayerState],
+    ) -> Result<(), ReflexError> {
+        for (saved, state) in snapshot.iter().zip(states) {
+            if let (
+                Some([c_saved, s_saved]),
+                GraniteLayerState::Ssm {
+                    conv_state,
+                    ssm_state,
+                },
+            ) = (saved, state)
+            {
+                self.device
+                    .dtod_copy(c_saved, conv_state)
+                    .and_then(|()| self.device.dtod_copy(s_saved, ssm_state))
+                    .map_err(|e| crate::gpu_err!(e, "restore granitehybrid state: {e}"))?;
+            }
+        }
+        Ok(())
     }
 }
 

@@ -652,20 +652,19 @@ impl Model {
     /// Qwen3.5 hybrid Gated DeltaNet path -- see [`Self::system1_evaluate`]'s
     /// doc comment for the overall approach.
     ///
-    /// **Single-token candidates only.** Unlike dense/MLA, `GatedDeltaNet`
-    /// sublayers' `conv_state`/`recurrent` (`HybridLayerState::Gdn`) are a
-    /// running recurrent accumulator, not a position-addressed slot --
-    /// dense's/MLA's trick of reusing one shared cache sequentially across
-    /// candidates (safe there because K/V is indexed by position, so a
-    /// later candidate's continuation simply overwrites an earlier one's)
-    /// would instead leave a multi-token candidate's continuation drifted
-    /// past the shared post-prefill snapshot, silently corrupting every
-    /// candidate scored after the first multi-token one. Rejecting
-    /// multi-token candidates here avoids that hazard entirely; this still
-    /// covers System1's own headline use cases (Yes/No, A-D, a 1-10 scale).
-    /// State-cloning to lift this restriction is a real follow-up, not
-    /// attempted here. The same holds after a cached prefix (`imported`, see
-    /// `Model::system1_evaluate_resumed`), which is copied, never written.
+    /// Multi-token candidates get a teacher-forced continuation, as on the
+    /// dense path. Unlike dense/MLA, `GatedDeltaNet` sublayers'
+    /// `conv_state`/`recurrent` (`HybridLayerState::Gdn`) are a running
+    /// accumulator, not a position-addressed slot, so a continuation leaves
+    /// them advanced past the prompt. When more than one candidate continues,
+    /// those buffers are copied on the device after the prefill and copied
+    /// back before every continuation but the first; the attention layers'
+    /// K/V needs no copy, since each continuation restarts at the same
+    /// position and overwrites the previous one's rows. Single-token
+    /// candidates never touch the state, so a request without two multi-token
+    /// candidates takes no snapshot. The same holds after a cached prefix
+    /// (`imported`, see `Model::system1_evaluate_resumed`), which is copied,
+    /// never written.
     pub(super) fn system1_evaluate_hybrid(
         &self,
         h: &HybridModel,
@@ -684,24 +683,83 @@ impl Model {
             .iter()
             .map(|c| self.resolve_candidate_token_ids(prompt, &c.text, true))
             .collect::<Result<_, _>>()?;
-        if resolved.iter().any(|ids| ids.len() > 1) {
-            return Err(ReflexError::InvalidInput(
-                "system1_evaluate: hybrid Qwen3.5 models currently support single-token candidates only"
-                    .to_string(),
-            ));
-        }
+        let max_len = resolved.iter().map(Vec::len).max().unwrap_or(1);
 
-        let (ids, hidden_batched, _states, _position) =
-            self.prefill_hybrid_batched(h, prompt, imported, 0)?;
+        let (ids, hidden_batched, mut states, base_position) =
+            self.prefill_hybrid_batched(h, prompt, imported, max_len.saturating_sub(1))?;
         let hidden_size = h.attn_cfg.hidden_size;
         let eps = h.attn_cfg.rmsnorm_eps;
         let hidden = self.last_row(&hidden_batched, ids.len(), hidden_size)?;
 
         let normed = self.rmsnorm(&hidden, self.output_norm.f32()?, 1, hidden_size, eps)?;
         let first_tokens: Vec<u32> = resolved.iter().map(|ids| ids[0]).collect();
-        let scores = self.gemv_gather_lm_head(&normed, &first_tokens)?;
+        let mut scores = self.gemv_gather_lm_head(&normed, &first_tokens)?;
+
+        let multi: Vec<usize> = (0..resolved.len())
+            .filter(|&i| resolved[i].len() > 1)
+            .collect();
+        let snapshot = if multi.len() > 1 {
+            Some(self.snapshot_gdn_states(&states)?)
+        } else {
+            None
+        };
+        for (n, &i) in multi.iter().enumerate() {
+            if let (true, Some(snapshot)) = (n > 0, &snapshot) {
+                self.restore_gdn_states(snapshot, &mut states)?;
+            }
+            for (position, w) in (base_position..).zip(resolved[i].windows(2)) {
+                let step = self.forward_one_token_hybrid(h, w[0], position, &mut states)?;
+                let normed_step =
+                    self.rmsnorm(&step, self.output_norm.f32()?, 1, hidden_size, eps)?;
+                scores[i] += self.gemv_gather_lm_head(&normed_step, &[w[1]])?[0];
+            }
+        }
 
         Self::finish_system1_response(candidates, resolved, scores, temperature)
+    }
+
+    /// Device copies of every `GatedDeltaNet` layer's `conv_state` and
+    /// `recurrent` (`None` for attention layers), for
+    /// [`Self::restore_gdn_states`].
+    fn snapshot_gdn_states(
+        &self,
+        states: &[HybridLayerState],
+    ) -> Result<Vec<Option<[CudaSlice<f32>; 2]>>, ReflexError> {
+        states
+            .iter()
+            .map(|s| match s {
+                HybridLayerState::Attn { .. } => Ok(None),
+                HybridLayerState::Gdn {
+                    conv_state,
+                    recurrent,
+                } => Ok(Some([conv_state.try_clone()?, recurrent.try_clone()?])),
+            })
+            .collect::<Result<_, cudarc::driver::DriverError>>()
+            .map_err(|e| crate::gpu_err!(e, "snapshot hybrid state: {e}"))
+    }
+
+    /// Copies a [`Self::snapshot_gdn_states`] snapshot back into `states`.
+    fn restore_gdn_states(
+        &self,
+        snapshot: &[Option<[CudaSlice<f32>; 2]>],
+        states: &mut [HybridLayerState],
+    ) -> Result<(), ReflexError> {
+        for (saved, state) in snapshot.iter().zip(states) {
+            if let (
+                Some([c_saved, r_saved]),
+                HybridLayerState::Gdn {
+                    conv_state,
+                    recurrent,
+                },
+            ) = (saved, state)
+            {
+                self.device
+                    .dtod_copy(c_saved, conv_state)
+                    .and_then(|()| self.device.dtod_copy(r_saved, recurrent))
+                    .map_err(|e| crate::gpu_err!(e, "restore hybrid state: {e}"))?;
+            }
+        }
+        Ok(())
     }
 
     /// Causal depthwise conv1d + SiLU over the fused qkv, advancing

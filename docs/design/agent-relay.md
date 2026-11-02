@@ -891,9 +891,11 @@ How it works:
 - **The prompt must add at least one token.** The scores come from the last position
   of this request's own prefill. The final hidden state of the cached prefix isn't
   kept, so an empty continuation returns `invalid_input`.
-- **The Qwen3.5 hybrid takes single-token candidates**, after a prefix as without one.
-  Scoring a multi-token candidate would need the recurrent state copied again for every
-  candidate, so it returns `invalid_input`.
+- **The Qwen3.5 hybrid takes multi-token candidates too**, after a prefix as without one.
+  Its Gated DeltaNet state is a running accumulator rather than position-indexed, so
+  when two or more candidates are multi-token the request copies that state on the
+  device after its own prefill and restores it before each continuation but the first.
+  (When this phase shipped, a multi-token candidate returned `invalid_input` here.)
 - **Gemma 4 and Granite 4.0-H** have no prefix-state format yet. They still score fresh
   prompts and return `unsupported_architecture` with a prefix, before reading any file.
 
@@ -918,7 +920,6 @@ Errors on a `candidates` request:
 | `use_pinned` together with `import_kv` | `invalid_input` |
 | `use_pinned` with nothing pinned | `invalid_input` |
 | an empty continuation | `invalid_input` |
-| a multi-token candidate on the Qwen3.5 hybrid | `invalid_input` |
 | `use_pinned` or `import_kv` on Gemma 4 or Granite 4.0-H | `unsupported_architecture` |
 | `json_schema` | `invalid_input` |
 

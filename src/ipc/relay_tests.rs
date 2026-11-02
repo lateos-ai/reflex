@@ -805,36 +805,18 @@ fn ipc_system1_resumed_mla_fixture_matches_joined() {
     assert_system1_resumes(&model, [PARTS[0], PARTS[1]], &MULTI, Match::F32, "mla");
 }
 
-/// Qwen3.5 hybrid: single-token candidates after a resumed prefix, and a
-/// multi-token one rejected as it is without a prefix.
+/// Qwen3.5 hybrid: single- and multi-token candidates after a resumed prefix.
 #[test]
 #[ignore]
-fn qwen35moe_fixture_ipc_system1_resumed_single_token() {
+fn qwen35moe_fixture_ipc_system1_resumed_matches_joined() {
     let model = load(QWEN35MOE_FIXTURE, WeightsDtype::F32);
-    let single = [" the", " a", " and"];
     assert_system1_resumes(
         &model,
         [PARTS[0], PARTS[1]],
-        &single,
+        &MULTI,
         Match::F32,
         "qwen35moe",
     );
-
-    let mut slot = PrefixSlot::new();
-    let lines = session_with(
-        &model,
-        &mut slot,
-        &[
-            serde_json::json!({"prompt": PARTS[0], "pin_prefix": true, "max_tokens": 1}),
-            serde_json::json!({"prompt": PARTS[1], "candidates": [" the", " Paris, and Rome"],
-                               "use_pinned": true}),
-            serde_json::json!({"prompt": PARTS[1], "candidates": [" the", " Paris, and Rome"]}),
-        ],
-    );
-    final_ok(&lines[0]);
-    for l in &lines[1..] {
-        assert_eq!(l["error_kind"], "invalid_input", "{l}");
-    }
 }
 
 /// A real SentencePiece model (`SPM_GGUF` in the nightly): the continuation and

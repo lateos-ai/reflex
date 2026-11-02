@@ -532,8 +532,7 @@ fn granite_fixture_f16_weights_agree_on_clear_picks() {
     }
 }
 
-/// System1's single-token scores equal the full logits at those ids; a
-/// multi-token candidate is rejected (the SSM state can't be rewound).
+/// System1's single-token scores equal the full logits at those ids.
 #[test]
 #[ignore]
 fn granite_fixture_system1_scores_match_full_logits() {
@@ -572,11 +571,101 @@ fn granite_fixture_system1_scores_match_full_logits() {
             r.score
         );
     }
-    let multi = [System1Candidate {
-        text: " Paris is lovely".to_string(),
-    }];
-    let e = err_text(model.system1_evaluate(prompt, &multi, 1.0));
-    assert!(e.contains("single-token"), "{e}");
+}
+
+/// Multi-token candidates: each score equals the sum of its tokens' full logits
+/// from its own prefill and teacher-forced continuation, with two multi-token
+/// candidates in a row (the second one sees whatever the first left in the SSM
+/// state). The single-token scores are bit-identical to a request with only
+/// those candidates.
+#[test]
+#[ignore]
+fn granite_fixture_system1_multi_token_matches_full_prefills() {
+    let Some(file) = fixture() else {
+        return;
+    };
+    let model = load(&file, WeightsDtype::F32);
+    let m = model.granite.as_ref().expect("granitehybrid model");
+    let prompt = "The capital of France is";
+    let texts = [
+        " Paris",
+        " the city of Paris",
+        " Rome, Italy",
+        " London",
+        " a",
+    ];
+    let candidates = |texts: &[&str]| -> Vec<System1Candidate> {
+        texts
+            .iter()
+            .map(|t| System1Candidate {
+                text: t.to_string(),
+            })
+            .collect()
+    };
+    let resp = model
+        .system1_evaluate(prompt, &candidates(&texts), 1.0)
+        .expect("system1");
+    assert!(
+        resp.results
+            .iter()
+            .filter(|r| r.token_ids.len() > 1)
+            .count()
+            >= 2,
+        "expected at least two multi-token candidates"
+    );
+
+    let mut max_diff = 0.0f32;
+    for r in &resp.results {
+        let ids = &r.token_ids;
+        let (prompt_ids, hidden, mut states, mut position) = model
+            .prefill_granite(m, prompt, ids.len())
+            .expect("reference prefill");
+        let mut hidden = model
+            .last_row(&hidden, prompt_ids.len(), m.cfg.hidden_size)
+            .expect("last row");
+        let mut want = 0.0f32;
+        for (step, &id) in ids.iter().enumerate() {
+            if step > 0 {
+                hidden = model
+                    .forward_one_token_granite(m, ids[step - 1], position, &mut states)
+                    .expect("reference step");
+                position += 1;
+            }
+            want += model.granite_logits(m, &hidden).expect("logits")[id as usize];
+        }
+        let diff = (r.score - want).abs();
+        max_diff = max_diff.max(diff);
+        eprintln!(
+            "{:?}: tokens {ids:?} score {} reference {want} diff {diff:e}",
+            r.text, r.score
+        );
+        assert!(
+            diff <= 1e-4 * (1.0 + want.abs()),
+            "{:?}: system1 score {} vs reference {want}",
+            r.text,
+            r.score
+        );
+    }
+    eprintln!("granite: max |score - reference| = {max_diff:e}");
+
+    let singles: Vec<&str> = resp
+        .results
+        .iter()
+        .filter(|r| r.token_ids.len() == 1)
+        .map(|r| r.text.as_str())
+        .collect();
+    let alone = model
+        .system1_evaluate(prompt, &candidates(&singles), 1.0)
+        .expect("system1, single-token candidates");
+    for a in &alone.results {
+        let mixed = resp.results.iter().find(|r| r.text == a.text).unwrap();
+        assert_eq!(
+            mixed.score.to_bits(),
+            a.score.to_bits(),
+            "{:?}: single-token score changed by multi-token candidates",
+            a.text
+        );
+    }
 }
 
 /// The rejected options on a loaded model: LoRA and KV export.

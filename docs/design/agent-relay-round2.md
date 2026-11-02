@@ -116,7 +116,8 @@ Engine (`src/model/`):
 - On the Qwen3.5 hybrid, multi-token candidates would need the recurrent state copied
   again for each candidate. It starts with single-token candidates on a resumed
   prefix, and a multi-token candidate returns `invalid_input`, matching its current
-  System-1 limit.
+  System-1 limit. (Lifted since: the hybrid now copies its recurrent state and
+  scores multi-token candidates, with or without a prefix; see `agent-relay.md`.)
 - Gemma 4 and Granite 4.0-H keep returning `unsupported_architecture`.
 - Candidates are tokenized as continuations (`Tokenizer::encode_continuation`, the
   SentencePiece rule).

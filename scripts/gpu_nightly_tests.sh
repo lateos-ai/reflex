@@ -52,7 +52,7 @@ mkdir -p "$LOG_DIR"
 # to run, and what to set when it is missing.
 requirement() {
   case "$1" in
-    *::prefill_hybrid_batched_matches_sequential|*::ipc_kv_f16_file_hybrid_model_*|model::kv_f16_tests::hybrid_*|model::kv_cache_f16_tests::hybrid_*) echo "$HYBRID_GGUF|$HYBRID_GGUF|set HYBRID_GGUF" ;;
+    *::prefill_hybrid_batched_matches_sequential|model::hybrid_system1_tests::hybrid_*|*::ipc_kv_f16_file_hybrid_model_*|model::kv_f16_tests::hybrid_*|model::kv_cache_f16_tests::hybrid_*) echo "$HYBRID_GGUF|$HYBRID_GGUF|set HYBRID_GGUF" ;;
     *::iq_dequant_kernel_matches_host_on_real_tensors) echo "$IQ_GGUF|$IQ_GGUF|set IQ_GGUF" ;;
     *::prefill_mla_batched_matches_sequential_real_moe_checkpoint) echo "$MLA_REAL_GGUF|$MLA_REAL_GGUF|set MLA_REAL_GGUF" ;;
     *::qwen2_real_model_*) echo "$QWEN2_GGUF|$QWEN2_GGUF|set QWEN2_GGUF" ;;
