@@ -16,12 +16,18 @@
    System-1 `candidates` hop, and a `json_schema` hop. Compared with
    `scripts/bench_compare.py --relay` against `bench/relay-baseline-t4.json` (see
    [The relay baseline](#the-relay-baseline)).
-4. **Whole-process energy** (`scripts/bench_cold_energy.sh`, `reflex system1` under
+4. **Cold `generate`** (`scripts/bench_cold_start_phases.sh`, first token on the same
+   model, n=10): reported, not gated; there is no `generate` baseline.
+5. **Whole-process energy** (`scripts/bench_cold_energy.sh`, `reflex system1` under
    `reflex-energy`): gross energy, idle baseline and net energy, p50/p95. Reported in
    the run summary only; it does not gate the job.
+6. **A one-row results table** (`scripts/nightly_summary.py`): date, commit, GPU,
+   `system1` and `generate` p50, net energy p50 and the three relay hops' p50s. See
+   [Latest results](#latest-results).
 
 All results go to the run's summary page. The raw logs (per-test logs, per-run
-`/usr/bin/time -v` output, bench stdout) are uploaded as an artifact kept for 30 days.
+`/usr/bin/time -v` output, bench stdout, `nightly-summary.md`) are uploaded as an
+artifact kept for 30 days.
 
 GitHub-hosted runners have no GPU, so the workflow starts an **ephemeral self-hosted
 runner** on an EC2 `g4dn.xlarge` (Tesla T4, `sm_75`) with
@@ -116,7 +122,7 @@ The workflow skips every job until the repository variable
 
 Trigger it manually (Actions → GPU nightly → Run workflow) and check that:
 
-- the summary shows the GPU test table and the bench comparison;
+- the summary shows the GPU test table, the bench comparisons and the results table;
 - the EC2 console shows the `reflex-gpu-nightly` instance **terminated** afterwards.
 
 Then replace the provisional baseline (next section).
@@ -181,6 +187,33 @@ python3 scripts/bench_compare.py relay-output.txt --relay \
 The relay threshold and hop count can be changed per run with the manual-dispatch
 inputs.
 
+## Latest results
+
+Refreshed by hand at release time from a nightly run; the workflow never pushes to the
+repository. Every run's summary page ends with this table's row for that run (also in
+the artifact as `nightly-summary.md`), so refreshing it means copying that row here and
+linking the run. A cell is `n/a` in a run when its bench produced nothing usable, and
+the summary says why.
+
+| date | commit | GPU | system1 p50 | generate p50 | net energy p50 | relay pinned p50 | relay candidates p50 | relay constrained p50 |
+|---|---|---|---|---|---|---|---|---|
+| TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+
+Run: TBD.
+
+What the columns are, all on Qwen3-0.6B-Q4_K_M with the workflow's build (default
+weights, `--features ipc,nvml`, `sm_75` cubin):
+
+- **system1 / generate p50**: cold processes, process start to result (`system1`, two
+  candidates) and to first token (`generate`), n=10 each.
+- **net energy p50**: whole-process GPU energy of a cold `system1` run, measured by
+  `reflex-energy` from outside the process, minus the GPU's idle draw for the same
+  window, n=10. The engine itself runs without `REFLEX_ENERGY=1`, so its timings are
+  the default path's.
+- **relay p50s**: the gated p50 per hop kind on one warm `reflex stdio`, 20 hops each:
+  pinned and constrained round trip, `candidates` System-1 round trip (see
+  [The relay baseline](#the-relay-baseline)).
+
 ## Cost
 
 Everything in this section is an **estimate** from list prices, not a measurement.
@@ -226,4 +259,8 @@ DENSE_GGUF=/path/Qwen3-0.6B-Q4_K_M.gguf HYBRID_GGUF=/path/Qwen3.5-0.8B-Q4_K_M.gg
   scripts/gpu_nightly_tests.sh
 scripts/bench_cold_start_phases_system1.sh /path/Qwen3-0.6B-Q4_K_M.gguf 10 | tee bench.txt
 python3 scripts/bench_compare.py bench.txt --baseline bench/baseline-t4.json
+scripts/bench_cold_start_phases.sh /path/Qwen3-0.6B-Q4_K_M.gguf 10 | tee generate.txt
+python3 scripts/nightly_summary.py --commit "$(git rev-parse HEAD)" \
+  --gpu "$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)" \
+  --system1 bench.txt --generate generate.txt
 ```
