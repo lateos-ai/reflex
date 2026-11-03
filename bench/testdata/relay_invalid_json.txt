@@ -1,0 +1,48 @@
+# Synthetic sample for bench/test_bench_compare.py, not a measurement.
+Agent relay bench config: model=Qwen3-0.6B-Q4_K_M.gguf target=stdio hops=20 warmup=3 max_tokens=32 fixed_notes=1 sampling=greedy
+
+## agent relay: stdio, prefix pinned, 20 hops
+
+| metric | p50 | p95 | mean |
+|---|---:|---:|---:|
+| round trip (ms) | 230.00 | 241.50 | 232.30 |
+| first token (ms) | 16.00 | 16.80 | 16.16 |
+| engine total (ms) | 228.00 | 239.40 | 230.28 |
+| overhead (ms) | 1.50 | 1.58 | 1.52 |
+| prefix read/copy (ms) | 0.20 | 0.21 | 0.20 |
+| decode / token (ms) | 6.90 | 7.25 | 6.97 |
+| tokens generated | 32.00 | 32.00 | 32.32 |
+
+## agent relay: stdio, prefix pinned, system1, 20 hops
+
+| metric | p50 | p95 | mean |
+|---|---:|---:|---:|
+| turn: System-1 hop + generate hop (ms) | 250.00 | 262.50 | 252.50 |
+| System-1 round trip (ms) | 10.00 | 10.50 | 10.10 |
+| System-1 engine total (ms) | 8.50 | 8.93 | 8.59 |
+| System-1 prefix read/copy (ms) | 0.20 | 0.21 | 0.20 |
+| round trip (ms) | 230.00 | 241.50 | 232.30 |
+| first token (ms) | 16.00 | 16.80 | 16.16 |
+| engine total (ms) | 228.00 | 239.40 | 230.28 |
+| overhead (ms) | 1.50 | 1.58 | 1.52 |
+| prefix read/copy (ms) | 0.20 | 0.21 | 0.20 |
+| decode / token (ms) | 6.90 | 7.25 | 6.97 |
+| tokens generated | 32.00 | 32.00 | 32.32 |
+
+System-1 chosen labels: coder 12, reviewer 8
+
+## agent relay: stdio, prefix pinned, json_schema, 20 hops
+
+| metric | p50 | p95 | mean |
+|---|---:|---:|---:|
+| round trip (ms) | 260.00 | 273.00 | 262.60 |
+| first token (ms) | 16.00 | 16.80 | 16.16 |
+| engine total (ms) | 258.00 | 270.90 | 260.58 |
+| overhead (ms) | 1.50 | 1.58 | 1.52 |
+| prefix read/copy (ms) | 0.20 | 0.21 | 0.20 |
+| decode / token (ms) | 6.90 | 7.25 | 6.97 |
+| json_schema masking (ms) | 9.500 | 9.975 | 9.595 |
+| masking per token (ms) | 0.300 | 0.315 | 0.303 |
+| tokens generated | 30.00 | 32.00 | 30.30 |
+
+valid JSON outputs: 12/20

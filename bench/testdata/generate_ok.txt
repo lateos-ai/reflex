@@ -1,0 +1,12 @@
+# Synthetic sample for bench/test_nightly_summary.py, not a measurement.
+
+Cold-start phase breakdown, n=10 runs, Qwen3-0.6B-Q4_K_M.gguf:
+
+| phase | p50 | p95 | p50 joules |
+|---|---|---|---|
+| process launch (external − internal) | 100.000 ms | 110.000 ms | n/a (pre-main) |
+| gguf open (mmap + metadata parse) | 60.000 ms | 62.000 ms | n/a |
+| cuda init | 140.000 ms | 142.000 ms | n/a |
+| model load | 160.000 ms | 165.000 ms | n/a |
+| prompt eval (first token) | 20.000 ms | 21.000 ms | n/a |
+| total (process_start_to_first_token_ms) | 400.000 ms | 410.000 ms | n/a |

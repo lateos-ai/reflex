@@ -1,0 +1,13 @@
+# Synthetic sample for bench/test_nightly_summary.py, not a measurement: every
+# reflex-energy run failed, so each row has no values.
+
+Whole-process energy (reflex system1), n=10 runs, Qwen3-0.6B-Q4_K_M.gguf, idle window 2000 ms:
+
+| metric | p50 | p95 |
+|---|---|---|
+| wall clock, spawn to exit (ms) | n/a | n/a |
+| gross energy over the run (J) | n/a | n/a |
+| idle baseline for the same window (J) | n/a | n/a |
+| **net energy** (gross - idle) (J) | n/a | n/a |
+| idle power (W) | n/a | n/a |
+| in-process joules, main() to result (J) | n/a | n/a |

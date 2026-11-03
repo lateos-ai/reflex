@@ -38,10 +38,13 @@ for i in $(seq 1 "$n_runs"); do
     || echo "warning: run $i exited non-zero, see $results_dir/run_${i}.err" >&2
 done
 
-# field <name> <line prefix>: one value per run, sorted
+# field <name> <line prefix>: one value per run, sorted. A missing field yields no
+# value (the row prints n/a), never a failure: `joules=` is only on the result line
+# when the run had REFLEX_ENERGY=1, and under pipefail a failed grep would abort the
+# script before the table ends.
 field() {
   for i in $(seq 1 "$n_runs"); do
-    grep "^$2" "$results_dir/run_${i}.log" | grep -o " $1=[-0-9.]*" | head -1 | cut -d= -f2
+    grep "^$2" "$results_dir/run_${i}.log" | grep -o " $1=[-0-9.]*" | head -1 | cut -d= -f2 || true
   done | sort -n
 }
 
@@ -55,6 +58,10 @@ percentile() {  # $1 = percentile; sorted numbers on stdin
 row() {  # label, field, prefix, divisor (1000 turns mJ into J)
   local values p50 p95
   values="$(field "$2" "$3")"
+  if [[ -z "$values" ]]; then
+    echo "| $1 | n/a | n/a |"
+    return
+  fi
   p50=$(echo "$values" | percentile 50)
   p95=$(echo "$values" | percentile 95)
   if [[ "$4" != 1 && "$p50" != n/a ]]; then

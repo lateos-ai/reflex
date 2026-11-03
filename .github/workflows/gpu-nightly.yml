@@ -3,7 +3,8 @@ name: GPU nightly
 # Real-GPU correctness + cold-start regression check. GitHub-hosted runners have no
 # NVIDIA GPU (see ci.yml), so this starts an ephemeral self-hosted runner on an EC2
 # g4dn.xlarge (Tesla T4), runs every #[ignore]d GPU test plus the cold-start phase
-# bench against bench/baseline-t4.json, then terminates the instance -- even on
+# bench against bench/baseline-t4.json (plus the relay, generate and energy benches and
+# a one-row results table), then terminates the instance -- even on
 # failure or cancellation. Setup, secrets, cost and how to update the baseline:
 # docs/gpu-ci.md.
 #
@@ -24,6 +25,12 @@ on:
       bench_runs:
         description: "Cold-start bench runs (n)"
         default: "10"
+      relay_threshold_pct:
+        description: "Fail if a relay hop's gated p50 regresses by more than this percent (and by 3 ms)"
+        default: "15"
+      relay_hops:
+        description: "Relay bench hops per hop kind (n)"
+        default: "20"
 
 permissions:
   contents: read
@@ -162,13 +169,61 @@ jobs:
             --threshold-pct "${{ inputs.threshold_pct || '15' }}" \
             --summary-file "$GITHUB_STEP_SUMMARY"
 
+      # Cold first token, for the results table only: no generate baseline, not gated.
+      - name: Cold-start bench (generate)
+        if: always() && steps.tests.outcome != 'skipped'
+        run: |
+          set -o pipefail
+          mkdir -p bench-results
+          bash scripts/bench_cold_start_phases.sh \
+            "$MODELS_DIR/$DENSE_FILE" "${{ inputs.bench_runs || '10' }}" | tee bench-results/generate-output.txt
+
+      # Warm agent-relay hops on one `reflex stdio`: pinned prefix, System-1
+      # `candidates`, json_schema (scripts/bench_relay_nightly.sh).
+      - name: Relay hop bench
+        if: always() && steps.tests.outcome != 'skipped'
+        run: |
+          set -o pipefail
+          mkdir -p bench-results
+          bash scripts/bench_relay_nightly.sh \
+            "$MODELS_DIR/$DENSE_FILE" "${{ inputs.relay_hops || '20' }}" bench-results \
+            | tee bench-results/relay-output.txt
+
+      - name: Compare relay against baseline
+        if: always() && hashFiles('bench-results/relay-output.txt') != ''
+        run: |
+          python3 scripts/bench_compare.py bench-results/relay-output.txt --relay \
+            --baseline bench/relay-baseline-t4.json \
+            --threshold-pct "${{ inputs.relay_threshold_pct || '15' }}" \
+            --summary-file "$GITHUB_STEP_SUMMARY"
+
       # Whole-process energy, net of the GPU's idle draw (src/bin/reflex-energy.rs).
       # Reported in the summary, not gated: energy has no committed baseline yet.
       - name: Cold-start energy
         if: always() && steps.tests.outcome != 'skipped'
         run: |
           set -o pipefail
-          bash scripts/bench_cold_energy.sh "$MODELS_DIR/$DENSE_FILE" "${{ inputs.bench_runs || '10' }}"             | tee -a "$GITHUB_STEP_SUMMARY"
+          mkdir -p bench-results
+          bash scripts/bench_cold_energy.sh "$MODELS_DIR/$DENSE_FILE" "${{ inputs.bench_runs || '10' }}" \
+            | tee bench-results/energy-output.txt
+          cat bench-results/energy-output.txt >> "$GITHUB_STEP_SUMMARY"
+
+      # One row for the run (scripts/nightly_summary.py), also kept in the artifact.
+      # docs/gpu-ci.md's "Latest results" is refreshed from it by hand; this job never
+      # pushes to the repository.
+      - name: Results table
+        if: always() && steps.tests.outcome != 'skipped'
+        run: |
+          mkdir -p bench-results
+          python3 scripts/nightly_summary.py \
+            --commit "$GITHUB_SHA" \
+            --gpu "$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)" \
+            --system1 bench-results/bench-output.txt \
+            --generate bench-results/generate-output.txt \
+            --energy bench-results/energy-output.txt \
+            --relay bench-results/relay-output.txt \
+            --out bench-results/nightly-summary.md \
+            --summary-file "$GITHUB_STEP_SUMMARY"
 
       - name: Upload raw logs
         if: always()

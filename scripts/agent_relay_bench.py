@@ -98,6 +98,11 @@ a run with the schema and one without can share the same prompt. A small model
 asked for a free-text note under a schema tends to fill the string until
 --max-tokens runs out.
 
+--fixed-notes: every hop's previous note is TASK instead of the previous hop's
+output, so the prompts are a fixed set of len(ROLES) suffixes whatever the model
+writes. The GPU nightly uses it: a change that alters outputs then can't move the
+timings by changing later prompts.
+
 Usage:
   scripts/agent_relay_bench.py stdio --reflex target/release/reflex --model m.gguf
   scripts/agent_relay_bench.py uds --reflex target/release/reflex --model m.gguf
@@ -114,7 +119,7 @@ Usage:
   cold-chain/cold-warm/--reuse-prefix: [--kv-dtype f32|f16]
              [--system1 planner,coder,reviewer,tester]
   stdio/uds/llama-server: [--json-schema scripts/relay_handoff_schema.json]
-  any target: [--json-prompt]
+  any target: [--json-prompt] [--fixed-notes]
   llama-cli: [--llama-cli-args "-ngl 99 --no-warmup ..."] [--llama-prompt-cache]
 
 Standard library only, so it runs anywhere Python 3.8+ does.
@@ -563,14 +568,17 @@ def energy_sample(energy, hops):
     }
 
 
-def run_chain(do_hop, hops, warmup, max_tokens, carry_chars, on_measure_start=None):
+def run_chain(
+    do_hop, hops, warmup, max_tokens, carry_chars, on_measure_start=None, fixed_notes=False
+):
     samples = []
     previous = ""
     for hop in range(warmup + hops):
         if hop == warmup and on_measure_start is not None:
             on_measure_start()
         sample, text = do_hop(hop_suffix(hop, previous, carry_chars), max_tokens)
-        previous = text.strip()
+        if not fixed_notes:
+            previous = text.strip()
         if hop >= warmup:
             # Greedy and deterministic, so chains on different targets can be diffed.
             sample["text"] = text
@@ -746,6 +754,19 @@ def selftest():
     summary = summarize([{"s1_chosen": "coder", "s1_rtt_ms": 1.0}, {"s1_chosen": "coder"}])
     assert summary["s1_chosen"] == {"coder": 2} and summary["s1_rtt_ms"]["p50"] == 1.0, summary
 
+    sent = []
+
+    def echo(suffix, max_tokens):
+        sent.append(suffix)
+        return {}, f"output {len(sent)}"
+
+    run_chain(echo, 7, 1, 4, 400, fixed_notes=True)
+    assert all(s.startswith(f"Previous note: {TASK}\n") for s in sent), sent
+    assert len(set(sent)) == len(ROLES) and sent[len(ROLES)] == sent[0], sent
+    sent.clear()
+    run_chain(echo, 2, 0, 4, 400)
+    assert sent[1].startswith("Previous note: output 1\n"), sent
+
     assert kv_export_cli("f32") == [] and kv_export_cli("f16") == ["--export-kv-dtype", "f16"]
     assert list(kv_export_request("p", "f32")) == ["export_kv"]
     assert kv_export_request("p", "f16") == {"export_kv": "p", "export_kv_dtype": "f16"}
@@ -826,6 +847,11 @@ def main(argv=None):
         "--json-prompt",
         action="store_true",
         help="ask for the note as compact JSON in the shared system prompt",
+    )
+    ap.add_argument(
+        "--fixed-notes",
+        action="store_true",
+        help="every hop's previous note is the fixed task, not the previous hop's output",
     )
     ap.add_argument("--energy", action="store_true", help="measure GPU energy with reflex-energy")
     ap.add_argument("--reflex-energy", default="target/release/reflex-energy")
@@ -1016,7 +1042,13 @@ def main(argv=None):
                     return sample, text
 
         samples = run_chain(
-            do_hop, args.hops, args.warmup, args.max_tokens, args.carry_chars, on_measure_start
+            do_hop,
+            args.hops,
+            args.warmup,
+            args.max_tokens,
+            args.carry_chars,
+            on_measure_start,
+            args.fixed_notes,
         )
         energy_bracket = None
         if "running" in bracket:
@@ -1071,6 +1103,7 @@ def main(argv=None):
                     "kv_dir": cold.kv_dir if cold is not None else args.kv_dir,
                     "json_schema": args.json_schema,
                     "json_prompt": args.json_prompt,
+                    "fixed_notes": args.fixed_notes,
                     "system1_labels": labels,
                     "energy": args.energy,
                     "energy_idle_ms": args.energy_idle_ms if args.energy else None,

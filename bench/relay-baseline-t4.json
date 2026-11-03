@@ -1,0 +1,84 @@
+{
+  "provisional": true,
+  "provisional_reason": "until two scheduled nightly runs exist",
+  "source": "T4 box run 2026-10-27 (g4dn.xlarge, driver 595.91.07, sm_75), not a GitHub run: run 2 of 3 back-to-back runs of scripts/bench_relay_nightly.sh, the median one; n=20 hops per kind after 3 warmup",
+  "run_to_run_spread": "gated p50 over the 3 runs (n=20 each), min-max: pinned rtt_ms 163.65-164.98, candidates s1_rtt_ms 15.46-15.53, constrained rtt_ms 155.25-155.83; valid JSON 20/20 in all; hop texts identical across runs",
+  "recorded": "2026-10-27",
+  "gpu": "Tesla T4",
+  "model": "Qwen3-0.6B-Q4_K_M.gguf",
+  "target": "stdio",
+  "hops": 20,
+  "warmup": 3,
+  "max_tokens": 32,
+  "fixed_notes": 1,
+  "sampling": "greedy",
+  "hop_kinds": {
+    "pinned": {
+      "gate": "rtt_ms",
+      "metrics": {
+        "rtt_ms": {
+          "p50": 164.12,
+          "p95": 165.17
+        },
+        "first_token_ms": {
+          "p50": 9.71,
+          "p95": 9.85
+        },
+        "kv_io_ms": {
+          "p50": 0.22,
+          "p95": 0.24
+        },
+        "decode_ms_per_token": {
+          "p50": 4.98,
+          "p95": 5.01
+        },
+        "tokens": {
+          "p50": 32.0,
+          "p95": 32.0
+        }
+      }
+    },
+    "candidates": {
+      "gate": "s1_rtt_ms",
+      "metrics": {
+        "s1_rtt_ms": {
+          "p50": 15.49,
+          "p95": 15.74
+        },
+        "s1_model_ms": {
+          "p50": 15.4,
+          "p95": 15.63
+        },
+        "s1_kv_io_ms": {
+          "p50": 0.21,
+          "p95": 0.24
+        }
+      }
+    },
+    "constrained": {
+      "gate": "rtt_ms",
+      "metrics": {
+        "rtt_ms": {
+          "p50": 155.25,
+          "p95": 174.01
+        },
+        "first_token_ms": {
+          "p50": 11.19,
+          "p95": 11.4
+        },
+        "mask_ms": {
+          "p50": 8.253,
+          "p95": 8.713
+        },
+        "tokens": {
+          "p50": 28.5,
+          "p95": 32.0
+        }
+      },
+      "valid": {
+        "count": 20,
+        "of": 20
+      }
+    }
+  }
+}
