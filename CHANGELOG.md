@@ -5,6 +5,22 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Agent-relay hops and a results table in the GPU nightly.** The nightly now runs
+  `scripts/bench_relay_nightly.sh` on one warm `reflex stdio` (Qwen3-0.6B-Q4_K_M,
+  system prompt pinned, 20 fixed greedy hops each of a pinned generate hop, a System-1
+  `candidates` hop and a `json_schema` hop) and compares it with
+  `bench_compare.py --relay` against a provisional `bench/relay-baseline-t4.json`
+  (fails on a p50 above +15% and +3 ms, or on fewer valid JSON outputs). It also
+  reports cold `generate` (not gated) and ends with a one-row table
+  (`scripts/nightly_summary.py`) in the job summary and the artifact. The first run on a
+  T4 is in [docs/gpu-ci.md](docs/gpu-ci.md#latest-results): `system1` 354.4 ms,
+  `generate` 384.7 ms, relay pinned 162.5 / candidates 15.2 / constrained 154.6 ms p50,
+  all within 2% of the baseline.
+- **Fixed the nightly's energy step.** `scripts/bench_cold_energy.sh` exited under
+  `pipefail` when a run printed no in-process `joules=` (only printed with
+  `REFLEX_ENERGY=1` since energy reporting became opt-in), which had turned the
+  scheduled nightly red. A missing field now prints `n/a`.
+
 - **Multi-token `system1` candidates on Qwen3.5 and Granite 4.0-H.** The recurrent
   hybrids no longer reject a candidate that tokenizes to more than one token (CLI,
   IPC `candidates`, FFI, sidecar `/v1/classify`), on a fresh prompt and, on Qwen3.5,
