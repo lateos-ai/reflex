@@ -11,7 +11,7 @@ single phases (process launch, gguf open) are noisy at the tens-of-ms scale.
 With --relay it reads scripts/bench_relay_nightly.sh's output instead: three
 scripts/agent_relay_bench.py tables over one warm `reflex stdio` (pinned-prefix,
 `candidates` and `json_schema` hops), compared against a baseline such as
-bench/baseline-relay-t4.json. Each hop kind has one gated p50 (RELAY_KINDS); it
+bench/relay-baseline-t4.json. Each hop kind has one gated p50 (RELAY_KINDS); it
 regresses when it grows by more than the threshold *and* by at least
 --min-delta-ms, since a warm hop is small enough for a few ms of jitter to be a
 large percentage. Fewer valid JSON outputs on the constrained hop also count as a
@@ -27,7 +27,7 @@ Usage:
       [--threshold-pct 15] [--strict] [--summary-file $GITHUB_STEP_SUMMARY]
   scripts/bench_compare.py <bench-output.txt> --write-baseline <new.json>
       [--source "nightly run <url>"]    # intentional baseline update, see docs/gpu-ci.md
-  scripts/bench_compare.py <relay-output.txt> --relay --baseline bench/baseline-relay-t4.json
+  scripts/bench_compare.py <relay-output.txt> --relay --baseline bench/relay-baseline-t4.json
       [--threshold-pct 15] [--min-delta-ms 3] [--strict] [--summary-file ...]
   scripts/bench_compare.py <relay-output.txt> --relay --write-baseline <new.json>
       [--provisional] [--source ...]

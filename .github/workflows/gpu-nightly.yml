@@ -183,7 +183,7 @@ jobs:
         if: always() && hashFiles('bench-results/relay-output.txt') != ''
         run: |
           python3 scripts/bench_compare.py bench-results/relay-output.txt --relay \
-            --baseline bench/baseline-relay-t4.json \
+            --baseline bench/relay-baseline-t4.json \
             --threshold-pct "${{ inputs.relay_threshold_pct || '15' }}" \
             --summary-file "$GITHUB_STEP_SUMMARY"
 

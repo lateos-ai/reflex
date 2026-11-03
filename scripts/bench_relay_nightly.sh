@@ -7,7 +7,7 @@
 #   candidates   the same plus a System-1 `candidates` hop before every generate hop
 #   constrained  a generate hop under scripts/relay_handoff_schema.json
 # and prints one config line plus the three tables, which
-# `scripts/bench_compare.py --relay` compares against bench/baseline-relay-t4.json.
+# `scripts/bench_compare.py --relay` compares against bench/relay-baseline-t4.json.
 # The per-hop JSON (every sample) goes to <out-dir>/relay-<kind>.json.
 #
 # Usage: scripts/bench_relay_nightly.sh <path-to-gguf> [hops] [out-dir]

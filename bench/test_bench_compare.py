@@ -181,7 +181,7 @@ class CliTests(unittest.TestCase):
             os.remove(summary)
 
 
-RELAY_BASELINE = os.path.join(HERE, "baseline-relay-t4.json")
+RELAY_BASELINE = os.path.join(HERE, "relay-baseline-t4.json")
 
 
 def parse_relay(name):

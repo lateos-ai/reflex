@@ -14,7 +14,7 @@
    on the same model with the shared system prompt pinned, 20 hops of each kind with
    fixed prompts and greedy decoding: a generate hop resumed from the pinned prefix, a
    System-1 `candidates` hop, and a `json_schema` hop. Compared with
-   `scripts/bench_compare.py --relay` against `bench/baseline-relay-t4.json` (see
+   `scripts/bench_compare.py --relay` against `bench/relay-baseline-t4.json` (see
    [The relay baseline](#the-relay-baseline)).
 4. **Whole-process energy** (`scripts/bench_cold_energy.sh`, `reflex system1` under
    `reflex-energy`): gross energy, idle baseline and net energy, p50/p95. Reported in
@@ -158,7 +158,7 @@ with the manual-dispatch inputs.
 
 ## The relay baseline
 
-`bench/baseline-relay-t4.json` holds one gated p50 per hop kind: the round trip of the
+`bench/relay-baseline-t4.json` holds one gated p50 per hop kind: the round trip of the
 pinned generate hop, the round trip of the `candidates` hop, and the round trip of the
 `json_schema` hop, plus that hop's count of valid JSON outputs. A hop kind regresses
 when its p50 grows by more than the threshold (default 15%) **and** by at least 3 ms
@@ -174,7 +174,7 @@ says so and the step passes. To write one from a run's `relay-output.txt`:
 
 ```
 python3 scripts/bench_compare.py relay-output.txt --relay \
-  --write-baseline bench/baseline-relay-t4.json [--provisional] \
+  --write-baseline bench/relay-baseline-t4.json [--provisional] \
   --source "GPU nightly run https://github.com/<org>/<repo>/actions/runs/<id>"
 ```
 
