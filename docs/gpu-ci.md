@@ -197,9 +197,12 @@ the summary says why.
 
 | date | commit | GPU | system1 p50 | generate p50 | net energy p50 | relay pinned p50 | relay candidates p50 | relay constrained p50 |
 |---|---|---|---|---|---|---|---|---|
-| TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
+| 2026-11-03 | 3b904c5 | Tesla T4 | 354.4 ms | 384.7 ms | TBD | 162.5 ms | 15.2 ms | 154.6 ms |
 
-Run: TBD.
+Run: [GPU nightly run 41568038765](https://github.com/lateos-ai/reflex/actions/runs/41568038765)
+(manual dispatch on the branch that added this table; constrained hop 20/20 valid JSON).
+Net energy is TBD: the external net-energy p50 still varies too much from run to run to
+publish.
 
 What the columns are, all on Qwen3-0.6B-Q4_K_M with the workflow's build (default
 weights, `--features ipc,nvml`, `sm_75` cubin):
