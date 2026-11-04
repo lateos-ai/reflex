@@ -198,12 +198,12 @@ the summary says why.
 
 | date | commit | GPU | system1 p50 | generate p50 | gross energy p50 | relay pinned p50 | relay candidates p50 | relay constrained p50 |
 |---|---|---|---|---|---|---|---|---|
-| 2026-11-03 | 3b904c5 | Tesla T4 | 354.4 ms | 384.7 ms | TBD | 162.5 ms | 15.2 ms | 154.6 ms |
+| 2026-11-04 | 3ab06da | Tesla T4 | 335.2 ms | 370.4 ms | 20.33 J | 161.9 ms | 15.2 ms | 153.3 ms |
 
-Run: [GPU nightly run 41568038765](https://github.com/lateos-ai/reflex/actions/runs/41568038765)
-(manual dispatch on the branch that added this table; constrained hop 20/20 valid JSON).
-Gross energy is TBD until a nightly runs with the counter-aligned reads; that run predates
-them, and its net figure varied too much from run to run to publish.
+Run: [GPU nightly run 41755149365](https://github.com/lateos-ai/reflex/actions/runs/41755149365)
+(manual dispatch on the branch that switched this column to gross energy; constrained hop
+20/20 valid JSON). Gross energy p95 20.60 J; net of idle in the same run 1.24 J p50
+(1.33 J p95), which the energy step's own table reports but this table doesn't.
 
 What the columns are, all on Qwen3-0.6B-Q4_K_M with the workflow's build (default
 weights, `--features ipc,nvml`, `sm_75` cubin):
