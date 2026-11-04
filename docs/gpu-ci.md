@@ -19,10 +19,11 @@
 4. **Cold `generate`** (`scripts/bench_cold_start_phases.sh`, first token on the same
    model, n=10): reported, not gated; there is no `generate` baseline.
 5. **Whole-process energy** (`scripts/bench_cold_energy.sh`, `reflex system1` under
-   `reflex-energy`): gross energy, idle baseline and net energy, p50/p95. Reported in
-   the run summary only; it does not gate the job.
+   `reflex-energy`, which reads the counter on its updates): gross energy, idle
+   baseline and net energy, p50/p95. Reported in the run summary only; it does not gate
+   the job.
 6. **A one-row results table** (`scripts/nightly_summary.py`): date, commit, GPU,
-   `system1` and `generate` p50, net energy p50 and the three relay hops' p50s. See
+   `system1` and `generate` p50, gross energy p50 and the three relay hops' p50s. See
    [Latest results](#latest-results).
 
 All results go to the run's summary page. The raw logs (per-test logs, per-run
@@ -195,24 +196,27 @@ the artifact as `nightly-summary.md`), so refreshing it means copying that row h
 linking the run. A cell is `n/a` in a run when its bench produced nothing usable, and
 the summary says why.
 
-| date | commit | GPU | system1 p50 | generate p50 | net energy p50 | relay pinned p50 | relay candidates p50 | relay constrained p50 |
+| date | commit | GPU | system1 p50 | generate p50 | gross energy p50 | relay pinned p50 | relay candidates p50 | relay constrained p50 |
 |---|---|---|---|---|---|---|---|---|
-| 2026-11-03 | 3b904c5 | Tesla T4 | 354.4 ms | 384.7 ms | TBD | 162.5 ms | 15.2 ms | 154.6 ms |
+| 2026-11-04 | 3ab06da | Tesla T4 | 335.2 ms | 370.4 ms | 20.33 J | 161.9 ms | 15.2 ms | 153.3 ms |
 
-Run: [GPU nightly run 41568038765](https://github.com/lateos-ai/reflex/actions/runs/41568038765)
-(manual dispatch on the branch that added this table; constrained hop 20/20 valid JSON).
-Net energy is TBD: the external net-energy p50 still varies too much from run to run to
-publish.
+Run: [GPU nightly run 41755149365](https://github.com/lateos-ai/reflex/actions/runs/41755149365)
+(manual dispatch on the branch that switched this column to gross energy; constrained hop
+20/20 valid JSON). Gross energy p95 20.60 J; net of idle in the same run 1.24 J p50
+(1.33 J p95), which the energy step's own table reports but this table doesn't.
 
 What the columns are, all on Qwen3-0.6B-Q4_K_M with the workflow's build (default
 weights, `--features ipc,nvml`, `sm_75` cubin):
 
 - **system1 / generate p50**: cold processes, process start to result (`system1`, two
   candidates) and to first token (`generate`), n=10 each.
-- **net energy p50**: whole-process GPU energy of a cold `system1` run, measured by
-  `reflex-energy` from outside the process, minus the GPU's idle draw for the same
-  window, n=10. The engine itself runs without `REFLEX_ENERGY=1`, so its timings are
-  the default path's.
+- **gross energy p50**: whole-process GPU energy of a cold `system1` run, measured by
+  `reflex-energy` from outside the process over a window between two counter updates,
+  n=10, not net of idle (most of it is the GPU's idle draw). Net of idle is in the
+  energy step's own table, but a cold start's ~1 J net is below what this method gets
+  right (see [docs/benchmarks.md](benchmarks.md#energy)), so gross is the
+  run-to-run signal. The engine itself runs without `REFLEX_ENERGY=1`, so its timings
+  are the default path's.
 - **relay p50s**: the gated p50 per hop kind on one warm `reflex stdio`, 20 hops each:
   pinned and constrained round trip, `candidates` System-1 round trip (see
   [The relay baseline](#the-relay-baseline)).

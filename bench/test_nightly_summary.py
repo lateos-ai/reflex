@@ -59,16 +59,16 @@ class ParserTest(unittest.TestCase):
             self.assertEqual(nightly_summary.cold_total(f.read()),
                              (400.0, 10, "Qwen3-0.6B-Q4_K_M.gguf"))
 
-    def test_net_energy(self):
+    def test_gross_energy(self):
         with open(sample("energy_ok.txt"), encoding="utf-8") as f:
-            self.assertEqual(nightly_summary.net_energy(f.read()),
-                             (12.0, 10, "Qwen3-0.6B-Q4_K_M.gguf"))
+            self.assertEqual(nightly_summary.gross_energy(f.read()),
+                             (30.0, 10, "Qwen3-0.6B-Q4_K_M.gguf"))
 
-    def test_net_energy_without_values_is_an_error(self):
+    def test_gross_energy_without_values_is_an_error(self):
         with open(sample("energy_no_counter.txt"), encoding="utf-8") as f:
             text = f.read()
         with self.assertRaises(nightly_summary.bench_compare.BenchParseError):
-            nightly_summary.net_energy(text)
+            nightly_summary.gross_energy(text)
 
     def test_relay_gated_p50s(self):
         with open(sample("relay_ok.txt"), encoding="utf-8") as f:
@@ -83,7 +83,7 @@ class TableTest(unittest.TestCase):
         code, report = run(META + ALL_INPUTS)
         self.assertEqual(code, 0)
         self.assertEqual(row_cells(report), [
-            "2026-01-02", "0123456", "Tesla T4", "489.0 ms", "400.0 ms", "12.00 J",
+            "2026-01-02", "0123456", "Tesla T4", "489.0 ms", "400.0 ms", "30.00 J",
             "230.0 ms", "10.0 ms", "260.0 ms",
         ])
         self.assertNotIn("missing:", report)

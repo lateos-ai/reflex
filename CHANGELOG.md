@@ -20,6 +20,16 @@ What has been built, in order. Measurements live in
   `pipefail` when a run printed no in-process `joules=` (only printed with
   `REFLEX_ENERGY=1` since energy reporting became opt-in), which had turned the
   scheduled nightly red. A missing field now prints `n/a`.
+- **Energy reads aligned to NVML's counter; the nightly reports gross energy.** On a T4
+  the energy counter updates every ~100 ms in ~3.2 J steps, more than a cold start's
+  ~1.4 J net, so the nightly's net p50 swung between 0.21 and 1.62 J from batch to batch.
+  `reflex-energy` now reads the counter right after an update and times each window
+  between two updates; `scripts/bench_cold_energy.sh`'s idle window default goes from 2 s
+  to 5 s (the energy step took 58 s instead of 26 s on a T4, n=10). Net became
+  repeatable (1.31-1.41 J p50) but not accurate (`reflex-energy -- sleep 1` nets about
+  +0.5 J), so the results table's energy column is now gross energy (21.6 J p50 on a
+  T4), with net still in the energy step's own table. See
+  [docs/benchmarks.md](docs/benchmarks.md#energy).
 
 - **Multi-token `system1` candidates on Qwen3.5 and Granite 4.0-H.** The recurrent
   hybrids no longer reject a candidate that tokenizes to more than one token (CLI,
