@@ -12,14 +12,18 @@
 # Usage: scripts/bench_cold_energy.sh <path-to-gguf> [n_runs] [prompt]
 #   Build both binaries first:  cargo build --release --features nvml
 #   Run on a dedicated GPU: the counter is device-wide.
-# Environment: IDLE_MS (default 2000), the idle window measured before each run.
+# Environment: IDLE_MS (default 5000), the idle window measured before each run. On a
+# T4, 5 s gave a net p50 within 1% across batches of 30, 2 s within 3% (but ~9%
+# lower): the net figure depends on the idle window, so compare like with like. Gross
+# energy is the figure to compare across runs: on a T4, 21.6 J p50 and 21.8 J p95 over
+# n=30. Net isn't accurate below ~1 J (`reflex-energy -- sleep 1` nets about +0.5 J).
 
 set -euo pipefail
 
 gguf_path="${1:?usage: $0 <path-to-gguf> [n_runs] [prompt]}"
 n_runs="${2:-10}"
 prompt="${3:-Q: Is the sky blue during the day? A:}"
-idle_ms="${IDLE_MS:-2000}"
+idle_ms="${IDLE_MS:-5000}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 reflex="$repo_root/target/release/reflex"
