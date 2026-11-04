@@ -3,7 +3,7 @@
 
 Reads the bench outputs the nightly writes under bench-results/ and prints one
 markdown table row: date, commit, GPU, cold `system1` and `generate` p50, whole-process
-net energy p50, and the warm relay hops' gated p50s. The nightly appends it to the job
+gross energy p50, and the warm relay hops' gated p50s. The nightly appends it to the job
 summary and keeps it as bench-results/nightly-summary.md in the run's artifact; the
 same header is docs/gpu-ci.md's "Latest results" table, so refreshing that table at
 release time is copying the row.
@@ -42,7 +42,7 @@ COLUMNS = [
     "GPU",
     "system1 p50",
     "generate p50",
-    "net energy p50",
+    "gross energy p50",
     "relay pinned p50",
     "relay candidates p50",
     "relay constrained p50",
@@ -52,7 +52,7 @@ NA = "n/a"
 _PHASES_HEADER = re.compile(
     r"Cold-start phase breakdown(?: \(reflex \w+\))?, n=(\d+) runs, (\S+?):?\s*$")
 _ENERGY_HEADER = re.compile(r"Whole-process energy \(reflex (\w+)\), n=(\d+) runs, ([^,]+),")
-_ENERGY_NET = re.compile(r"^\|\s*\**net energy\**[^|]*\|\s*([0-9.]+|n/a)\s*\|")
+_ENERGY_GROSS = re.compile(r"^\|\s*gross energy[^|]*\|\s*([0-9.]+|n/a)\s*\|")
 
 
 def _read(path):
@@ -71,23 +71,27 @@ def cold_total(text):
     return total, n, model
 
 
-def net_energy(text):
-    """(net energy p50 in J, n_runs or None, model or None) from bench_cold_energy.sh."""
-    n, model, net = None, None, None
+def gross_energy(text):
+    """(gross energy p50 in J, n_runs or None, model or None) from bench_cold_energy.sh.
+
+    Gross, not net of idle: with the counter read on its updates, gross is stable run to
+    run, while the ~1 J net of a cold start moves with the idle window and read method.
+    """
+    n, model, gross = None, None, None
     for line in text.splitlines():
         line = line.strip()
         m = _ENERGY_HEADER.search(line)
         if m:
             n, model = int(m.group(2)), m.group(3).strip()
             continue
-        m = _ENERGY_NET.match(line)
+        m = _ENERGY_GROSS.match(line)
         if m:
             if m.group(1) == NA:
-                raise bench_compare.BenchParseError("net energy row has no measurements")
-            net = float(m.group(1))
-    if net is None:
-        raise bench_compare.BenchParseError("no net energy row")
-    return net, n, model
+                raise bench_compare.BenchParseError("gross energy row has no measurements")
+            gross = float(m.group(1))
+    if gross is None:
+        raise bench_compare.BenchParseError("no gross energy row")
+    return gross, n, model
 
 
 def relay_p50s(text):
@@ -122,7 +126,7 @@ def build(args):
     details = []
     system1 = _load("system1", args.system1, cold_total, notes)
     generate = _load("generate", args.generate, cold_total, notes)
-    energy = _load("energy", args.energy, net_energy, notes)
+    energy = _load("energy", args.energy, gross_energy, notes)
     relay = _load("relay", args.relay, relay_p50s, notes)
 
     def ms(v):
@@ -144,7 +148,7 @@ def build(args):
     for name, got, what in (
         ("system1", system1, "cold processes, process start to result"),
         ("generate", generate, "cold processes, process start to first token"),
-        ("net energy", energy, "cold `system1` processes, whole process, net of idle"),
+        ("gross energy", energy, "cold `system1` processes, whole process, not net of idle"),
     ):
         if got is not None:
             n = f"n={got[1]} " if got[1] is not None else ""

@@ -615,6 +615,21 @@ moves between runs (5.35 vs 5.66 J) even when the gross one quadruples. Caveats:
 counter is device-wide, so this needs a dedicated GPU, and the idle baseline depends on
 the GPU's power state, so compare net numbers only across runs measured the same way.
 
+**Counter resolution: report gross, not net.** Re-measured on the same kind of T4
+(driver 595.91.07, Qwen3-0.6B-Q4_K_M `system1`, 2026-11-03), NVML's energy counter
+updates only every ~100 ms, in steps of ~3.2 J at the 32 W idle, so a read can be one
+step stale. That is more than a cold start's own net energy (~1.4 J at today's ~0.45 s):
+with unaligned reads and a 2 s idle window, three batches of 30 runs gave net p50s of
+1.62, 0.21 and 0.33 J. `reflex-energy` now waits for the counter's next update before
+each read and times each window between two updates (idle window 5 s by default).
+That makes net repeatable (p50 1.31, 1.41 and 1.36 J over three batches of 10) but
+not accurate: `reflex-energy -- sleep 1` now nets +0.46 to +0.54 J (the unaligned tool
+gave -0.06 to 0.06 J), and with the idle window as long as the run window the same
+`system1` nets 0.96 J instead of 1.35 J. A net figure this small moves with the method
+by a few tenths of a joule. Gross energy over the aligned window is stable (21.6 J p50,
+21.8 J p95, n=30), so it is the figure the GPU nightly reports. The 5.35 J table above
+was measured with the unaligned tool on an older, slower build.
+
 ## Kernel build modes
 
 **Portable PTX is only cheap when the driver's JIT cache is warm.** Measured on a real
