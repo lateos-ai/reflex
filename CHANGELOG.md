@@ -5,6 +5,9 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Runpod Hub: `v0.2.18-runpod-hub`.** Same engine and worker as `v0.2.16` and
+  `v0.2.17`, released from a new commit because the Hub never started a build for either
+  of those (both tagged `9ae55e6`).
 - **Agent-relay hops and a results table in the GPU nightly.** The nightly now runs
   `scripts/bench_relay_nightly.sh` on one warm `reflex stdio` (Qwen3-0.6B-Q4_K_M,
   system prompt pinned, 20 fixed greedy hops each of a pinned generate hop, a System-1
