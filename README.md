@@ -72,9 +72,12 @@ something fails, never for being slower.
 build options and output formats: [docs/reference.md](docs/reference.md).
 
 No GPU of your own? Reflex is listed on the
-[Runpod Hub](https://console.runpod.io/hub/listing/lateos-ai/reflex): deploy it as a
-serverless endpoint in one click, no build required ([worker docs](.runpod/README.md)),
-with optional retrieval over your own documents ([RAG](.runpod/README.md#optional-rag)).
+[Runpod Hub](https://console.runpod.io/hub/listing/lateos-ai/reflex): deploy a
+scale-to-zero endpoint in one click, no build required ([worker docs](.runpod/README.md)),
+for routing and guardrails (`/v1/classify` scores every label in one prefill) and
+extraction (`response_format` JSON Schema output), plus chat, embeddings and optional
+retrieval over your own documents ([RAG](.runpod/README.md#optional-rag)). Presets set
+up each use case ([presets](.runpod/README.md#presets)).
 
 ## Supported models and limits
 

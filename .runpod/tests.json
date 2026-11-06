@@ -32,6 +32,30 @@
         "labels": [" billing", " tech_support", " sales", " legal"]
       },
       "timeout": 120000
+    },
+    {
+      "name": "smoke-json-schema",
+      "input": {
+        "messages": [{"role": "user", "content": "Review: The battery died after two days. Extract the sentiment and the product part mentioned, as JSON."}],
+        "max_tokens": 256,
+        "response_format": {
+          "type": "json_schema",
+          "json_schema": {
+            "name": "review",
+            "strict": true,
+            "schema": {
+              "type": "object",
+              "properties": {
+                "sentiment": {"enum": ["positive", "negative", "neutral"]},
+                "part": {"type": "string"}
+              },
+              "required": ["sentiment", "part"],
+              "additionalProperties": false
+            }
+          }
+        }
+      },
+      "timeout": 120000
     }
   ],
   "config": {
