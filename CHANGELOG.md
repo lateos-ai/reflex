@@ -5,6 +5,19 @@ What has been built, in order. Measurements live in
 
 ## Unreleased
 
+- **Runpod Hub listing leads with classification and JSON Schema output.** `hub.json`'s
+  title and description now open with what the worker is for (routing, guardrails,
+  extraction) and its three job types, with the cold-start comparison and its caveats
+  moved lower and the queue worker's own n=1 cold measurement stated next to the
+  load-balancing path's. Five deploy presets (intent router, guardrail classifier,
+  embeddings, chat with your documents, compliance-audited) set existing fields only;
+  `.runpod/README.md` gains a Presets section and documents `response_format`, replacing
+  a stale note that said Reflex had no constrained decoding. `tests.json` gains a
+  `response_format` JSON Schema job on the default model. `handler.py` is unchanged: the
+  runpod SDK already fails a job at the first yielded `error` item, so a
+  `grammar_dead_end` fails the test instead of passing it; the new
+  `.runpod/test_hub_config.py` checks that, and that every preset names real fields and
+  dropdown values. Takes effect with the next `vX.Y.Z-runpod-hub` release.
 - **Runpod Hub: `v0.2.18-runpod-hub`.** Same engine and worker as `v0.2.16` and
   `v0.2.17`, released from a new commit because the Hub never started a build for either
   of those (both tagged `9ae55e6`).

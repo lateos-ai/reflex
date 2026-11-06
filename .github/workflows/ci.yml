@@ -122,7 +122,9 @@ jobs:
   # the embedding server passed in, so it is unit-tested here with a fake one;
   # test_compliance.py imports handler.py itself with a stub runpod module and a
   # faked adapter and download server, so the compliance wiring (and the
-  # unchanged responses with every option off) is tested without the SDK. Python
+  # unchanged responses with every option off) is tested without the SDK.
+  # test_hub_config.py checks hub.json's presets, tests.json's JSON Schema job and
+  # that a grammar_dead_end reaches Runpod as a failed job. Python
   # 3.10 is the Hub image's (Ubuntu 22.04) interpreter.
   hub-handler-syntax-check:
     runs-on: ubuntu-latest

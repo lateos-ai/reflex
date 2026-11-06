@@ -53,6 +53,23 @@ holding that `classification` object, like a non-streaming chat job:
            "labels": [" positive", " negative"]}}
 ```
 
+**JSON Schema output**: a chat job with `response_format` gets one JSON value that
+validates against the schema, from the engine's grammar-constrained decoding (see
+[`sidecar/openai-adapter/README.md`](../sidecar/openai-adapter/README.md#response_format-json-schema-output)
+for the supported schema subset). Give `max_tokens` room for the whole value: if it runs
+out first, the job fails with code `grammar_dead_end` instead of returning JSON that
+doesn't parse. An unsupported keyword (`pattern`, `minLength`, ...) fails the job too.
+
+```json
+{"input": {"messages": [{"role": "user", "content": "Review: The battery died after two days. Extract the sentiment and the product part mentioned, as JSON."}],
+           "max_tokens": 256,
+           "response_format": {"type": "json_schema", "json_schema": {"name": "review", "strict": true,
+             "schema": {"type": "object",
+                        "properties": {"sentiment": {"enum": ["positive", "negative", "neutral"]},
+                                       "part": {"type": "string"}},
+                        "required": ["sentiment", "part"], "additionalProperties": false}}}}}
+```
+
 **Embeddings**: a job whose `input` has `input` and no `messages` goes to the adapter's
 `POST /v1/embeddings` (see
 [`sidecar/openai-adapter/README.md`](../sidecar/openai-adapter/README.md#post-v1embeddings)).
@@ -78,6 +95,39 @@ The worker bakes **Qwen3-0.6B-Q8_0** (not the Q4_K_M the `runpod-lb` image uses)
 listing leads with classification, and on a sub-3B model Q8_0 preserves the fine-grained
 logits the label softmax reads where a 4-bit quant can move a near-tie. No generation
 happens, so the extra bandwidth is paid once at load, not per decoded token.
+
+## Presets
+
+The deploy form offers five presets. Each one sets `MODEL`, `RAG`, `COMPLIANCE` and
+`AUDIT_LOG`, so switching from one to another leaves none of the first behind; every
+other field keeps its default. Every preset but the first and the last downloads its
+model when a worker starts, once per worker, or once in all with a network volume
+attached (see "Where downloads go" below).
+
+| Preset | Model | Also sets | For |
+|---|---|---|---|
+| Intent router (fastest) | Qwen3-0.6B Q8_0, baked in | RAG off | Routing and classification with `labels`; no download, ready in 0.5 s in the table below |
+| Guardrail classifier (larger model) | Qwen3-1.7B Q4_K_M | RAG off | The same classify jobs on a model about 3x the size |
+| Embeddings | Nemotron-3.5-Embed-1B Q8_0 | RAG off | `input` jobs only; chat and classify jobs fail |
+| Chat with your documents (RAG) | Qwen2.5-7B-Instruct Q4_K_M | RAG on | Chat jobs with a `rag` field (see [Optional RAG](#optional-rag)) |
+| Compliance-audited (needs a network volume) | Qwen3-0.6B Q8_0, baked in | COMPLIANCE on, AUDIT_LOG volume | Attestations and an audit log file per worker; without a volume the worker stops at start |
+
+Why these models:
+
+- **Guardrail classifier: Qwen3-1.7B.** It is the next Qwen3 size up, the family that
+  rates the sentiment smoke test correctly (TinyLlama, Granite 350M and Gemma 4 12B
+  don't; see "Choosing the model"). In the ready-time table below it was ready in 3.4 s,
+  against 31.8 s for Qwen3-4B and 17.0 s for Qwen3-8B (one run each, download speed
+  varies), so it adds a few seconds to a cold worker rather than tens. No accuracy
+  comparison between the Qwen3 sizes has been run here: check it on your own labels, and
+  pick Qwen3-4B or 8B in the Model field if 1.7B isn't enough.
+- **Chat with your documents: Qwen2.5-7B-Instruct.** A RAG answer is only as good as the
+  chat model's reading of the passages, and a 0.6B model follows them less reliably than
+  a 7B one (see "Optional RAG"). Of the 7B instruct models in the table, Qwen2.5-7B was
+  ready in 13.2 s against Mistral-7B's 28.3 s. Its 4.7 GB file plus the embedding
+  model's 1.2 GB is well under the 16 GB pool's VRAM, but this exact pairing hasn't been
+  run with RAG on yet; the RAG checks below used Qwen3-0.6B and Gemma 4 12B (13.6 GB
+  peak with the embedder).
 
 ## Choosing the model
 
@@ -161,14 +211,16 @@ its numbers mean anything, all of them the caller's to get right:
   human review or a larger model. Label-order bias is also uncorrected: calibrate on
   held-out data and do not trust the listed order.
 
-Strategy B from the general classifier playbook -- grammar-constrained JSON output for
-multi-label extraction -- is **not** implemented here: `system1_evaluate` is scoring
-only, and Reflex has no grammar-constrained sampling yet (it is a queued backlog item).
-Use chat completions with a prompt that demands JSON if you need it, and parse
-defensively.
+For multi-label extraction, or anything that isn't one label from a fixed set, use a
+chat job with `response_format` (see "JSON Schema output" above): the reply is decoded
+under the schema, so it always parses and validates, but the values in it are the
+model's and are not scored the way `/v1/classify`'s labels are.
 
 The Hub smoke tests (`tests.json`) only assert the job completes; they do not assert the
-predicted label. Check accuracy locally with `reflex system1` on real data before
+predicted label or the JSON's values. The JSON Schema test does exercise the constrained
+path: a job that can't finish its value fails rather than completing
+(`test_hub_config.py` checks that the handler turns the adapter's `grammar_dead_end`
+into a failed job). Check accuracy locally with `reflex system1` on real data before
 trusting a deployment.
 
 `handler` is a Runpod **generator** handler started with `return_aggregate_stream`, the
